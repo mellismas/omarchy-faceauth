@@ -1,0 +1,15 @@
+[package]
+name = "faceauth-camera"
+description = "Camera capture for Omarchy FaceAuth: V4L2 (UVC and Intel IPU3), IPU3 unpack, exposure and colour calibration, IR illuminator control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+nix.workspace = true
+libc.workspace = true
+serde.workspace = true
