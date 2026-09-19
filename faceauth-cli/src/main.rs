@@ -32,6 +32,14 @@ fn main() -> Result<()> {
         ["engine", "test", rest @ ..] => engine_test(rest),
         ["engine", "live", rest @ ..] => engine_live(rest),
         ["enroll", rest @ ..] => enroll(rest),
+        ["presence"] => {
+            let f = "/run/faceauth/presence.json";
+            match std::fs::read_to_string(f) {
+                Ok(t) => println!("{}", t.trim()),
+                Err(e) => println!("no presence state ({}): {}", f, e),
+            }
+            Ok(())
+        }
         ["auth", rest @ ..] => {
             let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
             let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));

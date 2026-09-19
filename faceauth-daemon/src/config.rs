@@ -29,6 +29,8 @@ pub struct Config {
     pub ir_orientation: [bool; 3],
     /// Run the flash-response liveness gate (needs the strobe control).
     pub liveness: bool,
+    /// The presence watch (auto-lock when the enrolled user leaves).
+    pub presence: crate::presence::PresenceConfig,
 }
 
 impl Default for Config {
@@ -46,6 +48,7 @@ impl Default for Config {
             // The reference machine (Surface Book 2): transpose plus both flips.
             ir_orientation: [true, true, true],
             liveness: true,
+            presence: Default::default(),
         }
     }
 }

@@ -25,7 +25,7 @@ struct Request {
     user: String,
 }
 
-pub fn serve(auth: Authenticator, socket: &Path) -> Result<()> {
+pub fn serve(auth: Arc<Mutex<Authenticator>>, socket: &Path) -> Result<()> {
     if let Some(dir) = socket.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
@@ -34,7 +34,6 @@ pub fn serve(auth: Authenticator, socket: &Path) -> Result<()> {
     // World-connectable; the peer-credential check below is the access control.
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o666))?;
     log::info!("listening on {}", socket.display());
-    let auth = Arc::new(Mutex::new(auth));
     for conn in listener.incoming() {
         let stream = match conn {
             Ok(s) => s,

@@ -1,0 +1,12 @@
+#!/bin/bash
+# Lock a user's Omarchy session from the faceauth daemon (root). The shell's
+# lock service is reached over the user's runtime directory; OMARCHY_PATH must
+# name the tree the running shell was launched from.
+#   faceauth-lock-session <user> [omarchy-path]
+set -euo pipefail
+user=${1:?user}
+omarchy_path=${2:-$(sed -n 's/^OMARCHY_PATH=//p' /etc/omarchy.conf 2>/dev/null | tr -d '"' | head -1)}
+omarchy_path=${omarchy_path:-/usr/share/omarchy}
+uid=$(id -u "$user")
+exec runuser -u "$user" -- env "XDG_RUNTIME_DIR=/run/user/$uid" "OMARCHY_PATH=$omarchy_path" \
+  PATH=/usr/local/bin:/usr/bin:/bin omarchy-system-lock

@@ -4,5 +4,6 @@
 pub mod auth;
 pub mod capture;
 pub mod config;
+pub mod presence;
 pub mod server;
 pub mod store;

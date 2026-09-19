@@ -11,6 +11,7 @@ pub mod detect;
 pub mod embed;
 pub mod image;
 pub mod liveness;
+pub mod pose;
 pub mod runtime;
 
 use anyhow::Result;

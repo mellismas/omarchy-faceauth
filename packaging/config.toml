@@ -10,3 +10,15 @@ liveness = true             # flash-response gate (needs the ov7251 strobe contr
 # ir_video = "/dev/video2"  # override camera detection (UVC IR cameras go here)
 # ir_subdev = "/dev/v4l-subdev7"
 ir_orientation = [true, true, true]   # transpose, flip_x, flip_y: Surface Book 2 mounting
+
+[presence]
+enabled = false             # auto-lock when the enrolled user leaves; opt-in
+user = ""                   # whose templates define "present"
+tick_seconds = 2.0          # one short look (about 0.45 s of camera) per tick
+identify_every = 3          # identity check every N ticks; detection every tick
+away_seconds = 20.0         # unseen for this long -> lock the session
+require_attention = false   # also require the face to be turned to the camera
+max_yaw = 0.25
+max_roll_degrees = 25.0
+lock_command = ["/usr/bin/faceauth-lock-session", ""]   # second arg: the user
+state_file = "/run/faceauth/presence.json"

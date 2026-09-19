@@ -1,0 +1,196 @@
+//! Presence watch: is the enrolled user in front of the machine?
+//!
+//! Low duty by construction: every `tick_seconds` the watch takes the camera
+//! for a fraction of a second, grabs a few frames with the illuminator on,
+//! detects on the last one and, every `identify_every` ticks, embeds it and
+//! checks it against the templates. The camera is closed between ticks, so an
+//! authentication attempt never waits for more than one tick.
+//!
+//! State: `Present` (enrolled user seen recently), `Away` (no face for
+//! `away_seconds`, session locked once on the transition), `Stranger` (a face
+//! that is not the enrolled user; treated as away for locking). The state is
+//! published to `<runtime>/presence.json` for the shell.
+
+use crate::auth::Authenticator;
+use anyhow::Result;
+use faceauth_engine::pose;
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PresenceConfig {
+    pub enabled: bool,
+    /// Whose presence: the user whose templates are matched.
+    pub user: String,
+    pub tick_seconds: f32,
+    /// Ticks between identity checks (detection alone runs every tick).
+    pub identify_every: u32,
+    /// Seconds without the user before the session is locked.
+    pub away_seconds: f32,
+    /// Also require the face to be turned toward the camera.
+    pub require_attention: bool,
+    pub max_yaw: f32,
+    pub max_roll_degrees: f32,
+    /// Command run (as root) to lock the session on the away transition.
+    pub lock_command: Vec<String>,
+    /// Where the state file goes.
+    pub state_file: String,
+}
+
+impl Default for PresenceConfig {
+    fn default() -> Self {
+        PresenceConfig {
+            enabled: false,
+            user: String::new(),
+            tick_seconds: 2.0,
+            identify_every: 3,
+            away_seconds: 20.0,
+            require_attention: false,
+            max_yaw: 0.25,
+            max_roll_degrees: 25.0,
+            lock_command: vec!["/usr/bin/faceauth-lock-session".into()],
+            state_file: "/run/faceauth/presence.json".into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum State {
+    Present,
+    Away,
+    Stranger,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Published {
+    pub state: State,
+    pub attentive: bool,
+    pub last_seen_secs_ago: Option<f32>,
+    pub locked_by_presence: bool,
+    pub updated: u64,
+}
+
+pub fn run(auth: Arc<Mutex<Authenticator>>, cfg: PresenceConfig) {
+    let mut last_seen: Option<Instant> = None;
+    let mut state = State::Unknown;
+    let mut locked_by_presence = false;
+    let mut tick: u32 = 0;
+    let mut identity_ok = true; // until an identity check says otherwise
+    log::info!("presence watch on for {} (tick {}s, away after {}s, attention {})", cfg.user, cfg.tick_seconds, cfg.away_seconds, cfg.require_attention);
+    loop {
+        std::thread::sleep(Duration::from_secs_f32(cfg.tick_seconds));
+        tick = tick.wrapping_add(1);
+        let identify = tick % cfg.identify_every.max(1) == 0 || state != State::Present;
+        let obs = {
+            let mut a = auth.lock().unwrap_or_else(|p| p.into_inner());
+            match observe(&mut a, &cfg, identify) {
+                Ok(o) => o,
+                Err(e) => {
+                    log::warn!("presence tick: {}", e);
+                    continue;
+                }
+            }
+        };
+        let now = Instant::now();
+        if let Some(id) = obs.identity {
+            identity_ok = id;
+        }
+        let seen = obs.face && identity_ok && (!cfg.require_attention || obs.attentive);
+        if seen {
+            last_seen = Some(now);
+        }
+        let away_for = last_seen.map(|t| now.duration_since(t).as_secs_f32());
+        let next = if seen {
+            State::Present
+        } else if obs.face && !identity_ok {
+            State::Stranger
+        } else if away_for.map(|s| s >= cfg.away_seconds).unwrap_or(false) {
+            State::Away
+        } else if state == State::Unknown {
+            State::Unknown
+        } else {
+            state // in the away window: keep the previous state
+        };
+        if next != state {
+            log::info!("presence: {:?} -> {:?}{}", state, next, away_for.map(|s| format!(" (unseen {:.0}s)", s)).unwrap_or_default());
+        }
+        if next == State::Away && state != State::Away && !locked_by_presence {
+            log::info!("presence: locking the session");
+            match std::process::Command::new(&cfg.lock_command[0]).args(&cfg.lock_command[1..]).status() {
+                Ok(s) if s.success() => locked_by_presence = true,
+                Ok(s) => log::warn!("lock command exited {}", s),
+                Err(e) => log::warn!("lock command: {}", e),
+            }
+        }
+        if next == State::Present {
+            locked_by_presence = false;
+        }
+        state = next;
+        let pub_ = Published {
+            state,
+            attentive: obs.attentive,
+            last_seen_secs_ago: away_for,
+            locked_by_presence,
+            updated: crate::store::now_secs(),
+        };
+        if let Ok(json) = serde_json::to_string(&pub_) {
+            let tmp = format!("{}.tmp", cfg.state_file);
+            if std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, &cfg.state_file)).is_err() {
+                log::debug!("presence: cannot write {}", cfg.state_file);
+            }
+        }
+    }
+}
+
+struct Observation {
+    face: bool,
+    attentive: bool,
+    /// Some(true/false) when an identity check ran.
+    identity: Option<bool>,
+}
+
+/// One short look: open the camera, LEDs on, a few frames, detect, maybe identify, close.
+fn observe(a: &mut Authenticator, cfg: &PresenceConfig, identify: bool) -> Result<Observation> {
+    use crate::capture::IrCapture;
+    let mut cap = IrCapture::open(&a.cfg)?;
+    if let Some(i) = &cap.illuminator {
+        i.set(true)?;
+    }
+    // Let exposure react for a handful of frames; the last one is what we look at.
+    let mut img = None;
+    let deadline = Instant::now() + Duration::from_millis(450);
+    while Instant::now() < deadline {
+        if let Some(g) = cap.next(Duration::from_millis(500))? {
+            img = Some(g);
+        }
+    }
+    let Some(img) = img else {
+        cap.stop()?;
+        return Ok(Observation { face: false, attentive: false, identity: None });
+    };
+    let faces = a.pipeline.detector.detect(&img, a.cfg.min_detection)?;
+    let Some(face) = faces.into_iter().max_by(|x, y| x.score.total_cmp(&y.score)) else {
+        cap.stop()?;
+        return Ok(Observation { face: false, attentive: false, identity: None });
+    };
+    let p = pose::pose(&face.landmarks);
+    let attentive = pose::is_attentive(&p, cfg.max_yaw, cfg.max_roll_degrees);
+    let identity = if identify {
+        let crop = faceauth_engine::align::align_112(&img, &face.landmarks);
+        let e = a.pipeline.embedder.embed(&crop)?;
+        let ok = match a.store.load(&cfg.user)? {
+            Some(t) => t.best_match(&e).map(|(s, _)| s >= a.cfg.accept_threshold).unwrap_or(false),
+            None => false,
+        };
+        Some(ok)
+    } else {
+        None
+    };
+    cap.stop()?;
+    log::debug!("presence tick: face {:.2} yaw {:.2} pitch {:.2} roll {:.0} attentive {} identity {:?}", face.score, p.yaw, p.pitch, p.roll.to_degrees(), attentive, identity);
+    Ok(Observation { face: true, attentive, identity })
+}

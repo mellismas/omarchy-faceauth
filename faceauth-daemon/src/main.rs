@@ -11,7 +11,12 @@ fn main() -> Result<()> {
     let cfg = Config::load(&cfg_path)?;
     log::info!("config {}: models {} store {} socket {}", cfg_path, cfg.models_dir.display(), cfg.store_dir.display(), cfg.socket.display());
     let socket = cfg.socket.clone();
-    let auth = Authenticator::new(cfg)?;
+    let presence = cfg.presence.clone();
+    let auth = std::sync::Arc::new(std::sync::Mutex::new(Authenticator::new(cfg)?));
     log::info!("models loaded; ready");
+    if presence.enabled {
+        let a = std::sync::Arc::clone(&auth);
+        std::thread::Builder::new().name("presence".into()).spawn(move || faceauth_daemon::presence::run(a, presence))?;
+    }
     server::serve(auth, &socket)
 }
