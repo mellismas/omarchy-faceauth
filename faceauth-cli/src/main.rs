@@ -89,6 +89,7 @@ fn main() -> Result<()> {
             let f = "/run/faceauth/presence.json";
             match std::fs::read_to_string(f) {
                 Ok(t) => println!("{}", t.trim()),
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => println!("presence state is root-only ({}); run with sudo", f),
                 Err(e) => println!("no presence state ({}): {}", f, e),
             }
             Ok(())

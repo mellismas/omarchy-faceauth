@@ -337,6 +337,61 @@ WARN    tpm.present          no TPM device; templates cannot be sealed
 PASS    pam.module           /usr/lib/security/pam_faceauth.so
 ```
 
+## Security review and what changed (2026-09-19 03:45)
+
+An adversarial review (Opus, read-only, with live probes against the socket)
+found the core property intact: no path returns PAM_SUCCESS without a genuine
+match from the daemon. It found four high and four medium findings. Fixed in
+this commit:
+
+- **Unbounded pre-authorisation read** (any uid could grow a root process until
+  the OOM killer fired): requests are read through a 4 KiB cap and must end in a
+  newline; error replies never echo request bytes; at most 8 connections at
+  once; `MemoryMax=1536M`, `TasksMax=64` in the unit.
+- **Enrolment and deletion were unauthenticated** (anything running as the user,
+  including over ssh to a locked machine, could enrol a new face): the daemon
+  now takes both only from root; `omarchy-setup-security-face` runs them under
+  sudo, and refuses to run as root itself so the templates belong to the user.
+- **Camera-mutex starvation**: a request waits at most 1.5 s for the camera and
+  then answers `busy` instead of queueing; enrolment is clamped to 20 s.
+- **The verdict was a substring match** on a reply that could contain reflected
+  bytes: the module now requires the reply to begin with the match object.
+- **No liveness gate on cameras without the strobe control** looked identical to
+  a gated match: `liveness_required = true` by default refuses to authenticate
+  there; setting it false is an explicit acceptance that a print can pass, and
+  `doctor` reports it.
+- **Auto-lock**: the helper calls the lock command by absolute path with a 15 s
+  bound, the daemon retries the lock every tick while away until it succeeds, and
+  an empty user argument means the presence user.
+- **Cooldown**: five failed attempts for a user within a minute hold that user
+  for 30 s, so a print at the lock screen does not get unlimited tries.
+- Typed passwords are zeroed in every copy; auth-log lines strip control
+  characters; the presence state file is root-only; `FACEAUTH_DUMP` exists only
+  in debug builds; the lock plugin probes by absolute path; a polkit override that
+  setup created is deleted on removal; `Deleted` is its own outcome.
+- **Unit**: runs with an empty capability set (verified: CapEff 0), no network,
+  `SystemCallFilter=@system-service`, `ProtectHome=yes`, `UMask=0077`, and the
+  W^X concession for ONNX Runtime named in a comment. The session-lock helper was
+  re-verified under that exact sandbox.
+
+Accepted for now, and written into the threat model rather than hidden:
+
+- **The Enter prompt is not consent against hostile code running as the user.**
+  A malicious process can drive sudo on a pty or answer the polkit agent's
+  conversation with an empty line and scan while the owner sits there. Against
+  that attacker it lowers the bar versus a password. The remedy is a
+  confirmation the daemon verifies itself (a gesture challenge such as a nod or
+  double blink) rather than one the calling application relays; that is a design
+  decision for the owner.
+- **No impostor distribution yet.** All evidence is one subject and one print.
+  Before this ships as a sudo factor it needs other people's faces measured.
+- Templates outlive an account of the same name (no uid in the file); TPM
+  sealing waits on a machine that has one.
+
+Lesson from the verification itself: never give an ad-hoc `systemd-run` test
+`RuntimeDirectory=faceauth`; systemd removes that directory when the transient
+unit exits and takes the live daemon's socket with it.
+
 ## Decisions carried into the code
 
 - **The daemon owns the cameras.** No v4l2loopback node in the authentication path:
