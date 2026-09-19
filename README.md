@@ -438,6 +438,28 @@ a checkout shell launched by hand makes `omarchy-shell` from a keybind say "not
 running" and Super+Space finds nothing. `omarchy dev link` plus a reboot is the
 only way every layer agrees; running the checkout shell live is for short tests.
 
+## Lit lock, masked notifications, greeter, uid binding, package build (2026-09-19 05:30)
+
+- **A presence lock keeps the panel lit for ten minutes** (`lock lockPresence`
+  IPC, used by the lock helper) instead of five seconds, so the waiting screen
+  is visible from across the desk. While lit with nobody there, three failed
+  scans switch the loop to the cheap probe, so the camera and LEDs are not
+  driven for ten minutes; a face brings the scan back.
+- **Notifications that arrive while locked** show on the lock screen by app
+  name and count only. Screenshot: `omarchy-action · 1 notification` above the
+  field, no body.
+- **Greeter**: `omarchy setup security face --greeter` wires `/etc/pam.d/sddm`
+  (face only, no nod: logging in is not elevation); off by default since most
+  installs log in automatically; `doctor` reports it as info.
+- **Templates are bound to the uid** they were enrolled under; a recreated
+  account with the same name reads as not enrolled.
+- **faillock**: decided and documented: a face match does not reset the
+  password's failure counter; `doctor` warns.
+- **Package**: `makepkg` builds `omarchy-faceauth 0.1.0-1` (5.5 MiB) from a
+  tarball of `src/` with the tests in `check()`; contents listed in
+  `design/pr-omarchy-pkgs.md`. PR drafts for both repositories in `design/`.
+- Manual page for Omarchy: `manual/52-face-authentication.md` in the series.
+
 ## Decisions carried into the code
 
 - **The daemon owns the cameras.** No v4l2loopback node in the authentication path:
