@@ -61,6 +61,7 @@ pub struct pam_handle_t {
 }
 
 extern "C" {
+    fn syslog(priority: c_int, fmt: *const c_char, ...);
     fn pam_get_user(pamh: *mut pam_handle_t, user: *mut *const c_char, prompt: *const c_char) -> c_int;
     fn pam_get_item(pamh: *const pam_handle_t, item_type: c_int, item: *mut *const c_void) -> c_int;
     fn pam_set_item(pamh: *mut pam_handle_t, item_type: c_int, item: *const c_void) -> c_int;
@@ -71,6 +72,18 @@ struct Args {
     socket: String,
     timeout: Duration,
     prompt: Option<String>,
+}
+
+const LOG_AUTHPRIV_INFO: c_int = (10 << 3) | 6;
+
+/// One line to the auth log per decision, for `doctor` and for measuring the
+/// stack around us. Never includes the password.
+fn log(msg: &str) {
+    if let Ok(c) = std::ffi::CString::new(msg) {
+        let fmt = b"pam_faceauth: %s\0";
+        // SAFETY: format string with one %s and a matching C string argument.
+        unsafe { syslog(LOG_AUTHPRIV_INFO, fmt.as_ptr() as *const c_char, c.as_ptr()) };
+    }
 }
 
 const DEFAULT_PROMPT: &str = "Press Enter to authenticate by face, or type your password: ";
@@ -179,6 +192,7 @@ fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char
     if user.is_empty() || user.len() > 256 {
         return PAM_IGNORE;
     }
+    let t0 = std::time::Instant::now();
     if let Some(text) = &args.prompt {
         match converse(pamh, text) {
             // Typed something: that is the password for the module behind us; no scan.
@@ -187,6 +201,7 @@ fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char
                     // SAFETY: PAM copies the item.
                     unsafe { pam_set_item(pamh, PAM_AUTHTOK, tok.as_ptr() as *const c_void) };
                 }
+                log(&format!("user {}: password typed at the prompt, no scan", user));
                 return PAM_IGNORE;
             }
             // Bare Enter: the deliberate act. Scan.
@@ -196,7 +211,9 @@ fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char
             Err(()) => return PAM_IGNORE,
         }
     }
-    if daemon_says_match(Path::new(&args.socket), &user, args.timeout) {
+    let ok = daemon_says_match(Path::new(&args.socket), &user, args.timeout);
+    log(&format!("user {}: {} after {} ms", user, if ok { "match, success" } else { "no match or no daemon, ignore" }, t0.elapsed().as_millis()));
+    if ok {
         PAM_SUCCESS
     } else {
         PAM_IGNORE

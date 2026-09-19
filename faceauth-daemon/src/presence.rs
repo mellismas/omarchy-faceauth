@@ -120,9 +120,9 @@ pub fn run(auth: Arc<Mutex<Authenticator>>, cfg: PresenceConfig) {
         }
         if next == State::Away && state != State::Away && !locked_by_presence {
             log::info!("presence: locking the session");
-            match std::process::Command::new(&cfg.lock_command[0]).args(&cfg.lock_command[1..]).status() {
-                Ok(s) if s.success() => locked_by_presence = true,
-                Ok(s) => log::warn!("lock command exited {}", s),
+            match std::process::Command::new(&cfg.lock_command[0]).args(&cfg.lock_command[1..]).env("PATH", "/usr/local/bin:/usr/bin:/bin").output() {
+                Ok(o) if o.status.success() => locked_by_presence = true,
+                Ok(o) => log::warn!("lock command exited {}: {} {}", o.status, String::from_utf8_lossy(&o.stdout).trim(), String::from_utf8_lossy(&o.stderr).trim()),
                 Err(e) => log::warn!("lock command: {}", e),
             }
         }

@@ -232,6 +232,44 @@ Press Enter to authenticate by face, or type your password:
 
 The response buffer is wiped before it is freed, since it may hold a password.
 
+## Measured, one surface at a time (2026-09-19 02:12 to 02:23)
+
+With the presence watch off and nothing else touching the camera:
+
+| Test | Result |
+| --- | --- |
+| sudo, Enter at the prompt | prompt shown, match 0.868 in 1.85 s, sudo exit 0 at 1.9 s after Enter |
+| polkit (`pkexec true`), Enter in the dialog | match 0.868 in 1.85 s, command ran 14 ms later |
+| lock screen, face unblocked | secure to unlocked 1.8 s; settle 1.25 s at exposure 360, 2 lit pairs, 2 scored, 2 matched |
+| lock screen, face fully blocked | no face in 105 frames, attempt ends at 3.5 s; unblocked: match in 1.9 s |
+| lock screen, face partially blocked (earlier run) | 33 frames scored, best 0.797, one frame above 0.70 |
+| lock screen, blocked past the panel blank, then return | probe wakes the panel 3 s after the return, unlock 1.8 s after that |
+
+Three things came out of the measurements and are now in the code:
+
+- **Attempt timeout 3.5 s** (was 6). The shell's PAM helper discards a reply that
+  arrives after about five seconds: a match reported at 5.94 s was dropped and the
+  next attempt did the unlock. Long attempts are pointless under a retry loop anyway.
+- **The probe.** The lock plugin stops scanning when the panel blanks (5 s), so a
+  returning user waited for a key press. Now, while blank, the plugin asks the
+  daemon every 3 s for one half-second, detector-only look (`{"probe":true}` on the
+  socket, `faceauth probe` on the CLI); a face wakes the panel and the wake starts
+  the scan. Camera duty while away: about 15 percent, no identity work.
+- **Threshold margin.** A partially blocked face reached 0.797 on one frame, above
+  the 0.70 line; the two-matching-frames rule held it. That margin is thinner than
+  the print test suggested. Keep `required_matches = 2`, and expect the threshold
+  to rise once more subjects are measured.
+
+Also: `pam_faceauth` now writes one line per decision to the auth log (never the
+password), and the attempt logs a detail line: settle exposure, frame, lit-pair,
+face and scored counts, and the per-frame score trail.
+
+The presence watch (auto-lock) is written but off: its helper could not lock the
+session from inside the hardened unit (no CAP_SETUID; runuser's PAM session fails
+there too). The working helper runs the lock command inside the user's own
+systemd manager (`systemd-run --machine=user@.host --user`), verified under the
+sandbox, and goes in with the next measured test.
+
 ## Decisions carried into the code
 
 - **The daemon owns the cameras.** No v4l2loopback node in the authentication path:

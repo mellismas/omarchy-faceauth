@@ -23,6 +23,9 @@ use std::time::Duration;
 #[derive(Deserialize)]
 struct Request {
     user: String,
+    /// true: a presence probe (one short look, detector only) instead of an attempt.
+    #[serde(default)]
+    probe: bool,
 }
 
 pub fn serve(auth: Arc<Mutex<Authenticator>>, socket: &Path) -> Result<()> {
@@ -67,6 +70,14 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
         log::warn!("uid {} asked about {}: refused", cred.uid(), req.user);
         return reply(&mut stream, &Outcome::Error { message: "not permitted".into() });
     }
+    if req.probe {
+        let outcome = {
+            let mut a = auth.lock().unwrap_or_else(|p| p.into_inner());
+            a.probe()
+        };
+        log::debug!("probe for {}: {:?}", req.user, outcome);
+        return reply(&mut stream, &outcome);
+    }
     log::info!("attempt for {} (uid {}, pid {})", req.user, cred.uid(), cred.pid());
     let outcome = {
         let mut a = auth.lock().unwrap_or_else(|p| p.into_inner());
@@ -89,10 +100,18 @@ fn user_uid(name: &str) -> Option<u32> {
 
 /// Client side, shared by the CLI and (in C form) the PAM module.
 pub fn ask(socket: &Path, user: &str, timeout: Duration) -> Result<Outcome> {
+    request(socket, user, false, timeout)
+}
+
+pub fn probe(socket: &Path, user: &str, timeout: Duration) -> Result<Outcome> {
+    request(socket, user, true, timeout)
+}
+
+fn request(socket: &Path, user: &str, probe: bool, timeout: Duration) -> Result<Outcome> {
     let mut stream = UnixStream::connect(socket).with_context(|| format!("connect {}", socket.display()))?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    let req = serde_json::json!({ "user": user }).to_string() + "\n";
+    let req = serde_json::json!({ "user": user, "probe": probe }).to_string() + "\n";
     stream.write_all(req.as_bytes())?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;

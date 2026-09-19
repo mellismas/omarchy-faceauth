@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth auth [--user NAME] [--socket PATH]      (asks a running faceauthd)\n  faceauth enroll --store DIR [--user NAME] [--label TEXT] [--seconds N] [--count N]\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
+        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth auth [--user NAME] [--socket PATH]      (asks a running faceauthd)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there?)\n  faceauth enroll --store DIR [--user NAME] [--label TEXT] [--seconds N] [--count N]\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
     );
     std::process::exit(2)
 }
@@ -32,6 +32,13 @@ fn main() -> Result<()> {
         ["engine", "test", rest @ ..] => engine_test(rest),
         ["engine", "live", rest @ ..] => engine_live(rest),
         ["enroll", rest @ ..] => enroll(rest),
+        ["probe", rest @ ..] => {
+            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
+            let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
+            let o = faceauth_daemon::server::probe(&socket, &user, Duration::from_secs(5))?;
+            println!("{}", serde_json::to_string(&o)?);
+            Ok(())
+        }
         ["presence"] => {
             let f = "/run/faceauth/presence.json";
             match std::fs::read_to_string(f) {

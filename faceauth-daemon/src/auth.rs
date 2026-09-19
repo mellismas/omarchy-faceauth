@@ -29,6 +29,8 @@ pub enum Outcome {
     NotEnrolled,
     /// Camera or model failure; the caller falls through to the next factor.
     Error { message: String },
+    /// Answer to a presence probe: one short look, detector only.
+    Probe { face: bool, attentive: bool, face_px: f32, elapsed_ms: u64 },
 }
 
 pub struct Authenticator {
@@ -42,6 +44,45 @@ impl Authenticator {
         let pipeline = Pipeline::load(&cfg.models_dir)?;
         let store = Store::open(&cfg.store_dir)?;
         Ok(Authenticator { cfg, pipeline, store })
+    }
+
+    /// One cheap look for the lock screen while its panel is blank: is anyone
+    /// there? About half a second of camera, detection only, no identity.
+    pub fn probe(&mut self) -> Outcome {
+        let t0 = Instant::now();
+        let r = (|| -> Result<Outcome> {
+            let mut cap = IrCapture::open(&self.cfg)?;
+            if let Some(i) = &cap.illuminator {
+                i.set(true)?;
+            }
+            let mut img = None;
+            let deadline = Instant::now() + Duration::from_millis(450);
+            while Instant::now() < deadline {
+                if let Some(g) = cap.next(Duration::from_millis(500))? {
+                    img = Some(g);
+                }
+            }
+            let out = match img {
+                None => Outcome::Probe { face: false, attentive: false, face_px: 0.0, elapsed_ms: 0 },
+                Some(img) => {
+                    let faces = self.pipeline.detector.detect(&img, self.cfg.min_detection)?;
+                    match faces.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) {
+                        Some(f) => {
+                            let p = faceauth_engine::pose::pose(&f.landmarks);
+                            Outcome::Probe { face: true, attentive: faceauth_engine::pose::is_attentive(&p, 0.25, 25.0), face_px: f.bbox[2], elapsed_ms: 0 }
+                        }
+                        None => Outcome::Probe { face: false, attentive: false, face_px: 0.0, elapsed_ms: 0 },
+                    }
+                }
+            };
+            cap.stop()?;
+            Ok(out)
+        })();
+        match r {
+            Ok(Outcome::Probe { face, attentive, face_px, .. }) => Outcome::Probe { face, attentive, face_px, elapsed_ms: t0.elapsed().as_millis() as u64 },
+            Ok(o) => o,
+            Err(e) => Outcome::Error { message: e.to_string() },
+        }
     }
 
     pub fn authenticate(&mut self, user: &str) -> Outcome {
@@ -71,11 +112,15 @@ impl Authenticator {
         let (mut best, mut matches, mut scored) = (-1f32, 0usize, 0usize);
         let mut face_seen = false;
         let mut alternating_since: Option<Instant> = None;
+        let (mut n_frames, mut n_lit, mut n_faces, mut n_nosignal) = (0usize, 0usize, 0usize, 0usize);
+        let mut settle_info = String::new();
+        let mut score_trail: Vec<String> = Vec::new();
         loop {
             if t0.elapsed() > deadline {
                 break;
             }
             let Some(img) = cap.next(Duration::from_secs(2))? else { continue };
+            n_frames += 1;
             let mean = img.data.iter().map(|&v| v as f64).sum::<f64>() / img.data.len() as f64;
 
             if !settled {
@@ -90,6 +135,7 @@ impl Authenticator {
                 // Settled: a face has been metered on for a few steps, or a second has passed with one.
                 if face_seen && t0.elapsed() > Duration::from_millis(1200) {
                     settled = true;
+                    settle_info = format!("settled at {:.2}s exp {} gain {} meter {:.2} frame mean {:.0}", t0.elapsed().as_secs_f32(), cap.exposure.exposure, cap.exposure.gain, cap.metering.mean, mean);
                     cap.freeze_exposure(true);
                     if strobe {
                         cap.illuminator.as_ref().unwrap().set_pattern(0xaa)?;
@@ -111,6 +157,7 @@ impl Authenticator {
                 if mean < p_mean * 1.15 {
                     continue;
                 }
+                n_lit += 1;
                 Some(p_img)
             } else {
                 if cap.frames % 3 != 0 {
@@ -120,11 +167,15 @@ impl Authenticator {
             };
             let faces = self.pipeline.analyse(&img, self.cfg.min_detection, 1)?;
             let Some(face) = faces.first() else { continue };
+            n_faces += 1;
             if let Some(unlit) = &pair {
                 let fr = FlashResponse::measure(&img, unlit, face, cap.exposure.exposure, cap.exposure.gain.max(16));
                 match fr.verdict() {
                     Verdict::Pass => {}
-                    Verdict::NoSignal => continue,
+                    Verdict::NoSignal => {
+                        n_nosignal += 1;
+                        continue;
+                    }
                     v => {
                         log::warn!("liveness denied: {:?} {:?}", v, fr);
                         cap.stop()?;
@@ -135,6 +186,9 @@ impl Authenticator {
             let Some(e) = &face.embedding else { continue };
             let Some((score, _)) = templates.best_match(e) else { continue };
             scored += 1;
+            if score_trail.len() < 40 {
+                score_trail.push(format!("{:.1}s:{:.2}{}", t0.elapsed().as_secs_f32(), score, if score >= self.cfg.accept_threshold { "*" } else { "" }));
+            }
             if let Ok(dir) = std::env::var("FACEAUTH_DUMP") {
                 if scored <= 3 {
                     let _ = std::fs::create_dir_all(&dir);
@@ -152,10 +206,12 @@ impl Authenticator {
             }
             log::debug!("frame {} score {:.3} matches {}/{}", scored, score, matches, self.cfg.required_matches);
             if matches >= self.cfg.required_matches {
+                log::info!("attempt detail: {} | frames {} lit {} faces {} nosignal {} scored {} matches {} | scores {}", settle_info, n_frames, n_lit, n_faces, n_nosignal, scored, matches, score_trail.join(" "));
                 cap.stop()?;
                 return Ok(Outcome::Match { score: best, frames: scored, elapsed_ms: ms(t0) });
             }
         }
+        log::info!("attempt detail: {} | frames {} lit {} faces {} nosignal {} scored {} matches {} | scores {}", if settle_info.is_empty() { "never settled".to_string() } else { settle_info.clone() }, n_frames, n_lit, n_faces, n_nosignal, scored, matches, score_trail.join(" "));
         cap.stop()?;
         if scored == 0 {
             Ok(Outcome::NoFace { elapsed_ms: ms(t0) })
