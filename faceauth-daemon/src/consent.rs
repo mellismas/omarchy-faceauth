@@ -203,17 +203,19 @@ pub fn notify(cfg: &Config, user: &str, title: &str, body: &str) {
 }
 
 /// Watch for the consent gesture: two nods within `window`. A nod is the head
-/// pitching down past a threshold and coming back, measured as the nose's
-/// position between the eye line and the mouth line, which rises when the
-/// head tips down. Baseline is the median of the first frames.
+/// pitching away from its resting pose past a threshold and coming back,
+/// measured as the nose's position between the eye line and the mouth line.
+/// Measured on the reference machine, a nod moves it about 0.12 (from 0.53 to
+/// 0.41); the sign depends on the sensor mounting, so any excursion counts.
+/// Baseline is the median of the first frames.
 pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, min_detection: f32, window: Duration, nods_needed: usize) -> Result<bool> {
     let t0 = Instant::now();
     let mut baseline: Vec<f32> = Vec::new();
     let mut base: Option<f32> = None;
     let mut down = false;
     let mut nods = 0usize;
-    const DOWN: f32 = 0.06;
-    const UP: f32 = 0.025;
+    const DOWN: f32 = 0.06; // excursion from baseline that starts a nod
+    const UP: f32 = 0.03; // return within this of baseline that completes it
     let mut trace: Vec<String> = Vec::new();
     while t0.elapsed() < window {
         let Some(img) = cap.next(Duration::from_secs(1))? else { continue };
@@ -232,9 +234,9 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, min_detection
                 }
             }
             Some(b) => {
-                if !down && p > b + DOWN {
+                if !down && (p - b).abs() > DOWN {
                     down = true;
-                } else if down && p < b + UP {
+                } else if down && (p - b).abs() < UP {
                     down = false;
                     nods += 1;
                     log::debug!("consent: nod {} at {:.2}s", nods, t0.elapsed().as_secs_f32());

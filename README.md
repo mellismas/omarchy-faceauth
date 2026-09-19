@@ -418,11 +418,13 @@ be something no program can forge. Built:
   (a version that did hold focus once left the keyboard dead when a hide call
   was lost).
 
-Status: the flow runs end to end on this machine from `faceauth auth --consent`
-(window up, match at 0.87, requester chain shown, refused with no nod, window
-closed), but the nod detector has not yet seen a real nod: the pitch trace was
-flat because nobody nodded. Threshold calibration needs the owner in front of
-the camera. Until then the sudo and polkit lines keep `prompt`, not `consent`.
+Calibrated on the owner (2026-09-19, after the dev-link reboot): a nod moves
+the pitch measure by about 0.12 (0.53 to 0.41 and back) on this sensor, and the
+sign depends on the mounting, so any excursion beyond 0.06 that returns within
+0.03 of the resting pose counts as one nod. First run with the corrected
+detector: match 0.887, two nods, allowed, 5.1 s from request to yes, notification
+delivered. A run with no nod: refused at 8.3 s. The requester chain shown for a
+CLI request was `bash <- claude <- foot <- Hyprland`.
 
 Dev-shell lesson: Hyprland spawns keybinds with the packaged `OMARCHY_PATH`, so
 a checkout shell launched by hand makes `omarchy-shell` from a keybind say "not
