@@ -210,20 +210,113 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
         return reply(&mut stream, &outcome);
     }
     log::info!("attempt for {} (uid {}, pid {}{})", req.user, cred.uid(), cred.pid(), if req.consent { ", consent" } else { "" });
-    let outcome = match take() {
-        Some(mut a) => {
-            if req.consent {
-                let uid = user_uid(&req.user).unwrap_or(cred.uid());
-                let caller = crate::consent::CallerInfo::from_pid(cred.pid(), uid);
-                a.authenticate_with_consent(&req.user, caller, req.budget)
-            } else {
-                a.authenticate(&req.user)
-            }
+    let outcome = if req.consent {
+        let uid = user_uid(&req.user).unwrap_or(cred.uid());
+        let caller = crate::consent::CallerInfo::from_pid(cred.pid(), uid);
+        consent_rounds(&take, &req.user, caller, req.budget)
+    } else {
+        match take() {
+            Some(mut a) => a.authenticate(&req.user),
+            None => Outcome::Error { message: "busy".into() },
         }
-        None => Outcome::Error { message: "busy".into() },
     };
     log::info!("attempt for {}: {:?}", req.user, outcome);
     reply(&mut stream, &outcome)
+}
+
+/// Drive a consent request through as many camera rounds as it needs. When
+/// the user leaves mid-request the session is locked and the request parks
+/// without the camera (so the lock screen can use it), until the user is back
+/// (a face match on the lock screen), a password or a dismissal arrives from
+/// the window, or the caller's budget runs out.
+fn consent_rounds<'a>(take: &dyn Fn() -> Option<std::sync::MutexGuard<'a, Authenticator>>, user: &str, caller: crate::consent::CallerInfo, budget: Option<f32>) -> Outcome {
+    use crate::auth::Round;
+    use crate::consent::{Answer, Gesture};
+    let mut session = match take() {
+        Some(mut a) => match a.consent_begin(user, caller, budget) {
+            Ok(s) => s,
+            Err(o) => return o,
+        },
+        None => return Outcome::Error { message: "busy".into() },
+    };
+    loop {
+        let round = match take() {
+            Some(mut a) => a.consent_round(&mut session),
+            None => {
+                // The camera is taken (the lock screen, most likely): wait
+                // a little and try again rather than giving up.
+                if session.started.elapsed().as_secs_f32() > session.total {
+                    return Outcome::ConsentDenied { reason: "no answer".into(), elapsed_ms: session.started.elapsed().as_millis() as u64 };
+                }
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+        };
+        let Round::FaceLost = round else {
+            let Round::Done(o) = round else { unreachable!() };
+            return o;
+        };
+        // Lock the session, then park.
+        let lock_time = Instant::now();
+        let (lock_cmd, lock_user) = {
+            let cfg = &session.dialog.cfg.presence;
+            (cfg.lock_command.clone(), cfg.user.clone())
+        };
+        if session.locked_at.is_none() && !lock_cmd.is_empty() {
+            // Hand the lock to the presence watch first so it does not lock too.
+            if let Some(mut a) = take() {
+                a.session_locked_at = Some(lock_time);
+            }
+            let args: Vec<String> = lock_cmd.iter().skip(1).map(|a| if a.is_empty() { lock_user.clone() } else { a.clone() }).collect();
+            match std::process::Command::new(&lock_cmd[0]).args(&args).env("PATH", "/usr/local/bin:/usr/bin:/bin").output() {
+                Ok(o) if o.status.success() => {
+                    log::info!("consent: user left with a request pending; session locked");
+                    session.locked_at = Some(lock_time);
+                }
+                Ok(o) => log::warn!("consent: lock command exited {}: {}", o.status, String::from_utf8_lossy(&o.stderr).trim()),
+                Err(e) => log::warn!("consent: lock command: {}", e),
+            }
+        }
+        let _ = session.dialog.show("locked", "Locked while you were away. Unlock, then look at the camera or type your password.", &session.caller, session.total);
+        // Park: no camera. Wake on a face match newer than the lock, on an
+        // answer from the window, or when the budget is out.
+        loop {
+            if session.started.elapsed().as_secs_f32() > session.total - 2.0 {
+                let ms = session.started.elapsed().as_millis() as u64;
+                return match take() {
+                    Some(mut a) => a.consent_finish(&mut session, Some(Gesture::Timeout), Outcome::NoFace { elapsed_ms: ms }),
+                    None => Outcome::ConsentDenied { reason: "no answer".into(), elapsed_ms: ms },
+                };
+            }
+            let answer = ANSWERS.lock().ok().and_then(|mut m| m.remove(user));
+            if let Some(ans) = answer {
+                let g = match ans {
+                    Answer::Password(pw) => Gesture::Password(pw),
+                    Answer::Dismiss => Gesture::Dismissed,
+                };
+                let ms = session.started.elapsed().as_millis() as u64;
+                loop {
+                    if let Some(mut a) = take() {
+                        return a.consent_finish(&mut session, Some(g), Outcome::NoFace { elapsed_ms: ms });
+                    }
+                }
+            }
+            let back = match take() {
+                Some(a) => a.last_match.get(user).map(|m| *m > lock_time).unwrap_or(false),
+                None => false,
+            };
+            if back {
+                log::info!("consent: user back after the lock; the request resumes");
+                if let Some(mut a) = take() {
+                    a.session_locked_at = None;
+                }
+                session.locked_at = None;
+                let _ = session.dialog.show("scanning", "Welcome back. Look at the camera.", &session.caller, session.total);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
 }
 
 fn reply(stream: &mut UnixStream, o: &Outcome) -> Result<()> {

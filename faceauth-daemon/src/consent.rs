@@ -154,7 +154,7 @@ fn parent_chain(pid: i32) -> String {
 /// The window on the desktop. Every call is one `omarchy-shell` invocation
 /// inside the user's own systemd manager, the same route the session lock uses.
 pub struct Dialog {
-    cfg: Config,
+    pub cfg: Config,
     user: String,
     open: bool,
 }
@@ -254,6 +254,8 @@ pub enum Gesture {
     Password(String),
     Dismissed,
     Timeout,
+    /// No face for the presence watch's away time: the user left.
+    FaceLost,
 }
 
 /// Nod detection as a pure state machine over (pitch, time) samples, so the
@@ -280,8 +282,9 @@ pub struct NodDetector {
     /// The farthest the pitch got from the baseline during this excursion, signed.
     extreme: f32,
     last_nod: Option<f32>,
-    /// After a long hold away from baseline, wait for a return before arming.
-    need_return: bool,
+    /// After a swing through to the far side, wait for the head to settle
+    /// (or re-baseline there if it does not come back) before arming.
+    need_return: Option<f32>,
     /// Time of the last frame that left the baseline at all.
     last_active: Option<f32>,
     /// Running mean of |pitch - base| over still frames: the noise floor.
@@ -303,10 +306,20 @@ impl NodDetector {
     const NOD_MAX_S: f32 = 0.8;
     const GAP_MIN_S: f32 = 0.15;
     /// Baseline follows the head while it is still (per idle frame).
-    const DRIFT: f32 = 0.05;
+    const DRIFT: f32 = 0.08;
+    /// A head held on the far side of a swing this long has settled there.
+    const SETTLE_S: f32 = 0.5;
+
+    fn rebase(&mut self, p: f32) {
+        self.base = Some(p);
+        self.out_since = None;
+        self.out_frames = 0;
+        self.in_frames = 0;
+        self.need_return = None;
+    }
 
     pub fn new() -> Self {
-        NodDetector { raw: Vec::new(), settle: Vec::new(), base: None, down_thr: Self::MIN_DOWN, up_thr: Self::MIN_DOWN / 2.0, out_frames: 0, in_frames: 0, out_since: None, out_first: 0.0, extreme: 0.0, last_nod: None, need_return: false, last_active: None, jitter: 0.0, nods: 0 }
+        NodDetector { raw: Vec::new(), settle: Vec::new(), base: None, down_thr: Self::MIN_DOWN, up_thr: Self::MIN_DOWN / 2.0, out_frames: 0, in_frames: 0, out_since: None, out_first: 0.0, extreme: 0.0, last_nod: None, need_return: None, last_active: None, jitter: 0.0, nods: 0 }
     }
 
     /// True while the head is still or has only just moved: the caller may
@@ -355,8 +368,9 @@ impl NodDetector {
         let d = e.abs();
         if d > self.up_thr {
             self.last_active = Some(t);
-        } else {
-            // Still: let the baseline follow slow drift.
+        }
+        if self.out_since.is_none() && d < self.down_thr {
+            // Not in a nod: let the baseline follow slow posture drift.
             self.base = Some(b + Self::DRIFT * e);
         }
         if d < self.down_thr {
@@ -366,9 +380,12 @@ impl NodDetector {
             self.down_thr = (self.jitter * Self::JITTER_MULT).clamp(Self::MIN_DOWN, Self::MAX_DOWN);
             self.up_thr = self.down_thr / 2.0;
         }
-        if self.need_return {
+        if let Some(since) = self.need_return {
             if d < self.up_thr {
-                self.need_return = false;
+                self.need_return = None;
+            } else if t - since > Self::SETTLE_S {
+                // The head settled on the far side: that is the new baseline.
+                self.rebase(p);
             }
             return false;
         }
@@ -400,26 +417,25 @@ impl NodDetector {
                 let done = self.complete(t, since);
                 if swung {
                     // The head is on the far side now; wait for it to settle.
-                    self.need_return = true;
+                    self.need_return = Some(t);
                 }
                 return done;
             }
         } else {
             self.in_frames = 0;
             if t - since > Self::NOD_MAX_S {
-                // Held away too long: a posture change, not a nod. Re-arm
-                // only once the head is back at the baseline.
-                self.out_since = None;
-                self.out_frames = 0;
-                self.need_return = true;
+                // Held away too long: a posture change, not a nod. The head
+                // is where it is now; measure the next nod from there.
+                self.rebase(p);
             }
         }
         false
     }
 }
 
-pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, min_detection: f32, window: Duration, nods_needed: usize, answers: Option<(&Answers, &str)>) -> Result<Gesture> {
+pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, min_detection: f32, window: Duration, nods_needed: usize, answers: Option<(&Answers, &str)>, lost_after: Option<Duration>) -> Result<Gesture> {
     let t0 = Instant::now();
+    let mut last_face = Instant::now();
     let mut det = NodDetector::new();
     let mut trace: Vec<String> = Vec::new();
     let mut frame_no = 0usize;
@@ -437,6 +453,12 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, min_detection
                 None => {}
             }
         }
+        if let Some(l) = lost_after {
+            if last_face.elapsed() > l {
+                log::info!("consent: no face for {:.0}s after {} nods; the user left", l.as_secs_f32(), det.nods);
+                return Ok(Gesture::FaceLost);
+            }
+        }
         let Some(img) = cap.next(Duration::from_secs(1))? else { continue };
         // Slow polling while the head is still: every other frame is looked
         // at (a nod leaves the baseline for six or more frames, so its start
@@ -448,6 +470,7 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, min_detection
         }
         let faces = pipeline.detector.detect(&img, min_detection)?;
         let Some(face) = faces.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) else { continue };
+        last_face = Instant::now();
         let p = pose::pose(&face.landmarks).pitch;
         if trace.len() < 400 {
             trace.push(format!("{:.3}", p));
@@ -546,6 +569,24 @@ mod nod_tests {
             }
         }
         assert!(at.len() >= 2, "nods at frames {:?}, threshold {:.3}", at, d.down_thr);
+    }
+
+    /// Recorded 2026-09-19 after returning from a lock: the head settled
+    /// 0.05 to 0.10 below the early baseline and stayed there; the nods only
+    /// counted at frame 400 once the old line was crossed. With the baseline
+    /// following the posture, they must count well before that.
+    #[test]
+    fn nods_after_a_posture_change_count() {
+        let t: Vec<f32> = "0.572 0.606 0.598 0.589 0.578 0.570 0.559 0.553 0.556 0.552 0.547 0.551 0.548 0.544 0.548 0.555 0.555 0.548 0.558 0.555 0.557 0.551 0.554 0.547 0.543 0.546 0.547 0.546 0.548 0.541 0.532 0.524 0.551 0.576 0.582 0.524 0.560 0.529 0.528 0.561 0.583 0.581 0.584 0.567 0.561 0.579 0.578 0.574 0.575 0.572 0.572 0.570 0.568 0.568 0.566 0.531 0.562 0.529 0.568 0.567 0.569 0.530 0.529 0.537 0.531 0.540 0.527 0.524 0.527 0.531 0.526 0.523 0.525 0.530 0.527 0.527 0.525 0.527 0.529 0.526 0.531 0.526 0.527 0.537 0.529 0.525 0.529 0.531 0.523 0.522 0.523 0.524 0.524 0.526 0.525 0.527 0.523 0.524 0.519 0.523 0.519 0.523 0.523 0.524 0.537 0.527 0.530 0.523 0.527 0.525 0.521 0.516 0.520 0.534 0.520 0.517 0.527 0.519 0.535 0.532 0.519 0.531 0.520 0.517 0.524 0.525 0.521 0.523 0.523 0.523 0.523 0.526 0.521 0.524 0.524 0.521 0.520 0.519 0.523 0.558 0.520 0.513 0.534 0.541 0.518 0.533 0.517 0.515 0.520 0.524 0.524 0.532 0.531 0.524 0.524 0.524 0.525 0.561 0.563 0.557 0.554 0.548 0.548 0.551 0.549 0.541 0.537 0.520 0.511 0.528 0.532 0.520 0.521 0.508 0.517 0.523 0.528 0.540 0.535 0.485 0.483 0.495 0.477 0.471 0.483 0.516 0.525 0.511 0.508 0.502 0.506 0.493 0.495 0.499 0.489 0.489 0.488 0.504 0.503 0.500 0.501 0.491 0.500 0.491 0.476 0.488 0.470 0.474 0.475 0.477 0.462 0.473 0.453 0.489 0.486 0.483 0.492 0.473 0.466 0.477 0.487 0.492 0.492 0.503 0.513 0.502 0.494 0.505 0.508 0.496 0.495 0.487 0.525 0.515 0.504 0.511 0.527 0.515 0.546 0.534 0.542 0.533 0.513 0.523 0.514 0.512 0.531 0.534 0.523 0.533 0.533 0.543 0.545 0.537 0.552 0.547 0.546 0.545 0.547 0.524 0.546 0.536 0.523 0.557 0.533 0.538 0.520 0.514 0.520 0.528 0.533 0.528 0.532 0.535 0.535 0.530 0.534 0.530 0.537 0.535 0.528 0.530 0.530 0.538 0.539 0.544 0.547 0.542 0.545 0.521 0.521 0.526 0.532 0.550 0.550 0.560 0.518 0.518 0.513 0.525 0.553 0.562 0.566 0.568 0.563 0.564 0.563 0.563 0.568 0.561 0.560 0.563 0.563 0.563 0.559 0.561 0.561 0.562 0.560 0.560 0.560 0.560 0.560 0.554 0.561 0.558 0.560 0.556 0.559 0.555 0.554 0.555 0.549 0.551 0.549 0.541 0.552 0.555 0.559 0.549 0.539 0.542 0.550 0.546 0.545 0.547 0.541 0.539 0.545 0.543 0.552 0.550 0.551 0.553 0.557 0.552 0.554 0.553 0.558 0.558 0.557 0.559 0.559 0.558 0.555 0.555 0.554 0.559 0.560 0.559 0.560 0.558 0.564 0.561 0.565 0.557 0.564 0.568 0.563 0.560 0.562 0.558 0.562 0.565 0.563 0.559 0.562 0.566 0.568 0.566 0.567 0.570 0.574 0.578 0.574 0.576 0.571 0.572 0.575 0.576".split(' ').map(|v| v.parse().unwrap()).collect();
+        let mut d = NodDetector::new();
+        let mut at = Vec::new();
+        for (i, &p) in t.iter().enumerate() {
+            if d.push(p, i as f32 / 28.0) {
+                at.push(i);
+            }
+        }
+        assert!(at.len() >= 2, "nods at frames {:?}", at);
+        assert!(at[1] < 300, "second nod before frame 300, got {:?}", at);
     }
 
     #[test]

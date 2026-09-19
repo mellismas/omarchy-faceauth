@@ -555,3 +555,26 @@ consent flow holds the camera, so a long window used to read as time unseen and
 the next tick locked the session at once. Now the walk-away clock restarts from
 the end of any consent flow and from any face match. Measured: a 22 s consent
 window (nod held back on purpose), then no transition and no lock.
+
+## 2026-09-19, later still: the request survives a walk-away lock
+
+A consent request holds the camera, so the presence watch cannot see the user
+leave. The request now watches for that itself: no face for the presence
+watch's away time (during the scan or the nod watch) locks the session through
+the same helper, hands the lock to the presence watch, and parks the request
+without the camera. The window shows "Locked while you were away". Parked, it
+wakes on a face match newer than the lock (the lock screen unlocking by face),
+on a password or a dismissal from the window, or when the caller's budget is
+out; on the user's return it runs another camera round ("Welcome back") and
+takes the nod. Measured end to end: left the desk, locked after 14 s, unlocked
+by face, request resumed, nodded, approved at 45 s with no timeout.
+
+Budgets: the caller's limit is the only bound. The PAM module now defaults to
+ten minutes for `consent` (clamp 1..600) and the CLI uses the same; a
+`timeout=` in the PAM line overrides it.
+
+Nod detector: the baseline follows posture drift whenever no nod is in
+progress, a head held away for longer than a nod re-baselines there, and a
+swing that does not come back settles as the new baseline after half a second.
+Nine recorded traces are unit tests. Whenever nods feel finicky, pull the
+`consent:` pitch trace from the journal and add it as a test.

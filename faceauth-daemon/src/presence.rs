@@ -82,6 +82,7 @@ pub fn run(auth: Arc<Mutex<Authenticator>>, cfg: PresenceConfig) {
     let mut identity_ok = true; // until two consecutive identity checks say otherwise
     let mut identity_fails: u32 = 0;
     let mut locked_at: Option<Instant> = None;
+    let mut adopted: Option<Instant> = None;
     log::info!("presence watch on for {} (tick {}s, away after {}s, attention {})", cfg.user, cfg.tick_seconds, cfg.away_seconds, cfg.require_attention);
     loop {
         std::thread::sleep(Duration::from_secs_f32(cfg.tick_seconds));
@@ -101,6 +102,21 @@ pub fn run(auth: Arc<Mutex<Authenticator>>, cfg: PresenceConfig) {
             state = State::Present;
             identity_ok = true;
             identity_fails = 0;
+        }
+        {
+            // A consent request that locked the session while the user was
+            // away hands the lock to this watch, which then waits for the
+            // face match that unlocks it like one of its own.
+            let taken = auth.lock().ok().and_then(|a| a.session_locked_at);
+            if let Some(t) = taken {
+                if adopted.map(|a| t > a).unwrap_or(true) {
+                    adopted = Some(t);
+                    locked_at = Some(t);
+                    locked_by_presence = true;
+                    state = State::Away;
+                    continue;
+                }
+            }
         }
         let obs = {
             let mut a = auth.lock().unwrap_or_else(|p| p.into_inner());
