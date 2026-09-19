@@ -66,6 +66,29 @@ t= 5.5s face score 0.83 bbox 50x76 at (302,337) 132 ms | vs prev 0.933 vs first 
 Proof in `faceauth-engine/proof/`: the detected frame, the aligned 112x112 crop, and
 the run log.
 
+## Enrolment and first attack test (2026-09-18 20:50)
+
+`faceauth enroll` captures ten embeddings over a 12 s burst with the illuminator on
+and face-box metering (samples spaced across the window), and stores them as
+templates (`faceauth-daemon/src/store.rs`: JSON, mode 0600, several templates per
+user matched by best score). `faceauth verify` runs a five-frame burst and reports
+the best cosine against the templates, optionally logging every frame to a CSV
+with a label for the threshold analysis.
+
+| Test | Frames | Cosine (best template) | Time |
+| --- | --- | --- | --- |
+| Genuine, run 1 | 5 | 0.942 to 0.955 | 2.1 s capture |
+| Genuine, run 2 | 5 | 0.863 to 0.936 | 2.1 s capture |
+| Enrolment self-consistency, 10 templates | 45 pairs | min 0.902, mean 0.945, max 0.982 | |
+| Phone showing a photo of the enrolled face | 0 faces in 8 s | no detection, no score | |
+
+The phone-screen replay never reaches the recognizer. In the IR frame
+(`faceauth-engine/proof/attack-phone-screen-ir-2026-09-18.png`) the screen is a
+starburst of the illuminator's own reflection with no image on it: a display emits
+almost nothing in the near infrared and its glass mirrors the LEDs. That is the
+physics the design leans on, confirmed on the first try. The threshold still waits
+on the print attack, which paper will pass to the recognizer.
+
 ## Decisions carried into the code
 
 - **The daemon owns the cameras.** No v4l2loopback node in the authentication path:
