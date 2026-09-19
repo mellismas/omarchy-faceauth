@@ -10,5 +10,7 @@ set -euo pipefail
 user=${1:?user}
 omarchy_path=${2:-$(sed -n 's/^OMARCHY_PATH=//p' /etc/omarchy.conf 2>/dev/null | tr -d '"' | head -1)}
 omarchy_path=${omarchy_path:-/usr/share/omarchy}
-exec /usr/bin/systemd-run --machine="$user@.host" --user --wait --collect --quiet \
-  -E "OMARCHY_PATH=$omarchy_path" omarchy-system-lock
+# Absolute path: inside the user's manager PATH is the user's to shape, and a
+# shadowed command answering "ok" would leave the machine open. Bounded wait.
+exec /usr/bin/timeout 15 /usr/bin/systemd-run --machine="$user@.host" --user --wait --collect --quiet \
+  -E "OMARCHY_PATH=$omarchy_path" /usr/bin/omarchy-system-lock

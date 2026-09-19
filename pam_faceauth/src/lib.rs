@@ -86,6 +86,21 @@ fn log(msg: &str) {
     }
 }
 
+/// Overwrite a CString's bytes before it is freed.
+fn wipe(c: std::ffi::CString) {
+    let mut bytes = c.into_bytes();
+    for b in bytes.iter_mut() {
+        // SAFETY-adjacent: volatile so the compiler keeps the stores.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    drop(bytes);
+}
+
+/// Names go into the auth log; strip anything that could forge a line.
+fn sanitise(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(64).collect()
+}
+
 const DEFAULT_PROMPT: &str = "Press Enter to authenticate by face, or type your password: ";
 
 /// Ask through the application's conversation. `Ok(Some(text))` is what the
@@ -176,8 +191,11 @@ fn daemon_says_match(socket: &Path, user: &str, timeout: Duration) -> bool {
     if reader.read_line(&mut line).is_err() {
         return false;
     }
-    // The reply is `{"result":"match",...}`; only that exact tag counts.
-    line.contains("\"result\":\"match\"")
+    // The daemon serialises the tag first: the reply must BEGIN with the
+    // match object, so no later field (which may echo request bytes) can
+    // ever make a non-match read as one.
+    let t = line.trim_start();
+    t.starts_with("{\"result\":\"match\",") || t == "{\"result\":\"match\"}"
 }
 
 fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char) -> c_int {
@@ -196,12 +214,16 @@ fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char
     if let Some(text) = &args.prompt {
         match converse(pamh, text) {
             // Typed something: that is the password for the module behind us; no scan.
-            Ok(Some(typed)) if !typed.is_empty() => {
-                if let Ok(tok) = std::ffi::CString::new(typed) {
+            Ok(Some(mut typed)) if !typed.is_empty() => {
+                if let Ok(tok) = std::ffi::CString::new(typed.clone()) {
                     // SAFETY: PAM copies the item.
                     unsafe { pam_set_item(pamh, PAM_AUTHTOK, tok.as_ptr() as *const c_void) };
+                    wipe(tok);
                 }
-                log(&format!("user {}: password typed at the prompt, no scan", user));
+                // The password must not linger in freed heap.
+                unsafe { std::ptr::write_bytes(typed.as_mut_vec().as_mut_ptr(), 0, typed.len()) };
+                drop(typed);
+                log(&format!("user {}: password typed at the prompt, no scan", sanitise(&user)));
                 return PAM_IGNORE;
             }
             // Bare Enter: the deliberate act. Scan.
@@ -212,7 +234,7 @@ fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char
         }
     }
     let ok = daemon_says_match(Path::new(&args.socket), &user, args.timeout);
-    log(&format!("user {}: {} after {} ms", user, if ok { "match, success" } else { "no match or no daemon, ignore" }, t0.elapsed().as_millis()));
+    log(&format!("user {}: {} after {} ms", sanitise(&user), if ok { "match, success" } else { "no match or no daemon, ignore" }, t0.elapsed().as_millis()));
     if ok {
         PAM_SUCCESS
     } else {

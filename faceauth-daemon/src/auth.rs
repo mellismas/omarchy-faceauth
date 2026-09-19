@@ -35,21 +35,32 @@ pub enum Outcome {
     Pong { version: String, model: String, templates: usize },
     /// Enrolment result.
     Enrolled { added: usize, total: usize, consistency_min: f32, consistency_mean: f32, path: String },
+    /// Templates deleted.
+    Deleted,
+    /// Too many failed attempts for this user recently; try again later.
+    Cooldown { seconds: u64 },
 }
 
 pub struct Authenticator {
     pub cfg: Config,
     pub pipeline: Pipeline,
     pub store: Store,
-    /// When the last attempt matched; the presence watch resumes on it.
-    pub last_match: Option<Instant>,
+    /// When the last attempt matched, per user; the presence watch resumes on it.
+    pub last_match: std::collections::HashMap<String, Instant>,
+    /// Recent failed attempts per user, for the cooldown.
+    failures: std::collections::HashMap<String, Vec<Instant>>,
 }
+
+/// After this many failed attempts within the window, the user waits.
+const COOLDOWN_FAILURES: usize = 5;
+const COOLDOWN_WINDOW: Duration = Duration::from_secs(60);
+const COOLDOWN_HOLD: Duration = Duration::from_secs(30);
 
 impl Authenticator {
     pub fn new(cfg: Config) -> Result<Self> {
         let pipeline = Pipeline::load(&cfg.models_dir)?;
         let store = Store::open(&cfg.store_dir)?;
-        Ok(Authenticator { cfg, pipeline, store, last_match: None })
+        Ok(Authenticator { cfg, pipeline, store, last_match: Default::default(), failures: Default::default() })
     }
 
     /// One cheap look for the lock screen while its panel is blank: is anyone
@@ -161,10 +172,29 @@ impl Authenticator {
             Ok(None) => return Outcome::NotEnrolled,
             Err(e) => return Outcome::Error { message: e.to_string() },
         };
+        // Cooldown: a print held up at the lock screen does not get unlimited tries.
+        let now = Instant::now();
+        let fails = self.failures.entry(user.to_string()).or_default();
+        fails.retain(|t| now.duration_since(*t) < COOLDOWN_WINDOW);
+        if fails.len() >= COOLDOWN_FAILURES {
+            let last = fails.last().copied().unwrap_or(now);
+            let hold = COOLDOWN_HOLD.saturating_sub(now.duration_since(last));
+            if !hold.is_zero() {
+                return Outcome::Cooldown { seconds: hold.as_secs().max(1) };
+            }
+            fails.clear();
+        }
         match self.run(&templates) {
             Ok(o) => {
-                if matches!(o, Outcome::Match { .. }) {
-                    self.last_match = Some(Instant::now());
+                match &o {
+                    Outcome::Match { .. } => {
+                        self.last_match.insert(user.to_string(), Instant::now());
+                        self.failures.remove(user);
+                    }
+                    Outcome::NoMatch { .. } | Outcome::Denied { .. } => {
+                        self.failures.entry(user.to_string()).or_default().push(Instant::now());
+                    }
+                    _ => {}
                 }
                 o
             }
@@ -178,6 +208,13 @@ impl Authenticator {
         let ms = |t: Instant| t.elapsed().as_millis() as u64;
         let mut cap = IrCapture::open(&self.cfg)?;
         let strobe = cap.illuminator.is_some() && self.cfg.liveness;
+        // Without the strobe the flash-response gate cannot run, and a print in
+        // front of an IR camera is the documented attack. Refuse unless the
+        // administrator has explicitly accepted ungated authentication.
+        if !strobe && self.cfg.liveness_required {
+            cap.stop()?;
+            return Ok(Outcome::Error { message: "liveness gate unavailable (no strobe control) and liveness_required is set".into() });
+        }
         if let Some(i) = &cap.illuminator {
             i.set(true)?;
         }
@@ -264,6 +301,7 @@ impl Authenticator {
             if score_trail.len() < 40 {
                 score_trail.push(format!("{:.1}s:{:.2}{}", t0.elapsed().as_secs_f32(), score, if score >= self.cfg.accept_threshold { "*" } else { "" }));
             }
+            #[cfg(debug_assertions)]
             if let Ok(dir) = std::env::var("FACEAUTH_DUMP") {
                 if scored <= 3 {
                     let _ = std::fs::create_dir_all(&dir);

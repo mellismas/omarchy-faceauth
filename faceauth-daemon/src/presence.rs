@@ -90,7 +90,7 @@ pub fn run(auth: Arc<Mutex<Authenticator>>, cfg: PresenceConfig) {
         // After locking, leave the camera to the lock screen (its own probe wakes
         // the panel); resume only once an attempt has matched.
         if let Some(t) = locked_at {
-            let resumed = auth.lock().map(|a| a.last_match.map(|m| m > t).unwrap_or(false)).unwrap_or(false);
+            let resumed = auth.lock().map(|a| a.last_match.get(&cfg.user).map(|m| *m > t).unwrap_or(false)).unwrap_or(false);
             if !resumed {
                 continue;
             }
@@ -143,9 +143,12 @@ pub fn run(auth: Arc<Mutex<Authenticator>>, cfg: PresenceConfig) {
         if next != state {
             log::info!("presence: {:?} -> {:?}{}", state, next, away_for.map(|s| format!(" (unseen {:.0}s)", s)).unwrap_or_default());
         }
-        if next == State::Away && state != State::Away && !locked_by_presence {
+        // Lock on the away transition, and keep trying every tick while away
+        // until it succeeds: a failed lock must not leave the machine open.
+        if next == State::Away && !locked_by_presence {
             log::info!("presence: locking the session");
-            match std::process::Command::new(&cfg.lock_command[0]).args(&cfg.lock_command[1..]).env("PATH", "/usr/local/bin:/usr/bin:/bin").output() {
+            let args: Vec<String> = cfg.lock_command.iter().skip(1).map(|a| if a.is_empty() { cfg.user.clone() } else { a.clone() }).collect();
+            match std::process::Command::new(&cfg.lock_command[0]).args(&args).env("PATH", "/usr/local/bin:/usr/bin:/bin").output() {
                 Ok(o) if o.status.success() => {
                     locked_by_presence = true;
                     locked_at = Some(Instant::now());
@@ -166,8 +169,16 @@ pub fn run(auth: Arc<Mutex<Authenticator>>, cfg: PresenceConfig) {
             updated: crate::store::now_secs(),
         };
         if let Ok(json) = serde_json::to_string(&pub_) {
+            // Root-only: whether the owner is at the desk is a timing signal an
+            // attacker on the machine would like. The lock screen reads it as
+            // root through the daemon, not from this file.
+            use std::os::unix::fs::OpenOptionsExt;
             let tmp = format!("{}.tmp", cfg.state_file);
-            if std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, &cfg.state_file)).is_err() {
+            let written = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp).and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(json.as_bytes())
+            });
+            if written.and_then(|_| std::fs::rename(&tmp, &cfg.state_file)).is_err() {
                 log::debug!("presence: cannot write {}", cfg.state_file);
             }
         }

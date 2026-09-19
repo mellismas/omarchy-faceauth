@@ -17,24 +17,45 @@ RuntimeDirectoryMode=0755
 StateDirectory=faceauth
 StateDirectoryMode=0700
 ConfigurationDirectory=faceauth
-# Root for the camera nodes and the template store. Everything else locked down.
+# Root because the camera nodes and the template store are root-owned, but
+# with no capabilities at all: opening root-owned devices, binding the socket
+# and writing the store need none, and the session lock goes through PID 1.
 User=root
+CapabilityBoundingSet=
+AmbientCapabilities=
 NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=read-only
+ProtectHome=yes
 PrivateTmp=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
 RestrictSUIDSGID=yes
 RestrictRealtime=yes
 LockPersonality=yes
+# ONNX Runtime JIT-compiles kernels; this is the one W^X concession, named here
+# so a reviewer sees it.
 MemoryDenyWriteExecute=no
 SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 DevicePolicy=closed
 DeviceAllow=char-video4linux rw
 DeviceAllow=char-media rw
 ReadWritePaths=/var/lib/faceauth /run/faceauth
+UMask=0077
+# The recognition model is ~700 MB resident; a runaway is killed well before
+# the system is.
+MemoryMax=1536M
+TasksMax=64
 Environment=RUST_LOG=info
 
 [Install]

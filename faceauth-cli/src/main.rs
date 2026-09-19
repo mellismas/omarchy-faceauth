@@ -988,6 +988,14 @@ fn doctor(rest: &[&str]) -> Result<()> {
         Ok(o) => push("daemon.running", "warn", format!("unexpected reply {}", serde_json::to_string(&o).unwrap_or_default())),
         Err(e) => push("daemon.running", "fail", format!("{}", e)),
     }
+    match std::fs::read_to_string("/etc/faceauth/config.toml").ok().and_then(|t| toml::from_str::<toml::Value>(&t).ok()) {
+        Some(c) => {
+            let req = c.get("liveness_required").and_then(|v| v.as_bool()).unwrap_or(true);
+            let on = c.get("liveness").and_then(|v| v.as_bool()).unwrap_or(true);
+            push("liveness.policy", if on && req { "pass" } else { "warn" }, format!("liveness = {}, liveness_required = {}{}", on, req, if !(on && req) { ": a print in front of the camera can authenticate" } else { "" }));
+        }
+        None => push("liveness.policy", "unknown", "config not readable".into()),
+    }
     push("templates.at_rest", "warn", "templates are plaintext at rest (root 0600); TPM sealing not implemented".into());
     // PAM wiring
     for (id, path, want_deny) in [("pam.sudo", "/etc/pam.d/sudo", false), ("pam.polkit", "/etc/pam.d/polkit-1", false), ("pam.lock", "/etc/pam.d/omarchy-lock-face", true)] {

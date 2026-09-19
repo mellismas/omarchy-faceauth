@@ -13,12 +13,21 @@ use crate::auth::{Authenticator, Outcome};
 use anyhow::{Context, Result};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use serde::Deserialize;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Longest request line accepted, before any authorisation.
+const MAX_REQUEST: u64 = 4096;
+/// Connections handled at once; the rest are refused immediately.
+const MAX_CONNECTIONS: usize = 8;
+/// How long a request waits for the camera before answering "busy".
+const BUSY_WAIT: Duration = Duration::from_millis(1500);
+static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Deserialize)]
 struct Request {
@@ -58,11 +67,18 @@ pub fn serve(auth: Arc<Mutex<Authenticator>>, socket: &Path) -> Result<()> {
                 continue;
             }
         };
+        if ACTIVE.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            let mut s = stream;
+            let _ = reply(&mut s, &Outcome::Error { message: "busy".into() });
+            continue;
+        }
         let auth = Arc::clone(&auth);
         std::thread::spawn(move || {
             if let Err(e) = handle(stream, &auth) {
                 log::warn!("connection: {}", e);
             }
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
         });
     }
     Ok(())
@@ -72,51 +88,90 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let cred = getsockopt(&stream, PeerCredentials).context("peer credentials")?;
+    // Bounded read before anything else: a peer that never sends a newline
+    // cannot grow this, and the error never echoes the peer's bytes back.
     let mut line = String::new();
-    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+    let mut reader = BufReader::new(stream.try_clone()?).take(MAX_REQUEST);
+    reader.read_line(&mut line)?;
+    if !line.ends_with('\n') {
+        return reply(&mut stream, &Outcome::Error { message: "bad request".into() });
+    }
     let req: Request = match serde_json::from_str(line.trim()) {
         Ok(r) => r,
-        Err(e) => return reply(&mut stream, &Outcome::Error { message: format!("bad request: {}", e) }),
+        Err(_) => return reply(&mut stream, &Outcome::Error { message: "bad request".into() }),
     };
     let allowed = cred.uid() == 0 || user_uid(&req.user).map(|u| u == cred.uid()).unwrap_or(false);
     if !allowed {
         log::warn!("uid {} asked about {}: refused", cred.uid(), req.user);
         return reply(&mut stream, &Outcome::Error { message: "not permitted".into() });
     }
+    // Take the camera, or say "busy" instead of queueing behind another
+    // attempt: the callers (PAM, the lock screen) retry on their own terms.
+    let take = || -> Option<std::sync::MutexGuard<'_, Authenticator>> {
+        let deadline = Instant::now() + BUSY_WAIT;
+        loop {
+            match auth.try_lock() {
+                Ok(g) => return Some(g),
+                Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if Instant::now() > deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+    };
     if req.ping {
-        let outcome = auth.lock().unwrap_or_else(|p| p.into_inner()).ping(&req.user);
+        let outcome = match take() {
+            Some(a) => a.ping(&req.user),
+            None => Outcome::Error { message: "busy".into() },
+        };
         return reply(&mut stream, &outcome);
+    }
+    // Enrolment and deletion change who can unlock the machine: only root may
+    // ask (the setup command runs them under sudo, behind the password), so no
+    // unprivileged process, and nothing reaching a locked session over ssh,
+    // can enrol a new face or erase the enrolled one.
+    if req.enroll.is_some() || req.delete_templates {
+        if cred.uid() != 0 {
+            log::warn!("uid {} asked to change templates for {}: refused", cred.uid(), req.user);
+            return reply(&mut stream, &Outcome::Error { message: "not permitted: enrolment and deletion require root".into() });
+        }
     }
     if let Some(label) = &req.enroll {
         log::info!("enrolment for {} (uid {}, label {:?})", req.user, cred.uid(), label);
-        let outcome = {
-            let mut a = auth.lock().unwrap_or_else(|p| p.into_inner());
-            a.enroll(&req.user, label, req.seconds.unwrap_or(12.0), req.count.unwrap_or(10))
+        let outcome = match take() {
+            Some(mut a) => a.enroll(&req.user, label, req.seconds.unwrap_or(12.0).clamp(4.0, 20.0), req.count.unwrap_or(10)),
+            None => Outcome::Error { message: "busy".into() },
         };
         log::info!("enrolment for {}: {:?}", req.user, outcome);
         return reply(&mut stream, &outcome);
     }
     if req.delete_templates {
-        let outcome = match auth.lock().unwrap_or_else(|p| p.into_inner()).store.delete(&req.user) {
-            Ok(true) => Outcome::Error { message: "deleted".into() },
-            Ok(false) => Outcome::NotEnrolled,
-            Err(e) => Outcome::Error { message: e.to_string() },
+        let outcome = match take() {
+            Some(a) => match a.store.delete(&req.user) {
+                Ok(true) => Outcome::Deleted,
+                Ok(false) => Outcome::NotEnrolled,
+                Err(e) => Outcome::Error { message: e.to_string() },
+            },
+            None => Outcome::Error { message: "busy".into() },
         };
         log::info!("templates for {} deleted by uid {}: {:?}", req.user, cred.uid(), outcome);
         return reply(&mut stream, &outcome);
     }
     if req.probe {
-        let outcome = {
-            let mut a = auth.lock().unwrap_or_else(|p| p.into_inner());
-            a.probe()
+        let outcome = match take() {
+            Some(mut a) => a.probe(),
+            None => Outcome::Error { message: "busy".into() },
         };
         log::debug!("probe for {}: {:?}", req.user, outcome);
         return reply(&mut stream, &outcome);
     }
     log::info!("attempt for {} (uid {}, pid {})", req.user, cred.uid(), cred.pid());
-    let outcome = {
-        let mut a = auth.lock().unwrap_or_else(|p| p.into_inner());
-        a.authenticate(&req.user)
+    let outcome = match take() {
+        Some(mut a) => a.authenticate(&req.user),
+        None => Outcome::Error { message: "busy".into() },
     };
     log::info!("attempt for {}: {:?}", req.user, outcome);
     reply(&mut stream, &outcome)
