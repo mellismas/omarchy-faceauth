@@ -283,11 +283,13 @@ pub struct NodDetector {
 
 impl NodDetector {
     /// The smallest excursion ever accepted (a natural nod is about 0.05).
-    pub const MIN_DOWN: f32 = 0.045;
+    pub const MIN_DOWN: f32 = 0.04;
     /// Excursion threshold as a multiple of the measured jitter.
-    pub const JITTER_MULT: f32 = 3.0;
+    pub const JITTER_MULT: f32 = 2.5;
+    /// The largest excursion ever required, however jittery the baseline.
+    pub const MAX_DOWN: f32 = 0.06;
     const SETTLE_FRAMES: usize = 8;
-    const OUT_FRAMES: usize = 3;
+    const OUT_FRAMES: usize = 2;
     const IN_FRAMES: usize = 2;
     const NOD_MIN_S: f32 = 0.12;
     const NOD_MAX_S: f32 = 0.8;
@@ -320,7 +322,7 @@ impl NodDetector {
                 s.sort_by(|a, b| a.total_cmp(b));
                 let base = s[s.len() / 2];
                 let jitter = s.iter().map(|v| (v - base).abs()).fold(0f32, f32::max);
-                self.down_thr = (jitter * Self::JITTER_MULT).max(Self::MIN_DOWN);
+                self.down_thr = (jitter * Self::JITTER_MULT).clamp(Self::MIN_DOWN, Self::MAX_DOWN);
                 self.up_thr = self.down_thr / 2.0;
                 self.base = Some(base);
             }
@@ -384,23 +386,30 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, min_detection
     while t0.elapsed() < window {
         if let Some((answers, user)) = answers {
             match take_answer(answers, user) {
-                Some(Answer::Password(pw)) => return Ok(Gesture::Password(pw)),
-                Some(Answer::Dismiss) => return Ok(Gesture::Dismissed),
+                Some(Answer::Password(pw)) => {
+                    log::info!("consent: password answer after {} nods in {:.1}s, base {:?}, threshold {:.3}, pitch trace {}", det.nods, t0.elapsed().as_secs_f32(), det.base, det.down_thr, trace.join(" "));
+                    return Ok(Gesture::Password(pw));
+                }
+                Some(Answer::Dismiss) => {
+                    log::info!("consent: dismissed after {} nods in {:.1}s, pitch trace {}", det.nods, t0.elapsed().as_secs_f32(), trace.join(" "));
+                    return Ok(Gesture::Dismissed);
+                }
                 None => {}
             }
         }
         let Some(img) = cap.next(Duration::from_secs(1))? else { continue };
-        // Slow polling while the head is still: every third frame is enough
-        // to catch the start of a nod, and the rest are only drained. Once a
+        // Slow polling while the head is still: every other frame is looked
+        // at (a nod leaves the baseline for six or more frames, so its start
+        // cannot slip between two), the rest are only drained. Once a
         // movement begins every frame is looked at.
         frame_no += 1;
-        if det.idle(t0.elapsed().as_secs_f32()) && frame_no % 3 != 0 {
+        if det.idle(t0.elapsed().as_secs_f32()) && frame_no % 2 != 0 {
             continue;
         }
         let faces = pipeline.detector.detect(&img, min_detection)?;
         let Some(face) = faces.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) else { continue };
         let p = pose::pose(&face.landmarks).pitch;
-        if trace.len() < 160 {
+        if trace.len() < 400 {
             trace.push(format!("{:.3}", p));
         }
         if det.push(p, t0.elapsed().as_secs_f32()) {
