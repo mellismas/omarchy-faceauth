@@ -288,6 +288,55 @@ without touching anything. The first scan after the lock took 3.0 s instead of
 1.8 because it raced the watch's final tick for the camera; the watch is paused
 from then until the match.
 
+## Lock-screen UI, Omarchy commands, doctor (2026-09-19 03:30)
+
+- **Lock screen**: a face icon inside the field's left edge (pulses while a scan
+  runs, dims while the panel is blank and only the probe watches), mirroring the
+  fingerprint icon on the right; under the field, the active player's track with
+  previous / play-pause / next, usable without unlocking. Proof:
+  `../omarchy/lock-screen-face-and-media-2026-09-19.png`.
+- **Enrolment through the daemon** (`{"enroll": label}` on the socket): the CLI
+  never touches the camera in production; the direct path stays for development
+  (`--store`). Also `ping` and `delete_templates` requests, all under the same
+  peer-credential rule.
+- **`faceauth models fetch`** downloads the manifest's weights with `curl` and
+  verifies size and SHA-256 before installing; **`faceauth doctor`** reports
+  camera, illuminator, models (checksummed), daemon, templates, each PAM stack
+  (and whether the lock stack is closed by pam_deny and whether the elevation
+  lines carry the prompt), faillock, TPM and the module, with stable ids and
+  `--json`. Fail exits 1; Unknown is not Fail.
+- **Omarchy side** (`../omarchy/faceauth-omarchy-series.patch`, four commits on
+  the checkout): `omarchy-capture-ir-camera-list` (MIPI sensors by their Y10 pad
+  format through the media controller, UVC by greyscale-only format lists, a
+  configured override first), `omarchy-hw-ir-camera`, `omarchy-setup-security-face`
+  (install, fetch models, enable the service, enrol, verify, and only then wire
+  PAM with backups outside `/etc/pam.d`), `omarchy-remove-security-face`
+  (restore originals, delete templates unless `--keep-templates`, abort on unknown
+  flags, PAM first whatever else is chosen), and the two menu entries. Omarchy's
+  CLI test suite passes with them.
+- **Packaging**: `../packaging/omarchy-faceauth/PKGBUILD` and `.install` for
+  omarchy-pkgs. Installing never touches PAM; `pre_remove` strips any remaining
+  reference so a stack never points at a missing module.
+
+`faceauth doctor` on the reference machine:
+
+```
+PASS    camera.ir            ov7251 3-0060 on /dev/video2 (640x480)
+PASS    camera.illuminator   strobe control present
+PASS    camera.rgb           ov5693 2-0036
+PASS    models.file          face_detection_yunet_2023mar.onnx: verified, MIT
+PASS    models.file          glintr100.onnx: verified, Apache-2.0
+PASS    daemon.running       faceauthd 0.1.0 answering on /run/faceauth/sock
+PASS    templates.user       10 template(s) for mellis (glintr100.onnx)
+WARN    templates.at_rest    templates are plaintext at rest (root 0600); TPM sealing not implemented
+PASS    pam.sudo             wired, prompt (Enter to scan)
+PASS    pam.polkit           wired, prompt (Enter to scan)
+PASS    pam.lock             wired, closed by pam_deny
+WARN    pam.faillock         a face match bypasses pam_faillock and never resets its counter
+WARN    tpm.present          no TPM device; templates cannot be sealed
+PASS    pam.module           /usr/lib/security/pam_faceauth.so
+```
+
 ## Decisions carried into the code
 
 - **The daemon owns the cameras.** No v4l2loopback node in the authentication path:
