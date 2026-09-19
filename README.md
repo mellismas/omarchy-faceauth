@@ -539,3 +539,13 @@ two natural nods within two seconds of the match. A presence lock that fires
 first (a hat the model does not know reads as a stranger for ten seconds) takes
 the camera, and the consent request then falls to the password: enrol the hat
 as a look.
+
+Second retune the same night, from two more recorded traces: nods that leave
+the noise band for only two or three frames (a 0.10 s minimum duration had
+rejected them, now 0.06 s timed from the first frame out) and light nods of
+0.017 in a noise floor of 0.004 (never seen at a fixed 0.025 floor). The floor
+is now 0.015, the noise floor is measured continuously on frames inside the
+band and the threshold is four times it, capped at 0.06, so a flickering
+landmark raises the bar and a steady one lowers it. Eight recorded traces are
+unit tests. Measured: `sudo true` approved 4.5 s after the request, match at
+1.9 s and both light nods 2.4 s later.

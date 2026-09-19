@@ -275,6 +275,8 @@ pub struct NodDetector {
     out_frames: usize,
     in_frames: usize,
     out_since: Option<f32>,
+    /// When the pitch first left the baseline in this excursion.
+    out_first: f32,
     /// The farthest the pitch got from the baseline during this excursion, signed.
     extreme: f32,
     last_nod: Option<f32>,
@@ -282,27 +284,29 @@ pub struct NodDetector {
     need_return: bool,
     /// Time of the last frame that left the baseline at all.
     last_active: Option<f32>,
+    /// Running mean of |pitch - base| over still frames: the noise floor.
+    jitter: f32,
     pub nods: usize,
 }
 
 impl NodDetector {
     /// The smallest excursion ever accepted (a natural nod swings 0.03 to 0.05).
-    pub const MIN_DOWN: f32 = 0.025;
+    pub const MIN_DOWN: f32 = 0.015;
     /// Excursion threshold as a multiple of the measured jitter.
-    pub const JITTER_MULT: f32 = 3.0;
+    pub const JITTER_MULT: f32 = 4.0;
     /// The largest excursion ever required, however jittery the baseline.
     pub const MAX_DOWN: f32 = 0.06;
     const SETTLE_FRAMES: usize = 8;
     const OUT_FRAMES: usize = 2;
     const IN_FRAMES: usize = 2;
-    const NOD_MIN_S: f32 = 0.10;
+    const NOD_MIN_S: f32 = 0.06;
     const NOD_MAX_S: f32 = 0.8;
-    const GAP_MIN_S: f32 = 0.2;
+    const GAP_MIN_S: f32 = 0.15;
     /// Baseline follows the head while it is still (per idle frame).
     const DRIFT: f32 = 0.05;
 
     pub fn new() -> Self {
-        NodDetector { raw: Vec::new(), settle: Vec::new(), base: None, down_thr: Self::MIN_DOWN, up_thr: Self::MIN_DOWN / 2.0, out_frames: 0, in_frames: 0, out_since: None, extreme: 0.0, last_nod: None, need_return: false, last_active: None, nods: 0 }
+        NodDetector { raw: Vec::new(), settle: Vec::new(), base: None, down_thr: Self::MIN_DOWN, up_thr: Self::MIN_DOWN / 2.0, out_frames: 0, in_frames: 0, out_since: None, out_first: 0.0, extreme: 0.0, last_nod: None, need_return: false, last_active: None, jitter: 0.0, nods: 0 }
     }
 
     /// True while the head is still or has only just moved: the caller may
@@ -340,8 +344,8 @@ impl NodDetector {
                 let mut s = self.settle.clone();
                 s.sort_by(|a, b| a.total_cmp(b));
                 let base = s[s.len() / 2];
-                let jitter = s.iter().map(|v| (v - base).abs()).fold(0f32, f32::max);
-                self.down_thr = (jitter * Self::JITTER_MULT).clamp(Self::MIN_DOWN, Self::MAX_DOWN);
+                self.jitter = s.iter().map(|v| (v - base).abs()).sum::<f32>() / s.len() as f32;
+                self.down_thr = (self.jitter * Self::JITTER_MULT).clamp(Self::MIN_DOWN, Self::MAX_DOWN);
                 self.up_thr = self.down_thr / 2.0;
                 self.base = Some(base);
             }
@@ -355,6 +359,13 @@ impl NodDetector {
             // Still: let the baseline follow slow drift.
             self.base = Some(b + Self::DRIFT * e);
         }
+        if d < self.down_thr {
+            // The noise floor keeps being measured on frames inside the band,
+            // so a flickering landmark raises the bar and a steady one lowers it.
+            self.jitter += 0.05 * (d - self.jitter);
+            self.down_thr = (self.jitter * Self::JITTER_MULT).clamp(Self::MIN_DOWN, Self::MAX_DOWN);
+            self.up_thr = self.down_thr / 2.0;
+        }
         if self.need_return {
             if d < self.up_thr {
                 self.need_return = false;
@@ -363,9 +374,12 @@ impl NodDetector {
         }
         let Some(since) = self.out_since else {
             if d > self.down_thr {
+                if self.out_frames == 0 {
+                    self.out_first = t;
+                }
                 self.out_frames += 1;
                 if self.out_frames >= Self::OUT_FRAMES {
-                    self.out_since = Some(t);
+                    self.out_since = Some(self.out_first);
                     self.in_frames = 0;
                     self.extreme = e;
                 }
@@ -498,6 +512,40 @@ mod nod_tests {
         }
         assert_eq!(at.len(), 2, "nods at frames {:?}, threshold {:.3}", at, d.down_thr);
         assert!(at[1] < 60, "both nods are within the first 60 frames, got {:?}", at);
+    }
+
+    /// Two small natural nods recorded 2026-09-19 at about 28 examined frames
+    /// a second (swing 0.03, out of the noise band for only two or three
+    /// frames each way). Took 160 frames to count under a 0.10 s minimum
+    /// duration; must count within 60 frames of the first movement.
+    #[test]
+    fn small_quick_nods_count_promptly() {
+        let t: Vec<f32> = "0.518 0.516 0.506 0.520 0.525 0.516 0.517 0.520 0.516 0.507 0.519 0.511 0.512 0.514 0.504 0.512 0.507 0.514 0.508 0.527 0.533 0.534 0.535 0.520 0.528 0.545 0.516 0.524 0.525 0.496 0.488 0.486 0.517 0.526 0.514 0.522 0.540 0.548 0.546 0.524 0.512 0.538 0.520 0.530 0.516 0.512 0.504 0.495 0.520 0.519 0.507 0.512 0.506 0.511 0.548 0.548 0.550 0.549 0.547 0.518 0.519 0.509 0.512 0.513 0.510 0.513 0.506 0.512 0.504 0.505 0.508 0.545 0.501 0.511 0.531 0.540 0.543 0.544 0.544 0.542 0.542 0.541 0.548 0.538 0.545 0.546 0.540 0.544 0.543 0.528 0.539 0.530 0.526 0.535 0.528 0.533 0.540 0.537 0.541 0.515 0.540 0.539 0.543 0.540 0.543 0.543 0.543 0.539 0.540 0.518 0.522 0.516 0.525 0.539 0.524 0.528 0.528 0.529 0.540 0.527 0.526 0.527 0.547 0.525 0.527 0.546 0.530 0.546 0.527 0.524 0.540 0.540 0.544 0.545 0.527 0.526 0.525 0.548 0.548 0.550 0.545 0.529 0.546 0.544 0.539 0.550 0.543 0.545 0.525 0.544 0.540 0.543 0.545 0.542 0.524 0.543 0.543 0.524 0.531 0.543".split(' ').map(|v| v.parse().unwrap()).collect();
+        let mut d = NodDetector::new();
+        let mut at = Vec::new();
+        for (i, &p) in t.iter().enumerate() {
+            if d.push(p, i as f32 / 28.0) {
+                at.push(i);
+            }
+        }
+        assert!(at.len() >= 2, "nods at frames {:?}, threshold {:.3}", at, d.down_thr);
+        assert!(at[1] < 85, "second nod within 60 frames of the first movement at 25, got {:?}", at);
+    }
+
+    /// Light nods recorded 2026-09-19: dips of 0.017 in a noise floor of
+    /// 0.004, never seen at a 0.025 threshold (the user typed the password
+    /// after ten seconds). Must count at least two.
+    #[test]
+    fn light_nods_count() {
+        let t: Vec<f32> = "0.528 0.519 0.520 0.533 0.532 0.533 0.530 0.530 0.534 0.537 0.529 0.531 0.532 0.533 0.532 0.534 0.533 0.537 0.538 0.534 0.535 0.532 0.535 0.535 0.535 0.534 0.534 0.536 0.536 0.537 0.539 0.535 0.525 0.516 0.513 0.517 0.535 0.540 0.534 0.526 0.512 0.516 0.532 0.536 0.535 0.537 0.536 0.531 0.534 0.532 0.531 0.531 0.534 0.539 0.534 0.537 0.539 0.536 0.535 0.543 0.536 0.532 0.536 0.536 0.543 0.537 0.539 0.543 0.540 0.539 0.538 0.538 0.539 0.541 0.543 0.542 0.544 0.538 0.541 0.542 0.543 0.545 0.543 0.542 0.544 0.540 0.544 0.540 0.546 0.545 0.541 0.544 0.545 0.542 0.549 0.544 0.542 0.543 0.546 0.548 0.544 0.548 0.546 0.549 0.545 0.544 0.540 0.542 0.545 0.545 0.547 0.543 0.538 0.543 0.550 0.542 0.542 0.538 0.538 0.544 0.545 0.547 0.551 0.546 0.546 0.540 0.544 0.541 0.544 0.539 0.538 0.543 0.540 0.541 0.537 0.545 0.538 0.540 0.539 0.536 0.537 0.541 0.537 0.540 0.539 0.542 0.548 0.542 0.543 0.544 0.542 0.539 0.541 0.546 0.538 0.539 0.545 0.545 0.539 0.543 0.537 0.539 0.539 0.538 0.539 0.532 0.536 0.537 0.540 0.539 0.533 0.538 0.537 0.534 0.541 0.535 0.534 0.534 0.535 0.536 0.533 0.535 0.535 0.533 0.534 0.534 0.539 0.535 0.536 0.535 0.537 0.536 0.536 0.535 0.533 0.535 0.534 0.533 0.537 0.531 0.534 0.532 0.531 0.534 0.534 0.532 0.529 0.536 0.536 0.531 0.533 0.532 0.532 0.534 0.532 0.533 0.537 0.535 0.533 0.532 0.530 0.531 0.528 0.531 0.527 0.533 0.531 0.531 0.531 0.532 0.527 0.528 0.532 0.524 0.524 0.531 0.534 0.535 0.532 0.536 0.553 0.540 0.546 0.546 0.527 0.525 0.519 0.526 0.529 0.539 0.540 0.542 0.543 0.542 0.539 0.541 0.537 0.534 0.535 0.539 0.541 0.533 0.531 0.526 0.523 0.523 0.521 0.521 0.546 0.521 0.524 0.521 0.520 0.530 0.525 0.525 0.534 0.538 0.534 0.535 0.530 0.536 0.537 0.536 0.535 0.538 0.542".split(' ').map(|v| v.parse().unwrap()).collect();
+        let mut d = NodDetector::new();
+        let mut at = Vec::new();
+        for (i, &p) in t.iter().enumerate() {
+            if d.push(p, i as f32 / 28.0) {
+                at.push(i);
+            }
+        }
+        assert!(at.len() >= 2, "nods at frames {:?}, threshold {:.3}", at, d.down_thr);
     }
 
     #[test]
