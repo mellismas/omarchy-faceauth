@@ -197,6 +197,14 @@ daemon: Match { score: 0.855, frames: 2, elapsed_ms: 1805 }
 unlocked 01:33:10.353            (1.8 s after the lock became secure)
 ```
 
+Negative test, same session: locked with the face covered for about 25 s, then
+uncovered. Three attempts ran to their 6 s timeout as `no_match` (best scores
+0.19, 0.10, 0.16 on 7, 1 and 8 partially visible faces), then the fourth matched
+at 0.875 on two frames in 1.8 s; unlocked 33 s after locking, with no keyboard
+input at any point. A tunable to revisit for the presence phase: an attempt that
+has scored several frames well below the threshold could end early instead of
+spending the full timeout, so the retry loop notices a returning face sooner.
+
 The desktop ran the checkout's shell for this test (launched with `OMARCHY_PATH`
 pointed at the checkout); `omarchy dev link` plus a reboot is the sanctioned way.
 
