@@ -9,8 +9,10 @@
 //!   albedo estimate: measured 0.28 for a face and 1.7 for a plain-paper print.
 //! - **Surround.** A print's surround is at the print's distance and lights up
 //!   with the face; a real head's surround is the room behind it, several times
-//!   farther, and the inverse-square falloff leaves it dark. Measured 0.31 to
-//!   0.36 for a face (shoulders included) and 0.44 to 0.54 for a print.
+//!   farther, and the inverse-square falloff leaves it dark. The ring is taken
+//!   beside and above the head only; below the chin are the shoulders, as close
+//!   as the face. First measurements with the full ring: 0.31 to 0.36 for a face
+//!   and 0.44 to 0.54 for a print; re-measured with the trimmed ring in the pack.
 //!
 //! Thresholds are published constants set from the first measurements with
 //! margin; re-measure before changing them and record the runs.
@@ -67,21 +69,27 @@ impl FlashResponse {
         };
         let [bx, by, bw, bh] = face.bbox;
         let (cx, cy) = (bx + bw / 2.0, by + bh / 2.0);
-        let mean_region = |lo: f32, hi: f32| -> f32 {
+        // Region between `lo` and `hi` times the box, optionally only the part
+        // beside and above the face (below the chin are the shoulders, which are
+        // as close as the face and lit like it).
+        let mean_region = |lo: f32, hi: f32, above_chin_only: bool| -> f32 {
             let (rx_lo, ry_lo, rx_hi, ry_hi) = (bw * lo / 2.0, bh * lo / 2.0, bw * hi / 2.0, bh * hi / 2.0);
             let (x0, x1) = ((cx - rx_hi).max(0.0) as i32, (cx + rx_hi).min(fw as f32 - 1.0) as i32);
             let (y0, y1) = ((cy - ry_hi).max(0.0) as i32, (cy + ry_hi).min(fh as f32 - 1.0) as i32);
+            let chin = cy + bh * 0.35;
             let (mut s, mut n) = (0f32, 0usize);
             let mut y = y0;
             while y <= y1 {
-                let mut x = x0;
-                while x <= x1 {
-                    let inside = ((x as f32 - cx).abs() < rx_lo) && ((y as f32 - cy).abs() < ry_lo);
-                    if !inside {
-                        s += flash_at(x, y);
-                        n += 1;
+                if !(above_chin_only && y as f32 > chin) {
+                    let mut x = x0;
+                    while x <= x1 {
+                        let inside = ((x as f32 - cx).abs() < rx_lo) && ((y as f32 - cy).abs() < ry_lo);
+                        if !inside {
+                            s += flash_at(x, y);
+                            n += 1;
+                        }
+                        x += 2;
                     }
-                    x += 2;
                 }
                 y += 2;
             }
@@ -91,8 +99,8 @@ impl FlashResponse {
                 s / n as f32
             }
         };
-        let face_flash = mean_region(0.0, 0.7);
-        let ring_flash = mean_region(1.4, 2.0);
+        let face_flash = mean_region(0.0, 0.7, false);
+        let ring_flash = mean_region(1.4, 2.0, true);
         let surround = if face_flash > 0.0 { ring_flash / face_flash } else { f32::INFINITY };
         let denom = (exposure.max(1) as f32) * (gain.max(1) as f32 / 16.0);
         let raw = face_flash / denom;

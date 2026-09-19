@@ -1,0 +1,11 @@
+# pam_faceauth is only ever `sufficient` or `[success=done default=ignore]`, never
+# `required`: every failure inside it returns PAM_IGNORE and the stack falls through
+# to the password. Insert ABOVE the password line (before pam_fprintd if present).
+
+# /etc/pam.d/omarchy-lock-face   (a third lock-screen stack beside -password and -fingerprint)
+#%PAM-1.0
+auth       required                    pam_faceauth.so socket=/run/faceauth/sock timeout=8
+account    include                     system-local-login
+
+# /etc/pam.d/sudo and /etc/pam.d/polkit-1: one line at the top, opt-in
+auth      sufficient pam_faceauth.so socket=/run/faceauth/sock timeout=8

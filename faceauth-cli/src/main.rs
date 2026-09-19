@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth enroll --store DIR [--user NAME] [--label TEXT] [--seconds N] [--count N]\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
+        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth auth [--user NAME] [--socket PATH]      (asks a running faceauthd)\n  faceauth enroll --store DIR [--user NAME] [--label TEXT] [--seconds N] [--count N]\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
     );
     std::process::exit(2)
 }
@@ -32,6 +32,14 @@ fn main() -> Result<()> {
         ["engine", "test", rest @ ..] => engine_test(rest),
         ["engine", "live", rest @ ..] => engine_live(rest),
         ["enroll", rest @ ..] => enroll(rest),
+        ["auth", rest @ ..] => {
+            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
+            let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
+            let t = Instant::now();
+            let o = faceauth_daemon::server::ask(&socket, &user, Duration::from_secs(15))?;
+            println!("{} ({:.2} s round trip)", serde_json::to_string(&o)?, t.elapsed().as_secs_f64());
+            Ok(())
+        }
         ["liveness", "capture", rest @ ..] => liveness_capture(rest),
         ["verify", rest @ ..] => verify(rest),
         _ => usage(),
@@ -768,9 +776,7 @@ fn liveness_capture(rest: &[&str]) -> Result<()> {
         };
         let face_flash = mean_region(0.0, 0.7);
         let ring_flash = mean_region(1.4, 2.0);
-        let surround = if face_flash > 1.0 { ring_flash / face_flash } else { f32::NAN };
-        // Reflectance per unit exposure: flash response of the face divided by exposure rows x gain/16.
-        let reflectance = face_flash / (lp.exposure.exposure as f32 * lp.exposure.gain as f32 / 16.0);
+        let _ = (face_flash, ring_flash);
         // Glint at native resolution: brightest flash pixel within 5 px of each eye
         // landmark over the mean of that neighbourhood.
         let glint_native = |ex: f32, ey: f32| -> f32 {
@@ -786,10 +792,13 @@ fn liveness_capture(rest: &[&str]) -> Result<()> {
             }
             mx / (sum / cnt as f32).max(1.0)
         };
+        let fr = faceauth_engine::liveness::FlashResponse::measure(lit, unlit, &face, lp.exposure.exposure, lp.exposure.gain.max(16));
+        let surround = fr.surround;
+        let reflectance = fr.reflectance;
         let gn_r = glint_native(face.landmarks[0][0], face.landmarks[0][1]);
         let gn_l = glint_native(face.landmarks[1][0], face.landmarks[1][1]);
         pairs += 1;
-        println!("pair {:2} lit {:5.1} gain {:4.2} ratio_hp {:.4} diff_hp {:.4} glint {:.2}/{:.2} native {:.2}/{:.2} surround {:.3} refl {:.4} face {:.0}px exp {}", pairs, lm, flash_gain, ratio_hp, diff_hp, glint_r, glint_l, gn_r, gn_l, surround, reflectance, bw, lp.exposure.exposure);
+        println!("pair {:2} lit {:5.1} gain {:4.2} ratio_hp {:.4} diff_hp {:.4} glint {:.2}/{:.2} native {:.2}/{:.2} surround {:.3} refl {:.4} face {:.0}px exp {} verdict {:?}", pairs, lm, flash_gain, ratio_hp, diff_hp, glint_r, glint_l, gn_r, gn_l, surround, reflectance, bw, lp.exposure.exposure, fr.verdict());
         csv += &format!("{},{},{:.1},{:.1},{:.3},{:.4},{:.4},{:.2},{:.2},{:.2},{:.2},{:.3},{:.4},{:.0},{}\n", label, pairs, lm, um, flash_gain, ratio_hp, diff_hp, glint_r, glint_l, gn_r, gn_l, surround, reflectance, bw, lp.exposure.exposure);
         if pairs <= 3 {
             lit_c.write_pgm(save.join(format!("{}-{}-lit.pgm", label, pairs)))?;

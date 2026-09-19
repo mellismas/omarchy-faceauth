@@ -1,0 +1,12 @@
+# /etc/faceauth/config.toml : every key optional; these are the defaults.
+models_dir = "/usr/share/faceauth/models"
+store_dir = "/var/lib/faceauth"
+socket = "/run/faceauth/sock"
+accept_threshold = 0.70     # cosine similarity; see src/README.md for the measurements behind it
+required_matches = 2        # frames at or above the threshold within one attempt
+attempt_timeout = 6.0       # seconds
+min_detection = 0.6
+liveness = true             # flash-response gate (needs the ov7251 strobe control)
+# ir_video = "/dev/video2"  # override camera detection (UVC IR cameras go here)
+# ir_subdev = "/dev/v4l-subdev7"
+ir_orientation = [true, true, true]   # transpose, flip_x, flip_y: Surface Book 2 mounting

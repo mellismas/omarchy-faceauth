@@ -1,0 +1,41 @@
+[Unit]
+Description=Omarchy FaceAuth daemon (camera, templates, verdicts for pam_faceauth)
+Documentation=https://github.com/basecamp/omarchy
+# Started at boot as a plain service. Never socket- or D-Bus-activated and never
+# started from anything inside a PAM stack: an on-demand start would recurse
+# through polkit into the PAM stack that contains pam_faceauth.
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/faceauthd /etc/faceauth/config.toml
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=faceauth
+RuntimeDirectoryMode=0755
+StateDirectory=faceauth
+StateDirectoryMode=0700
+ConfigurationDirectory=faceauth
+# Root for the camera nodes and the template store. Everything else locked down.
+User=root
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+SystemCallArchitectures=native
+DevicePolicy=closed
+DeviceAllow=char-video4linux rw
+DeviceAllow=char-media rw
+ReadWritePaths=/var/lib/faceauth /run/faceauth
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

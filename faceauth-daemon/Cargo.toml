@@ -5,9 +5,22 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[lib]
+name = "faceauth_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "faceauthd"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
+env_logger.workspace = true
+faceauth-camera = { version = "0.1.0", path = "../faceauth-camera" }
 faceauth-engine = { version = "0.1.0", path = "../faceauth-engine" }
+libc.workspace = true
 log.workspace = true
+nix = { workspace = true, features = ["socket", "user", "fs"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+toml.workspace = true
