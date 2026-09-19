@@ -1,11 +1,18 @@
-# pam_faceauth is only ever `sufficient` or `[success=done default=ignore]`, never
-# `required`: every failure inside it returns PAM_IGNORE and the stack falls through
-# to the password. Insert ABOVE the password line (before pam_fprintd if present).
+# pam_faceauth returns PAM_IGNORE for every failure (no daemon, timeout, no match,
+# malformed reply, panic). That is what makes it safe in a stack that has a
+# password behind it. It also means a stack with NOTHING behind it must be closed
+# with pam_deny: an ignored module leaves the stack without a verdict, and PAM
+# reads no verdict as success (measured by the author of omarchy PR 7935 against
+# a stopped backend: without pam_deny the stack authenticated anyone in 0.1 s).
 
-# /etc/pam.d/omarchy-lock-face   (a third lock-screen stack beside -password and -fingerprint)
+# /etc/pam.d/omarchy-lock-face   (the lock screen's third stack, beside -password and -fingerprint;
+#                                 the password is a separate service on its own lane, so this one
+#                                 must be closed)
 #%PAM-1.0
-auth       required                    pam_faceauth.so socket=/run/faceauth/sock timeout=8
+auth       sufficient                  pam_faceauth.so socket=/run/faceauth/sock timeout=8
+auth       required                    pam_deny.so
 account    include                     system-local-login
 
-# /etc/pam.d/sudo and /etc/pam.d/polkit-1: one line at the top, opt-in
+# /etc/pam.d/sudo and /etc/pam.d/polkit-1: one line at the top, opt-in. The
+# password lines below it are the fallback, so no pam_deny here.
 auth      sufficient pam_faceauth.so socket=/run/faceauth/sock timeout=8
