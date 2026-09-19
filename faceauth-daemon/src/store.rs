@@ -32,6 +32,10 @@ pub struct Template {
 pub struct UserTemplates {
     pub version: u32,
     pub user: String,
+    /// The account's uid when enrolled. A recreated account with the same name
+    /// is a different person; a mismatch on load is treated as not enrolled.
+    #[serde(default)]
+    pub uid: Option<u32>,
     /// Which recognition model produced these; a model change invalidates them.
     pub model: String,
     pub templates: Vec<Template>,
@@ -39,7 +43,7 @@ pub struct UserTemplates {
 
 impl UserTemplates {
     pub fn new(user: &str, model: &str) -> Self {
-        UserTemplates { version: FORMAT_VERSION, user: user.to_string(), model: model.to_string(), templates: Vec::new() }
+        UserTemplates { version: FORMAT_VERSION, user: user.to_string(), uid: current_uid(user), model: model.to_string(), templates: Vec::new() }
     }
 
     /// Best cosine similarity of `embedding` against every template, and which one.
@@ -99,6 +103,12 @@ impl Store {
         if t.version != FORMAT_VERSION {
             bail!("{}: template format {} (this build reads {})", p.display(), t.version, FORMAT_VERSION);
         }
+        if let (Some(stored), Some(now)) = (t.uid, current_uid(user)) {
+            if stored != now {
+                log::warn!("{}: templates belong to uid {} but {} is now uid {}; treating as not enrolled", p.display(), stored, user, now);
+                return Ok(None);
+            }
+        }
         Ok(Some(t))
     }
 
@@ -126,6 +136,10 @@ impl Store {
             Ok(false)
         }
     }
+}
+
+pub fn current_uid(user: &str) -> Option<u32> {
+    nix::unistd::User::from_name(user).ok().flatten().map(|u| u.uid.as_raw())
 }
 
 pub fn now_secs() -> u64 {

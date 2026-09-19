@@ -6,11 +6,19 @@
 # sandbox drops CAP_SETUID, and runuser/su would open a PAM session whose
 # modules fail under it. OMARCHY_PATH must name the tree the running shell was
 # launched from (the packaged one unless the desktop is dev-linked).
+#
+# A presence lock keeps the panel lit for ten minutes rather than the usual
+# few seconds: the owner may be a few feet away and wants to see the screen
+# waiting for them. `lock lockPresence` sets that before locking; the system
+# lock command then runs its usual extras (password manager, screensaver).
 set -euo pipefail
 user=${1:?user}
 omarchy_path=${2:-$(sed -n 's/^OMARCHY_PATH=//p' /etc/omarchy.conf 2>/dev/null | tr -d '"' | head -1)}
 omarchy_path=${omarchy_path:-/usr/share/omarchy}
-# Absolute path: inside the user's manager PATH is the user's to shape, and a
-# shadowed command answering "ok" would leave the machine open. Bounded wait.
+run_as_user() {
+  /usr/bin/timeout 15 /usr/bin/systemd-run --machine="$user@.host" --user --wait --collect --quiet \
+    -E "OMARCHY_PATH=$omarchy_path" "$@"
+}
+run_as_user /usr/bin/omarchy-shell lock lockPresence || true
 exec /usr/bin/timeout 15 /usr/bin/systemd-run --machine="$user@.host" --user --wait --collect --quiet \
   -E "OMARCHY_PATH=$omarchy_path" /usr/bin/omarchy-system-lock

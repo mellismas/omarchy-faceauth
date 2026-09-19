@@ -1003,15 +1003,17 @@ fn doctor(rest: &[&str]) -> Result<()> {
     }
     push("templates.at_rest", "warn", "templates are plaintext at rest (root 0600); TPM sealing not implemented".into());
     // PAM wiring
-    for (id, path, want_deny) in [("pam.sudo", "/etc/pam.d/sudo", false), ("pam.polkit", "/etc/pam.d/polkit-1", false), ("pam.lock", "/etc/pam.d/omarchy-lock-face", true)] {
+    for (id, path, want_deny) in [("pam.sudo", "/etc/pam.d/sudo", false), ("pam.polkit", "/etc/pam.d/polkit-1", false), ("pam.lock", "/etc/pam.d/omarchy-lock-face", true), ("pam.greeter", "/etc/pam.d/sddm", false)] {
         match std::fs::read_to_string(path) {
             Ok(t) => {
                 let has = t.lines().any(|l| l.contains("pam_faceauth.so") && !l.trim_start().starts_with('#'));
                 let deny = t.lines().any(|l| l.contains("pam_deny.so"));
                 let prompt = t.lines().any(|l| l.contains("pam_faceauth.so") && l.contains("prompt"));
-                let st = if !has { "warn" } else if want_deny && !deny { "fail" } else { "pass" };
+                let consent = t.lines().any(|l| l.contains("pam_faceauth.so") && l.contains("consent"));
+                let elevation = id == "pam.sudo" || id == "pam.polkit";
+                let st = if !has { if id == "pam.greeter" { "info" } else { "warn" } } else if want_deny && !deny { "fail" } else { "pass" };
                 let mut d = if has { "wired".to_string() } else { "not wired".to_string() };
-                if has && !want_deny { d += if prompt { ", prompt (Enter to scan)" } else { ", NO prompt: scans on presence" }; }
+                if has && elevation { d += if consent { ", consent (window + nod)" } else if prompt { ", prompt (Enter to scan)" } else { ", NO consent or prompt: scans on presence" }; }
                 if has && want_deny { d += if deny { ", closed by pam_deny" } else { ", NOT closed by pam_deny: an ignored module would read as success" }; }
                 push(id, st, d);
             }
