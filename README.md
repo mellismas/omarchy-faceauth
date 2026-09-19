@@ -418,6 +418,13 @@ be something no program can forge. Built:
   (a version that did hold focus once left the keyboard dead when a hide call
   was lost).
 
+Live on the reference machine (2026-09-19 morning): the sudo and polkit lines
+carry `consent` with `timeout=20`. Measured through the real stacks: `sudo true`
+allowed in 7.7 s (match 0.886, two nods); `pkexec true` allowed in 9.4 s. A
+first version reopened the camera between the match and the nod phase, and the
+two to three second restart ate the start of the gesture window; the nod phase
+now runs on the still-open camera with steady light and an eight-second window.
+
 Calibrated on the owner (2026-09-19, after the dev-link reboot): a nod moves
 the pitch measure by about 0.12 (0.53 to 0.41 and back) on this sensor, and the
 sign depends on the mounting, so any excursion beyond 0.06 that returns within

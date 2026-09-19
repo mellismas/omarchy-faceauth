@@ -72,6 +72,7 @@ impl CallerInfo {
             // polkit client) running with the user's real uid. Best effort.
             info.via = "polkit".into();
             let mut best: Option<(u64, i32)> = None;
+            let mut seen: Vec<String> = Vec::new();
             if let Ok(rd) = std::fs::read_dir("/proc") {
                 for e in rd.flatten() {
                     let Some(p) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else { continue };
@@ -82,6 +83,9 @@ impl CallerInfo {
                     // without ptrace rights, and this daemon has no capabilities;
                     // comm is readable by everyone.
                     let b = comm_of(p);
+                    if seen.len() < 40 {
+                        seen.push(format!("{}:{}", p, b));
+                    }
                     if b == "pkexec" || b == "run0" {
                         let t = starttime_of(p);
                         if best.map(|(bt, _)| t > bt).unwrap_or(true) {
@@ -90,6 +94,7 @@ impl CallerInfo {
                     }
                 }
             }
+            log::info!("consent: polkit requester search, uid {} processes: {}", user_uid, seen.join(" "));
             match best {
                 Some((_, p)) => {
                     info.kill_pid = p;
