@@ -37,13 +37,15 @@ pub struct Authenticator {
     pub cfg: Config,
     pub pipeline: Pipeline,
     pub store: Store,
+    /// When the last attempt matched; the presence watch resumes on it.
+    pub last_match: Option<Instant>,
 }
 
 impl Authenticator {
     pub fn new(cfg: Config) -> Result<Self> {
         let pipeline = Pipeline::load(&cfg.models_dir)?;
         let store = Store::open(&cfg.store_dir)?;
-        Ok(Authenticator { cfg, pipeline, store })
+        Ok(Authenticator { cfg, pipeline, store, last_match: None })
     }
 
     /// One cheap look for the lock screen while its panel is blank: is anyone
@@ -92,7 +94,12 @@ impl Authenticator {
             Err(e) => return Outcome::Error { message: e.to_string() },
         };
         match self.run(&templates) {
-            Ok(o) => o,
+            Ok(o) => {
+                if matches!(o, Outcome::Match { .. }) {
+                    self.last_match = Some(Instant::now());
+                }
+                o
+            }
             Err(e) => Outcome::Error { message: e.to_string() },
         }
     }

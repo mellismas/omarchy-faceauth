@@ -3,7 +3,7 @@
 #   faceauth-lock-session <user> [omarchy-path]
 # The lock command runs inside the user's own systemd manager, with that
 # session's environment, so the daemon never switches uid itself: the service
-# sandbox drops CAP_SETUID, and runuser/su would also open a PAM session whose
+# sandbox drops CAP_SETUID, and runuser/su would open a PAM session whose
 # modules fail under it. OMARCHY_PATH must name the tree the running shell was
 # launched from (the packaged one unless the desktop is dev-linked).
 set -euo pipefail

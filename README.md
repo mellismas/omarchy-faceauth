@@ -264,11 +264,29 @@ Also: `pam_faceauth` now writes one line per decision to the auth log (never the
 password), and the attempt logs a detail line: settle exposure, frame, lit-pair,
 face and scored counts, and the per-frame score trail.
 
-The presence watch (auto-lock) is written but off: its helper could not lock the
-session from inside the hardened unit (no CAP_SETUID; runuser's PAM session fails
-there too). The working helper runs the lock command inside the user's own
-systemd manager (`systemd-run --machine=user@.host --user`), verified under the
-sandbox, and goes in with the next measured test.
+## Auto-lock, measured (2026-09-19 02:56)
+
+The presence watch is on: one half-second look every 2 s (detector each tick,
+identity every third), away after 10 s unseen. Its lock helper runs the lock
+command inside the user's own systemd manager (`systemd-run --machine=user@.host
+--user -E OMARCHY_PATH=...`): the hardened unit has no CAP_SETUID and `runuser`
+opens a PAM session whose modules fail under the sandbox, so the daemon never
+switches uid itself. Two guards from the earlier runs: after locking, the watch
+stops looking until an attempt matches (the lock screen's own probe owns the
+camera while the panel is blank), and it takes two consecutive failed identity
+checks before the user stops counting as present.
+
+```
+02:56:08.67  presence: Unknown -> Present
+02:56:34.18  presence: Present -> Away (unseen 10s); locking the session
+02:56:34.37  shell: lock-requested        02:56:34.93 secure=true
+02:56:37.95  attempt: Match 0.807 (3.0 s); presence: session unlocked by face, watch resumes
+```
+
+Walk away, locked at ten seconds from inside the daemon; sit back down, open
+without touching anything. The first scan after the lock took 3.0 s instead of
+1.8 because it raced the watch's final tick for the camera; the watch is paused
+from then until the match.
 
 ## Decisions carried into the code
 

@@ -79,12 +79,29 @@ pub fn run(auth: Arc<Mutex<Authenticator>>, cfg: PresenceConfig) {
     let mut state = State::Unknown;
     let mut locked_by_presence = false;
     let mut tick: u32 = 0;
-    let mut identity_ok = true; // until an identity check says otherwise
+    let mut identity_ok = true; // until two consecutive identity checks say otherwise
+    let mut identity_fails: u32 = 0;
+    let mut locked_at: Option<Instant> = None;
     log::info!("presence watch on for {} (tick {}s, away after {}s, attention {})", cfg.user, cfg.tick_seconds, cfg.away_seconds, cfg.require_attention);
     loop {
         std::thread::sleep(Duration::from_secs_f32(cfg.tick_seconds));
         tick = tick.wrapping_add(1);
         let identify = tick % cfg.identify_every.max(1) == 0 || state != State::Present;
+        // After locking, leave the camera to the lock screen (its own probe wakes
+        // the panel); resume only once an attempt has matched.
+        if let Some(t) = locked_at {
+            let resumed = auth.lock().map(|a| a.last_match.map(|m| m > t).unwrap_or(false)).unwrap_or(false);
+            if !resumed {
+                continue;
+            }
+            log::info!("presence: session unlocked by face, watch resumes");
+            locked_at = None;
+            locked_by_presence = false;
+            last_seen = Some(Instant::now());
+            state = State::Present;
+            identity_ok = true;
+            identity_fails = 0;
+        }
         let obs = {
             let mut a = auth.lock().unwrap_or_else(|p| p.into_inner());
             match observe(&mut a, &cfg, identify) {
@@ -97,7 +114,15 @@ pub fn run(auth: Arc<Mutex<Authenticator>>, cfg: PresenceConfig) {
         };
         let now = Instant::now();
         if let Some(id) = obs.identity {
-            identity_ok = id;
+            if id {
+                identity_fails = 0;
+                identity_ok = true;
+            } else {
+                identity_fails += 1;
+                if identity_fails >= 2 {
+                    identity_ok = false;
+                }
+            }
         }
         let seen = obs.face && identity_ok && (!cfg.require_attention || obs.attentive);
         if seen {
@@ -121,7 +146,10 @@ pub fn run(auth: Arc<Mutex<Authenticator>>, cfg: PresenceConfig) {
         if next == State::Away && state != State::Away && !locked_by_presence {
             log::info!("presence: locking the session");
             match std::process::Command::new(&cfg.lock_command[0]).args(&cfg.lock_command[1..]).env("PATH", "/usr/local/bin:/usr/bin:/bin").output() {
-                Ok(o) if o.status.success() => locked_by_presence = true,
+                Ok(o) if o.status.success() => {
+                    locked_by_presence = true;
+                    locked_at = Some(Instant::now());
+                }
                 Ok(o) => log::warn!("lock command exited {}: {} {}", o.status, String::from_utf8_lossy(&o.stdout).trim(), String::from_utf8_lossy(&o.stderr).trim()),
                 Err(e) => log::warn!("lock command: {}", e),
             }
