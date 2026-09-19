@@ -178,6 +178,28 @@ authentication, so it cannot exercise the module; use a terminal.
 Fail-safe check: with the service stopped, the same `sudo true` prompts for the
 password as before (pam_faceauth returns PAM_IGNORE when it cannot connect).
 
+## Lock screen by face (2026-09-19 01:33)
+
+`/etc/pam.d/omarchy-lock-face` (pam_faceauth `sufficient`, closed by pam_deny)
+plus a 75-line change to the Omarchy shell's lock plugin
+(`../omarchy/0001-lock-face-authentication-as-a-third-PAM-stack.patch`, on a branch of
+the upstream checkout at 8675600): a third PamContext beside password and
+fingerprint, detected by the presence of the PAM file, started when the session
+lock is secure and on wake, stopped on blank, retried every 1.5 s. The contract is
+PR 7935's, so either backend fits it. The existing lock-screen shell tests pass.
+
+Locked through the shell's IPC, unlocked by face with no keyboard input:
+
+```
+lock-requested 01:33:07.984  ->  secure 01:33:08.535
+daemon: attempt for mellis (uid 1000)  01:33:08.544
+daemon: Match { score: 0.855, frames: 2, elapsed_ms: 1805 }
+unlocked 01:33:10.353            (1.8 s after the lock became secure)
+```
+
+The desktop ran the checkout's shell for this test (launched with `OMARCHY_PATH`
+pointed at the checkout); `omarchy dev link` plus a reboot is the sanctioned way.
+
 ## Decisions carried into the code
 
 - **The daemon owns the cameras.** No v4l2loopback node in the authentication path:
