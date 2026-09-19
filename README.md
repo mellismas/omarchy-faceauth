@@ -8,9 +8,9 @@ system libraries beyond libc; the kernel ABI it needs is hand-written in
 | --- | --- | --- |
 | `faceauth-camera` | Capture: V4L2 nodes and subdevices, media-controller graph, Intel IPU3 pipeline setup and 10-bit unpack, UVC decoders, the exposure / white-balance / tone calibration from `kernel/CALIBRATION.md`, the IR illuminator as a V4L2 control. | Working on the reference machine (see below). UVC path written, not yet exercised on hardware. |
 | `faceauth-engine` | Detect (YuNet), align (five-point similarity to the ArcFace template, contrast-normalised crop), embed (AuraFace glintr100, 512-D), cosine match; ONNX Runtime loaded dynamically from Arch's `onnxruntime-cpu`. | Working on the IR camera (see below). Presentation-attack gate not started. |
-| `faceauth-daemon` | Root service owning the cameras and templates; Unix socket for the PAM module; enrolment; presence state machine. | Placeholder. |
+| `faceauth-daemon` | `faceauthd`: config, camera capture per attempt (idle otherwise), the authentication flow (settle on the face, alternate the strobe, gate every lit frame, score until two match), template store, Unix socket with peer-credential checks. | Working end to end (see below). Presence state machine and TPM sealing not started. |
 | `faceauth-cli` | `faceauth` command: `cam probe`, `cam graph`, `cam test`, `engine inspect`, `engine test`, `engine live`; later `enroll`, `test`, `doctor`. | Camera and engine subcommands working. |
-| `pam_faceauth` | The PAM module: opens the socket, asks, maps the reply, never touches a camera or a model, panics firewalled to `PAM_IGNORE`. | Placeholder. |
+| `pam_faceauth` | The PAM module: opens the socket, asks, maps `match` to `PAM_SUCCESS` and everything else to `PAM_IGNORE`, panics firewalled; links only libc and libpam. | Built and unit-tested; not yet wired into a PAM stack. |
 
 ## Camera crate, first hardware run (2026-09-18 17:33)
 
@@ -128,6 +128,34 @@ for the face, 1.66 for the print). Thresholds are set from these two runs with
 margin and will be re-measured with more subjects, prints and distances; they are
 published, not hidden. Data: `faceauth-engine/proof/flash-*.csv`, crops in
 `flash-*-lit-unlit-diff-2026-09-18.png`.
+
+## The whole stack, first end-to-end run (2026-09-19 00:51)
+
+`faceauthd` running with a test config (models and store under `~/Work/fa-build`,
+socket in a scratch directory), asked over the socket by `faceauth auth`, which
+is the same request the PAM module sends. Each attempt: open the IR camera, LEDs
+on, find the face and settle exposure on it (1.2 s), freeze exposure, switch the
+strobe to alternate, then for every lit frame run the flash-response gate on its
+lit/unlit pair and score the face against the templates until two frames pass
+the threshold.
+
+```
+{"result":"match","score":0.9545612,"frames":2,"elapsed_ms":1689}
+{"result":"match","score":0.9487176,"frames":2,"elapsed_ms":1672}
+{"result":"match","score":0.94712895,"frames":2,"elapsed_ms":1694}
+```
+
+Three genuine attempts, three matches at 0.95, 1.7 s each from request to
+verdict, every scored frame having passed the liveness gate. Earlier in the
+same session, with the sitter looking down at a phone in profile and well back:
+`no_match` at 0.13 to 0.50 over 33 frames in 6 s, which is the correct answer.
+Asking about another user from an unprivileged connection is refused by the
+peer-credential check before any camera work.
+
+Packaging: `packaging/faceauth.service` (plain `Type=simple` at boot, hardened,
+device access limited to video and media nodes), `packaging/config.toml`, and
+`packaging/pam-example.txt` (the lock-screen stack and the opt-in sudo/polkit
+lines, always `sufficient`, never `required`).
 
 ## Decisions carried into the code
 
