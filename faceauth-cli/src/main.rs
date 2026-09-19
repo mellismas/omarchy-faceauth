@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth auth [--user NAME] [--socket PATH]      (asks a running faceauthd)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there?)\n  faceauth enroll [--user NAME] [--label TEXT] [--seconds N] [--count N]   (through the daemon)\n  faceauth enroll --store DIR ...                   (direct camera access, development)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]\n  faceauth doctor [--json]\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
+        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth auth [--user NAME] [--socket PATH]      (asks a running faceauthd)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there?)\n  faceauth enroll [--user NAME] [--label TEXT] [--seconds N] [--count N]   (through the daemon)\n  faceauth enroll --store DIR ...                   (direct camera access, development)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]\n  faceauth doctor [--json]\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence                                (current state)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
     );
     std::process::exit(2)
 }
@@ -65,6 +65,24 @@ fn main() -> Result<()> {
             let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
             let o = faceauth_daemon::server::probe(&socket, &user, Duration::from_secs(5))?;
             println!("{}", serde_json::to_string(&o)?);
+            Ok(())
+        }
+        ["presence", mode @ ("on" | "off"), rest @ ..] => {
+            // Root: rewrite the [presence] keys in the config and restart the service.
+            let cfg_path = opt(rest, "--config").unwrap_or("/etc/faceauth/config.toml").to_string();
+            let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("SUDO_USER").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "user".into()));
+            let away: f32 = opt(rest, "--away-seconds").unwrap_or("10").parse()?;
+            let text = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+            let mut doc: toml::Table = toml::from_str(&text).unwrap_or_default();
+            let mut presence = doc.get("presence").and_then(|v| v.as_table()).cloned().unwrap_or_default();
+            presence.insert("enabled".into(), toml::Value::Boolean(*mode == "on"));
+            presence.insert("user".into(), toml::Value::String(user.clone()));
+            presence.insert("away_seconds".into(), toml::Value::Float(away as f64));
+            presence.insert("lock_command".into(), toml::Value::Array(vec![toml::Value::String("/usr/bin/faceauth-lock-session".into()), toml::Value::String(user.clone())]));
+            doc.insert("presence".into(), toml::Value::Table(presence));
+            std::fs::write(&cfg_path, toml::to_string_pretty(&doc)?).with_context(|| format!("write {} (run as root)", cfg_path))?;
+            let st = std::process::Command::new("systemctl").args(["restart", "faceauth.service"]).status();
+            println!("presence watch {} for {} (away after {} s); service restart: {}", mode, user, away, st.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()));
             Ok(())
         }
         ["presence"] => {
