@@ -13,7 +13,12 @@
 //! PAM_IGNORE too.
 //!
 //! Module arguments (in the PAM line): `socket=/run/faceauth/sock`,
-//! `timeout=8` (seconds to wait for the daemon's reply).
+//! `timeout=8` (seconds to wait for the daemon's reply), and `prompt`, which
+//! makes the scan a deliberate act: the module asks through the PAM
+//! conversation, Enter on an empty line runs the face scan, anything typed is
+//! handed on as the password (PAM_AUTHTOK, for the `try_first_pass` module
+//! behind us) and no scan runs. Elevation (sudo, polkit) should use `prompt`;
+//! the lock screen, where looking at the machine is the act, should not.
 
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -24,6 +29,27 @@ use std::time::Duration;
 
 const PAM_SUCCESS: c_int = 0;
 const PAM_IGNORE: c_int = 25;
+const PAM_AUTHTOK: c_int = 6;
+const PAM_CONV: c_int = 5;
+const PAM_PROMPT_ECHO_OFF: c_int = 1;
+
+#[repr(C)]
+struct pam_message {
+    msg_style: c_int,
+    msg: *const c_char,
+}
+
+#[repr(C)]
+struct pam_response {
+    resp: *mut c_char,
+    resp_retcode: c_int,
+}
+
+#[repr(C)]
+struct pam_conv {
+    conv: Option<unsafe extern "C" fn(c_int, *mut *const pam_message, *mut *mut pam_response, *mut c_void) -> c_int>,
+    appdata_ptr: *mut c_void,
+}
 
 const DEFAULT_SOCKET: &str = "/run/faceauth/sock";
 const DEFAULT_TIMEOUT: u64 = 8;
@@ -36,15 +62,58 @@ pub struct pam_handle_t {
 
 extern "C" {
     fn pam_get_user(pamh: *mut pam_handle_t, user: *mut *const c_char, prompt: *const c_char) -> c_int;
+    fn pam_get_item(pamh: *const pam_handle_t, item_type: c_int, item: *mut *const c_void) -> c_int;
+    fn pam_set_item(pamh: *mut pam_handle_t, item_type: c_int, item: *const c_void) -> c_int;
+    fn free(p: *mut c_void);
 }
 
 struct Args {
     socket: String,
     timeout: Duration,
+    prompt: Option<String>,
+}
+
+const DEFAULT_PROMPT: &str = "Press Enter to authenticate by face, or type your password: ";
+
+/// Ask through the application's conversation. `Ok(Some(text))` is what the
+/// user typed (empty for a bare Enter); `Ok(None)` means no conversation is
+/// available, `Err` that the application refused.
+fn converse(pamh: *mut pam_handle_t, text: &str) -> Result<Option<String>, ()> {
+    let mut item: *const c_void = std::ptr::null();
+    // SAFETY: pamh is PAM's handle; item is a valid out-pointer.
+    let rc = unsafe { pam_get_item(pamh, PAM_CONV, &mut item) };
+    if rc != PAM_SUCCESS || item.is_null() {
+        return Ok(None);
+    }
+    let conv = unsafe { &*(item as *const pam_conv) };
+    let Some(f) = conv.conv else { return Ok(None) };
+    let ctext = std::ffi::CString::new(text).map_err(|_| ())?;
+    let msg = pam_message { msg_style: PAM_PROMPT_ECHO_OFF, msg: ctext.as_ptr() };
+    let mut msg_ptr: *const pam_message = &msg;
+    let mut resp: *mut pam_response = std::ptr::null_mut();
+    // SAFETY: one message, one response slot; the application allocates the
+    // response array with malloc and we free it (the PAM contract).
+    let rc = unsafe { f(1, &mut msg_ptr, &mut resp, conv.appdata_ptr) };
+    if rc != PAM_SUCCESS || resp.is_null() {
+        return Err(());
+    }
+    let out = unsafe {
+        let r = &*resp;
+        let text = if r.resp.is_null() { String::new() } else { CStr::from_ptr(r.resp).to_string_lossy().into_owned() };
+        if !r.resp.is_null() {
+            // Wipe before freeing: it may be a password.
+            let len = CStr::from_ptr(r.resp).to_bytes().len();
+            std::ptr::write_bytes(r.resp, 0, len);
+            free(r.resp as *mut c_void);
+        }
+        free(resp as *mut c_void);
+        text
+    };
+    Ok(Some(out))
 }
 
 fn parse_args(argc: c_int, argv: *const *const c_char) -> Args {
-    let mut a = Args { socket: DEFAULT_SOCKET.to_string(), timeout: Duration::from_secs(DEFAULT_TIMEOUT) };
+    let mut a = Args { socket: DEFAULT_SOCKET.to_string(), timeout: Duration::from_secs(DEFAULT_TIMEOUT), prompt: None };
     if argv.is_null() {
         return a;
     }
@@ -63,6 +132,10 @@ fn parse_args(argc: c_int, argv: *const *const c_char) -> Args {
             if let Ok(t) = v.parse::<u64>() {
                 a.timeout = Duration::from_secs(t.clamp(1, 60));
             }
+        } else if s == "prompt" {
+            a.prompt = Some(DEFAULT_PROMPT.to_string());
+        } else if let Some(v) = s.strip_prefix("prompt=") {
+            a.prompt = Some(v.replace('_', " "));
         }
     }
     a
@@ -106,6 +179,23 @@ fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char
     if user.is_empty() || user.len() > 256 {
         return PAM_IGNORE;
     }
+    if let Some(text) = &args.prompt {
+        match converse(pamh, text) {
+            // Typed something: that is the password for the module behind us; no scan.
+            Ok(Some(typed)) if !typed.is_empty() => {
+                if let Ok(tok) = std::ffi::CString::new(typed) {
+                    // SAFETY: PAM copies the item.
+                    unsafe { pam_set_item(pamh, PAM_AUTHTOK, tok.as_ptr() as *const c_void) };
+                }
+                return PAM_IGNORE;
+            }
+            // Bare Enter: the deliberate act. Scan.
+            Ok(Some(_)) => {}
+            // No conversation (a non-interactive caller): do not scan on our own initiative.
+            Ok(None) => return PAM_IGNORE,
+            Err(()) => return PAM_IGNORE,
+        }
+    }
     if daemon_says_match(Path::new(&args.socket), &user, args.timeout) {
         PAM_SUCCESS
     } else {
@@ -145,5 +235,18 @@ mod tests {
         let a = parse_args(0, std::ptr::null());
         assert_eq!(a.socket, DEFAULT_SOCKET);
         assert_eq!(a.timeout, Duration::from_secs(DEFAULT_TIMEOUT));
+        assert!(a.prompt.is_none());
+    }
+
+    #[test]
+    fn prompt_arguments() {
+        let args: Vec<std::ffi::CString> = ["prompt", "timeout=3"].iter().map(|s| std::ffi::CString::new(*s).unwrap()).collect();
+        let ptrs: Vec<*const c_char> = args.iter().map(|c| c.as_ptr()).collect();
+        let a = parse_args(2, ptrs.as_ptr());
+        assert_eq!(a.prompt.as_deref(), Some(DEFAULT_PROMPT));
+        assert_eq!(a.timeout, Duration::from_secs(3));
+        let args: Vec<std::ffi::CString> = ["prompt=Face:_Enter_to_scan"].iter().map(|s| std::ffi::CString::new(*s).unwrap()).collect();
+        let ptrs: Vec<*const c_char> = args.iter().map(|c| c.as_ptr()).collect();
+        assert_eq!(parse_args(1, ptrs.as_ptr()).prompt.as_deref(), Some("Face: Enter to scan"));
     }
 }
