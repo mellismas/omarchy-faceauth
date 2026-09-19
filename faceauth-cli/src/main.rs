@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth enroll --store DIR [--user NAME] [--label TEXT] [--seconds N] [--count N]\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
+        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth enroll --store DIR [--user NAME] [--label TEXT] [--seconds N] [--count N]\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
     );
     std::process::exit(2)
 }
@@ -32,6 +32,7 @@ fn main() -> Result<()> {
         ["engine", "test", rest @ ..] => engine_test(rest),
         ["engine", "live", rest @ ..] => engine_live(rest),
         ["enroll", rest @ ..] => enroll(rest),
+        ["liveness", "capture", rest @ ..] => liveness_capture(rest),
         ["verify", rest @ ..] => verify(rest),
         _ => usage(),
     }
@@ -587,5 +588,228 @@ fn verify(rest: &[&str]) -> Result<()> {
         }
     }
     println!("best {:.3} over {} frames in {:.1} s ({} templates)", best, samples.len(), elapsed, u.templates.len());
+    Ok(())
+}
+
+/// Flash-response experiment. Runs the strobe in the alternating pattern (0xaa),
+/// pairs each lit frame with the unlit frame before it, aligns both with the lit
+/// frame's landmarks, and writes the crops plus the per-pair statistics that the
+/// liveness gate will be built on. The key quantity is the ratio image lit/unlit:
+/// on a flat print the albedo cancels and the ratio is smooth, on a face the
+/// geometry does not cancel and the ratio carries the relief.
+fn liveness_capture(rest: &[&str]) -> Result<()> {
+    use faceauth_engine::{align, Grey};
+    let dir = models_dir(rest);
+    let label = opt(rest, "--label").unwrap_or("unlabelled").to_string();
+    let save = PathBuf::from(opt(rest, "--save").ok_or_else(|| anyhow!("--save DIR"))?);
+    let seconds: u64 = opt(rest, "--seconds").unwrap_or("8").parse()?;
+    std::fs::create_dir_all(&save)?;
+    let mut p = faceauth_engine::Pipeline::load(&dir)?;
+    let g = faceauth_camera::ipu3::probe()?.ok_or_else(|| anyhow!("no IPU3 graph"))?;
+    let ir = g.ir_sensor().ok_or_else(|| anyhow!("no IR sensor"))?;
+    let (iw, ih) = g.configure(ir, None)?;
+    let cam = Camera::open(&ir.video, &ir.subdev, iw, ih, ir.pixelformat, 6)?;
+    let illum = Illuminator::open(&ir.subdev)?.ok_or_else(|| anyhow!("IR sensor has no strobe control"))?;
+    // Settle exposure on the subject with the LEDs steady (face-box metering),
+    // then freeze it: the loop must not chase the alternation.
+    let mut lp = Loop::new(cam, Exposure { exposure: 500, gain: 16, dgain: 1.0 })?;
+    illum.set(true)?;
+    let settle = Instant::now();
+    let neutral = calib::IrLook { dgain: 1.0, brightness: 0.0, contrast: 1.0 };
+    while settle.elapsed() < Duration::from_millis(5000) {
+        if !lp.tick(0)? || lp.frames % 5 != 0 {
+            continue;
+        }
+        let f = &lp.frame;
+        let mut g8 = Grey::new(f.width, f.height);
+        calib::ir_to_grey8(&f.px, 0, 1023, neutral, &mut g8.data);
+        let img = g8.oriented(true, true, true);
+        if let Some(face) = p.detector.detect(&img, 0.5)?.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) {
+            let (rw, rh) = (f.width as f32, f.height as f32);
+            let [bx, by, bw, bh] = face.bbox;
+            let (ox0, oy0, ox1, oy1) = (bx.max(0.0), by.max(0.0), (bx + bw).max(0.0), (by + bh).max(0.0));
+            let x0 = (rw - 1.0 - oy1).max(0.0) as usize;
+            let x1 = (rw - 1.0 - oy0).max(0.0) as usize;
+            let y0 = (rh - 1.0 - ox1).max(0.0) as usize;
+            let y1 = (rh - 1.0 - ox0).max(0.0) as usize;
+            lp.window = Some(Window { x0, y0, x1: x1.max(x0 + 1), y1: y1.max(y0 + 1) });
+        }
+    }
+    println!("exposure settled at {} gain {} (face-box mean {:.2})", lp.exposure.exposure, lp.exposure.gain, lp.metering.mean);
+    illum.set_pattern(0xaa)?;
+    let t0 = Instant::now();
+    let mut prev: Option<(Grey, f64)> = None;
+    let mut pairs = 0usize;
+    let mut csv = String::from("label,pair,lit_mean,unlit_mean,flash_gain,ratio_hp,diff_hp,glint_r,glint_l,glint_native_r,glint_native_l,surround,reflectance,face_px,exposure\n");
+    while t0.elapsed() < Duration::from_secs(seconds) {
+        if !lp.cam.capture(&mut lp.frame, Duration::from_secs(2))? {
+            continue;
+        }
+        lp.frames += 1;
+        if t0.elapsed() < Duration::from_millis(700) {
+            continue;
+        }
+        let f = &lp.frame;
+        // Linear 8-bit (fixed mapping, no per-frame stretch) so lit/unlit are comparable.
+        let mut g8 = Grey::new(f.width, f.height);
+        for (o, &v) in g8.data.iter_mut().zip(&f.px) {
+            *o = (v >> 2) as u8;
+        }
+        let img = g8.oriented(true, true, true);
+        let mean = img.data.iter().map(|&v| v as f64).sum::<f64>() / img.data.len() as f64;
+        let Some((prev_img, prev_mean)) = prev.replace((img.clone(), mean)) else { continue };
+        // A lit frame is the brighter of two consecutive frames by a clear margin.
+        if mean < prev_mean * 1.15 {
+            continue;
+        }
+        let (lit, unlit) = (&img, &prev_img);
+        let faces = p.detector.detect(lit, 0.6)?;
+        let Some(face) = faces.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) else { continue };
+        let fwd = align::similarity(&face.landmarks, &align::ARCFACE_112);
+        let inv = align::invert(&fwd);
+        let lit_c = lit.warp_affine(&inv, 112, 112);
+        let unlit_c = unlit.warp_affine(&inv, 112, 112);
+        // Statistics on the central face region (exclude the border the warp may leave empty).
+        let idx = |x: usize, y: usize| y * 112 + x;
+        let (mut sl, mut su, mut n) = (0f64, 0f64, 0usize);
+        for y in 16..96 {
+            for x in 16..96 {
+                sl += lit_c.data[idx(x, y)] as f64;
+                su += unlit_c.data[idx(x, y)] as f64;
+                n += 1;
+            }
+        }
+        let (lm, um) = (sl / n as f64, su / n as f64);
+        let flash_gain = if um > 0.5 { lm / um } else { f64::INFINITY };
+        // Log-ratio and difference images, then their high-pass energy: subtract a
+        // 9x9 box blur and take the standard deviation of what remains.
+        let mut ratio = vec![0f32; 112 * 112];
+        let mut diff = vec![0f32; 112 * 112];
+        for i in 0..112 * 112 {
+            let l = lit_c.data[i] as f32 + 1.0;
+            let u = unlit_c.data[i] as f32 + 1.0;
+            ratio[i] = (l / u).ln();
+            diff[i] = l - u;
+        }
+        let hp_energy = |m: &[f32]| -> f64 {
+            let mut acc = 0f64;
+            let mut cnt = 0usize;
+            for y in 16..96 {
+                for x in 16..96 {
+                    let mut s = 0f32;
+                    for dy in 0..9 {
+                        for dx in 0..9 {
+                            s += m[idx(x + dx - 4, y + dy - 4)];
+                        }
+                    }
+                    let hp = m[idx(x, y)] - s / 81.0;
+                    acc += (hp * hp) as f64;
+                    cnt += 1;
+                }
+            }
+            (acc / cnt as f64).sqrt()
+        };
+        let ratio_hp = hp_energy(&ratio);
+        let diff_hp = hp_energy(&diff) / lm.max(1.0);
+        // Corneal glint: the brightest pixel within 6 px of each eye landmark in the
+        // difference image, relative to the local mean. A real eye mirrors the LED.
+        let glint = |ex: f32, ey: f32| -> f64 {
+            let (x, y) = (fwd[0][0] * ex + fwd[0][1] * ey + fwd[0][2], fwd[1][0] * ex + fwd[1][1] * ey + fwd[1][2]);
+            let (cx, cy) = (x.round() as i32, y.round() as i32);
+            let (mut mx, mut sum, mut cnt) = (0f32, 0f32, 0usize);
+            for dy in -6..=6 {
+                for dx in -6..=6 {
+                    let (px, py) = (cx + dx, cy + dy);
+                    if px < 0 || py < 0 || px >= 112 || py >= 112 {
+                        continue;
+                    }
+                    let v = diff[idx(px as usize, py as usize)];
+                    mx = mx.max(v);
+                    sum += v;
+                    cnt += 1;
+                }
+            }
+            if cnt == 0 { 0.0 } else { (mx / (sum / cnt as f32).max(1.0)) as f64 }
+        };
+        let glint_r = glint(face.landmarks[0][0], face.landmarks[0][1]);
+        let glint_l = glint(face.landmarks[1][0], face.landmarks[1][1]);
+        // Full-resolution cues on the flash response (lit minus unlit) of the oriented frame.
+        let (fw, fh) = (lit.width, lit.height);
+        let flash_at = |x: i32, y: i32| -> f32 {
+            if x < 0 || y < 0 || x >= fw as i32 || y >= fh as i32 {
+                return 0.0;
+            }
+            let i = y as usize * fw + x as usize;
+            (lit.data[i] as f32 - unlit.data[i] as f32).max(0.0)
+        };
+        let [bx, by, bw, bh] = face.bbox;
+        let (cx, cy) = (bx + bw / 2.0, by + bh / 2.0);
+        // Face region: the inner 70% of the box. Surround: a ring from 1.4x to 2.0x the
+        // box, which on a real head is the space beside the ears and above the hair.
+        let mean_region = |scale_lo: f32, scale_hi: f32| -> f32 {
+            let (mut s, mut n) = (0f32, 0usize);
+            let (rx_lo, ry_lo, rx_hi, ry_hi) = (bw * scale_lo / 2.0, bh * scale_lo / 2.0, bw * scale_hi / 2.0, bh * scale_hi / 2.0);
+            let (x0, x1) = ((cx - rx_hi).max(0.0) as i32, (cx + rx_hi).min(fw as f32 - 1.0) as i32);
+            let (y0, y1) = ((cy - ry_hi).max(0.0) as i32, (cy + ry_hi).min(fh as f32 - 1.0) as i32);
+            let mut y = y0;
+            while y <= y1 {
+                let mut x = x0;
+                while x <= x1 {
+                    let inside_lo = ((x as f32 - cx).abs() < rx_lo) && ((y as f32 - cy).abs() < ry_lo);
+                    if !inside_lo {
+                        s += flash_at(x, y);
+                        n += 1;
+                    }
+                    x += 2;
+                }
+                y += 2;
+            }
+            if n == 0 { 0.0 } else { s / n as f32 }
+        };
+        let face_flash = mean_region(0.0, 0.7);
+        let ring_flash = mean_region(1.4, 2.0);
+        let surround = if face_flash > 1.0 { ring_flash / face_flash } else { f32::NAN };
+        // Reflectance per unit exposure: flash response of the face divided by exposure rows x gain/16.
+        let reflectance = face_flash / (lp.exposure.exposure as f32 * lp.exposure.gain as f32 / 16.0);
+        // Glint at native resolution: brightest flash pixel within 5 px of each eye
+        // landmark over the mean of that neighbourhood.
+        let glint_native = |ex: f32, ey: f32| -> f32 {
+            let (cx, cy) = (ex.round() as i32, ey.round() as i32);
+            let (mut mx, mut sum, mut cnt) = (0f32, 0f32, 0usize);
+            for dy in -5..=5 {
+                for dx in -5..=5 {
+                    let v = flash_at(cx + dx, cy + dy);
+                    mx = mx.max(v);
+                    sum += v;
+                    cnt += 1;
+                }
+            }
+            mx / (sum / cnt as f32).max(1.0)
+        };
+        let gn_r = glint_native(face.landmarks[0][0], face.landmarks[0][1]);
+        let gn_l = glint_native(face.landmarks[1][0], face.landmarks[1][1]);
+        pairs += 1;
+        println!("pair {:2} lit {:5.1} gain {:4.2} ratio_hp {:.4} diff_hp {:.4} glint {:.2}/{:.2} native {:.2}/{:.2} surround {:.3} refl {:.4} face {:.0}px exp {}", pairs, lm, flash_gain, ratio_hp, diff_hp, glint_r, glint_l, gn_r, gn_l, surround, reflectance, bw, lp.exposure.exposure);
+        csv += &format!("{},{},{:.1},{:.1},{:.3},{:.4},{:.4},{:.2},{:.2},{:.2},{:.2},{:.3},{:.4},{:.0},{}\n", label, pairs, lm, um, flash_gain, ratio_hp, diff_hp, glint_r, glint_l, gn_r, gn_l, surround, reflectance, bw, lp.exposure.exposure);
+        if pairs <= 3 {
+            lit_c.write_pgm(save.join(format!("{}-{}-lit.pgm", label, pairs)))?;
+            unlit_c.write_pgm(save.join(format!("{}-{}-unlit.pgm", label, pairs)))?;
+            let mut r8 = Grey::new(112, 112);
+            let (rmin, rmax) = ratio.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+            for (o, &v) in r8.data.iter_mut().zip(&ratio) {
+                *o = (((v - rmin) / (rmax - rmin).max(1e-3)) * 255.0) as u8;
+            }
+            r8.write_pgm(save.join(format!("{}-{}-ratio.pgm", label, pairs)))?;
+            let mut d8 = Grey::new(112, 112);
+            for (o, &v) in d8.data.iter_mut().zip(&diff) {
+                *o = v.clamp(0.0, 255.0) as u8;
+            }
+            d8.write_pgm(save.join(format!("{}-{}-diff.pgm", label, pairs)))?;
+        }
+    }
+    illum.set(false)?;
+    lp.cam.stop()?;
+    std::fs::write(save.join(format!("{}.csv", label)), csv)?;
+    println!("{} lit/unlit pairs; crops and {}.csv in {}", pairs, label, save.display());
     Ok(())
 }

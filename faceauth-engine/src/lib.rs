@@ -10,6 +10,7 @@ pub mod align;
 pub mod detect;
 pub mod embed;
 pub mod image;
+pub mod liveness;
 pub mod runtime;
 
 use anyhow::Result;

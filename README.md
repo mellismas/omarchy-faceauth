@@ -96,6 +96,39 @@ defence: a print made from an IR frame of the enrolled face would score far clos
 The liveness gate is required regardless, and the print run is its first data
 (`faceauth-engine/proof/attack-print-*.png`, `scores-2026-09-18.csv`).
 
+## Liveness: the flash response, first measurements (2026-09-18 21:30)
+
+`faceauth liveness capture` settles exposure on the subject with the LEDs steady,
+freezes it, switches the strobe to the alternating pattern (0xaa), pairs each lit
+frame with the unlit one before it, and measures the flash response (lit minus
+unlit). 110 pairs each for the real face and the same life-size print, same
+distance, same room (night: the unlit frames are black, 4/255, so there is no
+ambient near-infrared to divide by and the lit/unlit ratio image is not usable
+here; it stays in the plan for daylight).
+
+| Cue | Real face | Print | Separated |
+| --- | --- | --- | --- |
+| Reflectance: face flash response / (exposure x gain/16) | 0.282 to 0.285 | 1.89 to 2.23 | yes, 7x |
+| Surround: flash on a ring 1.4 to 2.0x the face box / flash on the face | 0.309 to 0.363 | 0.444 to 0.539 | yes |
+| Exposure the face-box loop settled at | 267 | 66 | |
+| Glint at the eye landmarks (peak / local mean, 11x11) | 1.5 to 2.7 | 1.3 to 1.9 | no |
+
+Why these work: paper reflects near-infrared several times more strongly than
+skin, so at the same distance a print needs a fraction of the exposure; and a
+print's surround is at the print's distance while a real head's surround is the
+room behind it, several times farther, which the inverse-square falloff of the
+flash makes dark. The glint is visible by eye in the lit frames of the real face
+but is one pixel wide at this face size, and the 11x11 statistic does not resolve
+it; a proper corneal-reflection detector is later work.
+
+The gate in `faceauth-engine/src/liveness.rs` is deny-only and uses the first two
+cues, with reflectance normalised by face size (flash goes as 1/d^2 and face width
+as 1/d, so reflectance x (87 / face_px)^2 is a distance-free albedo estimate: 0.28
+for the face, 1.66 for the print). Thresholds are set from these two runs with
+margin and will be re-measured with more subjects, prints and distances; they are
+published, not hidden. Data: `faceauth-engine/proof/flash-*.csv`, crops in
+`flash-*-lit-unlit-diff-2026-09-18.png`.
+
 ## Decisions carried into the code
 
 - **The daemon owns the cameras.** No v4l2loopback node in the authentication path:
