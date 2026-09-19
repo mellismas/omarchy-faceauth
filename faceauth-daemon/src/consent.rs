@@ -78,7 +78,10 @@ impl CallerInfo {
                     if real_uid_of(p) != Some(user_uid) {
                         continue;
                     }
-                    let b = Path::new(&exe_of(p)).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                    // A setuid process (pkexec) hides its exe link from a reader
+                    // without ptrace rights, and this daemon has no capabilities;
+                    // comm is readable by everyone.
+                    let b = comm_of(p);
                     if b == "pkexec" || b == "run0" {
                         let t = starttime_of(p);
                         if best.map(|(bt, _)| t > bt).unwrap_or(true) {
@@ -90,7 +93,9 @@ impl CallerInfo {
             match best {
                 Some((_, p)) => {
                     info.kill_pid = p;
-                    info.command = read_proc(p, "cmdline").unwrap_or_default();
+                    // cmdline of a setuid process may be unreadable too; fall back to its name.
+                    let cl = read_proc(p, "cmdline").unwrap_or_default();
+                    info.command = if cl.is_empty() { format!("{} (arguments not readable)", comm_of(p)) } else { cl };
                     info.parents = parent_chain(p);
                 }
                 None => {
@@ -214,8 +219,8 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, min_detection
     let mut base: Option<f32> = None;
     let mut down = false;
     let mut nods = 0usize;
-    const DOWN: f32 = 0.06; // excursion from baseline that starts a nod
-    const UP: f32 = 0.03; // return within this of baseline that completes it
+    const DOWN: f32 = 0.035; // excursion from baseline that starts a nod (a natural nod is ~0.05, jitter ~0.01)
+    const UP: f32 = 0.02; // return within this of baseline that completes it
     let mut trace: Vec<String> = Vec::new();
     while t0.elapsed() < window {
         let Some(img) = cap.next(Duration::from_secs(1))? else { continue };
@@ -248,6 +253,6 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, min_detection
             }
         }
     }
-    log::info!("consent: {} nods in {:.1}s, base {:?}, pitch trace {}", nods, window.as_secs_f32(), base, trace.join(" "));
+    log::info!("consent: {} nods in {:.1}s ({} face frames), base {:?}, pitch trace {}", nods, window.as_secs_f32(), trace.len(), base, trace.join(" "));
     Ok(false)
 }

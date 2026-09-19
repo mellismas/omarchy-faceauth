@@ -61,7 +61,7 @@ impl Default for Config {
             liveness_required: true,
             presence: Default::default(),
             omarchy_path: None,
-            consent_seconds: 5.0,
+            consent_seconds: 8.0,
             consent_nods: 2,
         }
     }

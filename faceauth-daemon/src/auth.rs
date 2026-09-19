@@ -6,6 +6,7 @@
 //! liveness gate; a gate denial ends the attempt as `Denied` immediately.
 
 use crate::capture::IrCapture;
+use crate::consent::{notify, wait_for_nods, Dialog};
 use crate::config::Config;
 use crate::store::{Store, UserTemplates};
 use anyhow::Result;
@@ -172,47 +173,48 @@ impl Authenticator {
     /// An elevation request: the window goes up first, so nothing happens
     /// silently; then the face must match, then the nod must come.
     pub fn authenticate_with_consent(&mut self, user: &str, caller: crate::consent::CallerInfo) -> Outcome {
-        use crate::consent::{notify, wait_for_nods, Dialog};
-        let t0 = Instant::now();
-        let ms = |t: Instant| t.elapsed().as_millis() as u64;
         let mut dialog = Dialog::new(&self.cfg, user);
         if let Err(e) = dialog.show("scanning", "Look at the camera.", &caller, self.cfg.consent_seconds) {
             log::warn!("consent: no window for {}: {}", user, e);
-            return Outcome::ConsentDenied { reason: "no graphical session to ask in".into(), elapsed_ms: ms(t0) };
+            return Outcome::ConsentDenied { reason: "no graphical session to ask in".into(), elapsed_ms: 0 };
         }
-        let outcome = self.authenticate(user);
-        if !matches!(outcome, Outcome::Match { .. }) {
-            let _ = dialog.show("denied", "Face not recognised. Use your password.", &caller, 0.0);
-            std::thread::sleep(Duration::from_millis(900));
-            return outcome;
-        }
-        let msg = format!("Recognised. Nod {} times to allow this.", self.cfg.consent_nods);
-        let _ = dialog.show("nod", &msg, &caller, self.cfg.consent_seconds);
-        let nodded = (|| -> Result<bool> {
-            let mut cap = IrCapture::open(&self.cfg)?;
-            if let Some(i) = &cap.illuminator {
-                i.set(true)?;
-            }
-            let r = wait_for_nods(&mut cap, &mut self.pipeline, self.cfg.min_detection, Duration::from_secs_f32(self.cfg.consent_seconds), self.cfg.consent_nods);
-            cap.stop()?;
-            r
-        })();
-        match nodded {
-            Ok(true) => {
+        let templates = match self.store.load(user) {
+            Ok(Some(t)) => t,
+            Ok(None) => return Outcome::NotEnrolled,
+            Err(e) => return Outcome::Error { message: e.to_string() },
+        };
+        let cfg = self.cfg.clone();
+        let msg = format!("Recognised. Nod {} times to allow this.", cfg.consent_nods);
+        let dialog_cell = std::cell::RefCell::new(&mut dialog);
+        let caller_ref = &caller;
+        let mut hook = |cap: &mut IrCapture, pipeline: &mut Pipeline| -> Result<bool> {
+            let _ = dialog_cell.borrow_mut().show("nod", &msg, caller_ref, cfg.consent_seconds);
+            wait_for_nods(cap, pipeline, cfg.min_detection, Duration::from_secs_f32(cfg.consent_seconds), cfg.consent_nods)
+        };
+        let outcome = match self.run_with(&templates, Some(&mut hook)) {
+            Ok(o) => o,
+            Err(e) => Outcome::Error { message: e.to_string() },
+        };
+        match &outcome {
+            Outcome::Match { .. } => {
+                self.last_match.insert(user.to_string(), Instant::now());
+                self.failures.remove(user);
                 let _ = dialog.show("approved", "Allowed.", &caller, 0.0);
                 notify(&self.cfg, user, "Root access granted by face", &format!("{}\n{}", caller.command, caller.parents));
                 log::info!("consent granted for {}: {} [{}]", user, caller.command, caller.parents);
                 std::thread::sleep(Duration::from_millis(600));
-                outcome
             }
-            Ok(false) => {
+            Outcome::ConsentDenied { .. } => {
                 let _ = dialog.show("denied", "No nod seen. Refused.", &caller, 0.0);
                 log::warn!("consent refused for {} (no nod): {} [{}]", user, caller.command, caller.parents);
                 std::thread::sleep(Duration::from_millis(900));
-                Outcome::ConsentDenied { reason: "no nod".into(), elapsed_ms: ms(t0) }
             }
-            Err(e) => Outcome::Error { message: e.to_string() },
+            _ => {
+                let _ = dialog.show("denied", "Face not recognised. Use your password.", &caller, 0.0);
+                std::thread::sleep(Duration::from_millis(900));
+            }
         }
+        outcome
     }
 
     pub fn authenticate(&mut self, user: &str) -> Outcome {
@@ -252,6 +254,14 @@ impl Authenticator {
     }
 
     fn run(&mut self, templates: &UserTemplates) -> Result<Outcome> {
+        self.run_with(templates, None)
+    }
+
+    /// `after_match` runs on the still-open camera once two frames matched, before
+    /// the outcome is returned; `Ok(false)` from it turns the match into
+    /// `ConsentDenied`. Keeping the camera open avoids the two-to-three second
+    /// restart that would otherwise eat the start of a consent gesture.
+    fn run_with(&mut self, templates: &UserTemplates, after_match: Option<&mut dyn FnMut(&mut IrCapture, &mut Pipeline) -> Result<bool>>) -> Result<Outcome> {
         let t0 = Instant::now();
         let deadline = Duration::from_secs_f32(self.cfg.attempt_timeout);
         let ms = |t: Instant| t.elapsed().as_millis() as u64;
@@ -369,6 +379,19 @@ impl Authenticator {
             log::debug!("frame {} score {:.3} matches {}/{}", scored, score, matches, self.cfg.required_matches);
             if matches >= self.cfg.required_matches {
                 log::info!("attempt detail: {} | frames {} lit {} faces {} nosignal {} scored {} matches {} | scores {}", settle_info, n_frames, n_lit, n_faces, n_nosignal, scored, matches, score_trail.join(" "));
+                if let Some(hook) = after_match {
+                    // Steady light and free-running exposure for the gesture.
+                    if let Some(i) = &cap.illuminator {
+                        i.set(true)?;
+                    }
+                    cap.freeze_exposure(false);
+                    let ok = hook(&mut cap, &mut self.pipeline)?;
+                    cap.stop()?;
+                    if !ok {
+                        return Ok(Outcome::ConsentDenied { reason: "no nod".into(), elapsed_ms: ms(t0) });
+                    }
+                    return Ok(Outcome::Match { score: best, frames: scored, elapsed_ms: ms(t0) });
+                }
                 cap.stop()?;
                 return Ok(Outcome::Match { score: best, frames: scored, elapsed_ms: ms(t0) });
             }
