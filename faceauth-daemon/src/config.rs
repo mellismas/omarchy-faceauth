@@ -34,6 +34,13 @@ pub struct Config {
     pub liveness_required: bool,
     /// The presence watch (auto-lock when the enrolled user leaves).
     pub presence: crate::presence::PresenceConfig,
+    /// Omarchy tree the running shell was launched from (for the consent
+    /// window and notifications); default: /etc/omarchy.conf, else the package.
+    pub omarchy_path: Option<String>,
+    /// Seconds allowed for the consent gesture after a match.
+    pub consent_seconds: f32,
+    /// Nods required.
+    pub consent_nods: usize,
 }
 
 impl Default for Config {
@@ -53,6 +60,9 @@ impl Default for Config {
             liveness: true,
             liveness_required: true,
             presence: Default::default(),
+            omarchy_path: None,
+            consent_seconds: 5.0,
+            consent_nods: 2,
         }
     }
 }

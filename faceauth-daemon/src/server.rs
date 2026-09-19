@@ -48,6 +48,9 @@ struct Request {
     /// Delete this user's templates (own user, or root for anyone).
     #[serde(default)]
     delete_templates: bool,
+    /// An elevation: open the consent window, require the nod.
+    #[serde(default)]
+    consent: bool,
 }
 
 pub fn serve(auth: Arc<Mutex<Authenticator>>, socket: &Path) -> Result<()> {
@@ -168,9 +171,17 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
         log::debug!("probe for {}: {:?}", req.user, outcome);
         return reply(&mut stream, &outcome);
     }
-    log::info!("attempt for {} (uid {}, pid {})", req.user, cred.uid(), cred.pid());
+    log::info!("attempt for {} (uid {}, pid {}{})", req.user, cred.uid(), cred.pid(), if req.consent { ", consent" } else { "" });
     let outcome = match take() {
-        Some(mut a) => a.authenticate(&req.user),
+        Some(mut a) => {
+            if req.consent {
+                let uid = user_uid(&req.user).unwrap_or(cred.uid());
+                let caller = crate::consent::CallerInfo::from_pid(cred.pid(), uid);
+                a.authenticate_with_consent(&req.user, caller)
+            } else {
+                a.authenticate(&req.user)
+            }
+        }
         None => Outcome::Error { message: "busy".into() },
     };
     log::info!("attempt for {}: {:?}", req.user, outcome);
@@ -199,6 +210,10 @@ pub fn probe(socket: &Path, user: &str, timeout: Duration) -> Result<Outcome> {
 
 fn request(socket: &Path, user: &str, probe: bool, timeout: Duration) -> Result<Outcome> {
     send(socket, serde_json::json!({ "user": user, "probe": probe }), timeout)
+}
+
+pub fn ask_consent(socket: &Path, user: &str, timeout: Duration) -> Result<Outcome> {
+    send(socket, serde_json::json!({ "user": user, "consent": true }), timeout)
 }
 
 pub fn ping(socket: &Path, user: &str) -> Result<Outcome> {

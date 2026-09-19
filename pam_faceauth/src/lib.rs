@@ -72,6 +72,10 @@ struct Args {
     socket: String,
     timeout: Duration,
     prompt: Option<String>,
+    /// Elevation: the daemon opens the window and requires the nod. No
+    /// conversation with the caller at all, since the caller cannot be trusted
+    /// to relay a yes.
+    consent: bool,
 }
 
 const LOG_AUTHPRIV_INFO: c_int = (10 << 3) | 6;
@@ -141,7 +145,8 @@ fn converse(pamh: *mut pam_handle_t, text: &str) -> Result<Option<String>, ()> {
 }
 
 fn parse_args(argc: c_int, argv: *const *const c_char) -> Args {
-    let mut a = Args { socket: DEFAULT_SOCKET.to_string(), timeout: Duration::from_secs(DEFAULT_TIMEOUT), prompt: None };
+    let mut a = Args { socket: DEFAULT_SOCKET.to_string(), timeout: Duration::from_secs(DEFAULT_TIMEOUT), prompt: None, consent: false };
+    let mut timeout_given = false;
     if argv.is_null() {
         return a;
     }
@@ -159,18 +164,25 @@ fn parse_args(argc: c_int, argv: *const *const c_char) -> Args {
         } else if let Some(v) = s.strip_prefix("timeout=") {
             if let Ok(t) = v.parse::<u64>() {
                 a.timeout = Duration::from_secs(t.clamp(1, 60));
+                timeout_given = true;
             }
+        } else if s == "consent" {
+            a.consent = true;
         } else if s == "prompt" {
             a.prompt = Some(DEFAULT_PROMPT.to_string());
         } else if let Some(v) = s.strip_prefix("prompt=") {
             a.prompt = Some(v.replace('_', " "));
         }
     }
+    if a.consent && !timeout_given {
+        // Scan plus the nod window plus the window itself.
+        a.timeout = Duration::from_secs(20);
+    }
     a
 }
 
 /// The whole conversation with the daemon. Any error is `false`.
-fn daemon_says_match(socket: &Path, user: &str, timeout: Duration) -> bool {
+fn daemon_says_match(socket: &Path, user: &str, timeout: Duration, consent: bool) -> bool {
     let Ok(mut stream) = UnixStream::connect(socket) else { return false };
     if stream.set_read_timeout(Some(timeout)).is_err() || stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
         return false;
@@ -182,7 +194,7 @@ fn daemon_says_match(socket: &Path, user: &str, timeout: Duration) -> bool {
         c if c.is_control() => vec![],
         c => vec![c],
     }).collect();
-    let req = format!("{{\"user\":\"{}\"}}\n", escaped);
+    let req = if consent { format!("{{\"user\":\"{}\",\"consent\":true}}\n", escaped) } else { format!("{{\"user\":\"{}\"}}\n", escaped) };
     if stream.write_all(req.as_bytes()).is_err() {
         return false;
     }
@@ -211,7 +223,7 @@ fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char
         return PAM_IGNORE;
     }
     let t0 = std::time::Instant::now();
-    if let Some(text) = &args.prompt {
+    if let (Some(text), false) = (&args.prompt, args.consent) {
         match converse(pamh, text) {
             // Typed something: that is the password for the module behind us; no scan.
             Ok(Some(mut typed)) if !typed.is_empty() => {
@@ -233,7 +245,7 @@ fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char
             Err(()) => return PAM_IGNORE,
         }
     }
-    let ok = daemon_says_match(Path::new(&args.socket), &user, args.timeout);
+    let ok = daemon_says_match(Path::new(&args.socket), &user, args.timeout, args.consent);
     log(&format!("user {}: {} after {} ms", sanitise(&user), if ok { "match, success" } else { "no match or no daemon, ignore" }, t0.elapsed().as_millis()));
     if ok {
         PAM_SUCCESS
@@ -266,7 +278,7 @@ mod tests {
 
     #[test]
     fn no_daemon_is_not_a_match() {
-        assert!(!daemon_says_match(Path::new("/nonexistent/faceauth.sock"), "alice", Duration::from_secs(1)));
+        assert!(!daemon_says_match(Path::new("/nonexistent/faceauth.sock"), "alice", Duration::from_secs(1), false));
     }
 
     #[test]
@@ -284,6 +296,11 @@ mod tests {
         let a = parse_args(2, ptrs.as_ptr());
         assert_eq!(a.prompt.as_deref(), Some(DEFAULT_PROMPT));
         assert_eq!(a.timeout, Duration::from_secs(3));
+        let args: Vec<std::ffi::CString> = ["consent"].iter().map(|s| std::ffi::CString::new(*s).unwrap()).collect();
+        let ptrs: Vec<*const c_char> = args.iter().map(|c| c.as_ptr()).collect();
+        let c = parse_args(1, ptrs.as_ptr());
+        assert!(c.consent);
+        assert_eq!(c.timeout, Duration::from_secs(20));
         let args: Vec<std::ffi::CString> = ["prompt=Face:_Enter_to_scan"].iter().map(|s| std::ffi::CString::new(*s).unwrap()).collect();
         let ptrs: Vec<*const c_char> = args.iter().map(|c| c.as_ptr()).collect();
         assert_eq!(parse_args(1, ptrs.as_ptr()).prompt.as_deref(), Some("Face: Enter to scan"));

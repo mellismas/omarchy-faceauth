@@ -39,6 +39,9 @@ pub enum Outcome {
     Deleted,
     /// Too many failed attempts for this user recently; try again later.
     Cooldown { seconds: u64 },
+    /// The face matched but the consent gesture did not come (or the window
+    /// could not be shown): elevation refused.
+    ConsentDenied { reason: String, elapsed_ms: u64 },
 }
 
 pub struct Authenticator {
@@ -164,6 +167,52 @@ impl Authenticator {
         let (lo, mean, _) = u.self_consistency().unwrap_or((1.0, 1.0, 1.0));
         let path = self.store.save(&u)?;
         Ok(Outcome::Enrolled { added, total: u.templates.len(), consistency_min: lo, consistency_mean: mean, path: path.display().to_string() })
+    }
+
+    /// An elevation request: the window goes up first, so nothing happens
+    /// silently; then the face must match, then the nod must come.
+    pub fn authenticate_with_consent(&mut self, user: &str, caller: crate::consent::CallerInfo) -> Outcome {
+        use crate::consent::{notify, wait_for_nods, Dialog};
+        let t0 = Instant::now();
+        let ms = |t: Instant| t.elapsed().as_millis() as u64;
+        let mut dialog = Dialog::new(&self.cfg, user);
+        if let Err(e) = dialog.show("scanning", "Look at the camera.", &caller, self.cfg.consent_seconds) {
+            log::warn!("consent: no window for {}: {}", user, e);
+            return Outcome::ConsentDenied { reason: "no graphical session to ask in".into(), elapsed_ms: ms(t0) };
+        }
+        let outcome = self.authenticate(user);
+        if !matches!(outcome, Outcome::Match { .. }) {
+            let _ = dialog.show("denied", "Face not recognised. Use your password.", &caller, 0.0);
+            std::thread::sleep(Duration::from_millis(900));
+            return outcome;
+        }
+        let msg = format!("Recognised. Nod {} times to allow this.", self.cfg.consent_nods);
+        let _ = dialog.show("nod", &msg, &caller, self.cfg.consent_seconds);
+        let nodded = (|| -> Result<bool> {
+            let mut cap = IrCapture::open(&self.cfg)?;
+            if let Some(i) = &cap.illuminator {
+                i.set(true)?;
+            }
+            let r = wait_for_nods(&mut cap, &mut self.pipeline, self.cfg.min_detection, Duration::from_secs_f32(self.cfg.consent_seconds), self.cfg.consent_nods);
+            cap.stop()?;
+            r
+        })();
+        match nodded {
+            Ok(true) => {
+                let _ = dialog.show("approved", "Allowed.", &caller, 0.0);
+                notify(&self.cfg, user, "Root access granted by face", &format!("{}\n{}", caller.command, caller.parents));
+                log::info!("consent granted for {}: {} [{}]", user, caller.command, caller.parents);
+                std::thread::sleep(Duration::from_millis(600));
+                outcome
+            }
+            Ok(false) => {
+                let _ = dialog.show("denied", "No nod seen. Refused.", &caller, 0.0);
+                log::warn!("consent refused for {} (no nod): {} [{}]", user, caller.command, caller.parents);
+                std::thread::sleep(Duration::from_millis(900));
+                Outcome::ConsentDenied { reason: "no nod".into(), elapsed_ms: ms(t0) }
+            }
+            Err(e) => Outcome::Error { message: e.to_string() },
+        }
     }
 
     pub fn authenticate(&mut self, user: &str) -> Outcome {
