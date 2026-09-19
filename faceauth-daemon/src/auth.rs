@@ -199,19 +199,16 @@ impl Authenticator {
             Outcome::Match { .. } => {
                 self.last_match.insert(user.to_string(), Instant::now());
                 self.failures.remove(user);
-                let _ = dialog.show("approved", "Allowed.", &caller, 0.0);
+                dialog.show_final("approved", "Allowed.", &caller);
                 notify(&self.cfg, user, "Root access granted by face", &format!("{}\n{}", caller.command, caller.parents));
                 log::info!("consent granted for {}: {} [{}]", user, caller.command, caller.parents);
-                std::thread::sleep(Duration::from_millis(600));
             }
             Outcome::ConsentDenied { .. } => {
-                let _ = dialog.show("denied", "No nod seen. Refused.", &caller, 0.0);
+                dialog.show_final("denied", "No nod seen. Refused. Use your password, or kill or block the requester.", &caller);
                 log::warn!("consent refused for {} (no nod): {} [{}]", user, caller.command, caller.parents);
-                std::thread::sleep(Duration::from_millis(900));
             }
             _ => {
-                let _ = dialog.show("denied", "Face not recognised. Use your password.", &caller, 0.0);
-                std::thread::sleep(Duration::from_millis(900));
+                dialog.show_final("denied", "Face not recognised. Use your password, or kill or block the requester.", &caller);
             }
         }
         outcome

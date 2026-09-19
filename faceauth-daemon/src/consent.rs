@@ -185,6 +185,13 @@ impl Dialog {
         Ok(())
     }
 
+    /// A final state: the window keeps itself up for a while and closes on
+    /// its own, so the daemon must not hide it (and must not wait).
+    pub fn show_final(&mut self, state: &str, message: &str, caller: &CallerInfo) {
+        let _ = self.show(state, message, caller, 0.0);
+        self.open = false;
+    }
+
     pub fn hide(&mut self) {
         if self.open {
             if let Err(e) = self.shell(&["shell", "hide", "omarchy.faceauth"]) {
