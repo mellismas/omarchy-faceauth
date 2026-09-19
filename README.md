@@ -208,6 +208,30 @@ spending the full timeout, so the retry loop notices a returning face sooner.
 The desktop ran the checkout's shell for this test (launched with `OMARCHY_PATH`
 pointed at the checkout); `omarchy dev link` plus a reboot is the sanctioned way.
 
+## Elevation as a deliberate act: the prompt (2026-09-19 01:42)
+
+The owner's rule: the lock screen may open because he is looking at it, but
+sudo and polkit must not elevate just because he is sitting there. So
+`pam_faceauth` gained a `prompt` option, used on the sudo and polkit lines and
+not on the lock-screen one. With it the module asks through the PAM
+conversation:
+
+```
+Press Enter to authenticate by face, or type your password:
+```
+
+- Enter on the empty line is the act: the scan runs. Measured on a
+  pseudo-terminal: prompt shown, Enter at 2.0 s, daemon match at 0.837, sudo
+  exit 0 at 3.9 s.
+- A typed password is handed to the module behind us as `PAM_AUTHTOK` (Arch's
+  `pam_unix ... try_first_pass`) and no scan runs. Measured: a wrong password
+  drew "Sorry, try again." and a re-prompt, with zero requests reaching the
+  daemon.
+- A caller with no conversation gets no scan (`PAM_IGNORE`), so nothing
+  non-interactive elevates on presence.
+
+The response buffer is wiped before it is freed, since it may hold a password.
+
 ## Decisions carried into the code
 
 - **The daemon owns the cameras.** No v4l2loopback node in the authentication path:
