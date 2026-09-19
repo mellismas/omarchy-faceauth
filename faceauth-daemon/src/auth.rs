@@ -58,6 +58,10 @@ pub struct Authenticator {
     pub answers: Answers,
     /// Users with a consent request in flight (the window is up).
     pub pending: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// When the last consent flow ended, per user. The presence watch cannot
+    /// tick while one runs (the camera lock is held for the whole window), so
+    /// it treats the flow as the user being there rather than as time unseen.
+    pub last_consent: std::collections::HashMap<String, Instant>,
 }
 
 /// After this many failed attempts within the window, the user waits.
@@ -69,7 +73,7 @@ impl Authenticator {
     pub fn new(cfg: Config) -> Result<Self> {
         let pipeline = Pipeline::load(&cfg.models_dir)?;
         let store = Store::open(&cfg.store_dir)?;
-        Ok(Authenticator { cfg, pipeline, store, last_match: Default::default(), failures: Default::default(), answers: Default::default(), pending: Default::default() })
+        Ok(Authenticator { cfg, pipeline, store, last_match: Default::default(), failures: Default::default(), answers: Default::default(), pending: Default::default(), last_consent: Default::default() })
     }
 
     /// One cheap look for the lock screen while its panel is blank: is anyone
@@ -208,6 +212,7 @@ impl Authenticator {
             }
         }
         let _clear = Clear(pending, user_owned.clone());
+        self.last_consent.insert(user.to_string(), Instant::now());
         let msg = format!("Recognised. Nod {} times to allow this, or type your password.", cfg.consent_nods);
         let dialog_cell = std::cell::RefCell::new(&mut dialog);
         let caller_ref = &caller;
@@ -275,6 +280,7 @@ impl Authenticator {
             (_, o) => o,
         };
         let outcome = if password_ok { Outcome::Match { score: 1.0, frames: 0, elapsed_ms: 0 } } else { outcome };
+        self.last_consent.insert(user.to_string(), Instant::now());
         match &outcome {
             Outcome::Match { frames, .. } => {
                 self.last_match.insert(user.to_string(), Instant::now());

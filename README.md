@@ -549,3 +549,9 @@ band and the threshold is four times it, capped at 0.06, so a flickering
 landmark raises the bar and a steady one lowers it. Eight recorded traces are
 unit tests. Measured: `sudo true` approved 4.5 s after the request, match at
 1.9 s and both light nods 2.4 s later.
+
+**Presence and consent windows.** The presence watch cannot tick while a
+consent flow holds the camera, so a long window used to read as time unseen and
+the next tick locked the session at once. Now the walk-away clock restarts from
+the end of any consent flow and from any face match. Measured: a 22 s consent
+window (nod held back on purpose), then no transition and no lock.

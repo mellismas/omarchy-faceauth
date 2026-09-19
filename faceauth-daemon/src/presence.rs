@@ -104,6 +104,18 @@ pub fn run(auth: Arc<Mutex<Authenticator>>, cfg: PresenceConfig) {
         }
         let obs = {
             let mut a = auth.lock().unwrap_or_else(|p| p.into_inner());
+            // A consent window that ran while this thread waited for the lock
+            // is the user at the desk, not seconds unseen: the walk-away clock
+            // restarts from the end of that flow, and from any face match.
+            let recent = [a.last_consent.get(&cfg.user), a.last_match.get(&cfg.user)].into_iter().flatten().max().copied();
+            if let Some(r) = recent {
+                if last_seen.map(|l| r > l).unwrap_or(true) {
+                    last_seen = Some(r);
+                    if state != State::Present {
+                        log::info!("presence: consent or match since the last tick; clock restarts");
+                    }
+                }
+            }
             match observe(&mut a, &cfg, identify) {
                 Ok(o) => o,
                 Err(e) => {
