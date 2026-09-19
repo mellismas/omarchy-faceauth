@@ -81,13 +81,20 @@ with a label for the threshold analysis.
 | Genuine, run 2 | 5 | 0.863 to 0.936 | 2.1 s capture |
 | Enrolment self-consistency, 10 templates | 45 pairs | min 0.902, mean 0.945, max 0.982 | |
 | Phone showing a photo of the enrolled face | 0 faces in 8 s | no detection, no score | |
+| Life-size print of the enrolled face, run 1 | 5 | 0.365 to 0.531 | 4.8 s |
+| Life-size print of the enrolled face, run 2 | 5 | 0.454 to 0.556 | 4.7 s |
 
 The phone-screen replay never reaches the recognizer. In the IR frame
 (`faceauth-engine/proof/attack-phone-screen-ir-2026-09-18.png`) the screen is a
 starburst of the illuminator's own reflection with no image on it: a display emits
 almost nothing in the near infrared and its glass mirrors the LEDs. That is the
-physics the design leans on, confirmed on the first try. The threshold still waits
-on the print attack, which paper will pass to the recognizer.
+physics the design leans on, confirmed on the first try. The print (a visible-light, smiling photo on plain paper) is detected at scores
+0.84 to 0.91 and reaches the recognizer, which puts it at 0.37 to 0.56: well under
+the genuine 0.86 to 0.96, so a provisional accept threshold of 0.70 has margin on
+both sides for this one subject and this one print. That margin is not a liveness
+defence: a print made from an IR frame of the enrolled face would score far closer.
+The liveness gate is required regardless, and the print run is its first data
+(`faceauth-engine/proof/attack-print-*.png`, `scores-2026-09-18.csv`).
 
 ## Decisions carried into the code
 
