@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
+        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth enroll --store DIR [--user NAME] [--label TEXT] [--seconds N] [--count N]\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
     );
     std::process::exit(2)
 }
@@ -31,6 +31,8 @@ fn main() -> Result<()> {
         }
         ["engine", "test", rest @ ..] => engine_test(rest),
         ["engine", "live", rest @ ..] => engine_live(rest),
+        ["enroll", rest @ ..] => enroll(rest),
+        ["verify", rest @ ..] => verify(rest),
         _ => usage(),
     }
 }
@@ -442,5 +444,148 @@ fn engine_live(rest: &[&str]) -> Result<()> {
         println!("{} frames analysed, mean {:.1} ms per frame (detect + align + embed)", n, sum_ms / n as f64);
     }
     lp.cam.stop()?;
+    Ok(())
+}
+
+/// One embedded face from a capture burst.
+struct Sample {
+    embedding: Vec<f32>,
+    score: f32,
+    face_width: f32,
+}
+
+/// Stream the IR camera with the illuminator on and face-box metering, and
+/// collect up to `want` embeddings of the best-scoring detections within `seconds`.
+/// This is the capture the daemon runs for both enrolment and verification.
+fn capture_burst(p: &mut faceauth_engine::Pipeline, seconds: u64, want: usize, min_score: f32, quiet: bool, spacing_ms: u64) -> Result<Vec<Sample>> {
+    use faceauth_engine::Grey;
+    let g = faceauth_camera::ipu3::probe()?.ok_or_else(|| anyhow!("no IPU3 graph"))?;
+    let ir = g.ir_sensor().ok_or_else(|| anyhow!("no IR sensor"))?;
+    let (iw, ih) = g.configure(ir, None)?;
+    let cam = Camera::open(&ir.video, &ir.subdev, iw, ih, ir.pixelformat, 6)?;
+    let illum = Illuminator::open(&ir.subdev)?;
+    let mut lp = Loop::new(cam, Exposure { exposure: 500, gain: 16, dgain: 1.0 })?;
+    if let Some(i) = &illum {
+        i.set(true)?;
+    }
+    let t0 = Instant::now();
+    let (mut black, mut white) = (0u16, 1023u16);
+    let neutral = calib::IrLook { dgain: 1.0, brightness: 0.0, contrast: 1.0 };
+    let mut out: Vec<Sample> = Vec::new();
+    let mut seen = 0usize;
+    let mut last_sample = Instant::now();
+    while t0.elapsed() < Duration::from_secs(seconds) && out.len() < want {
+        if !lp.tick(black)? {
+            continue;
+        }
+        if lp.frames % 15 == 0 {
+            black = calib::percentile(&lp.frame.px, 7, 0.005);
+            white = calib::percentile(&lp.frame.px, 7, 0.995);
+        }
+        // Let the exposure settle for the first second, then sample every third frame.
+        if t0.elapsed() < Duration::from_millis(1000) || lp.frames % 3 != 0 {
+            continue;
+        }
+        let f = &lp.frame;
+        let mut g8 = Grey::new(f.width, f.height);
+        calib::ir_to_grey8(&f.px, black, white, neutral, &mut g8.data);
+        let img = g8.oriented(true, true, true);
+        let faces = p.analyse(&img, min_score, 1)?;
+        let Some(face) = faces.first() else { continue };
+        seen += 1;
+        {
+            let (rw, rh) = (f.width as f32, f.height as f32);
+            let [bx, by, bw, bh] = face.bbox;
+            let (ox0, oy0, ox1, oy1) = (bx.max(0.0), by.max(0.0), (bx + bw).max(0.0), (by + bh).max(0.0));
+            let x0 = (rw - 1.0 - oy1).max(0.0) as usize;
+            let x1 = (rw - 1.0 - oy0).max(0.0) as usize;
+            let y0 = (rh - 1.0 - ox1).max(0.0) as usize;
+            let y1 = (rh - 1.0 - ox0).max(0.0) as usize;
+            lp.window = Some(Window { x0, y0, x1: x1.max(x0 + 1), y1: y1.max(y0 + 1) });
+        }
+        // Skip frames before the face-box metering has had a chance to act, and
+        // space samples out so an enrolment covers different poses.
+        if seen <= 2 || (!out.is_empty() && last_sample.elapsed() < Duration::from_millis(spacing_ms)) {
+            continue;
+        }
+        last_sample = Instant::now();
+        if !quiet {
+            println!("  t={:4.1}s sample {} score {:.2} face {:.0}px exp={} gain={}", t0.elapsed().as_secs_f64(), out.len() + 1, face.score, face.bbox[2], lp.exposure.exposure, lp.exposure.gain);
+        }
+        out.push(Sample { embedding: face.embedding.clone().unwrap(), score: face.score, face_width: face.bbox[2] });
+    }
+    if let Some(i) = &illum {
+        i.set(false)?;
+    }
+    lp.cam.stop()?;
+    Ok(out)
+}
+
+fn opt<'a>(rest: &'a [&str], key: &str) -> Option<&'a str> {
+    rest.iter().position(|a| *a == key).and_then(|i| rest.get(i + 1).copied())
+}
+
+fn enroll(rest: &[&str]) -> Result<()> {
+    use faceauth_daemon::store::{now_secs, Store, Template, UserTemplates};
+    let dir = models_dir(rest);
+    let store = Store::open(opt(rest, "--store").ok_or_else(|| anyhow!("--store DIR"))?)?;
+    let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
+    let label = opt(rest, "--label").unwrap_or("enrol").to_string();
+    let seconds: u64 = opt(rest, "--seconds").unwrap_or("12").parse()?;
+    let count: usize = opt(rest, "--count").unwrap_or("10").parse()?;
+    let mut p = faceauth_engine::Pipeline::load(&dir)?;
+    println!("Enrolling {}: look at the camera and move your head a little over the next {} s.", user, seconds);
+    let spacing = ((seconds.saturating_sub(2)) * 1000 / count.max(1) as u64).clamp(100, 2000);
+    let samples = capture_burst(&mut p, seconds, count, 0.6, false, spacing)?;
+    if samples.len() < 3 {
+        bail!("only {} usable frames; sit closer, face the camera, and try again", samples.len());
+    }
+    let mut u = store.load(&user)?.unwrap_or_else(|| UserTemplates::new(&user, faceauth_engine::embed::AURAFACE_FILE));
+    if u.model != faceauth_engine::embed::AURAFACE_FILE {
+        bail!("existing templates are for model {}, delete them first", u.model);
+    }
+    let now = now_secs();
+    for s in &samples {
+        u.templates.push(Template { embedding: s.embedding.clone(), quality: s.score, face_width: s.face_width, created: now, label: label.clone() });
+    }
+    let (lo, mean, hi) = u.self_consistency().unwrap_or((1.0, 1.0, 1.0));
+    let path = store.save(&u)?;
+    println!("Saved {} templates ({} new) to {}", u.templates.len(), samples.len(), path.display());
+    println!("Template self-consistency (pairwise cosine): min {:.3} mean {:.3} max {:.3}", lo, mean, hi);
+    println!("Note: templates are plaintext at rest until TPM sealing is implemented.");
+    Ok(())
+}
+
+fn verify(rest: &[&str]) -> Result<()> {
+    use faceauth_daemon::store::Store;
+    let dir = models_dir(rest);
+    let store = Store::open(opt(rest, "--store").ok_or_else(|| anyhow!("--store DIR"))?)?;
+    let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
+    let seconds: u64 = opt(rest, "--seconds").unwrap_or("5").parse()?;
+    let u = store.load(&user)?.ok_or_else(|| anyhow!("no templates for {}", user))?;
+    let mut p = faceauth_engine::Pipeline::load(&dir)?;
+    let t = Instant::now();
+    let samples = capture_burst(&mut p, seconds, 5, 0.6, true, 0)?;
+    let elapsed = t.elapsed().as_secs_f64();
+    if samples.is_empty() {
+        println!("no face in {:.1} s", elapsed);
+        return Ok(());
+    }
+    let mut best = -1f32;
+    let label = opt(rest, "--label").unwrap_or("genuine");
+    let mut log = match opt(rest, "--log") {
+        Some(path) => Some(std::fs::OpenOptions::new().append(true).create(true).open(path)?),
+        None => None,
+    };
+    for (i, s) in samples.iter().enumerate() {
+        let (score, idx) = u.best_match(&s.embedding).unwrap();
+        best = best.max(score);
+        println!("frame {}: face {:.0}px det {:.2} best template #{} cosine {:.3}", i + 1, s.face_width, s.score, idx, score);
+        if let Some(f) = log.as_mut() {
+            use std::io::Write;
+            writeln!(f, "{},{},{},{:.3},{:.3},{:.0}", faceauth_daemon::store::now_secs(), label, i + 1, score, s.score, s.face_width)?;
+        }
+    }
+    println!("best {:.3} over {} frames in {:.1} s ({} templates)", best, samples.len(), elapsed, u.templates.len());
     Ok(())
 }

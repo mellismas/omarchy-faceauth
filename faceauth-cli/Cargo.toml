@@ -15,3 +15,4 @@ log.workspace = true
 env_logger.workspace = true
 faceauth-camera = { path = "../faceauth-camera" }
 faceauth-engine = { version = "0.1.0", path = "../faceauth-engine" }
+faceauth-daemon = { version = "0.1.0", path = "../faceauth-daemon" }

@@ -7,4 +7,7 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+faceauth-engine = { version = "0.1.0", path = "../faceauth-engine" }
 log.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
