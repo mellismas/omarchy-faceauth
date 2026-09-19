@@ -392,6 +392,43 @@ Lesson from the verification itself: never give an ad-hoc `systemd-run` test
 `RuntimeDirectory=faceauth`; systemd removes that directory when the transient
 unit exits and takes the live daemon's socket with it.
 
+## Consent for elevation (2026-09-19 04:30)
+
+The owner's rule after the review: nothing elevates silently, and the yes must
+be something no program can forge. Built:
+
+- **One window per elevation, opened by the daemon.** A `consent` request
+  (the PAM option `consent`, for the sudo and polkit lines) makes the daemon
+  summon `omarchy.faceauth`, a shell overlay it drives through the user's own
+  systemd manager: "Root access requested", the command, the requester and its
+  parent chain from `/proc` (for polkit: the newest `pkexec`/`run0` with the
+  user's real uid), then "Look at the camera", then "Recognised. Nod 2 times to
+  allow this", then allowed or refused. Buttons: deny and kill the requester,
+  block it for ten minutes (later requests from the same executable are killed
+  without a window), dismiss. No graphical session, no window, no elevation: the
+  request is refused and PAM falls through to the password.
+- **The yes is a nod.** After the match, the daemon watches its own camera for
+  the head pitching down and back twice within five seconds (`consent.rs`,
+  pitch from the five landmarks). The window cannot approve; the buttons only
+  refuse. Code running as the user can press Enter, register a polkit agent or
+  type into the real dialog; it cannot nod.
+- **Every elevation by face announces itself** with a desktop notification
+  naming the command and the caller.
+- The window never takes exclusive keyboard focus and closes itself after 30 s
+  (a version that did hold focus once left the keyboard dead when a hide call
+  was lost).
+
+Status: the flow runs end to end on this machine from `faceauth auth --consent`
+(window up, match at 0.87, requester chain shown, refused with no nod, window
+closed), but the nod detector has not yet seen a real nod: the pitch trace was
+flat because nobody nodded. Threshold calibration needs the owner in front of
+the camera. Until then the sudo and polkit lines keep `prompt`, not `consent`.
+
+Dev-shell lesson: Hyprland spawns keybinds with the packaged `OMARCHY_PATH`, so
+a checkout shell launched by hand makes `omarchy-shell` from a keybind say "not
+running" and Super+Space finds nothing. `omarchy dev link` plus a reboot is the
+only way every layer agrees; running the checkout shell live is for short tests.
+
 ## Decisions carried into the code
 
 - **The daemon owns the cameras.** No v4l2loopback node in the authentication path:

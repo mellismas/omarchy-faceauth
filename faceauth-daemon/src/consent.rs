@@ -174,7 +174,9 @@ impl Dialog {
 
     pub fn hide(&mut self) {
         if self.open {
-            let _ = self.shell(&["shell", "hide", "omarchy.faceauth"]);
+            if let Err(e) = self.shell(&["shell", "hide", "omarchy.faceauth"]) {
+                log::warn!("consent window: hide failed: {}", e);
+            }
             self.open = false;
         }
     }
