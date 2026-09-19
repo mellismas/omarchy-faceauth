@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth auth [--user NAME] [--socket PATH]      (asks a running faceauthd)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there?)\n  faceauth enroll --store DIR [--user NAME] [--label TEXT] [--seconds N] [--count N]\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
+        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth auth [--user NAME] [--socket PATH]      (asks a running faceauthd)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there?)\n  faceauth enroll [--user NAME] [--label TEXT] [--seconds N] [--count N]   (through the daemon)\n  faceauth enroll --store DIR ...                   (direct camera access, development)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]\n  faceauth doctor [--json]\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
     );
     std::process::exit(2)
 }
@@ -31,7 +31,35 @@ fn main() -> Result<()> {
         }
         ["engine", "test", rest @ ..] => engine_test(rest),
         ["engine", "live", rest @ ..] => engine_live(rest),
+        ["enroll", rest @ ..] if !rest.contains(&"--store") => {
+            // Production path: the daemon owns the camera and the store.
+            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
+            let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
+            let label = opt(rest, "--label").unwrap_or("enrol");
+            let seconds: f32 = opt(rest, "--seconds").unwrap_or("12").parse()?;
+            let count: usize = opt(rest, "--count").unwrap_or("10").parse()?;
+            println!("Enrolling {}: look at the camera and move your head a little over the next {} s.", user, seconds as u32);
+            let o = faceauth_daemon::server::enroll(&socket, &user, label, seconds, count)?;
+            match &o {
+                faceauth_daemon::auth::Outcome::Enrolled { added, total, consistency_min, consistency_mean, path } => {
+                    println!("Saved {} templates ({} new) to {}", total, added, path);
+                    println!("Template self-consistency (pairwise cosine): min {:.3} mean {:.3}", consistency_min, consistency_mean);
+                    println!("Note: templates are plaintext at rest until TPM sealing is implemented.");
+                    Ok(())
+                }
+                other => bail!("enrolment failed: {}", serde_json::to_string(other)?),
+            }
+        }
         ["enroll", rest @ ..] => enroll(rest),
+        ["templates", "delete", rest @ ..] => {
+            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
+            let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
+            let o = faceauth_daemon::server::delete_templates(&socket, &user)?;
+            println!("{}", serde_json::to_string(&o)?);
+            Ok(())
+        }
+        ["models", "fetch", rest @ ..] => models_fetch(rest),
+        ["doctor", rest @ ..] => doctor(rest),
         ["probe", rest @ ..] => {
             let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
             let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
@@ -835,5 +863,147 @@ fn liveness_capture(rest: &[&str]) -> Result<()> {
     lp.cam.stop()?;
     std::fs::write(save.join(format!("{}.csv", label)), csv)?;
     println!("{} lit/unlit pairs; crops and {}.csv in {}", pairs, label, save.display());
+    Ok(())
+}
+
+/// Download the model weights named in the manifest, verify size and SHA-256.
+fn models_fetch(rest: &[&str]) -> Result<()> {
+    let manifest = PathBuf::from(opt(rest, "--manifest").unwrap_or("/usr/share/faceauth/models.toml"));
+    let dir = PathBuf::from(opt(rest, "--dir").unwrap_or("/usr/share/faceauth/models"));
+    let text = std::fs::read_to_string(&manifest).with_context(|| manifest.display().to_string())?;
+    let doc: toml::Value = toml::from_str(&text)?;
+    let models = doc.get("model").and_then(|m| m.as_array()).ok_or_else(|| anyhow!("manifest has no [[model]] entries"))?;
+    std::fs::create_dir_all(&dir)?;
+    let mut failed = 0;
+    for m in models {
+        let name = m.get("name").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("model without name"))?;
+        let url = m.get("url").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("{}: no url", name))?;
+        let sha = m.get("sha256").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("{}: no sha256", name))?;
+        let size = m.get("size").and_then(|v| v.as_integer()).unwrap_or(0) as u64;
+        let dest = dir.join(name);
+        if dest.exists() && sha256_file(&dest)? == sha {
+            println!("{}: present and verified", name);
+            continue;
+        }
+        println!("{}: downloading {} bytes from {}", name, size, url);
+        let tmp = dir.join(format!("{}.part", name));
+        let status = std::process::Command::new("curl").args(["-sSL", "--fail", "-o"]).arg(&tmp).arg(url).status().context("run curl")?;
+        if !status.success() {
+            println!("{}: download failed ({})", name, status);
+            failed += 1;
+            continue;
+        }
+        let got = sha256_file(&tmp)?;
+        let len = std::fs::metadata(&tmp)?.len();
+        if got != sha || (size > 0 && len != size) {
+            println!("{}: VERIFICATION FAILED (sha256 {} size {}), not installed", name, got, len);
+            let _ = std::fs::remove_file(&tmp);
+            failed += 1;
+            continue;
+        }
+        std::fs::rename(&tmp, &dest)?;
+        println!("{}: verified and installed ({} bytes)", name, len);
+    }
+    if failed > 0 {
+        bail!("{} model(s) failed", failed);
+    }
+    Ok(())
+}
+
+fn sha256_file(p: &std::path::Path) -> Result<String> {
+    let out = std::process::Command::new("sha256sum").arg(p).output().context("run sha256sum")?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    Ok(text.split_whitespace().next().unwrap_or("").to_string())
+}
+
+#[derive(serde::Serialize)]
+struct Check {
+    id: &'static str,
+    status: &'static str,
+    detail: String,
+}
+
+/// Stable check identifiers are public API; add, never rename.
+fn doctor(rest: &[&str]) -> Result<()> {
+    let json = rest.contains(&"--json");
+    let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
+    let mut checks: Vec<Check> = Vec::new();
+    let mut push = |id: &'static str, status: &'static str, detail: String| checks.push(Check { id, status, detail });
+
+    // camera
+    match faceauth_camera::ipu3::probe() {
+        Ok(Some(g)) => match g.ir_sensor() {
+            Some(ir) => {
+                let strobe = faceauth_camera::Illuminator::open(&ir.subdev).ok().flatten().is_some();
+                push("camera.ir", "pass", format!("{} on {} ({}x{})", ir.name, ir.video.display(), ir.width, ir.height));
+                push("camera.illuminator", if strobe { "pass" } else { "warn" }, if strobe { "strobe control present".into() } else { "no strobe control: ambient light only, liveness gate off".into() });
+                push("camera.rgb", if g.colour_sensor().is_some() { "pass" } else { "warn" }, g.colour_sensor().map(|c| c.name.clone()).unwrap_or_else(|| "no front colour sensor".into()));
+            }
+            None => push("camera.ir", "fail", "IPU3 graph found but no front IR sensor".into()),
+        },
+        Ok(None) => push("camera.ir", "unknown", "no IPU3 graph; UVC IR cameras need ir_video in the config".into()),
+        Err(e) => push("camera.ir", "fail", e.to_string()),
+    }
+    // models
+    let manifest = PathBuf::from("/usr/share/faceauth/models.toml");
+    let models_dir = PathBuf::from(std::env::var("FACEAUTH_MODELS").unwrap_or_else(|_| "/usr/share/faceauth/models".into()));
+    match std::fs::read_to_string(&manifest).ok().and_then(|t| toml::from_str::<toml::Value>(&t).ok()) {
+        Some(doc) => {
+            for m in doc.get("model").and_then(|m| m.as_array()).cloned().unwrap_or_default() {
+                let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                let sha = m.get("sha256").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let lic = m.get("license").and_then(|v| v.as_str()).unwrap_or("?");
+                let p = models_dir.join(&name);
+                let (st, d) = if !p.exists() { ("fail", "missing".to_string()) } else if sha256_file(&p).unwrap_or_default() != sha { ("fail", "checksum mismatch".into()) } else { ("pass", format!("verified, {}", lic)) };
+                push("models.file", st, format!("{}: {}", name, d));
+            }
+        }
+        None => push("models.manifest", "unknown", format!("no manifest at {}", manifest.display())),
+    }
+    // daemon
+    let socket = PathBuf::from("/run/faceauth/sock");
+    match faceauth_daemon::server::ping(&socket, &user) {
+        Ok(faceauth_daemon::auth::Outcome::Pong { version, model, templates }) => {
+            push("daemon.running", "pass", format!("faceauthd {} answering on {}", version, socket.display()));
+            push("templates.user", if templates > 0 { "pass" } else { "warn" }, format!("{} template(s) for {} ({})", templates, user, model));
+        }
+        Ok(o) => push("daemon.running", "warn", format!("unexpected reply {}", serde_json::to_string(&o).unwrap_or_default())),
+        Err(e) => push("daemon.running", "fail", format!("{}", e)),
+    }
+    push("templates.at_rest", "warn", "templates are plaintext at rest (root 0600); TPM sealing not implemented".into());
+    // PAM wiring
+    for (id, path, want_deny) in [("pam.sudo", "/etc/pam.d/sudo", false), ("pam.polkit", "/etc/pam.d/polkit-1", false), ("pam.lock", "/etc/pam.d/omarchy-lock-face", true)] {
+        match std::fs::read_to_string(path) {
+            Ok(t) => {
+                let has = t.lines().any(|l| l.contains("pam_faceauth.so") && !l.trim_start().starts_with('#'));
+                let deny = t.lines().any(|l| l.contains("pam_deny.so"));
+                let prompt = t.lines().any(|l| l.contains("pam_faceauth.so") && l.contains("prompt"));
+                let st = if !has { "warn" } else if want_deny && !deny { "fail" } else { "pass" };
+                let mut d = if has { "wired".to_string() } else { "not wired".to_string() };
+                if has && !want_deny { d += if prompt { ", prompt (Enter to scan)" } else { ", NO prompt: scans on presence" }; }
+                if has && want_deny { d += if deny { ", closed by pam_deny" } else { ", NOT closed by pam_deny: an ignored module would read as success" }; }
+                push(id, st, d);
+            }
+            Err(_) => push(id, "warn", "no file (not wired)".into()),
+        }
+    }
+    push("pam.faillock", "warn", "a face match bypasses pam_faillock and never resets its counter; a locked-out password stays locked out".into());
+    // TPM
+    let tpm = std::path::Path::new("/dev/tpmrm0").exists() || std::path::Path::new("/dev/tpm0").exists();
+    push("tpm.present", if tpm { "pass" } else { "warn" }, if tpm { "TPM device present (sealing not implemented yet)".into() } else { "no TPM device; templates cannot be sealed".into() });
+    // module
+    push("pam.module", if std::path::Path::new("/usr/lib/security/pam_faceauth.so").exists() { "pass" } else { "fail" }, "/usr/lib/security/pam_faceauth.so".into());
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&checks)?);
+    } else {
+        for c in &checks {
+            println!("{:<7} {:<20} {}", c.status.to_uppercase(), c.id, c.detail);
+        }
+    }
+    let fails = checks.iter().filter(|c| c.status == "fail").count();
+    if fails > 0 {
+        std::process::exit(1);
+    }
     Ok(())
 }

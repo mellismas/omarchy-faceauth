@@ -26,6 +26,19 @@ struct Request {
     /// true: a presence probe (one short look, detector only) instead of an attempt.
     #[serde(default)]
     probe: bool,
+    /// true: is the daemon up, with models loaded and this user enrolled?
+    #[serde(default)]
+    ping: bool,
+    /// Some: enrol this user with the given label.
+    #[serde(default)]
+    enroll: Option<String>,
+    #[serde(default)]
+    seconds: Option<f32>,
+    #[serde(default)]
+    count: Option<usize>,
+    /// Delete this user's templates (own user, or root for anyone).
+    #[serde(default)]
+    delete_templates: bool,
 }
 
 pub fn serve(auth: Arc<Mutex<Authenticator>>, socket: &Path) -> Result<()> {
@@ -70,6 +83,28 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
         log::warn!("uid {} asked about {}: refused", cred.uid(), req.user);
         return reply(&mut stream, &Outcome::Error { message: "not permitted".into() });
     }
+    if req.ping {
+        let outcome = auth.lock().unwrap_or_else(|p| p.into_inner()).ping(&req.user);
+        return reply(&mut stream, &outcome);
+    }
+    if let Some(label) = &req.enroll {
+        log::info!("enrolment for {} (uid {}, label {:?})", req.user, cred.uid(), label);
+        let outcome = {
+            let mut a = auth.lock().unwrap_or_else(|p| p.into_inner());
+            a.enroll(&req.user, label, req.seconds.unwrap_or(12.0), req.count.unwrap_or(10))
+        };
+        log::info!("enrolment for {}: {:?}", req.user, outcome);
+        return reply(&mut stream, &outcome);
+    }
+    if req.delete_templates {
+        let outcome = match auth.lock().unwrap_or_else(|p| p.into_inner()).store.delete(&req.user) {
+            Ok(true) => Outcome::Error { message: "deleted".into() },
+            Ok(false) => Outcome::NotEnrolled,
+            Err(e) => Outcome::Error { message: e.to_string() },
+        };
+        log::info!("templates for {} deleted by uid {}: {:?}", req.user, cred.uid(), outcome);
+        return reply(&mut stream, &outcome);
+    }
     if req.probe {
         let outcome = {
             let mut a = auth.lock().unwrap_or_else(|p| p.into_inner());
@@ -108,10 +143,26 @@ pub fn probe(socket: &Path, user: &str, timeout: Duration) -> Result<Outcome> {
 }
 
 fn request(socket: &Path, user: &str, probe: bool, timeout: Duration) -> Result<Outcome> {
+    send(socket, serde_json::json!({ "user": user, "probe": probe }), timeout)
+}
+
+pub fn ping(socket: &Path, user: &str) -> Result<Outcome> {
+    send(socket, serde_json::json!({ "user": user, "ping": true }), Duration::from_secs(3))
+}
+
+pub fn enroll(socket: &Path, user: &str, label: &str, seconds: f32, count: usize) -> Result<Outcome> {
+    send(socket, serde_json::json!({ "user": user, "enroll": label, "seconds": seconds, "count": count }), Duration::from_secs_f32(seconds + 15.0))
+}
+
+pub fn delete_templates(socket: &Path, user: &str) -> Result<Outcome> {
+    send(socket, serde_json::json!({ "user": user, "delete_templates": true }), Duration::from_secs(3))
+}
+
+pub fn send(socket: &Path, body: serde_json::Value, timeout: Duration) -> Result<Outcome> {
     let mut stream = UnixStream::connect(socket).with_context(|| format!("connect {}", socket.display()))?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    let req = serde_json::json!({ "user": user, "probe": probe }).to_string() + "\n";
+    let req = body.to_string() + "\n";
     stream.write_all(req.as_bytes())?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;

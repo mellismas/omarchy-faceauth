@@ -31,6 +31,10 @@ pub enum Outcome {
     Error { message: String },
     /// Answer to a presence probe: one short look, detector only.
     Probe { face: bool, attentive: bool, face_px: f32, elapsed_ms: u64 },
+    /// Answer to a ping: the daemon is up and its models are loaded.
+    Pong { version: String, model: String, templates: usize },
+    /// Enrolment result.
+    Enrolled { added: usize, total: usize, consistency_min: f32, consistency_mean: f32, path: String },
 }
 
 pub struct Authenticator {
@@ -85,6 +89,70 @@ impl Authenticator {
             Ok(o) => o,
             Err(e) => Outcome::Error { message: e.to_string() },
         }
+    }
+
+    pub fn ping(&self, user: &str) -> Outcome {
+        let templates = self.store.load(user).ok().flatten().map(|t| t.templates.len()).unwrap_or(0);
+        Outcome::Pong { version: env!("CARGO_PKG_VERSION").to_string(), model: faceauth_engine::embed::AURAFACE_FILE.to_string(), templates }
+    }
+
+    /// Enrol: capture `count` embeddings over `seconds`, spaced across the
+    /// window so they cover different poses, LEDs on, exposure metered on the
+    /// face. Stored under `label` beside any existing templates.
+    pub fn enroll(&mut self, user: &str, label: &str, seconds: f32, count: usize) -> Outcome {
+        match self.run_enroll(user, label, seconds, count) {
+            Ok(o) => o,
+            Err(e) => Outcome::Error { message: e.to_string() },
+        }
+    }
+
+    fn run_enroll(&mut self, user: &str, label: &str, seconds: f32, count: usize) -> Result<Outcome> {
+        use crate::store::{now_secs, Template, UserTemplates};
+        let mut u = self.store.load(user)?.unwrap_or_else(|| UserTemplates::new(user, faceauth_engine::embed::AURAFACE_FILE));
+        if u.model != faceauth_engine::embed::AURAFACE_FILE {
+            return Ok(Outcome::Error { message: format!("existing templates are for model {}; delete them first", u.model) });
+        }
+        let t0 = Instant::now();
+        let deadline = Duration::from_secs_f32(seconds.clamp(4.0, 60.0));
+        let count = count.clamp(3, 40);
+        let spacing = Duration::from_millis((((seconds - 2.0).max(1.0) * 1000.0) / count as f32).clamp(150.0, 2000.0) as u64);
+        let mut cap = IrCapture::open(&self.cfg)?;
+        if let Some(i) = &cap.illuminator {
+            i.set(true)?;
+        }
+        let mut samples: Vec<(Vec<f32>, f32, f32)> = Vec::new();
+        let mut last = Instant::now() - spacing;
+        let mut seen = 0usize;
+        while t0.elapsed() < deadline && samples.len() < count {
+            let Some(img) = cap.next(Duration::from_secs(2))? else { continue };
+            if cap.frames % 3 != 0 {
+                continue;
+            }
+            let faces = self.pipeline.analyse(&img, self.cfg.min_detection, 1)?;
+            let Some(face) = faces.first() else { continue };
+            seen += 1;
+            cap.meter_on(face);
+            // Let the metering act before the first sample, then space them out.
+            if seen <= 3 || last.elapsed() < spacing {
+                continue;
+            }
+            last = Instant::now();
+            if let Some(e) = &face.embedding {
+                samples.push((e.clone(), face.score, face.bbox[2]));
+            }
+        }
+        cap.stop()?;
+        if samples.len() < 3 {
+            return Ok(Outcome::Error { message: format!("only {} usable frames; face the camera at normal distance and try again", samples.len()) });
+        }
+        let now = now_secs();
+        let added = samples.len();
+        for (e, q, w) in samples {
+            u.templates.push(Template { embedding: e, quality: q, face_width: w, created: now, label: label.to_string() });
+        }
+        let (lo, mean, _) = u.self_consistency().unwrap_or((1.0, 1.0, 1.0));
+        let path = self.store.save(&u)?;
+        Ok(Outcome::Enrolled { added, total: u.templates.len(), consistency_min: lo, consistency_mean: mean, path: path.display().to_string() })
     }
 
     pub fn authenticate(&mut self, user: &str) -> Outcome {
