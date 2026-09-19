@@ -66,8 +66,11 @@ impl CallerInfo {
         let exe = exe_of(pid);
         let cmdline = read_proc(pid, "cmdline").unwrap_or_default();
         let mut info = CallerInfo { pid, exe: exe.clone(), cmdline: cmdline.clone(), kill_pid: pid, ..Default::default() };
-        let base = Path::new(&exe).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        if base == "polkit-agent-helper-1" {
+        // The helper is setuid, so its exe link is unreadable without ptrace
+        // rights (this daemon has none); comm is readable but truncated to 15 bytes.
+        let comm = comm_of(pid);
+        let base = Path::new(&exe).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| comm.clone());
+        if base == "polkit-agent-helper-1" || comm.starts_with("polkit-agent-he") {
             // The helper is polkit's; the requester is the newest pkexec (or other
             // polkit client) running with the user's real uid. Best effort.
             info.via = "polkit".into();
@@ -94,7 +97,7 @@ impl CallerInfo {
                     }
                 }
             }
-            log::info!("consent: polkit requester search, uid {} processes: {}", user_uid, seen.join(" "));
+            log::debug!("consent: polkit requester search, uid {} processes: {}", user_uid, seen.join(" "));
             match best {
                 Some((_, p)) => {
                     info.kill_pid = p;
