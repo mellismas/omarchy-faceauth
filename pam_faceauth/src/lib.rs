@@ -163,7 +163,7 @@ fn parse_args(argc: c_int, argv: *const *const c_char) -> Args {
             a.socket = v.to_string();
         } else if let Some(v) = s.strip_prefix("timeout=") {
             if let Ok(t) = v.parse::<u64>() {
-                a.timeout = Duration::from_secs(t.clamp(1, 60));
+                a.timeout = Duration::from_secs(t.clamp(1, 120));
                 timeout_given = true;
             }
         } else if s == "consent" {
@@ -175,8 +175,8 @@ fn parse_args(argc: c_int, argv: *const *const c_char) -> Args {
         }
     }
     if a.consent && !timeout_given {
-        // Scan plus the nod window plus the window itself.
-        a.timeout = Duration::from_secs(20);
+        // The window waits for the user: scan up to 20 s, nod up to 30 s.
+        a.timeout = Duration::from_secs(60);
     }
     a
 }
@@ -300,7 +300,7 @@ mod tests {
         let ptrs: Vec<*const c_char> = args.iter().map(|c| c.as_ptr()).collect();
         let c = parse_args(1, ptrs.as_ptr());
         assert!(c.consent);
-        assert_eq!(c.timeout, Duration::from_secs(20));
+        assert_eq!(c.timeout, Duration::from_secs(60));
         let args: Vec<std::ffi::CString> = ["prompt=Face:_Enter_to_scan"].iter().map(|s| std::ffi::CString::new(*s).unwrap()).collect();
         let ptrs: Vec<*const c_char> = args.iter().map(|c| c.as_ptr()).collect();
         assert_eq!(parse_args(1, ptrs.as_ptr()).prompt.as_deref(), Some("Face: Enter to scan"));

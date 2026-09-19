@@ -37,6 +37,9 @@ pub struct Config {
     /// Omarchy tree the running shell was launched from (for the consent
     /// window and notifications); default: /etc/omarchy.conf, else the package.
     pub omarchy_path: Option<String>,
+    /// Seconds the scan waits for a face during a consent request (the window
+    /// is up; the user may not be looking yet).
+    pub consent_scan_seconds: f32,
     /// Seconds allowed for the consent gesture after a match.
     pub consent_seconds: f32,
     /// Nods required.
@@ -61,7 +64,8 @@ impl Default for Config {
             liveness_required: true,
             presence: Default::default(),
             omarchy_path: None,
-            consent_seconds: 8.0,
+            consent_scan_seconds: 20.0,
+            consent_seconds: 30.0,
             consent_nods: 2,
         }
     }

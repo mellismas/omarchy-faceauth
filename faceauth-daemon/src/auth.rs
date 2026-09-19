@@ -191,7 +191,8 @@ impl Authenticator {
             let _ = dialog_cell.borrow_mut().show("nod", &msg, caller_ref, cfg.consent_seconds);
             wait_for_nods(cap, pipeline, cfg.min_detection, Duration::from_secs_f32(cfg.consent_seconds), cfg.consent_nods)
         };
-        let outcome = match self.run_with(&templates, Some(&mut hook)) {
+        let scan_seconds = cfg.consent_scan_seconds;
+        let outcome = match self.run_with(&templates, Some(&mut hook), scan_seconds) {
             Ok(o) => o,
             Err(e) => Outcome::Error { message: e.to_string() },
         };
@@ -251,16 +252,17 @@ impl Authenticator {
     }
 
     fn run(&mut self, templates: &UserTemplates) -> Result<Outcome> {
-        self.run_with(templates, None)
+        let t = self.cfg.attempt_timeout;
+        self.run_with(templates, None, t)
     }
 
     /// `after_match` runs on the still-open camera once two frames matched, before
     /// the outcome is returned; `Ok(false)` from it turns the match into
     /// `ConsentDenied`. Keeping the camera open avoids the two-to-three second
     /// restart that would otherwise eat the start of a consent gesture.
-    fn run_with(&mut self, templates: &UserTemplates, after_match: Option<&mut dyn FnMut(&mut IrCapture, &mut Pipeline) -> Result<bool>>) -> Result<Outcome> {
+    fn run_with(&mut self, templates: &UserTemplates, after_match: Option<&mut dyn FnMut(&mut IrCapture, &mut Pipeline) -> Result<bool>>, timeout_seconds: f32) -> Result<Outcome> {
         let t0 = Instant::now();
-        let deadline = Duration::from_secs_f32(self.cfg.attempt_timeout);
+        let deadline = Duration::from_secs_f32(timeout_seconds);
         let ms = |t: Instant| t.elapsed().as_millis() as u64;
         let mut cap = IrCapture::open(&self.cfg)?;
         let strobe = cap.illuminator.is_some() && self.cfg.liveness;
