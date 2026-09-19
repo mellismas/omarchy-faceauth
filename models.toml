@@ -1,0 +1,25 @@
+# Model manifest for Omarchy FaceAuth. Weights are never vendored: `faceauth models fetch`
+# downloads each file, verifies the SHA-256 and size, and records the licence beside it.
+# See ../design/models.md for the selection and the sources.
+
+[[model]]
+name = "face_detection_yunet_2023mar.onnx"
+role = "detector"
+url = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+sha256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
+size = 232589
+license = "MIT"
+license_url = "https://github.com/opencv/opencv_zoo/blob/main/models/face_detection_yunet/LICENSE"
+provenance = "OpenCV Zoo; trained by the YuNet authors on WIDER Face"
+input = "1x3x640x640 float, 0..255, BGR order (grey replicated)"
+
+[[model]]
+name = "glintr100.onnx"
+role = "recognition"
+url = "https://huggingface.co/fal/AuraFace-v1/resolve/main/glintr100.onnx"
+sha256 = "a7933ea5330113b01c9b60351d8f4c33003f145d8470ac5f0e52ee2effe25c60"
+size = 260694151
+license = "Apache-2.0"
+license_url = "https://huggingface.co/fal/AuraFace-v1/blob/main/LICENSE.md"
+provenance = "fal AuraFace-v1, ResNet100 ArcFace trained on fal's own licensed commercial dataset; only this file from the repository (the bundled detector and landmark models are InsightFace-derived and non-commercial)"
+input = "Nx3x112x112 float, (v - 127.5) / 127.5, aligned to the ArcFace five-point template; output 512-D"

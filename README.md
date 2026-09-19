@@ -7,9 +7,9 @@ system libraries beyond libc; the kernel ABI it needs is hand-written in
 | Crate | What it is | State |
 | --- | --- | --- |
 | `faceauth-camera` | Capture: V4L2 nodes and subdevices, media-controller graph, Intel IPU3 pipeline setup and 10-bit unpack, UVC decoders, the exposure / white-balance / tone calibration from `kernel/CALIBRATION.md`, the IR illuminator as a V4L2 control. | Working on the reference machine (see below). UVC path written, not yet exercised on hardware. |
-| `faceauth-engine` | Detect, align, embed, match, presentation-attack gate on ONNX Runtime. | Placeholder. |
+| `faceauth-engine` | Detect (YuNet), align (five-point similarity to the ArcFace template, contrast-normalised crop), embed (AuraFace glintr100, 512-D), cosine match; ONNX Runtime loaded dynamically from Arch's `onnxruntime-cpu`. | Working on the IR camera (see below). Presentation-attack gate not started. |
 | `faceauth-daemon` | Root service owning the cameras and templates; Unix socket for the PAM module; enrolment; presence state machine. | Placeholder. |
-| `faceauth-cli` | `faceauth` command: `cam probe`, `cam graph`, `cam test`; later `enroll`, `test`, `doctor`. | Camera subcommands working. |
+| `faceauth-cli` | `faceauth` command: `cam probe`, `cam graph`, `cam test`, `engine inspect`, `engine test`, `engine live`; later `enroll`, `test`, `doctor`. | Camera and engine subcommands working. |
 | `pam_faceauth` | The PAM module: opens the socket, asks, maps the reply, never touches a camera or a model, panics firewalled to `PAM_IGNORE`. | Placeholder. |
 
 ## Camera crate, first hardware run (2026-09-18 17:33)
@@ -39,6 +39,32 @@ cadence; the daemon gives each camera a thread). Snapshots in
 rotated 90 degrees on this machine; the viewer rotates it and the daemon will carry
 a per-sensor rotation in its config), the RGB frame is the Bayer 2x2 reduction with
 the signed-off look.
+
+## Engine crate, first run on the IR camera (2026-09-18 20:20)
+
+`faceauth engine live --led on` streams the IR sensor, orients the frame, converts
+to 8-bit, and runs detect, align and embed on every fifth frame (release build):
+
+```
+t= 5.5s face score 0.83 bbox 50x76 at (302,337) 132 ms | vs prev 0.933 vs first 0.721 | exp=881 gain=16 meter 0.31
+90 frames analysed, mean 133.1 ms per frame (detect + align + embed)
+```
+
+- Arch's `onnxruntime-cpu` 1.29 loads under `ort` 2.0.0-rc.13 with `load-dynamic`.
+- 130 ms per frame for the whole pipeline; the recognition model is 261 MB and takes
+  most of it. A five-frame authentication burst is under a second.
+- The aligned crop is contrast-normalised on its own percentiles before embedding.
+  Without that, same-person similarity to the first frame decayed from 0.9 to 0.08 as
+  the exposure loop climbed; with it, it holds at 0.72 to 0.85 across the ramp and
+  0.90 to 0.96 frame to frame, with the face only about 50 pixels wide at desk distance.
+- The exposure loop meters on the detected face box (mapped back to raw sensor
+  coordinates), and settles at exposure 881, gain 16 with the illuminator on. The
+  centre window had driven it to maximum because most of the window is dark room.
+- Model manifest with checksums and licences: `models.toml`. Weights live outside the
+  repo (`FACEAUTH_MODELS` or `/usr/share/faceauth/models`).
+
+Proof in `faceauth-engine/proof/`: the detected frame, the aligned 112x112 crop, and
+the run log.
 
 ## Decisions carried into the code
 

@@ -7,4 +7,7 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+faceauth-camera = { version = "0.1.0", path = "../faceauth-camera" }
 log.workspace = true
+ndarray = "0.17.2"
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray"] }

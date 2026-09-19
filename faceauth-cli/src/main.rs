@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  faceauth cam probe\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
+        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
     );
     std::process::exit(2)
 }
@@ -24,6 +24,13 @@ fn main() -> Result<()> {
         ["cam", "probe"] => cam_probe(),
         ["cam", "graph"] => cam_graph(),
         ["cam", "test", rest @ ..] => cam_test(rest),
+        ["engine", "inspect", model] => {
+            faceauth_engine::runtime::init()?;
+            print!("{}", faceauth_engine::runtime::describe(model)?);
+            Ok(())
+        }
+        ["engine", "test", rest @ ..] => engine_test(rest),
+        ["engine", "live", rest @ ..] => engine_live(rest),
         _ => usage(),
     }
 }
@@ -83,6 +90,8 @@ fn cam_probe() -> Result<()> {
 }
 
 struct Loop {
+    /// Metering window in raw frame coordinates; None = centre window.
+    window: Option<Window>,
     cam: Camera,
     frame: Frame,
     frames: u64,
@@ -96,7 +105,7 @@ impl Loop {
     fn new(mut cam: Camera, start: Exposure) -> Result<Self> {
         cam.set_exposure(start)?;
         cam.start()?;
-        Ok(Loop { cam, frame: Frame::new(0, 0), frames: 0, smoother: Smoother::default(), exposure: start, metering: Default::default(), last_step: Instant::now() })
+        Ok(Loop { window: None, cam, frame: Frame::new(0, 0), frames: 0, smoother: Smoother::default(), exposure: start, metering: Default::default(), last_step: Instant::now() })
     }
 
     /// Capture one frame; every 0.5 s run an exposure step.
@@ -107,7 +116,7 @@ impl Loop {
         self.frames += 1;
         if self.last_step.elapsed() >= Duration::from_millis(500) {
             self.last_step = Instant::now();
-            let w = Window::centre(self.frame.width, self.frame.height);
+            let w = self.window.unwrap_or_else(|| Window::centre(self.frame.width, self.frame.height)).clamp(self.frame.width, self.frame.height);
             let mut m = calib::meter(&self.frame.px, self.frame.width, black, w);
             m.mean *= self.exposure.dgain;
             if m.mean > 0.95 {
@@ -278,5 +287,160 @@ fn write_ppm(path: &PathBuf, w: usize, h: usize, data: &[[u8; 3]]) -> Result<()>
     for p in data {
         f.write_all(p)?;
     }
+    Ok(())
+}
+
+fn models_dir(rest: &[&str]) -> PathBuf {
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        if *a == "--models" {
+            if let Some(d) = it.next() {
+                return PathBuf::from(d);
+            }
+        }
+    }
+    std::env::var("FACEAUTH_MODELS").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/usr/share/faceauth/models"))
+}
+
+/// Detect and embed faces in one or two PGM images; with two, print their similarity.
+fn engine_test(rest: &[&str]) -> Result<()> {
+    use faceauth_engine::{Grey, Pipeline};
+    let dir = models_dir(rest);
+    let images: Vec<&str> = rest.iter().copied().filter(|a| a.ends_with(".pgm")).collect();
+    if images.is_empty() {
+        usage();
+    }
+    let t = Instant::now();
+    let mut p = Pipeline::load(&dir)?;
+    println!("models loaded from {} in {:.0} ms", dir.display(), t.elapsed().as_secs_f64() * 1e3);
+    let mut embeddings = Vec::new();
+    for path in &images {
+        let img = Grey::read_pgm(path)?;
+        let t = Instant::now();
+        let faces = p.analyse(&img, 0.5, 1)?;
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        println!("{}: {}x{} {} face(s) in {:.1} ms", path, img.width, img.height, faces.len(), ms);
+        for f in &faces {
+            println!("  score {:.3} bbox [{:.0} {:.0} {:.0} {:.0}] eyes ({:.0},{:.0}) ({:.0},{:.0}) nose ({:.0},{:.0})",
+                f.score, f.bbox[0], f.bbox[1], f.bbox[2], f.bbox[3],
+                f.landmarks[0][0], f.landmarks[0][1], f.landmarks[1][0], f.landmarks[1][1], f.landmarks[2][0], f.landmarks[2][1]);
+        }
+        if let Some(e) = faces.first().and_then(|f| f.embedding.clone()) {
+            embeddings.push(e);
+        }
+    }
+    if embeddings.len() == 2 {
+        println!("cosine similarity: {:.4}", faceauth_engine::cosine(&embeddings[0], &embeddings[1]));
+    }
+    Ok(())
+}
+
+/// Stream the IR camera, run the pipeline on each frame, report timings and
+/// the similarity of successive embeddings (same person, so it should stay high).
+fn engine_live(rest: &[&str]) -> Result<()> {
+    use faceauth_engine::{Grey, Pipeline};
+    let dir = models_dir(rest);
+    let mut seconds = 10u64;
+    let mut led = "on";
+    let mut save: Option<PathBuf> = None;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "--seconds" => seconds = it.next().ok_or_else(|| anyhow!("--seconds N"))?.parse()?,
+            "--led" => led = it.next().ok_or_else(|| anyhow!("--led on|off"))?,
+            "--save" => save = Some(PathBuf::from(it.next().ok_or_else(|| anyhow!("--save DIR"))?)),
+            "--models" => { it.next(); }
+            _ => usage(),
+        }
+    }
+    let mut p = Pipeline::load(&dir)?;
+    let g = faceauth_camera::ipu3::probe()?.ok_or_else(|| anyhow!("no IPU3 graph"))?;
+    let ir = g.ir_sensor().ok_or_else(|| anyhow!("no IR sensor"))?;
+    let (iw, ih) = g.configure(ir, None)?;
+    let cam = Camera::open(&ir.video, &ir.subdev, iw, ih, ir.pixelformat, 6)?;
+    let illum = Illuminator::open(&ir.subdev)?;
+    let mut lp = Loop::new(cam, Exposure { exposure: 500, gain: 16, dgain: 1.0 })?;
+    if let Some(i) = &illum {
+        i.set(led == "on")?;
+    }
+    let t0 = Instant::now();
+    let mut black = 0u16;
+    let mut white = 1023u16;
+    let mut last: Option<Vec<f32>> = None;
+    let mut first: Option<Vec<f32>> = None;
+    let mut n = 0usize;
+    let mut sum_ms = 0f64;
+    let mut best_crop: Option<(f32, Grey)> = None;
+    let neutral = calib::IrLook { dgain: 1.0, brightness: 0.0, contrast: 1.0 };
+    while t0.elapsed() < Duration::from_secs(seconds) {
+        if !lp.tick(black)? {
+            continue;
+        }
+        if lp.frames % 15 == 0 {
+            black = calib::percentile(&lp.frame.px, 7, 0.005);
+            white = calib::percentile(&lp.frame.px, 7, 0.995);
+        }
+        if lp.frames % 5 != 0 {
+            continue;
+        }
+        let f = &lp.frame;
+        let mut g8 = Grey::new(f.width, f.height);
+        calib::ir_to_grey8(&f.px, black, white, neutral, &mut g8.data);
+        // Reference IR sensor mounting: transpose plus both flips brings the face upright.
+        let img = g8.oriented(true, true, true);
+        let t = Instant::now();
+        let faces = p.analyse(&img, 0.5, 1)?;
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        n += 1;
+        sum_ms += ms;
+        let Some(face) = faces.first() else {
+            println!("t={:4.1}s no face ({:.0} ms) exp={} gain={}", t0.elapsed().as_secs_f64(), ms, lp.exposure.exposure, lp.exposure.gain);
+            continue;
+        };
+        // Meter on the face: map the oriented-frame box back to raw sensor coordinates
+        // (orientation was transpose + both flips: raw x = W-1-oy, raw y = H-1-ox).
+        {
+            let (rw, rh) = (f.width as f32, f.height as f32);
+            let [bx, by, bw, bh] = face.bbox;
+            let (ox0, oy0, ox1, oy1) = (bx.max(0.0), by.max(0.0), (bx + bw).max(0.0), (by + bh).max(0.0));
+            let x0 = (rw - 1.0 - oy1).max(0.0) as usize;
+            let x1 = (rw - 1.0 - oy0).max(0.0) as usize;
+            let y0 = (rh - 1.0 - ox1).max(0.0) as usize;
+            let y1 = (rh - 1.0 - ox0).max(0.0) as usize;
+            lp.window = Some(Window { x0, y0, x1: x1.max(x0 + 1), y1: y1.max(y0 + 1) });
+        }
+        let e = face.embedding.clone().unwrap();
+        let sim_prev = last.as_ref().map(|l| faceauth_engine::cosine(l, &e));
+        let sim_first = first.as_ref().map(|l| faceauth_engine::cosine(l, &e));
+        println!(
+            "t={:4.1}s face score {:.2} bbox {:.0}x{:.0} at ({:.0},{:.0}) {:.0} ms | vs prev {} vs first {} | exp={} gain={} meter {:.2}",
+            t0.elapsed().as_secs_f64(), face.score, face.bbox[2], face.bbox[3], face.bbox[0], face.bbox[1], ms,
+            sim_prev.map(|s| format!("{:.3}", s)).unwrap_or("-".into()),
+            sim_first.map(|s| format!("{:.3}", s)).unwrap_or("-".into()),
+            lp.exposure.exposure, lp.exposure.gain, lp.metering.mean
+        );
+        if first.is_none() {
+            first = Some(e.clone());
+        }
+        last = Some(e);
+        if best_crop.as_ref().map(|(s, _)| face.score > *s).unwrap_or(true) {
+            best_crop = Some((face.score, faceauth_engine::align::align_112(&img, &face.landmarks)));
+            if let Some(dir) = &save {
+                std::fs::create_dir_all(dir)?;
+                img.write_pgm(dir.join("frame.pgm"))?;
+            }
+        }
+    }
+    if let Some(i) = &illum {
+        i.set(false)?;
+    }
+    if let (Some(dir), Some((s, crop))) = (&save, &best_crop) {
+        crop.write_pgm(dir.join("crop-112.pgm"))?;
+        println!("best crop (score {:.2}) saved to {}", s, dir.display());
+    }
+    if n > 0 {
+        println!("{} frames analysed, mean {:.1} ms per frame (detect + align + embed)", n, sum_ms / n as f64);
+    }
+    lp.cam.stop()?;
     Ok(())
 }

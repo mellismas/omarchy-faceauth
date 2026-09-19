@@ -1,0 +1,93 @@
+[2026-09-19T00:01:25.640Z INFO  faceauth_engine::runtime] onnxruntime loaded from /usr/lib/libonnxruntime.so
+t= 0.3s face score 0.82 bbox 53x79 at (290,329) 154 ms | vs prev - vs first - | exp=500 gain=16 meter 0.00
+t= 0.5s face score 0.82 bbox 53x80 at (290,329) 132 ms | vs prev 0.903 vs first 0.903 | exp=500 gain=16 meter 0.00
+t= 0.6s face score 0.81 bbox 53x79 at (290,330) 131 ms | vs prev 0.923 vs first 0.896 | exp=500 gain=16 meter 0.00
+t= 0.8s face score 0.83 bbox 52x78 at (291,330) 140 ms | vs prev 0.933 vs first 0.854 | exp=626 gain=16 meter 0.17
+t= 0.9s face score 0.85 bbox 51x76 at (293,332) 127 ms | vs prev 0.909 vs first 0.827 | exp=626 gain=16 meter 0.17
+t= 1.1s face score 0.83 bbox 53x78 at (290,330) 134 ms | vs prev 0.931 vs first 0.833 | exp=626 gain=16 meter 0.17
+t= 1.3s face score 0.86 bbox 51x75 at (292,333) 128 ms | vs prev 0.909 vs first 0.825 | exp=780 gain=16 meter 0.19
+t= 1.5s face score 0.88 bbox 51x74 at (291,332) 132 ms | vs prev 0.875 vs first 0.830 | exp=780 gain=16 meter 0.19
+t= 1.6s face score 0.86 bbox 49x72 at (294,334) 132 ms | vs prev 0.937 vs first 0.816 | exp=780 gain=16 meter 0.19
+t= 1.8s face score 0.86 bbox 49x72 at (294,335) 136 ms | vs prev 0.909 vs first 0.740 | exp=881 gain=16 meter 0.24
+t= 1.9s face score 0.85 bbox 47x69 at (296,336) 127 ms | vs prev 0.866 vs first 0.649 | exp=881 gain=16 meter 0.24
+t= 2.1s face score 0.82 bbox 47x69 at (297,337) 133 ms | vs prev 0.893 vs first 0.500 | exp=881 gain=16 meter 0.24
+t= 2.3s face score 0.84 bbox 49x70 at (296,336) 129 ms | vs prev 0.882 vs first 0.553 | exp=881 gain=16 meter 0.24
+t= 2.5s face score 0.83 bbox 47x71 at (298,337) 134 ms | vs prev 0.863 vs first 0.423 | exp=881 gain=16 meter 0.27
+t= 2.6s face score 0.85 bbox 46x71 at (298,336) 129 ms | vs prev 0.846 vs first 0.411 | exp=881 gain=16 meter 0.27
+t= 2.8s face score 0.86 bbox 47x71 at (298,336) 151 ms | vs prev 0.901 vs first 0.499 | exp=881 gain=16 meter 0.27
+t= 3.0s face score 0.86 bbox 48x73 at (297,335) 129 ms | vs prev 0.800 vs first 0.642 | exp=881 gain=16 meter 0.30
+t= 3.1s face score 0.84 bbox 49x76 at (297,334) 132 ms | vs prev 0.912 vs first 0.652 | exp=881 gain=16 meter 0.30
+t= 3.3s face score 0.85 bbox 50x77 at (296,334) 128 ms | vs prev 0.922 vs first 0.706 | exp=881 gain=16 meter 0.30
+t= 3.5s face score 0.85 bbox 50x77 at (297,333) 135 ms | vs prev 0.917 vs first 0.744 | exp=881 gain=16 meter 0.31
+t= 3.6s face score 0.85 bbox 50x77 at (297,333) 135 ms | vs prev 0.897 vs first 0.707 | exp=881 gain=16 meter 0.31
+t= 3.8s face score 0.85 bbox 51x76 at (296,335) 135 ms | vs prev 0.934 vs first 0.774 | exp=881 gain=16 meter 0.31
+t= 3.9s face score 0.84 bbox 52x78 at (297,333) 127 ms | vs prev 0.909 vs first 0.770 | exp=881 gain=16 meter 0.31
+t= 4.1s face score 0.84 bbox 51x76 at (297,334) 134 ms | vs prev 0.926 vs first 0.686 | exp=881 gain=16 meter 0.32
+t= 4.3s face score 0.84 bbox 51x76 at (298,334) 127 ms | vs prev 0.932 vs first 0.726 | exp=881 gain=16 meter 0.32
+t= 4.5s face score 0.85 bbox 50x76 at (301,337) 132 ms | vs prev 0.882 vs first 0.689 | exp=881 gain=16 meter 0.32
+t= 4.6s face score 0.84 bbox 50x77 at (303,337) 129 ms | vs prev 0.839 vs first 0.651 | exp=881 gain=16 meter 0.32
+t= 4.8s face score 0.87 bbox 52x78 at (301,338) 130 ms | vs prev 0.814 vs first 0.540 | exp=881 gain=16 meter 0.32
+t= 5.0s face score 0.85 bbox 52x79 at (302,337) 146 ms | vs prev 0.850 vs first 0.650 | exp=881 gain=16 meter 0.32
+t= 5.1s face score 0.84 bbox 52x79 at (302,336) 128 ms | vs prev 0.923 vs first 0.661 | exp=881 gain=16 meter 0.32
+t= 5.3s face score 0.84 bbox 51x77 at (302,336) 128 ms | vs prev 0.879 vs first 0.701 | exp=881 gain=16 meter 0.32
+t= 5.5s face score 0.83 bbox 50x76 at (302,337) 132 ms | vs prev 0.933 vs first 0.721 | exp=881 gain=16 meter 0.32
+t= 5.6s face score 0.74 bbox 53x78 at (298,333) 131 ms | vs prev 0.943 vs first 0.778 | exp=881 gain=16 meter 0.31
+t= 5.8s face score 0.74 bbox 55x78 at (298,333) 128 ms | vs prev 0.902 vs first 0.766 | exp=881 gain=16 meter 0.31
+t= 6.0s face score 0.82 bbox 52x80 at (297,331) 130 ms | vs prev 0.849 vs first 0.812 | exp=881 gain=16 meter 0.31
+t= 6.1s face score 0.76 bbox 54x79 at (296,331) 128 ms | vs prev 0.893 vs first 0.872 | exp=881 gain=16 meter 0.31
+t= 6.3s face score 0.76 bbox 53x79 at (296,330) 129 ms | vs prev 0.950 vs first 0.851 | exp=881 gain=16 meter 0.31
+t= 6.5s face score 0.79 bbox 52x76 at (296,332) 130 ms | vs prev 0.939 vs first 0.813 | exp=881 gain=16 meter 0.31
+t= 6.6s face score 0.79 bbox 53x77 at (295,332) 129 ms | vs prev 0.945 vs first 0.867 | exp=881 gain=16 meter 0.31
+t= 6.8s face score 0.80 bbox 50x77 at (296,333) 128 ms | vs prev 0.931 vs first 0.853 | exp=881 gain=16 meter 0.31
+t= 6.9s face score 0.78 bbox 50x76 at (296,333) 128 ms | vs prev 0.935 vs first 0.853 | exp=881 gain=16 meter 0.31
+t= 7.1s face score 0.82 bbox 52x79 at (294,331) 139 ms | vs prev 0.920 vs first 0.852 | exp=881 gain=16 meter 0.31
+t= 7.3s face score 0.82 bbox 54x81 at (290,329) 128 ms | vs prev 0.920 vs first 0.807 | exp=881 gain=16 meter 0.31
+t= 7.4s face score 0.79 bbox 52x78 at (292,331) 127 ms | vs prev 0.940 vs first 0.851 | exp=881 gain=16 meter 0.31
+t= 7.6s face score 0.81 bbox 52x78 at (292,331) 133 ms | vs prev 0.940 vs first 0.866 | exp=881 gain=16 meter 0.31
+t= 7.8s face score 0.82 bbox 52x77 at (292,331) 130 ms | vs prev 0.945 vs first 0.851 | exp=881 gain=16 meter 0.30
+t= 7.9s face score 0.81 bbox 53x79 at (289,329) 127 ms | vs prev 0.923 vs first 0.868 | exp=881 gain=16 meter 0.30
+t= 8.1s face score 0.82 bbox 54x80 at (288,329) 127 ms | vs prev 0.879 vs first 0.783 | exp=881 gain=16 meter 0.30
+t= 8.3s face score 0.82 bbox 55x81 at (288,328) 133 ms | vs prev 0.950 vs first 0.799 | exp=881 gain=16 meter 0.30
+t= 8.4s face score 0.83 bbox 53x80 at (288,329) 129 ms | vs prev 0.948 vs first 0.776 | exp=881 gain=16 meter 0.31
+t= 8.6s face score 0.81 bbox 53x80 at (289,329) 130 ms | vs prev 0.934 vs first 0.770 | exp=881 gain=16 meter 0.31
+t= 8.8s face score 0.82 bbox 54x81 at (288,328) 127 ms | vs prev 0.936 vs first 0.798 | exp=881 gain=16 meter 0.31
+t= 9.0s face score 0.79 bbox 53x81 at (288,328) 133 ms | vs prev 0.945 vs first 0.849 | exp=881 gain=16 meter 0.31
+t= 9.1s face score 0.81 bbox 54x81 at (288,328) 139 ms | vs prev 0.963 vs first 0.861 | exp=881 gain=16 meter 0.31
+t= 9.3s face score 0.79 bbox 54x81 at (288,329) 140 ms | vs prev 0.924 vs first 0.766 | exp=881 gain=16 meter 0.31
+t= 9.4s face score 0.82 bbox 53x81 at (288,329) 127 ms | vs prev 0.912 vs first 0.787 | exp=881 gain=16 meter 0.31
+t= 9.6s face score 0.80 bbox 54x82 at (288,328) 140 ms | vs prev 0.903 vs first 0.732 | exp=881 gain=16 meter 0.31
+t= 9.8s face score 0.80 bbox 53x81 at (288,329) 127 ms | vs prev 0.916 vs first 0.834 | exp=881 gain=16 meter 0.31
+t=10.0s face score 0.80 bbox 53x80 at (289,329) 132 ms | vs prev 0.920 vs first 0.771 | exp=881 gain=16 meter 0.31
+t=10.1s face score 0.80 bbox 53x81 at (289,328) 128 ms | vs prev 0.902 vs first 0.754 | exp=881 gain=16 meter 0.31
+t=10.3s face score 0.80 bbox 53x81 at (288,329) 145 ms | vs prev 0.897 vs first 0.768 | exp=881 gain=16 meter 0.31
+t=10.5s face score 0.79 bbox 52x80 at (288,329) 156 ms | vs prev 0.909 vs first 0.799 | exp=881 gain=16 meter 0.31
+t=10.6s face score 0.81 bbox 53x80 at (288,329) 136 ms | vs prev 0.943 vs first 0.839 | exp=881 gain=16 meter 0.31
+t=10.8s face score 0.79 bbox 53x80 at (288,329) 127 ms | vs prev 0.950 vs first 0.796 | exp=881 gain=16 meter 0.31
+t=11.0s face score 0.76 bbox 53x79 at (288,329) 131 ms | vs prev 0.926 vs first 0.791 | exp=881 gain=16 meter 0.31
+t=11.1s face score 0.81 bbox 53x81 at (288,328) 128 ms | vs prev 0.932 vs first 0.757 | exp=881 gain=16 meter 0.31
+t=11.3s face score 0.80 bbox 54x81 at (288,328) 161 ms | vs prev 0.956 vs first 0.823 | exp=881 gain=16 meter 0.31
+t=11.5s face score 0.81 bbox 53x82 at (288,328) 164 ms | vs prev 0.948 vs first 0.782 | exp=881 gain=16 meter 0.31
+t=11.6s face score 0.76 bbox 54x82 at (288,328) 133 ms | vs prev 0.951 vs first 0.806 | exp=881 gain=16 meter 0.31
+t=11.8s face score 0.80 bbox 53x81 at (288,328) 128 ms | vs prev 0.945 vs first 0.782 | exp=881 gain=16 meter 0.31
+t=11.9s face score 0.82 bbox 53x80 at (288,330) 129 ms | vs prev 0.926 vs first 0.807 | exp=881 gain=16 meter 0.31
+t=12.1s face score 0.81 bbox 53x80 at (288,330) 133 ms | vs prev 0.903 vs first 0.756 | exp=881 gain=16 meter 0.31
+t=12.3s face score 0.78 bbox 54x81 at (287,329) 128 ms | vs prev 0.929 vs first 0.779 | exp=881 gain=16 meter 0.31
+t=12.4s face score 0.80 bbox 53x80 at (288,329) 128 ms | vs prev 0.945 vs first 0.813 | exp=881 gain=16 meter 0.31
+t=12.6s face score 0.82 bbox 54x82 at (287,328) 129 ms | vs prev 0.937 vs first 0.769 | exp=881 gain=16 meter 0.31
+t=12.8s face score 0.85 bbox 53x80 at (288,329) 130 ms | vs prev 0.937 vs first 0.725 | exp=881 gain=16 meter 0.31
+t=12.9s face score 0.84 bbox 53x81 at (288,329) 127 ms | vs prev 0.942 vs first 0.741 | exp=881 gain=16 meter 0.31
+t=13.1s face score 0.81 bbox 54x82 at (287,328) 132 ms | vs prev 0.942 vs first 0.731 | exp=881 gain=16 meter 0.31
+t=13.3s face score 0.78 bbox 55x83 at (287,328) 134 ms | vs prev 0.961 vs first 0.760 | exp=881 gain=16 meter 0.31
+t=13.5s face score 0.75 bbox 54x82 at (288,328) 140 ms | vs prev 0.952 vs first 0.761 | exp=881 gain=16 meter 0.31
+t=13.6s face score 0.80 bbox 54x82 at (288,329) 131 ms | vs prev 0.951 vs first 0.725 | exp=881 gain=16 meter 0.31
+t=13.8s face score 0.83 bbox 54x82 at (288,329) 129 ms | vs prev 0.949 vs first 0.714 | exp=881 gain=16 meter 0.31
+t=14.0s face score 0.80 bbox 54x81 at (288,329) 133 ms | vs prev 0.926 vs first 0.771 | exp=881 gain=16 meter 0.31
+t=14.1s face score 0.84 bbox 54x81 at (288,329) 137 ms | vs prev 0.938 vs first 0.751 | exp=881 gain=16 meter 0.31
+t=14.3s face score 0.83 bbox 54x81 at (288,329) 128 ms | vs prev 0.954 vs first 0.733 | exp=881 gain=16 meter 0.31
+t=14.5s face score 0.83 bbox 55x83 at (287,329) 155 ms | vs prev 0.949 vs first 0.740 | exp=881 gain=16 meter 0.31
+t=14.6s face score 0.82 bbox 55x82 at (287,328) 129 ms | vs prev 0.961 vs first 0.748 | exp=881 gain=16 meter 0.31
+t=14.8s face score 0.82 bbox 54x82 at (288,329) 134 ms | vs prev 0.963 vs first 0.723 | exp=881 gain=16 meter 0.31
+t=15.0s face score 0.83 bbox 54x81 at (287,329) 131 ms | vs prev 0.947 vs first 0.755 | exp=881 gain=16 meter 0.31
+t=15.1s face score 0.83 bbox 53x80 at (288,330) 136 ms | vs prev 0.947 vs first 0.730 | exp=881 gain=16 meter 0.31
+best crop (score 0.88) saved to /tmp/claude-1000/-home-mellis-Work/cdfa30ff-532f-46cf-824f-3ef914ce7f76/scratchpad/live3
+90 frames analysed, mean 133.1 ms per frame (detect + align + embed)
