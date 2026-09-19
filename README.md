@@ -578,3 +578,41 @@ progress, a head held away for longer than a nod re-baselines there, and a
 swing that does not come back settles as the new baseline after half a second.
 Nine recorded traces are unit tests. Whenever nods feel finicky, pull the
 `consent:` pitch trace from the journal and add it as a test.
+
+## Checkpoint, end of 2026-09-19
+
+**Nod detector, current design.** Median-filtered pitch against a slow
+baseline (time constant 1.5 s) that absorbs leans and slumps; a nod is a pulse
+that leaves the band by four times the frame-to-frame noise (floor 0.015,
+cap 0.06) and comes back or swings through within 0.06 to 0.8 s; two pulses
+within 2.5 s are the gesture; a hold longer than a nod is a posture change that
+forgets any lone pulse and waits for the baseline to settle. A motion gate
+rejects a pulse when the face box changed width by more than 6 % or shifted by
+more than 10 % of its width around the pulse (a lean's wobble is the same size
+as a light nod; the gate is what tells them apart). Ten recorded traces are
+unit tests in `consent.rs`; raw traces with geometry go under
+`faceauth-daemon/traces/`.
+
+**Open, first thing next session.** With the gate installed the nods were not
+seen (trace `2026-09-19-0244-nods-missed-with-motion-gate.txt`, format
+pitch/width/cx/cy). The trace shows the detector flickering between two
+face boxes, 95 px and 89 px wide with pitch 0.559 and 0.511, frame by frame:
+that is landmark jitter, and the 6 % width tolerance trips on it, so every
+pulse is rejected. Fix: median-filter the width and centre over three frames
+like the pitch (the flicker is one frame long), and compare the filtered
+trend, not the raw extremes; then re-measure with the user's ordinary light
+nods. The same flicker is what the pitch median filter already removes.
+
+**Also open.** Two Omarchy shell tests fail on this branch and are ours:
+`bin-style-test` (omarchy-capture-ir-camera-list uses a raw command where a
+helper exists) and `privileged-heredoc-test` (omarchy-setup-security-face line
+75: the heredoc annotation says `paths=none` but `face_line` is path-shaped;
+name it and say why root using it is safe). Three others fail on quattro too
+(kernel migration, runtime smoke handler count, snapper's iso checkout) and
+are not ours.
+
+**Done today, all measured:** password in the window; window stays until
+acknowledged; polkit agent hidden during consent; stacked requests serialised;
+request survives a walk-away lock (locks, parks, resumes on the face unlock);
+presence clock restarts after a consent flow; blank lock panel wakes only for
+an attentive face; ten-minute default budget.
