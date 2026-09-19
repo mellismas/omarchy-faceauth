@@ -157,6 +157,27 @@ device access limited to video and media nodes), `packaging/config.toml`, and
 `packaging/pam-example.txt` (the lock-screen stack and the opt-in sudo/polkit
 lines, always `sufficient`, never `required`).
 
+## sudo by face on the reference machine (2026-09-19 01:17)
+
+Installed to the system paths (`/usr/bin/faceauthd`, `/usr/bin/faceauth`,
+`/usr/lib/security/pam_faceauth.so`, `/usr/share/faceauth/models`,
+`/etc/faceauth/config.toml`, `/var/lib/faceauth/<user>.json` root 0600,
+`/etc/systemd/system/faceauth.service`), service enabled and running under the
+hardened unit (707 MB resident: the recognition model). One line at the top of
+`/etc/pam.d/sudo`, backed up first to `/var/backups/faceauth/sudo.pre-face`:
+
+```
+auth      sufficient pam_faceauth.so socket=/run/faceauth/sock timeout=8
+```
+
+`sudo -k; sudo true` in a terminal: no password prompt, command runs; the
+daemon logged the request from sudo's process (uid 0) and a match at 0.946 in
+1.7 s. Note for testers: `sudo -n` never runs PAM when policy requires
+authentication, so it cannot exercise the module; use a terminal.
+
+Fail-safe check: with the service stopped, the same `sudo true` prompts for the
+password as before (pam_faceauth returns PAM_IGNORE when it cannot connect).
+
 ## Decisions carried into the code
 
 - **The daemon owns the cameras.** No v4l2loopback node in the authentication path:
