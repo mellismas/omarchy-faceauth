@@ -28,6 +28,16 @@ const MAX_CONNECTIONS: usize = 8;
 /// How long a request waits for the camera before answering "busy".
 const BUSY_WAIT: Duration = Duration::from_millis(1500);
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+/// The consent answer slot and the pending set, cloned from the authenticator
+/// at start so answer requests never need the camera lock.
+static ANSWERS: std::sync::LazyLock<crate::consent::Answers> = std::sync::LazyLock::new(Default::default);
+static PENDING: std::sync::LazyLock<Arc<Mutex<std::collections::HashSet<String>>>> = std::sync::LazyLock::new(Default::default);
+
+/// Wire the authenticator's answer slot and pending set to the server's statics.
+pub fn attach(auth: &mut Authenticator) {
+    auth.answers = Arc::clone(&ANSWERS);
+    auth.pending = Arc::clone(&PENDING);
+}
 
 #[derive(Deserialize)]
 struct Request {
@@ -51,6 +61,16 @@ struct Request {
     /// An elevation: open the consent window, require the nod.
     #[serde(default)]
     consent: bool,
+    /// Seconds the caller will wait for the consent verdict; the window stays
+    /// up for the whole of it minus a margin, and never longer.
+    #[serde(default)]
+    budget: Option<f32>,
+    /// From the consent window: the typed password for the pending request.
+    #[serde(default)]
+    consent_password: Option<String>,
+    /// From the consent window: dismiss the pending request.
+    #[serde(default)]
+    consent_dismiss: bool,
 }
 
 pub fn serve(auth: Arc<Mutex<Authenticator>>, socket: &Path) -> Result<()> {
@@ -125,6 +145,24 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
             }
         }
     };
+    // Answers to a pending consent request must not wait for the camera lock:
+    // the consent flow holds it. They go through the shared answer slot.
+    if req.consent_password.is_some() || req.consent_dismiss {
+        // No lock: read the shared handles through a short-lived try_lock on
+        // the authenticator is impossible while consent runs, so they live in
+        // the server's own copies (see `serve`).
+        let (answers, pending) = (&ANSWERS, &PENDING);
+        let is_pending = pending.lock().map(|p| p.contains(&req.user)).unwrap_or(false);
+        if !is_pending {
+            return reply(&mut stream, &Outcome::Error { message: "no pending request".into() });
+        }
+        let answer = if req.consent_dismiss { crate::consent::Answer::Dismiss } else { crate::consent::Answer::Password(req.consent_password.clone().unwrap_or_default()) };
+        if let Ok(mut m) = answers.lock() {
+            m.insert(req.user.clone(), answer);
+        }
+        log::info!("consent answer for {} from uid {}: {}", req.user, cred.uid(), if req.consent_dismiss { "dismiss" } else { "password" });
+        return reply(&mut stream, &Outcome::Pong { version: env!("CARGO_PKG_VERSION").into(), model: String::new(), templates: 0 });
+    }
     if req.ping {
         let outcome = match take() {
             Some(a) => a.ping(&req.user),
@@ -177,7 +215,7 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
             if req.consent {
                 let uid = user_uid(&req.user).unwrap_or(cred.uid());
                 let caller = crate::consent::CallerInfo::from_pid(cred.pid(), uid);
-                a.authenticate_with_consent(&req.user, caller)
+                a.authenticate_with_consent(&req.user, caller, req.budget)
             } else {
                 a.authenticate(&req.user)
             }
@@ -212,8 +250,16 @@ fn request(socket: &Path, user: &str, probe: bool, timeout: Duration) -> Result<
     send(socket, serde_json::json!({ "user": user, "probe": probe }), timeout)
 }
 
+pub fn consent_answer(socket: &Path, user: &str, password: Option<&str>, dismiss: bool) -> Result<Outcome> {
+    let body = match password {
+        Some(pw) => serde_json::json!({ "user": user, "consent_password": pw }),
+        None => serde_json::json!({ "user": user, "consent_dismiss": dismiss }),
+    };
+    send(socket, body, Duration::from_secs(3))
+}
+
 pub fn ask_consent(socket: &Path, user: &str, timeout: Duration) -> Result<Outcome> {
-    send(socket, serde_json::json!({ "user": user, "consent": true }), timeout)
+    send(socket, serde_json::json!({ "user": user, "consent": true, "budget": timeout.as_secs_f32() }), timeout)
 }
 
 pub fn ping(socket: &Path, user: &str) -> Result<Outcome> {

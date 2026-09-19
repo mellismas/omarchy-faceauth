@@ -163,7 +163,7 @@ fn parse_args(argc: c_int, argv: *const *const c_char) -> Args {
             a.socket = v.to_string();
         } else if let Some(v) = s.strip_prefix("timeout=") {
             if let Ok(t) = v.parse::<u64>() {
-                a.timeout = Duration::from_secs(t.clamp(1, 120));
+                a.timeout = Duration::from_secs(t.clamp(1, 600));
                 timeout_given = true;
             }
         } else if s == "consent" {
@@ -194,7 +194,7 @@ fn daemon_says_match(socket: &Path, user: &str, timeout: Duration, consent: bool
         c if c.is_control() => vec![],
         c => vec![c],
     }).collect();
-    let req = if consent { format!("{{\"user\":\"{}\",\"consent\":true}}\n", escaped) } else { format!("{{\"user\":\"{}\"}}\n", escaped) };
+    let req = if consent { format!("{{\"user\":\"{}\",\"consent\":true,\"budget\":{}}}\n", escaped, timeout.as_secs()) } else { format!("{{\"user\":\"{}\"}}\n", escaped) };
     if stream.write_all(req.as_bytes()).is_err() {
         return false;
     }

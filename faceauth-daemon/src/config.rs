@@ -65,7 +65,7 @@ impl Default for Config {
             presence: Default::default(),
             omarchy_path: None,
             consent_scan_seconds: 20.0,
-            consent_seconds: 30.0,
+            consent_seconds: 90.0,
             consent_nods: 2,
         }
     }

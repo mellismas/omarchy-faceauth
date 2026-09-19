@@ -486,3 +486,45 @@ cd src && cargo build
 Needs read/write access to `/dev/media*`, `/dev/video*` and `/dev/v4l-subdev*`
 (the `video` group on Omarchy). The kernel patches in `../kernel/` must be loaded
 for concurrent IR+RGB and for the illuminator control.
+
+## 2026-09-19, later: password in the window, one request at a time, nod detector rebuilt
+
+- **The consent window takes the password.** A field under the message sends
+  it to the daemon over the stdin of `faceauth consent-answer` (never argv);
+  the daemon checks it against the `system-auth` PAM stack (`pamcheck.rs`,
+  libpam linked directly, the copy wiped afterwards) and a good one approves
+  exactly like a nod. Dismiss, kill, block and Escape send a dismissal, so the
+  request ends at once instead of at a timeout. Answers are accepted only from
+  the user's own uid, only while that user's request is pending, and go through
+  a slot outside the camera lock so they never wait for it.
+- **The window stays until acknowledged.** The daemon watches for the whole
+  budget the PAM module gives it (the module sends its `timeout` in the request,
+  minus three seconds so the module always sees the verdict): a scan until the
+  face matches, then the nod watch for all the time left; a scan that finds no
+  one starts over. While the head is still it looks at every third frame and
+  drains the rest; the moment the pitch leaves the baseline it looks at every
+  frame. Nothing ends the request but a nod, a good password, a dismissal, a
+  kill or the module's own limit. Module clamp is now 1..600 s; use
+  `timeout=120 consent` or more in the PAM lines.
+- **Stacked requests cannot share a verdict.** Measured: two `auth --consent`
+  fired at once; the second got `busy` after 1.5 s (module ignores it, so that
+  caller falls to its own password) while the first ran its full window. The
+  authenticator mutex serialises everything, each PAM transaction has its own
+  connection and reply, and there is no recent-match grace: `last_match` is only
+  recorded. `sudo`'s own timestamp cache is the one thing that skips PAM; set
+  `Defaults timestamp_timeout=0` in sudoers to route every `sudo` through the
+  window.
+- **The nod detector misfired once** (an install approved with no nod: the
+  landmark pitch flickered between two quantised values 0.03 apart and the old
+  threshold logic counted two excursions). Rebuilt as a state machine with unit
+  tests against that exact trace: three-frame median, baseline and jitter
+  measured over the first eight frames, threshold the larger of 0.045 and three
+  times the jitter, three frames out and two back, a nod lasting 0.12 to 0.8 s,
+  0.25 s between nods, and a long hold away from the baseline (a look down at
+  the keyboard) re-arms only after the head comes back. Also measured: a real
+  nod then a deliberate look-down counts one.
+- **The polkit agent dialog stays hidden** while `pam_faceauth ... consent` is
+  in `/etc/pam.d/polkit-1` and PAM has not asked for a password. It held
+  exclusive keyboard focus over the consent window, which is why the field and
+  buttons were dead. When PAM does ask for a password (module ignored), the
+  agent dialog appears as before.

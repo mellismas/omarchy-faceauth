@@ -12,11 +12,29 @@
 
 use crate::capture::IrCapture;
 use crate::config::Config;
+use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Context, Result};
 use faceauth_engine::{pose, Pipeline};
 use serde::Serialize;
 use std::path::Path;
 use std::time::{Duration, Instant};
+
+/// What the window (or the CLI) can send while a request is pending.
+#[derive(Clone, Debug)]
+pub enum Answer {
+    /// The user typed their password into the window.
+    Password(String),
+    /// The user dismissed, killed or blocked: refuse now.
+    Dismiss,
+}
+
+/// Pending answers by user name, shared between the server threads and the
+/// consent flow that owns the camera.
+pub type Answers = Arc<Mutex<std::collections::HashMap<String, Answer>>>;
+
+pub fn take_answer(answers: &Answers, user: &str) -> Option<Answer> {
+    answers.lock().ok().and_then(|mut m| m.remove(user))
+}
 
 /// Who is asking, as far as /proc can say.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -228,46 +246,237 @@ pub fn notify(cfg: &Config, user: &str, title: &str, body: &str) {
 /// Measured on the reference machine, a nod moves it about 0.12 (from 0.53 to
 /// 0.41); the sign depends on the sensor mounting, so any excursion counts.
 /// Baseline is the median of the first frames.
-pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, min_detection: f32, window: Duration, nods_needed: usize) -> Result<bool> {
+/// Result of the gesture phase.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Gesture {
+    Nodded,
+    /// The window supplied a password (verified by the caller).
+    Password(String),
+    Dismissed,
+    Timeout,
+}
+
+/// Nod detection as a pure state machine over (pitch, time) samples, so the
+/// thresholds can be tested against recorded traces.
+///
+/// Pitch is median-filtered over three frames (landmark jitter is one frame
+/// long; a nod is not). The baseline and the jitter are measured from the
+/// first frames, and a nod must leave the baseline by several times that
+/// jitter, stay out for three consecutive frames, come back for two, and the
+/// nods must be spaced like a head movement, not like a flickering landmark.
+pub struct NodDetector {
+    raw: Vec<f32>,
+    settle: Vec<f32>,
+    pub base: Option<f32>,
+    pub down_thr: f32,
+    up_thr: f32,
+    out_frames: usize,
+    in_frames: usize,
+    out_since: Option<f32>,
+    last_nod: Option<f32>,
+    /// After a long hold away from baseline, wait for a return before arming.
+    need_return: bool,
+    /// Time of the last frame that left the baseline at all.
+    last_active: Option<f32>,
+    pub nods: usize,
+}
+
+impl NodDetector {
+    /// The smallest excursion ever accepted (a natural nod is about 0.05).
+    pub const MIN_DOWN: f32 = 0.045;
+    /// Excursion threshold as a multiple of the measured jitter.
+    pub const JITTER_MULT: f32 = 3.0;
+    const SETTLE_FRAMES: usize = 8;
+    const OUT_FRAMES: usize = 3;
+    const IN_FRAMES: usize = 2;
+    const NOD_MIN_S: f32 = 0.12;
+    const NOD_MAX_S: f32 = 0.8;
+    const GAP_MIN_S: f32 = 0.25;
+
+    pub fn new() -> Self {
+        NodDetector { raw: Vec::new(), settle: Vec::new(), base: None, down_thr: Self::MIN_DOWN, up_thr: Self::MIN_DOWN / 2.0, out_frames: 0, in_frames: 0, out_since: None, last_nod: None, need_return: false, last_active: None, nods: 0 }
+    }
+
+    /// True while the head is still or has only just moved: the caller may
+    /// look at fewer frames. False once something like a nod has begun.
+    pub fn idle(&self, t: f32) -> bool {
+        self.base.is_some() && self.last_active.map(|a| t - a > 1.0).unwrap_or(true)
+    }
+
+    /// Feed one face frame; returns true when a nod just completed.
+    pub fn push(&mut self, pitch: f32, t: f32) -> bool {
+        self.raw.push(pitch);
+        if self.raw.len() < 3 {
+            return false;
+        }
+        let n = self.raw.len();
+        let mut w = [self.raw[n - 3], self.raw[n - 2], self.raw[n - 1]];
+        w.sort_by(|a, b| a.total_cmp(b));
+        let p = w[1];
+        let Some(b) = self.base else {
+            self.settle.push(p);
+            if self.settle.len() >= Self::SETTLE_FRAMES {
+                let mut s = self.settle.clone();
+                s.sort_by(|a, b| a.total_cmp(b));
+                let base = s[s.len() / 2];
+                let jitter = s.iter().map(|v| (v - base).abs()).fold(0f32, f32::max);
+                self.down_thr = (jitter * Self::JITTER_MULT).max(Self::MIN_DOWN);
+                self.up_thr = self.down_thr / 2.0;
+                self.base = Some(base);
+            }
+            return false;
+        };
+        let d = (p - b).abs();
+        if d > self.up_thr {
+            self.last_active = Some(t);
+        }
+        if self.need_return {
+            if d < self.up_thr {
+                self.need_return = false;
+            }
+            return false;
+        }
+        if self.out_since.is_none() {
+            if d > self.down_thr {
+                self.out_frames += 1;
+                if self.out_frames >= Self::OUT_FRAMES {
+                    self.out_since = Some(t);
+                    self.in_frames = 0;
+                }
+            } else {
+                self.out_frames = 0;
+            }
+            return false;
+        }
+        let since = self.out_since.unwrap();
+        if d < self.up_thr {
+            self.in_frames += 1;
+            if self.in_frames >= Self::IN_FRAMES {
+                self.out_since = None;
+                self.out_frames = 0;
+                let dur = t - since;
+                let gap_ok = self.last_nod.map(|l| t - l >= Self::GAP_MIN_S).unwrap_or(true);
+                if (Self::NOD_MIN_S..=Self::NOD_MAX_S).contains(&dur) && gap_ok {
+                    self.nods += 1;
+                    self.last_nod = Some(t);
+                    return true;
+                }
+            }
+        } else {
+            self.in_frames = 0;
+            if t - since > Self::NOD_MAX_S {
+                // Held away too long: a posture change, not a nod. Re-arm
+                // only once the head is back at the baseline.
+                self.out_since = None;
+                self.out_frames = 0;
+                self.need_return = true;
+            }
+        }
+        false
+    }
+}
+
+pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, min_detection: f32, window: Duration, nods_needed: usize, answers: Option<(&Answers, &str)>) -> Result<Gesture> {
     let t0 = Instant::now();
-    let mut baseline: Vec<f32> = Vec::new();
-    let mut base: Option<f32> = None;
-    let mut down = false;
-    let mut nods = 0usize;
-    const DOWN: f32 = 0.035; // excursion from baseline that starts a nod (a natural nod is ~0.05, jitter ~0.01)
-    const UP: f32 = 0.02; // return within this of baseline that completes it
+    let mut det = NodDetector::new();
     let mut trace: Vec<String> = Vec::new();
+    let mut frame_no = 0usize;
     while t0.elapsed() < window {
+        if let Some((answers, user)) = answers {
+            match take_answer(answers, user) {
+                Some(Answer::Password(pw)) => return Ok(Gesture::Password(pw)),
+                Some(Answer::Dismiss) => return Ok(Gesture::Dismissed),
+                None => {}
+            }
+        }
         let Some(img) = cap.next(Duration::from_secs(1))? else { continue };
+        // Slow polling while the head is still: every third frame is enough
+        // to catch the start of a nod, and the rest are only drained. Once a
+        // movement begins every frame is looked at.
+        frame_no += 1;
+        if det.idle(t0.elapsed().as_secs_f32()) && frame_no % 3 != 0 {
+            continue;
+        }
         let faces = pipeline.detector.detect(&img, min_detection)?;
         let Some(face) = faces.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) else { continue };
         let p = pose::pose(&face.landmarks).pitch;
-        if trace.len() < 120 {
-            trace.push(format!("{:.2}", p));
+        if trace.len() < 160 {
+            trace.push(format!("{:.3}", p));
         }
-        match base {
-            None => {
-                baseline.push(p);
-                if baseline.len() >= 6 {
-                    baseline.sort_by(|a, b| a.total_cmp(b));
-                    base = Some(baseline[baseline.len() / 2]);
-                }
-            }
-            Some(b) => {
-                if !down && (p - b).abs() > DOWN {
-                    down = true;
-                } else if down && (p - b).abs() < UP {
-                    down = false;
-                    nods += 1;
-                    log::debug!("consent: nod {} at {:.2}s", nods, t0.elapsed().as_secs_f32());
-                    if nods >= nods_needed {
-                        log::info!("consent: {} nods, base {:.3}, pitch trace {}", nods, b, trace.join(" "));
-                        return Ok(true);
-                    }
-                }
+        if det.push(p, t0.elapsed().as_secs_f32()) {
+            log::debug!("consent: nod {} at {:.2}s", det.nods, t0.elapsed().as_secs_f32());
+            if det.nods >= nods_needed {
+                log::info!("consent: {} nods, base {:?}, threshold {:.3}, pitch trace {}", det.nods, det.base, det.down_thr, trace.join(" "));
+                return Ok(Gesture::Nodded);
             }
         }
     }
-    log::info!("consent: {} nods in {:.1}s ({} face frames), base {:?}, pitch trace {}", nods, window.as_secs_f32(), trace.len(), base, trace.join(" "));
-    Ok(false)
+    log::info!("consent: {} nods in {:.1}s ({} face frames), base {:?}, threshold {:.3}, pitch trace {}", det.nods, window.as_secs_f32(), trace.len(), det.base, det.down_thr, trace.join(" "));
+    Ok(Gesture::Timeout)
+}
+
+#[cfg(test)]
+mod nod_tests {
+    use super::NodDetector;
+
+    fn run(trace: &[f32], fps: f32) -> usize {
+        let mut d = NodDetector::new();
+        for (i, &p) in trace.iter().enumerate() {
+            d.push(p, i as f32 / fps);
+        }
+        d.nods
+    }
+
+    /// The trace that approved an install on 2026-09-19 with no nod: landmark
+    /// jitter between two quantised values, counted as two nods by the old
+    /// threshold logic. Must count zero.
+    #[test]
+    fn jitter_is_not_a_nod() {
+        let t: Vec<f32> = "0.57 0.57 0.57 0.54 0.57 0.54 0.57 0.54 0.54 0.54 0.57 0.54 0.54 0.57 0.54 0.54 0.54 0.54 0.54 0.54 0.54 0.54 0.54 0.54 0.54 0.57 0.57 0.54 0.55 0.54 0.54 0.54 0.54 0.58 0.57 0.54 0.54 0.54 0.57 0.57 0.57 0.53 0.57"
+            .split(' ')
+            .map(|v| v.parse().unwrap())
+            .collect();
+        assert_eq!(run(&t, 22.0), 0);
+        // Wider single-frame spikes are still one frame long.
+        let mut spiky = vec![0.55; 12];
+        for _ in 0..6 {
+            spiky.extend_from_slice(&[0.62, 0.55, 0.55, 0.55, 0.62, 0.55, 0.55]);
+        }
+        assert_eq!(run(&spiky, 22.0), 0);
+    }
+
+    #[test]
+    fn two_real_nods_count() {
+        let mut t = vec![0.55; 12];
+        for _ in 0..2 {
+            t.extend_from_slice(&[0.57, 0.60, 0.62, 0.63, 0.62, 0.60, 0.57, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55]);
+        }
+        assert_eq!(run(&t, 22.0), 2);
+    }
+
+    #[test]
+    fn small_nods_at_a_jittery_distance_need_more() {
+        // Jitter of 0.03 raises the threshold to 0.09; a 0.05 nod is ignored.
+        let mut t: Vec<f32> = (0..12).map(|i| if i % 2 == 0 { 0.57 } else { 0.54 }).collect();
+        t.extend_from_slice(&[0.60, 0.61, 0.61, 0.60, 0.57, 0.55, 0.55, 0.55, 0.60, 0.61, 0.61, 0.60, 0.57, 0.55, 0.55, 0.55]);
+        assert_eq!(run(&t, 22.0), 0);
+    }
+
+    #[test]
+    fn a_look_down_and_back_is_not_a_nod() {
+        // One real nod, then a deliberate look down for 1.2 s and back: one nod.
+        let mut t = vec![0.55; 12];
+        t.extend_from_slice(&[0.57, 0.60, 0.62, 0.63, 0.62, 0.60, 0.57, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55]);
+        t.extend(vec![0.64; 26]);
+        t.extend(vec![0.55; 10]);
+        assert_eq!(run(&t, 22.0), 1);
+    }
+
+    #[test]
+    fn a_posture_change_is_not_a_nod() {
+        let mut t = vec![0.55; 12];
+        t.extend(vec![0.65; 60]); // looked down and stayed there for ~2.7 s
+        t.extend(vec![0.55; 10]);
+        assert_eq!(run(&t, 22.0), 0);
+    }
 }

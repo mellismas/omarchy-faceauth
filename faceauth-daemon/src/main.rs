@@ -12,7 +12,9 @@ fn main() -> Result<()> {
     log::info!("config {}: models {} store {} socket {}", cfg_path, cfg.models_dir.display(), cfg.store_dir.display(), cfg.socket.display());
     let socket = cfg.socket.clone();
     let presence = cfg.presence.clone();
-    let auth = std::sync::Arc::new(std::sync::Mutex::new(Authenticator::new(cfg)?));
+    let mut authenticator = Authenticator::new(cfg)?;
+    server::attach(&mut authenticator);
+    let auth = std::sync::Arc::new(std::sync::Mutex::new(authenticator));
     log::info!("models loaded; ready");
     if presence.enabled {
         let a = std::sync::Arc::clone(&auth);
