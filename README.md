@@ -528,3 +528,14 @@ for concurrent IR+RGB and for the illuminator control.
   exclusive keyboard focus over the consent window, which is why the field and
   buttons were dead. When PAM does ask for a password (module ignored), the
   agent dialog appears as before.
+
+Retuned the same night from a recorded trace of two natural nods (swing about
+0.035 either side of the baseline, missed at a 0.045 threshold): the excursion
+threshold is the larger of 0.025 and three times the measured jitter, capped at
+0.06; a nod completes on a return to the baseline or a swing through to the
+other side; the baseline follows slow posture drift while the head is still.
+Six recorded traces are unit tests. Measured after: `sudo true` approved by
+two natural nods within two seconds of the match. A presence lock that fires
+first (a hat the model does not know reads as a stranger for ten seconds) takes
+the camera, and the consent request then falls to the password: enrol the hat
+as a look.

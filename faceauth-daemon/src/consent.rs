@@ -260,10 +260,12 @@ pub enum Gesture {
 /// thresholds can be tested against recorded traces.
 ///
 /// Pitch is median-filtered over three frames (landmark jitter is one frame
-/// long; a nod is not). The baseline and the jitter are measured from the
-/// first frames, and a nod must leave the baseline by several times that
-/// jitter, stay out for three consecutive frames, come back for two, and the
-/// nods must be spaced like a head movement, not like a flickering landmark.
+/// long; a nod is not). The baseline is measured from the first frames and
+/// then follows slow posture drift. A nod leaves the baseline by several
+/// times the measured jitter for two consecutive frames and then either comes
+/// back or swings through to the other side; it lasts a fraction of a second,
+/// and a head held away for longer is a posture change that re-arms only once
+/// the head is back.
 pub struct NodDetector {
     raw: Vec<f32>,
     settle: Vec<f32>,
@@ -273,6 +275,8 @@ pub struct NodDetector {
     out_frames: usize,
     in_frames: usize,
     out_since: Option<f32>,
+    /// The farthest the pitch got from the baseline during this excursion, signed.
+    extreme: f32,
     last_nod: Option<f32>,
     /// After a long hold away from baseline, wait for a return before arming.
     need_return: bool,
@@ -282,27 +286,42 @@ pub struct NodDetector {
 }
 
 impl NodDetector {
-    /// The smallest excursion ever accepted (a natural nod is about 0.05).
-    pub const MIN_DOWN: f32 = 0.04;
+    /// The smallest excursion ever accepted (a natural nod swings 0.03 to 0.05).
+    pub const MIN_DOWN: f32 = 0.025;
     /// Excursion threshold as a multiple of the measured jitter.
-    pub const JITTER_MULT: f32 = 2.5;
+    pub const JITTER_MULT: f32 = 3.0;
     /// The largest excursion ever required, however jittery the baseline.
     pub const MAX_DOWN: f32 = 0.06;
     const SETTLE_FRAMES: usize = 8;
     const OUT_FRAMES: usize = 2;
     const IN_FRAMES: usize = 2;
-    const NOD_MIN_S: f32 = 0.12;
+    const NOD_MIN_S: f32 = 0.10;
     const NOD_MAX_S: f32 = 0.8;
-    const GAP_MIN_S: f32 = 0.25;
+    const GAP_MIN_S: f32 = 0.2;
+    /// Baseline follows the head while it is still (per idle frame).
+    const DRIFT: f32 = 0.05;
 
     pub fn new() -> Self {
-        NodDetector { raw: Vec::new(), settle: Vec::new(), base: None, down_thr: Self::MIN_DOWN, up_thr: Self::MIN_DOWN / 2.0, out_frames: 0, in_frames: 0, out_since: None, last_nod: None, need_return: false, last_active: None, nods: 0 }
+        NodDetector { raw: Vec::new(), settle: Vec::new(), base: None, down_thr: Self::MIN_DOWN, up_thr: Self::MIN_DOWN / 2.0, out_frames: 0, in_frames: 0, out_since: None, extreme: 0.0, last_nod: None, need_return: false, last_active: None, nods: 0 }
     }
 
     /// True while the head is still or has only just moved: the caller may
     /// look at fewer frames. False once something like a nod has begun.
     pub fn idle(&self, t: f32) -> bool {
         self.base.is_some() && self.last_active.map(|a| t - a > 1.0).unwrap_or(true)
+    }
+
+    fn complete(&mut self, t: f32, since: f32) -> bool {
+        self.out_since = None;
+        self.out_frames = 0;
+        let dur = t - since;
+        let gap_ok = self.last_nod.map(|l| t - l >= Self::GAP_MIN_S).unwrap_or(true);
+        if (Self::NOD_MIN_S..=Self::NOD_MAX_S).contains(&dur) && gap_ok {
+            self.nods += 1;
+            self.last_nod = Some(t);
+            return true;
+        }
+        false
     }
 
     /// Feed one face frame; returns true when a nod just completed.
@@ -328,9 +347,13 @@ impl NodDetector {
             }
             return false;
         };
-        let d = (p - b).abs();
+        let e = p - b;
+        let d = e.abs();
         if d > self.up_thr {
             self.last_active = Some(t);
+        } else {
+            // Still: let the baseline follow slow drift.
+            self.base = Some(b + Self::DRIFT * e);
         }
         if self.need_return {
             if d < self.up_thr {
@@ -338,31 +361,34 @@ impl NodDetector {
             }
             return false;
         }
-        if self.out_since.is_none() {
+        let Some(since) = self.out_since else {
             if d > self.down_thr {
                 self.out_frames += 1;
                 if self.out_frames >= Self::OUT_FRAMES {
                     self.out_since = Some(t);
                     self.in_frames = 0;
+                    self.extreme = e;
                 }
             } else {
                 self.out_frames = 0;
             }
             return false;
+        };
+        if e.abs() > self.extreme.abs() && e.signum() == self.extreme.signum() {
+            self.extreme = e;
         }
-        let since = self.out_since.unwrap();
-        if d < self.up_thr {
+        // Back at the baseline, or swung through to the other side by a full
+        // threshold: either way the head has reversed, which is the nod.
+        let swung = e.signum() != self.extreme.signum() && (e - self.extreme).abs() >= self.down_thr * 1.5;
+        if d < self.up_thr || swung {
             self.in_frames += 1;
-            if self.in_frames >= Self::IN_FRAMES {
-                self.out_since = None;
-                self.out_frames = 0;
-                let dur = t - since;
-                let gap_ok = self.last_nod.map(|l| t - l >= Self::GAP_MIN_S).unwrap_or(true);
-                if (Self::NOD_MIN_S..=Self::NOD_MAX_S).contains(&dur) && gap_ok {
-                    self.nods += 1;
-                    self.last_nod = Some(t);
-                    return true;
+            if self.in_frames >= Self::IN_FRAMES || swung {
+                let done = self.complete(t, since);
+                if swung {
+                    // The head is on the far side now; wait for it to settle.
+                    self.need_return = true;
                 }
+                return done;
             }
         } else {
             self.in_frames = 0;
@@ -452,6 +478,26 @@ mod nod_tests {
             spiky.extend_from_slice(&[0.62, 0.55, 0.55, 0.55, 0.62, 0.55, 0.55]);
         }
         assert_eq!(run(&spiky, 22.0), 0);
+    }
+
+    /// Two natural nods recorded 2026-09-19 (swing about 0.035 either side of
+    /// the baseline), followed by the head drifting lower. The old threshold
+    /// of 0.045 missed both; they must count, and the drift must not.
+    #[test]
+    fn natural_nods_count() {
+        let t: Vec<f32> = "0.552 0.551 0.550 0.550 0.559 0.556 0.550 0.555 0.549 0.559 0.554 0.555 0.561 0.557 0.564 0.555 0.562 0.561 0.550 0.543 0.558 0.531 0.525 0.528 0.522 0.521 0.521 0.526 0.531 0.551 0.580 0.595 0.588 0.592 0.582 0.579 0.550 0.520 0.518 0.515 0.516 0.515 0.518 0.527 0.573 0.575 0.585 0.587 0.591 0.582 0.573 0.571 0.566 0.548 0.546 0.547 0.541 0.541 0.541 0.534 0.539 0.547 0.543 0.542 0.545 0.542 0.543 0.551 0.540 0.536 0.549 0.542 0.542 0.545 0.547 0.537 0.535 0.529 0.523 0.526 0.508 0.529 0.520 0.522 0.524 0.519 0.520 0.516 0.514 0.516 0.510 0.507 0.517 0.515 0.505 0.517 0.510"
+            .split(' ')
+            .map(|v| v.parse().unwrap())
+            .collect();
+        let mut d = NodDetector::new();
+        let mut at = Vec::new();
+        for (i, &p) in t.iter().enumerate() {
+            if d.push(p, i as f32 / 22.0) {
+                at.push(i);
+            }
+        }
+        assert_eq!(at.len(), 2, "nods at frames {:?}, threshold {:.3}", at, d.down_thr);
+        assert!(at[1] < 60, "both nods are within the first 60 frames, got {:?}", at);
     }
 
     #[test]
