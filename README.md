@@ -751,3 +751,11 @@ Also found: the setup script wrote `timeout=8 prompt` for sudo and polkit,
 the pre-consent design, so a fresh install would have got the Enter prompt and
 no window. It now writes `socket=/run/faceauth/sock consent`; the PAM example
 says the same.
+
+Two false hang-ups found on the way, both in the watcher's blocking peek:
+`EINTR` (the daemon reaps the window's helper processes) and `EAGAIN` (the
+request socket carries the handler's five-second read timeout, which the
+cloned descriptor shares). Both now mean "still waiting". Measured: a CLI
+request killed at 3 s ends with `requester gone` at 2.6 s and the window is
+hidden; the install dialog sat unanswered ten minutes and still took the
+password.
