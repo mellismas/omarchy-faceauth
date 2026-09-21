@@ -317,34 +317,50 @@ fn consent_rounds<'a>(take: &dyn Fn() -> Option<std::sync::MutexGuard<'a, Authen
         },
         None => return Outcome::Error { message: "busy".into() },
     };
+    // A request that arrives while the session is locked waits, unseen and
+    // without the camera (the lock screen owns it), until the unlock.
+    let mut already_locked = crate::consent::session_locked(user);
+    if already_locked {
+        log::info!("consent: request from pid {} arrived while the session is locked; parked until the unlock", session.caller.pid);
+        session.dialog.hide();
+    }
     loop {
         if gone() {
             log::info!("consent: the requester went away after {:.0}s; window closed", session.started.elapsed().as_secs_f32());
             return Outcome::ConsentDenied { reason: "requester gone".into(), elapsed_ms: session.started.elapsed().as_millis() as u64 };
         }
-        let round = match take() {
-            Some(mut a) => a.consent_round(&mut session),
-            None => {
-                // The camera is taken (the lock screen, most likely): wait
-                // a little and try again rather than giving up.
-                if session.started.elapsed().as_secs_f32() > session.total {
-                    return Outcome::ConsentDenied { reason: "no answer".into(), elapsed_ms: session.started.elapsed().as_millis() as u64 };
+        if !already_locked {
+            let round = match take() {
+                Some(mut a) => a.consent_round(&mut session),
+                None => {
+                    // The camera is taken (the lock screen, most likely): wait
+                    // a little and try again rather than giving up.
+                    if session.started.elapsed().as_secs_f32() > session.total {
+                        return Outcome::ConsentDenied { reason: "no answer".into(), elapsed_ms: session.started.elapsed().as_millis() as u64 };
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                    continue;
                 }
-                std::thread::sleep(Duration::from_millis(500));
-                continue;
-            }
-        };
-        let Round::FaceLost = round else {
-            let Round::Done(o) = round else { unreachable!() };
-            return o;
-        };
-        // Lock the session, then park.
+            };
+            let Round::FaceLost = round else {
+                let Round::Done(o) = round else { unreachable!() };
+                return o;
+            };
+        }
+        // Lock the session (unless it already is), then park.
         let lock_time = Instant::now();
         let (lock_cmd, lock_user) = {
             let cfg = &session.dialog.cfg.presence;
             (cfg.lock_command.clone(), cfg.user.clone())
         };
-        if session.locked_at.is_none() && !lock_cmd.is_empty() {
+        if already_locked {
+            // Somebody else locked it; adopt the lock so the presence watch
+            // does not lock again and the resume logic below applies.
+            if let Some(mut a) = take() {
+                a.session_locked_at = Some(lock_time);
+            }
+            session.locked_at = Some(lock_time);
+        } else if session.locked_at.is_none() && !lock_cmd.is_empty() {
             // Hand the lock to the presence watch first so it does not lock too.
             if let Some(mut a) = take() {
                 a.session_locked_at = Some(lock_time);
@@ -359,9 +375,14 @@ fn consent_rounds<'a>(take: &dyn Fn() -> Option<std::sync::MutexGuard<'a, Authen
                 Err(e) => log::warn!("consent: lock command: {}", e),
             }
         }
-        let _ = session.dialog.show("locked", "Locked while you were away. Unlock, then look at the camera or type your password.", &session.caller, session.total);
-        // Park: no camera. Wake on a face match newer than the lock, on an
-        // answer from the window, or when the budget is out.
+        if !already_locked {
+            let _ = session.dialog.show("locked", "Locked while you were away. Unlock, then look at the camera or type your password.", &session.caller, session.total);
+        }
+        already_locked = false;
+        // Park: no camera. Wake on a face match newer than the lock, on the
+        // session unlocking by any means, on an answer from the window, or
+        // when the budget is out.
+        let mut last_lock_check = Instant::now();
         loop {
             if session.started.elapsed().as_secs_f32() > session.total - 2.0 {
                 let ms = session.started.elapsed().as_millis() as u64;
@@ -388,10 +409,14 @@ fn consent_rounds<'a>(take: &dyn Fn() -> Option<std::sync::MutexGuard<'a, Authen
                     }
                 }
             }
-            let back = match take() {
+            let mut back = match take() {
                 Some(a) => a.last_match.get(user).map(|m| *m > lock_time).unwrap_or(false),
                 None => false,
             };
+            if !back && last_lock_check.elapsed() > Duration::from_secs(2) {
+                last_lock_check = Instant::now();
+                back = !crate::consent::session_locked(user);
+            }
             if back {
                 log::info!("consent: user back after the lock; the request resumes");
                 if let Some(mut a) = take() {

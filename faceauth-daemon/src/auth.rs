@@ -398,8 +398,14 @@ impl Authenticator {
                 notify(&self.cfg, user, &format!("Root access granted by {}", how), &format!("{}\n{}", caller.command, caller.parents));
                 log::info!("consent granted ({}) for {}: {} [{}]", how, user, caller.command, caller.parents);
             }
+            Outcome::ConsentDenied { reason, .. } if matches!(gesture, Some(Gesture::Dismissed)) || reason == "dismissed" => {
+                // The user closed the window; do not put it back up with a
+                // verdict on it.
+                s.dialog.hide();
+                log::warn!("consent refused for {}: {} [{}] (dismissed)", user, caller.command, caller.parents);
+            }
             Outcome::ConsentDenied { .. } => {
-                let why = match gesture { Some(Gesture::Dismissed) => "Dismissed.", Some(Gesture::Password(_)) => "Wrong password. Refused.", _ => "No answer in time. Refused." };
+                let why = match gesture { Some(Gesture::Password(_)) => "Wrong password. Refused.", _ => "No answer. Refused." };
                 s.dialog.show_final("denied", &format!("{} Kill or block the requester, or dismiss.", why), caller);
                 log::warn!("consent refused for {}: {} [{}] ({})", user, caller.command, caller.parents, why);
             }

@@ -242,6 +242,20 @@ impl Drop for Dialog {
 
 /// A desktop notification in the user's session: every elevation by face
 /// announces itself, so a loop is visible the first time it fires.
+/// Is the user's session locked? Asked of the compositor from inside the
+/// user's manager, the same way the window is summoned. Unknown reads as
+/// not locked.
+pub fn session_locked(user: &str) -> bool {
+    std::process::Command::new("/usr/bin/timeout")
+        .args(["5", "/usr/bin/systemd-run", "--quiet", "--wait", "--collect", "--user"])
+        .arg(format!("--machine={}@.host", user))
+        .arg("/usr/bin/omarchy-hyprland-session-locked")
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .status()
+        .map(|st| st.success())
+        .unwrap_or(false)
+}
+
 pub fn notify(cfg: &Config, user: &str, title: &str, body: &str) {
     let d = Dialog::new(cfg, user);
     let omarchy_path = cfg.omarchy_path.clone().unwrap_or_else(|| "/usr/share/omarchy".into());

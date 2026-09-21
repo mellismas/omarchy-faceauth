@@ -801,3 +801,18 @@ side: the agent lives in a Loader and is made afresh every three seconds
 while unregistered (measured with a stub holding the slot: registered within
 eight seconds of its release). The crash and the single registration attempt
 are upstream Quickshell matters.
+
+**A request that arrives while the session is locked.** The install request
+of 12:51 arrived four minutes into a walk-away lock; the daemon summoned its
+window over the lock screen and scanned, contending with the lock screen's
+own face attempts, and when the user came back and dismissed it the verdict
+read "No answer in time. Refused." and the window was put back up with that
+on it: the "old dialog" seen on return. Now the daemon asks the compositor
+(`omarchy-hyprland-session-locked`, run in the user's manager like the
+summon) whether the session is locked when a request arrives; if so the
+request parks at once, unseen and without the camera, and adopts the lock so
+the presence watch does not lock again. While parked, any unlock resumes it:
+a face match newer than the lock, or the compositor reporting the session
+unlocked (polled every two seconds, so a password unlock works too). A
+dismissal closes the window and stays closed; the verdict wording no longer
+claims a timeout.
