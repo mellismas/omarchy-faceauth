@@ -44,7 +44,7 @@ fn main() -> Result<()> {
                 faceauth_daemon::auth::Outcome::Enrolled { added, total, consistency_min, consistency_mean, path } => {
                     println!("Saved {} templates ({} new) to {}", total, added, path);
                     println!("Template self-consistency (pairwise cosine): min {:.3} mean {:.3}", consistency_min, consistency_mean);
-                    println!("Note: templates are plaintext at rest until TPM sealing is implemented.");
+                    println!("{}", at_rest_note(path));
                     Ok(())
                 }
                 other => bail!("enrolment failed: {}", serde_json::to_string(other)?),
@@ -637,14 +637,24 @@ fn enroll(rest: &[&str]) -> Result<()> {
     }
     let now = now_secs();
     for s in &samples {
-        u.templates.push(Template { embedding: s.embedding.clone(), quality: s.score, face_width: s.face_width, created: now, label: label.clone() });
+        // Development path (direct camera): unbound templates, usable on any camera.
+        u.templates.push(Template { embedding: s.embedding.clone(), quality: s.score, face_width: s.face_width, created: now, label: label.clone(), device: None });
     }
     let (lo, mean, hi) = u.self_consistency().unwrap_or((1.0, 1.0, 1.0));
     let path = store.save(&u)?;
     println!("Saved {} templates ({} new) to {}", u.templates.len(), samples.len(), path.display());
     println!("Template self-consistency (pairwise cosine): min {:.3} mean {:.3} max {:.3}", lo, mean, hi);
-    println!("Note: templates are plaintext at rest until TPM sealing is implemented.");
+    println!("{}", at_rest_note(&path.display().to_string()));
     Ok(())
+}
+
+/// What the saved path says about how the templates rest.
+fn at_rest_note(path: &str) -> String {
+    if path.ends_with(".cred") {
+        "Templates are sealed to this machine's TPM; nothing on disk can read them without it.".into()
+    } else {
+        "Note: templates are plaintext at rest (root 0600); this machine has no working TPM to seal them.".into()
+    }
 }
 
 fn verify(rest: &[&str]) -> Result<()> {
@@ -1002,9 +1012,12 @@ fn doctor(rest: &[&str]) -> Result<()> {
     // daemon
     let socket = PathBuf::from("/run/faceauth/sock");
     match faceauth_daemon::server::ping(&socket, &user) {
-        Ok(faceauth_daemon::auth::Outcome::Pong { version, model, templates }) => {
+        Ok(faceauth_daemon::auth::Outcome::Pong { version, model, templates, sealed }) => {
             push("daemon.running", "pass", format!("faceauthd {} answering on {}", version, socket.display()));
             push("templates.user", if templates > 0 { "pass" } else { "warn" }, format!("{} template(s) for {} ({})", templates, user, model));
+            if templates > 0 {
+                push("templates.at_rest", if sealed { "pass" } else { "warn" }, if sealed { "sealed to the TPM (systemd-creds, bound to the user name, no PCR policy; re-enrol is the only recovery)".into() } else { "plaintext at rest (root 0600): no working TPM to seal them".into() });
+            }
         }
         Ok(o) => push("daemon.running", "warn", format!("unexpected reply {}", serde_json::to_string(&o).unwrap_or_default())),
         Err(e) => push("daemon.running", "fail", format!("{}", e)),
@@ -1017,7 +1030,6 @@ fn doctor(rest: &[&str]) -> Result<()> {
         }
         None => push("liveness.policy", "unknown", "config not readable".into()),
     }
-    push("templates.at_rest", "warn", "templates are plaintext at rest (root 0600); TPM sealing not implemented".into());
     // PAM wiring
     for (id, path, want_deny) in [("pam.sudo", "/etc/pam.d/sudo", false), ("pam.polkit", "/etc/pam.d/polkit-1", false), ("pam.lock", "/etc/pam.d/omarchy-lock-face", true), ("pam.greeter", "/etc/pam.d/sddm", false)] {
         match std::fs::read_to_string(path) {
@@ -1039,7 +1051,7 @@ fn doctor(rest: &[&str]) -> Result<()> {
     push("pam.faillock", "warn", "a face match bypasses pam_faillock and never resets its counter; a locked-out password stays locked out".into());
     // TPM
     let tpm = std::path::Path::new("/dev/tpmrm0").exists() || std::path::Path::new("/dev/tpm0").exists();
-    push("tpm.present", if tpm { "pass" } else { "warn" }, if tpm { "TPM device present (sealing not implemented yet)".into() } else { "no TPM device; templates cannot be sealed".into() });
+    push("tpm.present", if tpm { "pass" } else { "warn" }, if tpm { "TPM device present (templates.at_rest says whether the daemon can use it)".into() } else { "no TPM device; templates stay plaintext (root 0600)".into() });
     // module
     push("pam.module", if std::path::Path::new("/usr/lib/security/pam_faceauth.so").exists() { "pass" } else { "fail" }, "/usr/lib/security/pam_faceauth.so".into());
 

@@ -28,6 +28,8 @@ use std::path::Path;
 use std::time::Duration;
 
 const PAM_SUCCESS: c_int = 0;
+/// PAM_RHOST: set by network services (sshd) to the remote host name.
+const PAM_RHOST: c_int = 4;
 const PAM_IGNORE: c_int = 25;
 const PAM_AUTHTOK: c_int = 6;
 const PAM_CONV: c_int = 5;
@@ -224,6 +226,19 @@ fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char
     let user = unsafe { CStr::from_ptr(user_ptr) }.to_string_lossy().into_owned();
     if user.is_empty() || user.len() > 256 {
         return PAM_IGNORE;
+    }
+    // A remote host on the transaction means a network login (sshd sets it):
+    // the camera cannot vouch for that caller, so no scan. The daemon checks
+    // the caller's ancestry and logind session itself; this is the cheap
+    // first gate, not the trusted one.
+    let mut rhost: *const c_void = std::ptr::null();
+    // SAFETY: pamh is PAM's handle; rhost is a valid out-pointer.
+    if unsafe { pam_get_item(pamh, PAM_RHOST, &mut rhost) } == PAM_SUCCESS && !rhost.is_null() {
+        let host = unsafe { CStr::from_ptr(rhost as *const c_char) }.to_string_lossy();
+        if !host.is_empty() {
+            log(&format!("user {}: remote host {} on the transaction, no scan", sanitise(&user), sanitise(&host)));
+            return PAM_IGNORE;
+        }
     }
     let t0 = std::time::Instant::now();
     if let (Some(text), false) = (&args.prompt, args.consent) {

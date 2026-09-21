@@ -62,14 +62,14 @@ fn exe_of(pid: i32) -> String {
     std::fs::read_link(format!("/proc/{}/exe", pid)).map(|p| p.display().to_string()).unwrap_or_default()
 }
 
-fn ppid_of(pid: i32) -> Option<i32> {
+pub(crate) fn ppid_of(pid: i32) -> Option<i32> {
     let stat = read_proc(pid, "stat")?;
     // "pid (comm) state ppid ..."; comm may contain spaces, so split after the last ')'.
     let rest = stat.rsplit(')').next()?;
     rest.split_whitespace().nth(1)?.parse().ok()
 }
 
-fn comm_of(pid: i32) -> String {
+pub(crate) fn comm_of(pid: i32) -> String {
     read_proc(pid, "comm").unwrap_or_default()
 }
 

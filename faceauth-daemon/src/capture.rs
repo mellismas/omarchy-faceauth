@@ -21,6 +21,9 @@ pub struct IrCapture {
     window: Option<Window>,
     orientation: [bool; 3],
     ae_enabled: bool,
+    /// What this camera is, for binding templates to it: the IPU3 sensor
+    /// entity ("ipu3:ov7251 3-0060") or the UVC driver, card and bus path.
+    pub identity: String,
 }
 
 impl IrCapture {
@@ -33,19 +36,20 @@ impl IrCapture {
     /// As `open`, starting from a remembered exposure instead of the default,
     /// so a short look needs no settling time.
     pub fn open_at(cfg: &Config, seed: Option<Exposure>) -> Result<Self> {
-        let (video, subdev, width, height, pixelformat) = match (&cfg.ir_video, &cfg.ir_subdev) {
+        let (video, subdev, width, height, pixelformat, identity) = match (&cfg.ir_video, &cfg.ir_subdev) {
             (Some(v), Some(s)) => {
                 // Explicit UVC-style node: take the node's current format.
                 let vd = faceauth_camera::v4l2::VideoDevice::open(v)?;
                 let fmts = vd.formats()?;
                 let pf = fmts.iter().map(|(f, _)| *f).find(|f| faceauth_camera::Decoder::for_pixelformat(*f).is_some()).ok_or_else(|| anyhow!("{}: no decodable format", v.display()))?;
-                (v.clone(), s.clone(), 640, 480, pf)
+                let (driver, card, bus) = vd.driver_and_card().unwrap_or_default();
+                (v.clone(), s.clone(), 640, 480, pf, format!("uvc:{}:{}:{}", driver, card, bus))
             }
             _ => {
                 let g = faceauth_camera::ipu3::probe()?.ok_or_else(|| anyhow!("no IPU3 camera graph and no ir_video configured"))?;
                 let ir = g.ir_sensor().ok_or_else(|| anyhow!("no front IR sensor on the IPU3 graph"))?;
                 let (w, h) = g.configure(ir, None)?;
-                (ir.video.clone(), ir.subdev.clone(), w, h, ir.pixelformat)
+                (ir.video.clone(), ir.subdev.clone(), w, h, ir.pixelformat, format!("ipu3:{}", ir.name))
             }
         };
         let mut cam = Camera::open(&video, &subdev, width, height, pixelformat, 6).context("open IR camera")?;
@@ -65,6 +69,7 @@ impl IrCapture {
             window: None,
             orientation: cfg.ir_orientation,
             ae_enabled: true,
+            identity,
         })
     }
 

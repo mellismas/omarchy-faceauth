@@ -50,6 +50,8 @@ SystemCallErrorNumber=EPERM
 DevicePolicy=closed
 DeviceAllow=char-video4linux rw
 DeviceAllow=char-media rw
+# The TPM resource manager, for sealing templates through systemd-creds.
+DeviceAllow=/dev/tpmrm0 rw
 ReadWritePaths=/var/lib/faceauth /run/faceauth
 UMask=0077
 # The recognition model is ~700 MB resident; a runaway is killed well before

@@ -19,10 +19,21 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Outcome {
-    /// Enough frames matched; `score` is the best.
-    Match { score: f32, frames: usize, elapsed_ms: u64 },
+    /// Enough frames matched; `score` is the best. The score is only sent
+    /// to root: to any other caller it is a tuning oracle for a spoof.
+    Match {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        score: Option<f32>,
+        frames: usize,
+        elapsed_ms: u64,
+    },
     /// A face was seen but did not match.
-    NoMatch { score: f32, frames: usize, elapsed_ms: u64 },
+    NoMatch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        score: Option<f32>,
+        frames: usize,
+        elapsed_ms: u64,
+    },
     /// No usable face within the timeout.
     NoFace { elapsed_ms: u64 },
     /// The liveness gate refused: a presentation attack or a flat object.
@@ -34,7 +45,14 @@ pub enum Outcome {
     /// Answer to a presence probe: one short look, detector only.
     Probe { face: bool, attentive: bool, face_px: f32, elapsed_ms: u64 },
     /// Answer to a ping: the daemon is up and its models are loaded.
-    Pong { version: String, model: String, templates: usize },
+    Pong {
+        version: String,
+        model: String,
+        templates: usize,
+        /// Whether this user's templates rest sealed to the TPM.
+        #[serde(default)]
+        sealed: bool,
+    },
     /// Enrolment result.
     Enrolled { added: usize, total: usize, consistency_min: f32, consistency_mean: f32, path: String },
     /// Templates deleted.
@@ -44,6 +62,17 @@ pub enum Outcome {
     /// The face matched but the consent gesture did not come (or the window
     /// could not be shown): elevation refused.
     ConsentDenied { reason: String, elapsed_ms: u64 },
+}
+
+impl Outcome {
+    /// The outcome as an unprivileged caller may see it: without scores.
+    pub fn redacted(self) -> Outcome {
+        match self {
+            Outcome::Match { frames, elapsed_ms, .. } => Outcome::Match { score: None, frames, elapsed_ms },
+            Outcome::NoMatch { frames, elapsed_ms, .. } => Outcome::NoMatch { score: None, frames, elapsed_ms },
+            o => o,
+        }
+    }
 }
 
 /// A consent request that outlives one turn with the camera.
@@ -111,6 +140,7 @@ impl Authenticator {
     pub fn new(cfg: Config) -> Result<Self> {
         let pipeline = Pipeline::load(&cfg.models_dir)?;
         let store = Store::open(&cfg.store_dir)?;
+        log::info!("templates rest {}", store.sealing().describe());
         Ok(Authenticator { cfg, pipeline, store, last_match: Default::default(), failures: Default::default(), answers: Default::default(), pending: Default::default(), last_consent: Default::default(), session_locked_at: None, last_exposure: None })
     }
 
@@ -155,7 +185,7 @@ impl Authenticator {
 
     pub fn ping(&self, user: &str) -> Outcome {
         let templates = self.store.load(user).ok().flatten().map(|t| t.templates.len()).unwrap_or(0);
-        Outcome::Pong { version: env!("CARGO_PKG_VERSION").to_string(), model: faceauth_engine::embed::AURAFACE_FILE.to_string(), templates }
+        Outcome::Pong { version: env!("CARGO_PKG_VERSION").to_string(), model: faceauth_engine::embed::AURAFACE_FILE.to_string(), templates, sealed: self.store.is_sealed(user) }
     }
 
     /// Enrol: capture `count` embeddings over `seconds`, spaced across the
@@ -203,6 +233,7 @@ impl Authenticator {
                 samples.push((e.clone(), face.score, face.bbox[2]));
             }
         }
+        let device = cap.identity.clone();
         cap.stop()?;
         if samples.len() < 3 {
             return Ok(Outcome::Error { message: format!("only {} usable frames; face the camera at normal distance and try again", samples.len()) });
@@ -210,7 +241,7 @@ impl Authenticator {
         let now = now_secs();
         let added = samples.len();
         for (e, q, w) in samples {
-            u.templates.push(Template { embedding: e, quality: q, face_width: w, created: now, label: label.to_string() });
+            u.templates.push(Template { embedding: e, quality: q, face_width: w, created: now, label: label.to_string(), device: Some(device.clone()) });
         }
         let (lo, mean, _) = u.self_consistency().unwrap_or((1.0, 1.0, 1.0));
         let path = self.store.save(&u)?;
@@ -391,7 +422,7 @@ impl Authenticator {
             (Some(Gesture::Password(_)), o) if !password_ok => Outcome::ConsentDenied { reason: "wrong password".into(), elapsed_ms: elapsed_of(&o) },
             (_, o) => o,
         };
-        let outcome = if password_ok { Outcome::Match { score: 1.0, frames: 0, elapsed_ms: s.started.elapsed().as_millis() as u64 } } else { outcome };
+        let outcome = if password_ok { Outcome::Match { score: Some(1.0), frames: 0, elapsed_ms: s.started.elapsed().as_millis() as u64 } } else { outcome };
         self.last_consent.insert(user.to_string(), Instant::now());
         match &outcome {
             Outcome::Match { frames, .. } => {
@@ -481,6 +512,14 @@ impl Authenticator {
         if !strobe && self.cfg.liveness_required {
             cap.stop()?;
             return Ok(Outcome::Error { message: "liveness gate unavailable (no strobe control) and liveness_required is set".into() });
+        }
+        // Templates only match on the camera they were enrolled on: a camera
+        // swapped in for it has nothing to match against.
+        let device = cap.identity.clone();
+        if templates.usable_on(&device) == 0 {
+            cap.stop()?;
+            log::warn!("attempt for {}: templates are bound to {:?}, this camera is {:?}; re-enrol", templates.user, templates.bound_devices(), device);
+            return Ok(Outcome::Error { message: format!("templates are bound to another camera ({}); this one is {}; re-enrol", templates.bound_devices().join(", "), device) });
         }
         if let Some(i) = &cap.illuminator {
             i.set(true)?;
@@ -588,7 +627,7 @@ impl Authenticator {
                 }
             }
             let Some(e) = &face.embedding else { continue };
-            let Some((score, _)) = templates.best_match(e) else { continue };
+            let Some((score, _)) = templates.best_match_on(e, &device) else { continue };
             scored += 1;
             if score_trail.len() < 40 {
                 score_trail.push(format!("{:.1}s:{:.2}{}", t0.elapsed().as_secs_f32(), score, if score >= self.cfg.accept_threshold { "*" } else { "" }));
@@ -623,10 +662,10 @@ impl Authenticator {
                     if !ok {
                         return Ok(Outcome::ConsentDenied { reason: "no nod".into(), elapsed_ms: ms(t0) });
                     }
-                    return Ok(Outcome::Match { score: best, frames: scored, elapsed_ms: ms(t0) });
+                    return Ok(Outcome::Match { score: Some(best), frames: scored, elapsed_ms: ms(t0) });
                 }
                 cap.stop()?;
-                return Ok(Outcome::Match { score: best, frames: scored, elapsed_ms: ms(t0) });
+                return Ok(Outcome::Match { score: Some(best), frames: scored, elapsed_ms: ms(t0) });
             }
         }
         log::info!("attempt detail: {} | frames {} lit {} faces {} nosignal {} scored {} matches {} | scores {}", if settle_info.is_empty() { "never settled".to_string() } else { settle_info.clone() }, n_frames, n_lit, n_faces, n_nosignal, scored, matches, score_trail.join(" "));
@@ -634,7 +673,7 @@ impl Authenticator {
         if scored == 0 {
             Ok(Outcome::NoFace { elapsed_ms: ms(t0) })
         } else {
-            Ok(Outcome::NoMatch { score: best, frames: scored, elapsed_ms: ms(t0) })
+            Ok(Outcome::NoMatch { score: Some(best), frames: scored, elapsed_ms: ms(t0) })
         }
     }
 }

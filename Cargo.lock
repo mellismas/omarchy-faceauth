@@ -165,7 +165,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "faceauth-camera"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "libc",
@@ -177,7 +177,7 @@ dependencies = [
 
 [[package]]
 name = "faceauth-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "faceauth-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -208,7 +208,7 @@ dependencies = [
 
 [[package]]
 name = "faceauth-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "faceauth-camera",
@@ -417,7 +417,7 @@ checksum = "cf211e3776eea6aec988552fa118dd746d70e1b1e5e244058d1c98015f3e5872"
 
 [[package]]
 name = "pam_faceauth"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
 ]

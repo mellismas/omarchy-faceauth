@@ -163,7 +163,7 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
             m.insert(req.user.clone(), answer);
         }
         log::info!("consent answer for {} from uid {}: {}", req.user, cred.uid(), if req.consent_dismiss { "dismiss" } else { "password" });
-        return reply(&mut stream, &Outcome::Pong { version: env!("CARGO_PKG_VERSION").into(), model: String::new(), templates: 0 });
+        return reply(&mut stream, &Outcome::Pong { version: env!("CARGO_PKG_VERSION").into(), model: String::new(), templates: 0, sealed: false });
     }
     if req.ping {
         let outcome = match take() {
@@ -210,6 +210,14 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
         };
         log::debug!("probe for {}: {:?}", req.user, outcome);
         return reply(&mut stream, &outcome);
+    }
+    // Face authentication is local by definition: the camera sees whoever is
+    // at the machine, which says nothing about a caller reaching it over the
+    // network. A request from a remote session is refused before any window
+    // or camera, and the caller's stack falls through to its password.
+    if let Some(why) = remote_caller(cred.pid()) {
+        log::warn!("attempt for {} from pid {} refused: {}", req.user, cred.pid(), why);
+        return reply(&mut stream, &Outcome::Error { message: format!("face authentication is local only: {}", why) });
     }
     log::info!("attempt for {} (uid {}, pid {}{})", req.user, cred.uid(), cred.pid(), if req.consent { ", consent" } else { "" });
     let outcome = if req.consent {
@@ -299,7 +307,107 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
         }
     };
     log::info!("attempt for {}: {:?}", req.user, outcome);
+    // Scores stay in the log; only root gets them on the wire.
+    let outcome = if cred.uid() == 0 { outcome } else { outcome.redacted() };
     reply(&mut stream, &outcome)
+}
+
+/// Why `pid` counts as a remote caller, if it does: an sshd in its ancestry
+/// (the shell of an SSH login, or anything it started), or a logind session
+/// that logind itself marks remote (which also covers a tmux or screen server
+/// left behind by an SSH login and attached locally later). A process in no
+/// logind session at all (the desktop's user services, the lock screen's PAM
+/// helper) is local.
+fn remote_caller(pid: i32) -> Option<String> {
+    let mut p = pid;
+    for _ in 0..64 {
+        let Some(pp) = crate::consent::ppid_of(p) else { break };
+        if pp <= 1 {
+            break;
+        }
+        let comm = crate::consent::comm_of(pp);
+        if is_ssh_comm(&comm) {
+            return Some(format!("started under {} (pid {})", comm, pp));
+        }
+        p = pp;
+    }
+    let cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", pid)).unwrap_or_default();
+    if let Some(id) = session_id_from_cgroup(&cgroup) {
+        let out = std::process::Command::new("/usr/bin/timeout")
+            .args(["5", "/usr/bin/loginctl", "show-session", &id, "-p", "Remote", "--value"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                if String::from_utf8_lossy(&o.stdout).trim() == "yes" {
+                    return Some(format!("logind session {} is remote", id));
+                }
+            }
+            Ok(o) => log::debug!("loginctl show-session {}: {}", id, String::from_utf8_lossy(&o.stderr).trim()),
+            Err(e) => log::debug!("loginctl: {}", e),
+        }
+    }
+    None
+}
+
+/// OpenSSH's per-connection processes: `sshd` up to 9.7, `sshd-session`
+/// from 9.8 (and `sshd-auth` during authentication, never an ancestor of a
+/// shell, listed for completeness).
+fn is_ssh_comm(comm: &str) -> bool {
+    matches!(comm.trim(), "sshd" | "sshd-session" | "sshd-auth")
+}
+
+/// The logind session id from a cgroup listing (`session-3.scope`,
+/// `session-c1.scope`), if the process is in one.
+fn session_id_from_cgroup(cgroup: &str) -> Option<String> {
+    for line in cgroup.lines() {
+        for part in line.split('/') {
+            if let Some(rest) = part.strip_prefix("session-") {
+                if let Some(id) = rest.strip_suffix(".scope") {
+                    if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric()) {
+                        return Some(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod remote_tests {
+    use super::*;
+
+    #[test]
+    fn ssh_process_names() {
+        assert!(is_ssh_comm("sshd"));
+        assert!(is_ssh_comm("sshd-session"));
+        assert!(!is_ssh_comm("bash"));
+        assert!(!is_ssh_comm("sshd-agent")); // not an OpenSSH process; a lookalike is not a remote login
+    }
+
+    #[test]
+    fn session_ids_from_cgroups() {
+        assert_eq!(session_id_from_cgroup("0::/user.slice/user-1000.slice/session-3.scope\n"), Some("3".into()));
+        assert_eq!(session_id_from_cgroup("0::/user.slice/user-1000.slice/session-c1.scope"), Some("c1".into()));
+        // The desktop's app scope: no logind session, so local.
+        assert_eq!(session_id_from_cgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-graphical.slice/app-Hyprland-xdg\\x2dterminal\\x2dexec-af100da6.scope"), None);
+        assert_eq!(session_id_from_cgroup("0::/system.slice/faceauth.service"), None);
+        assert_eq!(session_id_from_cgroup("0::/user.slice/session-.scope"), None);
+    }
+
+    #[test]
+    fn this_test_process_is_local() {
+        // cargo test runs from a terminal or CI, never over a path this should call remote
+        // unless the developer is on SSH, in which case the refusal is the point.
+        let r = remote_caller(std::process::id() as i32);
+        if std::env::var_os("SSH_CONNECTION").is_some() {
+            assert!(r.is_some(), "running over SSH should be detected");
+        } else {
+            assert!(r.is_none(), "{:?}", r);
+        }
+    }
 }
 
 /// Drive a consent request through as many camera rounds as it needs. When

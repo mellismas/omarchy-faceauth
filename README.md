@@ -824,3 +824,81 @@ answer with a dismissal (its close path does that for any pending request).
 Now a request that arrives locked never summons the window; it is shown
 first on resume. Measured: locked at 13:49:59, request parked, face unlock
 at 13:50:07, "Welcome back" at 13:50:08, approved by nod at 13:50:12.
+
+## 2026-09-21, night: sealed templates, local callers only, camera binding, no scores on the wire
+
+Four changes, prompted by reading the other face PR against Omarchy (#11612,
+built on Facelock) and the Facelock source behind it. The comparison is in the
+project notes; what follows is what changed here and how each was measured.
+
+**Templates are sealed to the TPM.** The Surface Book 2's TPM 2.0 was
+firmware-disabled for a Windows dual boot; enabling it (Windows here has no
+BitLocker, so nothing depended on it) gave `/dev/tpmrm0`. The store now seals
+each user's template JSON through `systemd-creds encrypt --with-key=tpm2
+--tpm2-pcrs=` into `<user>.cred`, bound to the credential name
+`faceauth-<user>`, and reads it back with `systemd-creds decrypt`. No new
+crates, no crypto of our own: systemd is already a dependency and its
+credential format is AES-256-GCM under a key only this TPM unwraps. No PCR
+policy in this first cut, so a kernel or firmware update does not strand the
+templates; binding to PCR 7 can come once Secure Boot is on. There is no
+recovery key anywhere on disk, on purpose: Facelock's TPM mode keeps a
+plaintext copy of its key beside the sealed one (and its reseal command
+recommends it), which reduces the TPM to file permissions. Here a template
+that cannot be unsealed is re-enrolled, twelve seconds. A plaintext
+`<user>.json` met by a store that can seal is sealed on first load and the
+plaintext removed; on a machine without a working TPM the store stays
+plaintext and `doctor` and enrolment say so. Unsealing costs about a second
+of TPM time, so the daemon caches templates against the file they came from.
+The daemon's sandbox needed one line: `DeviceAllow=/dev/tpmrm0 rw`. A stale
+copy of the unit in `/etc/systemd/system` from the first dev install shadowed
+the packaged one for a while (moved aside to `/var/backups/faceauth`).
+
+Measured: `mellis.json` (221 KB) became `mellis.cred` (299 KB, 0600) on the
+first ping after the restart; a fresh daemon's first attempt paid 1.8 s for
+the unseal, the next 0.57 s; a copy of the blob renamed to another user does
+not open (name-bound). `doctor` now reports `templates.at_rest` as PASS,
+sealed, from the daemon's own answer.
+
+**Face authentication is local only.** A request whose caller was started
+under `sshd` or `sshd-session`, or sits in a logind session that logind marks
+remote, is refused by the daemon before any window or camera, and the PAM
+stack falls through to its password. The check is the daemon's, from `/proc`
+and logind, not the module's: the module runs inside the caller's process,
+where environment and PAM items are the caller's to set. (The module does
+also abstain when `PAM_RHOST` is set, as the cheap first gate.) A process in
+no logind session at all, which is every desktop app under `user@.service`
+and the lock screen's PAM helper, is local. That last point is the trap
+#11612 fell into: Facelock refuses any caller without a resolvable logind
+session, Quickshell's PAM helper has none, and the PR's fix was to turn
+Facelock's remote check off in its one global config file, which also turns it
+off for sudo and polkit.
+
+Measured, sshd started for the test and stopped after: `ssh localhost sudo
+true` with a pty put `attempt for mellis from pid 136186 refused: started
+under sshd-session (pid 136184)` in the journal and a password prompt on the
+SSH side, no window on the desktop. (`sudo -n` proves nothing: sudo refuses
+non-interactive password auth before it calls PAM at all.)
+
+**Templates are bound to the camera that enrolled them.** Each template
+records `IrCapture::identity` (`ipu3:<sensor entity>` on IPU3 machines,
+`uvc:<driver>:<card>:<bus>` elsewhere) and only matches on that camera; an
+attempt on a camera with nothing usable is an error, logged with both names,
+so a camera swapped in for the enrolled one has nothing to match against.
+Templates from before this (no device) match anywhere until re-enrolled.
+Adopted from Facelock, which has it on by default.
+
+**No scores for callers.** Match and no-match replies carry the best cosine
+score only to root; any other peer (the lock screen's helper, the CLI as a
+user) gets the verdict, frames and time. A score visible to an unprivileged
+process is a hill-climbing oracle for tuning a spoof. Scores stay in the
+daemon's log. Measured: `faceauth auth` as the user now answers
+`{"result":"match","frames":2,"elapsed_ms":1771}`.
+
+For the record, two things the comparison first flagged as gaps and were not:
+the daemon already rate-limits (five failures in a minute, counted only when a
+face was seen, then a thirty-second hold), and the IR camera probe already
+uses the greyscale-only-formats rule Facelock arrived at after two webcams
+with "ir" in their names matched a name heuristic. And one honest limit,
+stated because a reviewer will find it: the flash-response liveness gate has
+been measured against a phone screen and a paper print, not against a video
+rendered on a display an IR camera can see. It is not claimed to stop that.
