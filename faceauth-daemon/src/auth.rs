@@ -93,6 +93,9 @@ pub struct Authenticator {
     /// When a consent request locked the session (the user left mid-request);
     /// the presence watch adopts it instead of locking again.
     pub session_locked_at: Option<Instant>,
+    /// The exposure the last attempt settled on with a face in view; the
+    /// presence watch starts its short looks from it.
+    pub last_exposure: Option<faceauth_camera::calib::Exposure>,
 }
 
 /// After this many failed attempts within the window, the user waits.
@@ -104,7 +107,7 @@ impl Authenticator {
     pub fn new(cfg: Config) -> Result<Self> {
         let pipeline = Pipeline::load(&cfg.models_dir)?;
         let store = Store::open(&cfg.store_dir)?;
-        Ok(Authenticator { cfg, pipeline, store, last_match: Default::default(), failures: Default::default(), answers: Default::default(), pending: Default::default(), last_consent: Default::default(), session_locked_at: None })
+        Ok(Authenticator { cfg, pipeline, store, last_match: Default::default(), failures: Default::default(), answers: Default::default(), pending: Default::default(), last_consent: Default::default(), session_locked_at: None, last_exposure: None })
     }
 
     /// One cheap look for the lock screen while its panel is blank: is anyone
@@ -457,6 +460,7 @@ impl Authenticator {
                 // Settled: a face has been metered on for a few steps, or a second has passed with one.
                 if face_seen && t0.elapsed() > Duration::from_millis(1200) {
                     settled = true;
+                    self.last_exposure = Some(cap.exposure);
                     settle_info = format!("settled at {:.2}s exp {} gain {} meter {:.2} frame mean {:.0}", t0.elapsed().as_secs_f32(), cap.exposure.exposure, cap.exposure.gain, cap.metering.mean, mean);
                     cap.freeze_exposure(true);
                     if strobe {

@@ -27,6 +27,11 @@ pub struct PresenceConfig {
     pub tick_seconds: f32,
     /// Ticks between identity checks (detection alone runs every tick).
     pub identify_every: u32,
+    /// On battery (no mains supply online) the tick stretches to this and
+    /// identity checks come every `battery_identify_every` ticks. Zero keeps
+    /// the mains cadence.
+    pub battery_tick_seconds: f32,
+    pub battery_identify_every: u32,
     /// Seconds without the user before the session is locked.
     pub away_seconds: f32,
     /// Also require the face to be turned toward the camera.
@@ -46,6 +51,8 @@ impl Default for PresenceConfig {
             user: String::new(),
             tick_seconds: 2.0,
             identify_every: 3,
+            battery_tick_seconds: 5.0,
+            battery_identify_every: 6,
             away_seconds: 20.0,
             require_attention: false,
             max_yaw: 0.25,
@@ -84,10 +91,20 @@ pub fn run(auth: Arc<Mutex<Authenticator>>, cfg: PresenceConfig) {
     let mut locked_at: Option<Instant> = None;
     let mut adopted: Option<Instant> = None;
     log::info!("presence watch on for {} (tick {}s, away after {}s, attention {})", cfg.user, cfg.tick_seconds, cfg.away_seconds, cfg.require_attention);
+    let mut on_battery = false;
     loop {
-        std::thread::sleep(Duration::from_secs_f32(cfg.tick_seconds));
+        let (tick_s, every) = if on_battery && cfg.battery_tick_seconds > 0.0 { (cfg.battery_tick_seconds, cfg.battery_identify_every) } else { (cfg.tick_seconds, cfg.identify_every) };
+        std::thread::sleep(Duration::from_secs_f32(tick_s));
         tick = tick.wrapping_add(1);
-        let identify = tick % cfg.identify_every.max(1) == 0 || state != State::Present;
+        let battery = on_battery_now();
+        if battery != on_battery {
+            on_battery = battery;
+            log::info!("presence: {} (tick {}s)", if battery { "on battery" } else { "on mains" }, if battery && cfg.battery_tick_seconds > 0.0 { cfg.battery_tick_seconds } else { cfg.tick_seconds });
+        }
+        // Identity is the dear part of a tick (the embedder costs several
+        // times the detector): on its cadence while present, every other tick
+        // while a face is there that has not been confirmed.
+        let identify = tick % every.max(1) == 0 || (state != State::Present && tick % 2 == 0);
         // After locking, leave the camera to the lock screen (its own probe wakes
         // the panel); resume only once an attempt has matched.
         if let Some(t) = locked_at {
@@ -220,10 +237,32 @@ struct Observation {
     identity: Option<bool>,
 }
 
+/// Is the machine running on its battery? True when a battery is present
+/// and no mains supply reports itself online; a desktop, with no battery,
+/// is never on battery.
+fn on_battery_now() -> bool {
+    let Ok(dir) = std::fs::read_dir("/sys/class/power_supply") else { return false };
+    let (mut battery, mut mains_online) = (false, false);
+    for e in dir.flatten() {
+        let p = e.path();
+        let read = |n: &str| std::fs::read_to_string(p.join(n)).map(|v| v.trim().to_string()).unwrap_or_default();
+        match read("type").as_str() {
+            "Battery" => battery = true,
+            "Mains" | "USB" | "USB_PD" | "USB_C" => {
+                if read("online") == "1" {
+                    mains_online = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    battery && !mains_online
+}
+
 /// One short look: open the camera, LEDs on, a few frames, detect, maybe identify, close.
 fn observe(a: &mut Authenticator, cfg: &PresenceConfig, identify: bool) -> Result<Observation> {
     use crate::capture::IrCapture;
-    let mut cap = IrCapture::open(&a.cfg)?;
+    let mut cap = IrCapture::open_at(&a.cfg, a.last_exposure)?;
     if let Some(i) = &cap.illuminator {
         i.set(true)?;
     }
@@ -244,16 +283,21 @@ fn observe(a: &mut Authenticator, cfg: &PresenceConfig, identify: bool) -> Resul
         cap.stop()?;
         return Ok(Observation { face: false, attentive: false, identity: None });
     };
+    // A face was in view at this exposure: the next look starts from it.
+    a.last_exposure = Some(cap.exposure);
     let p = pose::pose(&face.landmarks);
     let attentive = pose::is_attentive(&p, cfg.max_yaw, cfg.max_roll_degrees);
     let identity = if identify {
         let crop = faceauth_engine::align::align_112(&img, &face.landmarks);
         let e = a.pipeline.embedder.embed(&crop)?;
-        let ok = match a.store.load(&cfg.user)? {
-            Some(t) => t.best_match(&e).map(|(s, _)| s >= a.cfg.accept_threshold).unwrap_or(false),
-            None => false,
+        let score = match a.store.load(&cfg.user)? {
+            Some(t) => t.best_match(&e).map(|(s, _)| s).unwrap_or(-1.0),
+            None => -1.0,
         };
-        Some(ok)
+        if score < a.cfg.accept_threshold {
+            log::info!("presence: identity check failed, score {:.2} (exp {} gain {}, face {:.2})", score, cap.exposure.exposure, cap.exposure.gain, face.score);
+        }
+        Some(score >= a.cfg.accept_threshold)
     } else {
         None
     };

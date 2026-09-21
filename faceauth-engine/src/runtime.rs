@@ -25,6 +25,7 @@ pub fn init() -> Result<()> {
 
 pub fn session(path: impl AsRef<Path>, threads: usize) -> Result<Session> {
     init()?;
+    let threads = std::env::var("FACEAUTH_ORT_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(threads);
     let p = path.as_ref();
     // The builder's errors carry the builder back and are not Send; flatten them to text.
     let text = |e: ort::Error<_>| anyhow!("{}", e);
@@ -32,6 +33,13 @@ pub fn session(path: impl AsRef<Path>, threads: usize) -> Result<Session> {
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .map_err(text)?
         .with_intra_threads(threads)
+        .map_err(text)?
+        // Worker threads spin-wait between operators by default, which triples
+        // the CPU time of an inference for a small gain in latency. This runs
+        // on laptops, every couple of seconds, for the whole session: sleep.
+        .with_intra_op_spinning(false)
+        .map_err(text)?
+        .with_inter_op_spinning(false)
         .map_err(text)?
         .commit_from_file(p)
         .with_context(|| format!("load model {}", p.display()))

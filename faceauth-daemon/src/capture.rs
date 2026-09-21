@@ -27,6 +27,12 @@ impl IrCapture {
     /// Resolve the IR camera (config override, else the IPU3 graph's front IR
     /// sensor), configure it, and start streaming with the illuminator off.
     pub fn open(cfg: &Config) -> Result<Self> {
+        Self::open_at(cfg, None)
+    }
+
+    /// As `open`, starting from a remembered exposure instead of the default,
+    /// so a short look needs no settling time.
+    pub fn open_at(cfg: &Config, seed: Option<Exposure>) -> Result<Self> {
         let (video, subdev, width, height, pixelformat) = match (&cfg.ir_video, &cfg.ir_subdev) {
             (Some(v), Some(s)) => {
                 // Explicit UVC-style node: take the node's current format.
@@ -44,7 +50,7 @@ impl IrCapture {
         };
         let mut cam = Camera::open(&video, &subdev, width, height, pixelformat, 6).context("open IR camera")?;
         let illuminator = if cfg.liveness { Illuminator::open(&subdev)? } else { None };
-        let start = Exposure { exposure: 500.min(cam.limits.exposure.1), gain: cam.limits.gain.map(|g| g.0).unwrap_or(0), dgain: 1.0 };
+        let start = seed.unwrap_or(Exposure { exposure: 500.min(cam.limits.exposure.1), gain: cam.limits.gain.map(|g| g.0).unwrap_or(0), dgain: 1.0 });
         cam.set_exposure(start)?;
         cam.start()?;
         Ok(IrCapture {
