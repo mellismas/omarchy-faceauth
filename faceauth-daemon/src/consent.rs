@@ -81,6 +81,9 @@ fn starttime_of(pid: i32) -> u64 {
     read_proc(pid, "stat").and_then(|s| s.rsplit(')').next().and_then(|r| r.split_whitespace().nth(19).and_then(|v| v.parse().ok()))).unwrap_or(0)
 }
 
+/// The polkit requesters (pid, start time) already named by a window.
+static SERVED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(i32, u64)>>> = std::sync::LazyLock::new(Default::default);
+
 impl CallerInfo {
     pub fn from_pid(pid: i32, user_uid: u32) -> CallerInfo {
         let exe = exe_of(pid);
@@ -91,9 +94,12 @@ impl CallerInfo {
         let comm = comm_of(pid);
         let base = Path::new(&exe).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| comm.clone());
         if base == "polkit-agent-helper-1" || comm.starts_with("polkit-agent-he") {
-            // The helper is polkit's; the requester is the newest pkexec (or other
-            // polkit client) running with the user's real uid. Best effort.
+            // The helper is polkit's and carries nothing that names its
+            // requester. Polkit serves requests in order, so the one being
+            // served is the oldest pkexec (or run0) of the user's that this
+            // daemon has not named before; each is named once. Best effort.
             info.via = "polkit".into();
+            let mut served = SERVED.lock().unwrap_or_else(|p| p.into_inner());
             let mut best: Option<(u64, i32)> = None;
             let mut seen: Vec<String> = Vec::new();
             if let Ok(rd) = std::fs::read_dir("/proc") {
@@ -111,7 +117,10 @@ impl CallerInfo {
                     }
                     if b == "pkexec" || b == "run0" {
                         let t = starttime_of(p);
-                        if best.map(|(bt, _)| t > bt).unwrap_or(true) {
+                        if served.contains(&(p, t)) {
+                            continue;
+                        }
+                        if best.map(|(bt, _)| t < bt).unwrap_or(true) {
                             best = Some((t, p));
                         }
                     }
@@ -119,7 +128,10 @@ impl CallerInfo {
             }
             log::debug!("consent: polkit requester search, uid {} processes: {}", user_uid, seen.join(" "));
             match best {
-                Some((_, p)) => {
+                Some((t, p)) => {
+                    served.insert((p, t));
+                    // Forget the ones that have gone; the set stays small.
+                    served.retain(|&(sp, st)| std::path::Path::new(&format!("/proc/{}", sp)).exists() && starttime_of(sp) == st);
                     info.kill_pid = p;
                     // cmdline of a setuid process may be unreadable too; fall back to its name.
                     let cl = read_proc(p, "cmdline").unwrap_or_default();

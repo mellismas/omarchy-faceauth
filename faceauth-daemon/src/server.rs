@@ -31,6 +31,8 @@ static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 /// The consent answer slot and the pending set, cloned from the authenticator
 /// at start so answer requests never need the camera lock.
 static ANSWERS: std::sync::LazyLock<crate::consent::Answers> = std::sync::LazyLock::new(Default::default);
+/// Held by the consent request whose turn it is; the others wait on it.
+static CONSENT_TURN: Mutex<()> = Mutex::new(());
 static PENDING: std::sync::LazyLock<Arc<Mutex<std::collections::HashSet<String>>>> = std::sync::LazyLock::new(Default::default);
 
 /// Wire the authenticator's answer slot and pending set to the server's statics.
@@ -254,6 +256,33 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
             });
         }
         let gone = || flag.load(std::sync::atomic::Ordering::SeqCst);
+        // One consent request at a time, and the rest wait their turn rather
+        // than falling to the password: a request has no deadline, so the
+        // queue only ever drains by the user answering (or requesters going
+        // away). The turn is held for the whole request, parked spells
+        // included, so a later request never opens its window over an
+        // earlier one.
+        let _turn = {
+            let mut waited = false;
+            loop {
+                match CONSENT_TURN.try_lock() {
+                    Ok(g) => break g,
+                    Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        if gone() {
+                            active.store(false, std::sync::atomic::Ordering::SeqCst);
+                            let _ = ANSWERS.lock().map(|mut m| m.remove(&req.user));
+                            return reply(&mut stream, &Outcome::ConsentDenied { reason: "requester gone".into(), elapsed_ms: 0 });
+                        }
+                        if !waited {
+                            waited = true;
+                            log::info!("consent: request from pid {} waits its turn behind another", cred.pid());
+                        }
+                        std::thread::sleep(Duration::from_millis(300));
+                    }
+                }
+            }
+        };
         let outcome = consent_rounds(&take, &req.user, caller, req.budget, &gone);
         active.store(false, std::sync::atomic::Ordering::SeqCst);
         // A hang-up noticed after the verdict must not haunt the next request.
