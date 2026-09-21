@@ -221,11 +221,15 @@ impl Authenticator {
     /// silently; then the face must match, then the nod must come.
     /// Start a consent request: open the window, load the templates, mark the
     /// user pending. Errors are final outcomes.
-    pub fn consent_begin(&mut self, user: &str, caller: crate::consent::CallerInfo, budget: Option<f32>) -> std::result::Result<ConsentSession, Outcome> {
+    /// With `open_window` false (the session is locked) the window is not
+    /// summoned; the caller shows it when the request resumes.
+    pub fn consent_begin(&mut self, user: &str, caller: crate::consent::CallerInfo, budget: Option<f32>, open_window: bool) -> std::result::Result<ConsentSession, Outcome> {
         let mut dialog = Dialog::new(&self.cfg, user);
-        if let Err(e) = dialog.show("scanning", "Look at the camera.", &caller, 0.0) {
-            log::warn!("consent: no window for {}: {}", user, e);
-            return Err(Outcome::ConsentDenied { reason: "no graphical session to ask in".into(), elapsed_ms: 0 });
+        if open_window {
+            if let Err(e) = dialog.show("scanning", "Look at the camera.", &caller, 0.0) {
+                log::warn!("consent: no window for {}: {}", user, e);
+                return Err(Outcome::ConsentDenied { reason: "no graphical session to ask in".into(), elapsed_ms: 0 });
+            }
         }
         let templates = match self.store.load(user) {
             Ok(Some(t)) => t,

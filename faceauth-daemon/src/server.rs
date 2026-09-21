@@ -310,19 +310,20 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
 fn consent_rounds<'a>(take: &dyn Fn() -> Option<std::sync::MutexGuard<'a, Authenticator>>, user: &str, caller: crate::consent::CallerInfo, budget: Option<f32>, gone: &dyn Fn() -> bool) -> Outcome {
     use crate::auth::Round;
     use crate::consent::{Answer, Gesture};
+    // A request that arrives while the session is locked waits, unseen and
+    // without the camera (the lock screen owns it), until the unlock. The
+    // window is not summoned at all: hiding a pending window would make it
+    // answer with a dismissal.
+    let mut already_locked = crate::consent::session_locked(user);
     let mut session = match take() {
-        Some(mut a) => match a.consent_begin(user, caller, budget) {
+        Some(mut a) => match a.consent_begin(user, caller, budget, !already_locked) {
             Ok(s) => s,
             Err(o) => return o,
         },
         None => return Outcome::Error { message: "busy".into() },
     };
-    // A request that arrives while the session is locked waits, unseen and
-    // without the camera (the lock screen owns it), until the unlock.
-    let mut already_locked = crate::consent::session_locked(user);
     if already_locked {
         log::info!("consent: request from pid {} arrived while the session is locked; parked until the unlock", session.caller.pid);
-        session.dialog.hide();
     }
     loop {
         if gone() {

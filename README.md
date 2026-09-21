@@ -816,3 +816,11 @@ a face match newer than the lock, or the compositor reporting the session
 unlocked (polled every two seconds, so a password unlock works too). A
 dismissal closes the window and stays closed; the verdict wording no longer
 claims a timeout.
+
+First attempt at this showed the plain scanning window over the lock screen
+and then ended the request three seconds later: the window was summoned by
+the request's setup before the lock check, and hiding it made the window
+answer with a dismissal (its close path does that for any pending request).
+Now a request that arrives locked never summons the window; it is shown
+first on resume. Measured: locked at 13:49:59, request parked, face unlock
+at 13:50:07, "Welcome back" at 13:50:08, approved by nod at 13:50:12.
