@@ -643,3 +643,30 @@ first pulse of a pair only counts if the box has been still for the second
 before it (same median test), and a face seen for less than that second has
 not been still. That trace is a test and counts zero; the missed-nod trace
 still counts.
+
+## 2026-09-21: power
+
+The presence watch idled at 15 to 17 % of one core on mains (2 s tick). Where
+it went, measured per thread and with the CLI on saved frames: YuNet at
+640×640 costs only 14 ms (0.03 core-s); the embedder (glintr100) costs about
+0.35 core-s per run, and it ran every tick because the watch flapped Present
+to Stranger: the tick's 450 ms of frames is not enough for exposure to settle
+from the default (an attempt settles at 1.2 s), so its embeddings were poor
+and the identity check failed, and while unconfirmed the watch identified on
+every tick. Fixes: ticks start from the exposure the last attempt or tick
+settled on with a face in view (`IrCapture::open_at`, `last_exposure` on the
+authenticator); while unconfirmed the identity check runs every other tick;
+failed checks log their score; ONNX worker threads sleep instead of spinning
+(one detect+embed: 0.65 core-s spinning, 0.41 not; latency 132 vs 141 ms);
+and on battery (no mains supply online) the tick stretches to 5 s and the
+identity check to every sixth tick (`battery_tick_seconds`,
+`battery_identify_every`; zero keeps the mains cadence).
+
+Measured after: 5.9 % of a core idle on battery (5 s tick), one identity
+failure in a minute (score 0.17, a real turn-away). Whole-system draw from
+the battery meter (tools/power-measure.sh, 60 s phases) was dominated by
+other work on the machine and did not resolve the daemon; the one clean pair
+was the 5 s versus 2 s tick, 0.6 W apart whole-system, 1.5 W package. A
+clean run needs a quiet machine and longer phases. A dynamic-shape YuNet
+(all Reshapes use -1, Resizes use scales; only the declared input pins 640)
+runs a half-size frame in 1.8 ms versus 14, kept in mind, not needed.
