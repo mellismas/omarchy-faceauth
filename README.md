@@ -616,3 +616,21 @@ acknowledged; polkit agent hidden during consent; stacked requests serialised;
 request survives a walk-away lock (locks, parks, resumes on the face unlock);
 presence clock restarts after a consent flow; blank lock panel wakes only for
 an attentive face; ten-minute default budget.
+
+## 2026-09-21: nods count again
+
+The motion gate compared the raw extremes of the face box across a pulse, and
+the box flickers between two fits (95 and 89 px) on alternate frames and rides
+14 px up and down with the nod itself, so every pulse was rejected. Now the
+gate compares the three-frame median of the width and centre at the start of
+the pulse with the same at its end: a nod ends where it began, a lean or a
+shift does not. Tolerances unchanged (6 % width, 10 % of width sideways, 20 %
+vertically). The missed-nod trace of 2026-09-19 is a test and counts; the
+synthetic lean-in test grows the face a quarter over the second in which its
+pitch wobbles, and still counts zero.
+
+Measured: sudo approved by nod in 4.2 s (match 1.5 s); a second run in 8.4 s,
+where the first nod swung the pitch only 0.01 (under the 0.015 floor) though
+the box centre rode 14 px, and the second swung 0.04. Possible follow-up: use
+the box's vertical ride, normalised by width, as a second nod signal for very
+light nods.

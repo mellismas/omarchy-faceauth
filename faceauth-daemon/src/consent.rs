@@ -302,9 +302,11 @@ impl NodDetector {
     /// 0.05, a light one 0.02; the wobble of a head leaning in is the same
     /// size, and is told apart by the motion gate below, not by amplitude.
     pub const MIN_DOWN: f32 = 0.015;
-    /// Face width may change this much across a pulse; more is the body moving.
+    /// Filtered face width may end a pulse this far from where it began;
+    /// more is the body moving.
     const WIDTH_TOL: f32 = 0.06;
-    /// Face centre may shift this fraction of its width across a pulse.
+    /// Filtered face centre may end a pulse this fraction of its width from
+    /// where it began (twice that vertically, since a nod moves the box).
     const SHIFT_TOL: f32 = 0.10;
     /// Excursion threshold as a multiple of the noise floor.
     pub const JITTER_MULT: f32 = 4.0;
@@ -346,15 +348,26 @@ impl NodDetector {
         if !(Self::NOD_MIN_S..=Self::NOD_MAX_S).contains(&dur) {
             return false;
         }
-        // A nod turns the head; the face stays the same size and place. A
-        // lean, a slump or a shift moves it, and its pitch wobble is not a nod.
+        // A nod turns the head; the face ends the pulse the same size and
+        // place it began. A lean, a slump or a shift carries it somewhere
+        // else, and its pitch wobble is not a nod. The box flickers between
+        // two fits on alternate frames and rides up and down with the nod
+        // itself, so the test is the change of the three-frame median from
+        // the start of the pulse to its end, not the spread of the raw boxes.
         let window: Vec<&(f32, f32, f32, f32)> = self.motion.iter().filter(|m| m.0 >= since - 0.3 && m.0 <= t).collect();
-        if window.len() >= 2 {
-            let (wmin, wmax) = window.iter().fold((f32::MAX, 0f32), |(lo, hi), m| (lo.min(m.1), hi.max(m.1)));
-            let (xmin, xmax) = window.iter().fold((f32::MAX, f32::MIN), |(lo, hi), m| (lo.min(m.2), hi.max(m.2)));
-            let (ymin, ymax) = window.iter().fold((f32::MAX, f32::MIN), |(lo, hi), m| (lo.min(m.3), hi.max(m.3)));
-            if wmax / wmin.max(1.0) > 1.0 + Self::WIDTH_TOL || (xmax - xmin) / wmax.max(1.0) > Self::SHIFT_TOL || (ymax - ymin) / wmax.max(1.0) > Self::SHIFT_TOL * 1.5 {
-                log::debug!("consent: pulse rejected, the face moved (width {:.0}..{:.0}, x {:.0}..{:.0}, y {:.0}..{:.0})", wmin, wmax, xmin, xmax, ymin, ymax);
+        if window.len() >= 6 {
+            let med = |i: usize, f: fn(&(f32, f32, f32, f32)) -> f32| {
+                let mut v = [f(window[i]), f(window[i + 1]), f(window[i + 2])];
+                v.sort_by(|a, b| a.total_cmp(b));
+                v[1]
+            };
+            let last = window.len() - 3;
+            let (w0, w1) = (med(0, |m| m.1), med(last, |m| m.1));
+            let (x0, x1) = (med(0, |m| m.2), med(last, |m| m.2));
+            let (y0, y1) = (med(0, |m| m.3), med(last, |m| m.3));
+            let w = w0.max(w1).max(1.0);
+            if (w1 - w0).abs() / w > Self::WIDTH_TOL || (x1 - x0).abs() / w > Self::SHIFT_TOL || (y1 - y0).abs() / w > Self::SHIFT_TOL * 2.0 {
+                log::debug!("consent: pulse rejected, the face moved (width {:.0} to {:.0}, x {:.0} to {:.0}, y {:.0} to {:.0})", w0, w1, x0, x1, y0, y1);
                 self.pulses.clear();
                 return false;
             }
@@ -537,6 +550,40 @@ mod nod_tests {
         d.nods
     }
 
+    fn run_geom(text: &str, fps: f32) -> (usize, Vec<usize>) {
+        let mut d = NodDetector::new();
+        let mut at = Vec::new();
+        for (i, rec) in text.split_whitespace().enumerate() {
+            let f: Vec<f32> = rec.split('/').map(|v| v.parse().unwrap()).collect();
+            if d.push_with(f[0], i as f32 / fps, Some((f[1], f[2], f[3]))) {
+                at.push(i);
+            }
+        }
+        (d.nods, at)
+    }
+
+    /// Recorded 2026-09-19 with the motion gate installed: two ordinary nods
+    /// missed. The face box flickers between two sizes on alternate frames
+    /// while the head is still, and rides up and down with a real nod; the
+    /// gate must see through the flicker and allow the ride.
+    #[test]
+    fn nods_with_a_flickering_face_box_count() {
+        let (nods, at) = run_geom(include_str!("../traces/2026-09-19-0244-nods-missed-with-motion-gate.txt"), 28.0);
+        assert!(nods >= 2, "no pair, completions at {:?}", at);
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_flicker_trace() {
+        let text = include_str!("../traces/2026-09-19-0244-nods-missed-with-motion-gate.txt");
+        let mut d = NodDetector::new();
+        for (i, rec) in text.split_whitespace().enumerate() {
+            let f: Vec<f32> = rec.split('/').map(|v| v.parse().unwrap()).collect();
+            let hit = d.push_with(f[0], i as f32 / 28.0, Some((f[1], f[2], f[3])));
+            eprintln!("{:3} p {:.3} w {:.0} y {:.0} base {:.3} e {:+.3} thr {:.3} out {:?} pulses {} {}", i, f[0], f[1], f[3], d.base.unwrap_or(0.0), f[0] - d.base.unwrap_or(f[0]), d.down_thr, d.out_since.is_some(), d.pulses.len(), if hit { "NOD" } else { "" });
+        }
+    }
+
     /// The trace that approved an install on 2026-09-19 with no nod: landmark
     /// jitter between two quantised values, counted as two nods by the old
     /// threshold logic. Must count zero.
@@ -615,14 +662,14 @@ mod nod_tests {
     /// and the old detector approved. Must count zero.
     #[test]
     fn leaning_in_to_read_is_not_a_nod() {
-        // The recording has pitch only; the face grew as the user leaned in,
-        // which the gate sees as width rising across the trace.
+        // The recording has pitch only. The face grew about a quarter as the
+        // user leaned in over the second or so in which the pitch wobbles
+        // (frames 8 to 44); the gate sees the width rising through each pulse.
         let t: Vec<f32> = "0.518 0.533 0.531 0.538 0.541 0.531 0.529 0.528 0.532 0.532 0.533 0.533 0.530 0.519 0.540 0.517 0.515 0.516 0.545 0.537 0.536 0.541 0.553 0.541 0.545 0.543 0.536 0.538 0.526 0.522 0.516 0.523 0.527 0.528 0.545 0.550 0.546 0.550 0.548 0.541 0.547 0.535 0.532 0.536 0.532 0.540 0.540 0.580 0.519 0.554 0.547 0.549 0.550 0.550 0.551 0.551 0.554 0.553 0.554 0.554 0.555 0.553 0.548 0.551 0.551 0.552 0.551 0.549 0.549 0.552 0.554 0.555 0.553 0.545 0.545 0.548 0.545 0.546 0.543 0.545 0.544 0.543 0.546 0.543 0.542 0.541 0.540 0.542 0.543 0.543 0.522 0.522 0.522 0.528 0.527 0.531 0.537 0.533".split(' ').map(|v| v.parse().unwrap()).collect();
         let mut d = NodDetector::new();
-        let n = t.len() as f32;
         for (i, &p) in t.iter().enumerate() {
-            let w = 90.0 * (1.0 + 0.3 * i as f32 / n);
-            d.push_with(p, i as f32 / 28.0, Some((w, 320.0, 240.0 + 20.0 * i as f32 / n)));
+            let k = ((i as f32 - 8.0) / 36.0).clamp(0.0, 1.0);
+            d.push_with(p, i as f32 / 28.0, Some((90.0 * (1.0 + 0.25 * k), 320.0, 240.0 + 20.0 * k)));
         }
         assert_eq!(d.nods, 0);
         // The same pitch trace with a still face would read as light nods,
