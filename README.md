@@ -1,16 +1,66 @@
-# Omarchy FaceAuth: source
+# Omarchy FaceAuth
 
-Rust workspace for the face-authentication stack. Builds with stable Rust and no
-system libraries beyond libc; the kernel ABI it needs is hand-written in
-`faceauth-camera/src/sys.rs` and pinned by layout tests.
+Face authentication for [Omarchy](https://github.com/basecamp/omarchy) with the
+infrared camera that Windows Hello laptops carry: the lock screen opens when you
+look at it, and `sudo` and polkit requests are approved by a nod (or a password)
+in a window that names the command and the requester. MIT licensed, Rust, no
+system libraries beyond libc, libpam and Arch's `onnxruntime-cpu`.
 
-| Crate | What it is | State |
-| --- | --- | --- |
-| `faceauth-camera` | Capture: V4L2 nodes and subdevices, media-controller graph, Intel IPU3 pipeline setup and 10-bit unpack, UVC decoders, the exposure / white-balance / tone calibration from `kernel/CALIBRATION.md`, the IR illuminator as a V4L2 control. | Working on the reference machine (see below). UVC path written, not yet exercised on hardware. |
-| `faceauth-engine` | Detect (YuNet), align (five-point similarity to the ArcFace template, contrast-normalised crop), embed (AuraFace glintr100, 512-D), cosine match; ONNX Runtime loaded dynamically from Arch's `onnxruntime-cpu`. | Working on the IR camera (see below). Presentation-attack gate not started. |
-| `faceauth-daemon` | `faceauthd`: config, camera capture per attempt (idle otherwise), the authentication flow (settle on the face, alternate the strobe, gate every lit frame, score until two match), template store, Unix socket with peer-credential checks. | Working end to end (see below). Presence state machine and TPM sealing not started. |
-| `faceauth-cli` | `faceauth` command: `cam probe`, `cam graph`, `cam test`, `engine inspect`, `engine test`, `engine live`; later `enroll`, `test`, `doctor`. | Camera and engine subcommands working. |
-| `pam_faceauth` | The PAM module: opens the socket, asks, maps `match` to `PAM_SUCCESS` and everything else to `PAM_IGNORE`, panics firewalled; links only libc and libpam. | Built and unit-tested; not yet wired into a PAM stack. |
+The Omarchy side (lock screen PAM stack, consent window, setup and removal,
+menu entries, manual page) is a series of commits to `basecamp/omarchy`; the
+package recipe lives in `omacom/omarchy-pkgs` as `omarchy-faceauth`. This
+repository is the daemon, the PAM module and the command-line tool.
+
+## What it does
+
+- **Lock screen**: a third PAM stack, `omarchy-lock-face`, answered by the face
+  module and closed by `pam_deny`. The panel probes for a face while blank and
+  wakes only for an attentive one.
+- **`sudo` and polkit**: every request opens a consent window. Two nods approve
+  it; so does the password typed into the window. The window waits up to ten
+  minutes; if you walk away the session locks and the request resumes when
+  your face unlocks it. One request at a time, no grace period, no key or
+  click stands in for the nod.
+- **Walk-away lock** (optional, `faceauth presence on`): one short look every
+  two seconds (five on battery), lock ten seconds after the camera stops
+  seeing you.
+- **Liveness**: a phone is never seen as a face (the IR camera sees its own
+  illuminator in the glass). A print is refused by two physical measurements:
+  paper reflects the strobe several times more strongly than skin, and a
+  print's surround lights up with the face while a head's background stays
+  dark. Thresholds and measurements are in the development log below.
+- **Not defended**: a look-alike, a 3D mask, malware already running as you.
+  Every failure falls back to the password.
+
+## Layout
+
+| Crate | What it is |
+| --- | --- |
+| `faceauth-camera` | V4L2 and media-controller capture, Intel IPU3 pipeline setup and 10-bit unpack, UVC greyscale decoders, exposure control, the IR illuminator as a V4L2 control. |
+| `faceauth-engine` | Detect (YuNet), align, embed (AuraFace glintr100, 512-D), cosine match, head pose; ONNX Runtime loaded at run time from `/usr/lib/libonnxruntime.so`. |
+| `faceauth-daemon` | `faceauthd`: the authentication flow (settle, strobe, liveness gate, score until two frames match), the consent flow (window, nod detector, password check against `system-auth`), the presence watch, the template store, a Unix socket with peer-credential checks. |
+| `faceauth-cli` | `faceauth`: `doctor`, `enroll`, `auth`, `probe`, `presence`, `models fetch`, and the camera and engine tools used in development. |
+| `pam_faceauth` | The PAM module: asks the daemon, maps a match to `PAM_SUCCESS` and everything else to `PAM_IGNORE`; links only libc and libpam. |
+| `packaging/` | Service unit, default config, the lock helper, a PAM example. |
+
+Models are not in the repository or the package: `models.toml` names them with
+checksums and `faceauth models fetch` downloads and verifies them at setup.
+
+## Build
+
+```
+cargo build --release --locked
+cargo test --release --locked
+```
+
+Concurrent IR+RGB capture and the illuminator on Intel IPU3 laptops need the
+two kernel patches shipped in `linux-omarchy`; a UVC IR camera needs nothing.
+
+## Development log
+
+Everything below is the dated working record, newest sections last: hardware
+runs, measurements, decisions and their reasons. The reference machine is a
+Surface Book 2 (IPU3, ov7251 IR sensor, strobe-capable illuminator).
 
 ## Camera crate, first hardware run (2026-09-18 17:33)
 

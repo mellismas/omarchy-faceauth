@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["Michael Ellis"]
-repository = "https://github.com/basecamp/omarchy"
+repository = "https://github.com/mellismas/omarchy-faceauth"
 
 [workspace.dependencies]
 anyhow = "1"
