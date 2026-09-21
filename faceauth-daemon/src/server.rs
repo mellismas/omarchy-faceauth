@@ -234,6 +234,10 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
                         // A signal (the daemon reaps the window's helper
                         // processes) interrupts the wait; it is not a hang-up.
                         Err(nix::errno::Errno::EINTR) => continue,
+                        // The request socket carries the handler's five-second
+                        // read timeout, which the clone shares: an idle period
+                        // is not a hang-up either.
+                        Err(nix::errno::Errno::EAGAIN) => continue,
                         Err(e) => {
                             log::warn!("consent: request socket: {}", e);
                             break;
