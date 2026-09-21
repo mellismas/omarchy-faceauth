@@ -14,9 +14,10 @@ auth       required                    pam_deny.so
 account    include                     system-local-login
 
 # /etc/pam.d/sudo and /etc/pam.d/polkit-1: one line at the top, opt-in. The
-# password lines below it are the fallback, so no pam_deny here. `prompt` makes
-# elevation a deliberate act: the module asks "Press Enter to authenticate by
-# face, or type your password"; Enter scans, a typed password is handed to
-# pam_unix (try_first_pass) and no scan runs. Sitting in front of the machine
+# password lines below it are the fallback, so no pam_deny here. `consent`
+# makes elevation a deliberate act: the daemon opens a window naming the
+# command and the requester, and the request is approved by two nods or by
+# the password typed into that window. The window waits until it is answered
+# (`timeout=` is ignored on a consent line). Sitting in front of the machine
 # never elevates anything by itself.
-auth      sufficient pam_faceauth.so socket=/run/faceauth/sock timeout=8 prompt
+auth      sufficient pam_faceauth.so socket=/run/faceauth/sock consent

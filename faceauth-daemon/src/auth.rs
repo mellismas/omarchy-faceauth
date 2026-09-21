@@ -47,6 +47,10 @@ pub enum Outcome {
 }
 
 /// A consent request that outlives one turn with the camera.
+/// "Wait for the user" as a finite number of seconds: about four months, so
+/// every duration derived from it stays representable.
+pub const NO_BUDGET: f32 = 1.0e7;
+
 pub struct ConsentSession {
     pub user: String,
     pub caller: crate::consent::CallerInfo,
@@ -233,11 +237,13 @@ impl Authenticator {
             p.insert(user.to_string());
         }
         self.last_consent.insert(user.to_string(), Instant::now());
-        // The caller's own limit is the budget, minus a margin so the module
-        // always sees the verdict; without one, the configured window.
+        // A caller with a limit of its own (the CLI) sets the budget, minus a
+        // margin so it always sees the verdict. The PAM module sets none: the
+        // window waits until it is answered, and the only way it ends without
+        // an answer is the user dismissing it or the requester going away.
         let total = match budget {
             Some(b) => (b - 3.0).max(5.0),
-            None => self.cfg.consent_scan_seconds + self.cfg.consent_seconds,
+            None => NO_BUDGET,
         };
         Ok(ConsentSession { user: user.to_string(), caller, dialog, started: Instant::now(), total, templates, pending: Arc::clone(&self.pending), locked_at: None })
     }
@@ -282,10 +288,22 @@ impl Authenticator {
             };
             let g = gesture_cell.borrow_mut().take();
             match (&g, &o) {
+                // Nobody is waiting for the verdict: no verdict, and the
+                // window comes down when the session drops.
+                (Some(Gesture::Gone), _) => return Round::Done(Outcome::ConsentDenied { reason: "requester gone".into(), elapsed_ms: started.elapsed().as_millis() as u64 }),
+                (None, Outcome::ConsentDenied { reason, .. }) if reason == "requester gone" => return Round::Done(o.clone()),
                 (Some(Gesture::FaceLost), _) => return Round::FaceLost,
                 (None, Outcome::NoFace { .. }) if lost_after.is_some() => return Round::FaceLost,
                 (None, Outcome::NoMatch { .. }) | (None, Outcome::NoFace { .. }) => {
                     let _ = dialog_cell.borrow_mut().show("scanning", "Face not recognised. Look at the camera, or type your password.", caller_ref, total);
+                    continue;
+                }
+                // A liveness refusal is a verdict for a plain attempt, but the
+                // window is waiting for the user: it keeps waiting (nothing is
+                // approved by it), and the log keeps the refusal.
+                (None, Outcome::Denied { reason, .. }) if reason != "password" => {
+                    log::info!("consent: scan refused ({}); the window keeps waiting", reason);
+                    let _ = dialog_cell.borrow_mut().show("scanning", "Not accepted. Look straight at the camera, or type your password.", caller_ref, total);
                     continue;
                 }
                 _ => {
@@ -439,6 +457,11 @@ impl Authenticator {
                                 // Leave it in the map for the caller to verify.
                                 cap.stop()?;
                                 return Ok(Outcome::Denied { reason: "password".into(), elapsed_ms: ms(t0) });
+                            }
+                            Answer::Gone => {
+                                m.remove(u);
+                                cap.stop()?;
+                                return Ok(Outcome::ConsentDenied { reason: "requester gone".into(), elapsed_ms: ms(t0) });
                             }
                         }
                     }

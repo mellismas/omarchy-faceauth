@@ -24,6 +24,8 @@ use std::time::{Duration, Instant};
 pub enum Answer {
     /// The user typed their password into the window.
     Password(String),
+    /// The requester hung up its socket: nobody is waiting for the verdict.
+    Gone,
     /// The user dismissed, killed or blocked: refuse now.
     Dismiss,
 }
@@ -253,6 +255,8 @@ pub enum Gesture {
     /// The window supplied a password (verified by the caller).
     Password(String),
     Dismissed,
+    /// The requester went away; the window comes down with it.
+    Gone,
     Timeout,
     /// No face for the presence watch's away time: the user left.
     FaceLost,
@@ -517,6 +521,7 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, min_detection
                     log::info!("consent: dismissed after {} nods in {:.1}s, pitch trace {}", det.nods, t0.elapsed().as_secs_f32(), trace.join(" "));
                     return Ok(Gesture::Dismissed);
                 }
+                Some(Answer::Gone) => return Ok(Gesture::Gone),
                 None => {}
             }
         }

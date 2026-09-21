@@ -115,7 +115,7 @@ fn main() -> Result<()> {
             let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
             let t = Instant::now();
             let o = if rest.contains(&"--consent") {
-                faceauth_daemon::server::ask_consent(&socket, &user, Duration::from_secs(600))?
+                faceauth_daemon::server::ask_consent(&socket, &user)?
             } else {
                 faceauth_daemon::server::ask(&socket, &user, Duration::from_secs(15))?
             };

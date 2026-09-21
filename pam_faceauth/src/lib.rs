@@ -174,9 +174,10 @@ fn parse_args(argc: c_int, argv: *const *const c_char) -> Args {
             a.prompt = Some(v.replace('_', " "));
         }
     }
-    if a.consent && !timeout_given {
-        // The window stays until acknowledged; ten minutes is the ceiling.
-        a.timeout = Duration::from_secs(600);
+    if a.consent && timeout_given {
+        // A consent line waits for the user, without limit: the window sits
+        // there until it is answered. `timeout=` bounds a plain look only.
+        log("timeout= is ignored on a consent line; the window waits until it is answered");
     }
     a
 }
@@ -184,7 +185,9 @@ fn parse_args(argc: c_int, argv: *const *const c_char) -> Args {
 /// The whole conversation with the daemon. Any error is `false`.
 fn daemon_says_match(socket: &Path, user: &str, timeout: Duration, consent: bool) -> bool {
     let Ok(mut stream) = UnixStream::connect(socket) else { return false };
-    if stream.set_read_timeout(Some(timeout)).is_err() || stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
+    // A consent request has no deadline: the daemon answers when the user does.
+    let read_timeout = if consent { None } else { Some(timeout) };
+    if stream.set_read_timeout(read_timeout).is_err() || stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
         return false;
     }
     // A tiny hand-built JSON object: the user name is escaped for quotes and backslashes.
@@ -194,7 +197,7 @@ fn daemon_says_match(socket: &Path, user: &str, timeout: Duration, consent: bool
         c if c.is_control() => vec![],
         c => vec![c],
     }).collect();
-    let req = if consent { format!("{{\"user\":\"{}\",\"consent\":true,\"budget\":{}}}\n", escaped, timeout.as_secs()) } else { format!("{{\"user\":\"{}\"}}\n", escaped) };
+    let req = if consent { format!("{{\"user\":\"{}\",\"consent\":true}}\n", escaped) } else { format!("{{\"user\":\"{}\"}}\n", escaped) };
     if stream.write_all(req.as_bytes()).is_err() {
         return false;
     }
@@ -300,7 +303,6 @@ mod tests {
         let ptrs: Vec<*const c_char> = args.iter().map(|c| c.as_ptr()).collect();
         let c = parse_args(1, ptrs.as_ptr());
         assert!(c.consent);
-        assert_eq!(c.timeout, Duration::from_secs(600));
         let args: Vec<std::ffi::CString> = ["prompt=Face:_Enter_to_scan"].iter().map(|s| std::ffi::CString::new(*s).unwrap()).collect();
         let ptrs: Vec<*const c_char> = args.iter().map(|c| c.as_ptr()).collect();
         assert_eq!(parse_args(1, ptrs.as_ptr()).prompt.as_deref(), Some("Face: Enter to scan"));

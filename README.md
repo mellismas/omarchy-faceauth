@@ -17,9 +17,9 @@ repository is the daemon, the PAM module and the command-line tool.
   module and closed by `pam_deny`. The panel probes for a face while blank and
   wakes only for an attentive one.
 - **`sudo` and polkit**: every request opens a consent window. Two nods approve
-  it; so does the password typed into the window. The window waits up to ten
-  minutes; if you walk away the session locks and the request resumes when
-  your face unlocks it. One request at a time, no grace period, no key or
+  it; so does the password typed into the window. The window waits until it
+  is answered; if you walk away the session locks and the request resumes
+  when your face unlocks it. One request at a time, no grace period, no key or
   click stands in for the nod.
 - **Walk-away lock** (optional, `faceauth presence on`): one short look every
   two seconds (five on battery), lock ten seconds after the camera stops
@@ -720,3 +720,34 @@ was the 5 s versus 2 s tick, 0.6 W apart whole-system, 1.5 W package. A
 clean run needs a quiet machine and longer phases. A dynamic-shape YuNet
 (all Reshapes use -1, Resizes use scales; only the declared input pins 640)
 runs a half-size frame in 1.8 ms versus 14, kept in mind, not needed.
+
+## 2026-09-21, later: a consent request has no deadline
+
+A request that sat unanswered ended at 43 s, not because of the ten-minute
+budget but because the PAM lines on this machine still said `timeout=60` (the module handed the daemon 57 s) and, before
+that ran out, a liveness refusal during a scan round (the user far from the
+camera, not facing it, score 0.15; then `DenySurround`) was taken as the
+verdict. The user's rule, restated: **the window does not time out. It sits
+there and waits.**
+
+Now: a consent line ignores `timeout=` (logged once) and the module sets no
+read deadline on the socket; the request carries no budget, and the daemon
+takes none as "wait" (`NO_BUDGET`, four months, so every derived duration is
+representable); a liveness refusal during a consent round shows "Not
+accepted. Look straight at the camera, or type your password." and the round
+repeats. The CLI's `auth --consent` waits the same way.
+
+The protocol, for anyone writing a caller: **a consent reply arrives when the
+user answers the window, or never.** A caller must not set a read deadline
+and must be prepared to wait; the only thing that ends an unanswered request
+from the caller's side is closing the socket. The daemon checks the request
+socket for a hang-up between rounds and every 300 ms while parked, and takes
+the window down when the requester is gone (sudo interrupted, polkit helper
+gone): `ConsentDenied { reason: "requester gone" }` in the log. sudo's own
+`passwd_timeout` (default five minutes) bounds its password prompt, not a
+module blocked in `pam_authenticate`; polkit's helper has no limit.
+
+Also found: the setup script wrote `timeout=8 prompt` for sudo and polkit,
+the pre-consent design, so a fresh install would have got the Enter prompt and
+no window. It now writes `socket=/run/faceauth/sock consent`; the PAM example
+says the same.

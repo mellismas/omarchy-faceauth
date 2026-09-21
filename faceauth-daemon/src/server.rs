@@ -213,7 +213,45 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
     let outcome = if req.consent {
         let uid = user_uid(&req.user).unwrap_or(cred.uid());
         let caller = crate::consent::CallerInfo::from_pid(cred.pid(), uid);
-        consent_rounds(&take, &req.user, caller, req.budget)
+        // The requester may not wait for an answer (sudo interrupted, the
+        // polkit helper gone): a hang-up on its socket ends the request and
+        // takes the window down with it.
+        let probe = stream.try_clone()?;
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        {
+            // A watcher blocks on the request socket; a hang-up drops a
+            // "gone" answer into the slot every wait loop polls, so the
+            // window comes down within a frame wherever the request is.
+            let (flag, active, user) = (Arc::clone(&flag), Arc::clone(&active), req.user.clone());
+            std::thread::spawn(move || {
+                use nix::sys::socket::{recv, MsgFlags};
+                use std::os::fd::AsRawFd;
+                let mut b = [0u8; 1];
+                loop {
+                    match recv(probe.as_raw_fd(), &mut b, MsgFlags::MSG_PEEK) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => std::thread::sleep(Duration::from_millis(200)), // unexpected extra bytes; not our concern
+                    }
+                }
+                if active.load(std::sync::atomic::Ordering::SeqCst) {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if let Ok(mut m) = ANSWERS.lock() {
+                        m.insert(user, crate::consent::Answer::Gone);
+                    }
+                }
+            });
+        }
+        let gone = || flag.load(std::sync::atomic::Ordering::SeqCst);
+        let outcome = consent_rounds(&take, &req.user, caller, req.budget, &gone);
+        active.store(false, std::sync::atomic::Ordering::SeqCst);
+        // A hang-up noticed after the verdict must not haunt the next request.
+        if let Ok(mut m) = ANSWERS.lock() {
+            if matches!(m.get(&req.user), Some(crate::consent::Answer::Gone)) {
+                m.remove(&req.user);
+            }
+        }
+        outcome
     } else {
         match take() {
             Some(mut a) => a.authenticate(&req.user),
@@ -229,7 +267,7 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
 /// without the camera (so the lock screen can use it), until the user is back
 /// (a face match on the lock screen), a password or a dismissal arrives from
 /// the window, or the caller's budget runs out.
-fn consent_rounds<'a>(take: &dyn Fn() -> Option<std::sync::MutexGuard<'a, Authenticator>>, user: &str, caller: crate::consent::CallerInfo, budget: Option<f32>) -> Outcome {
+fn consent_rounds<'a>(take: &dyn Fn() -> Option<std::sync::MutexGuard<'a, Authenticator>>, user: &str, caller: crate::consent::CallerInfo, budget: Option<f32>, gone: &dyn Fn() -> bool) -> Outcome {
     use crate::auth::Round;
     use crate::consent::{Answer, Gesture};
     let mut session = match take() {
@@ -240,6 +278,10 @@ fn consent_rounds<'a>(take: &dyn Fn() -> Option<std::sync::MutexGuard<'a, Authen
         None => return Outcome::Error { message: "busy".into() },
     };
     loop {
+        if gone() {
+            log::info!("consent: the requester went away after {:.0}s; window closed", session.started.elapsed().as_secs_f32());
+            return Outcome::ConsentDenied { reason: "requester gone".into(), elapsed_ms: session.started.elapsed().as_millis() as u64 };
+        }
         let round = match take() {
             Some(mut a) => a.consent_round(&mut session),
             None => {
@@ -290,9 +332,14 @@ fn consent_rounds<'a>(take: &dyn Fn() -> Option<std::sync::MutexGuard<'a, Authen
             }
             let answer = ANSWERS.lock().ok().and_then(|mut m| m.remove(user));
             if let Some(ans) = answer {
+                if matches!(ans, crate::consent::Answer::Gone) {
+                    log::info!("consent: the requester went away while the session was locked; window closed");
+                    return Outcome::ConsentDenied { reason: "requester gone".into(), elapsed_ms: session.started.elapsed().as_millis() as u64 };
+                }
                 let g = match ans {
                     Answer::Password(pw) => Gesture::Password(pw),
                     Answer::Dismiss => Gesture::Dismissed,
+                    Answer::Gone => Gesture::Gone,
                 };
                 let ms = session.started.elapsed().as_millis() as u64;
                 loop {
@@ -313,6 +360,10 @@ fn consent_rounds<'a>(take: &dyn Fn() -> Option<std::sync::MutexGuard<'a, Authen
                 session.locked_at = None;
                 let _ = session.dialog.show("scanning", "Welcome back. Look at the camera.", &session.caller, session.total);
                 break;
+            }
+            if gone() {
+                log::info!("consent: the requester went away while the session was locked; window closed");
+                return Outcome::ConsentDenied { reason: "requester gone".into(), elapsed_ms: session.started.elapsed().as_millis() as u64 };
             }
             std::thread::sleep(Duration::from_millis(300));
         }
@@ -340,7 +391,7 @@ pub fn probe(socket: &Path, user: &str, timeout: Duration) -> Result<Outcome> {
 }
 
 fn request(socket: &Path, user: &str, probe: bool, timeout: Duration) -> Result<Outcome> {
-    send(socket, serde_json::json!({ "user": user, "probe": probe }), timeout)
+    send(socket, serde_json::json!({ "user": user, "probe": probe }), Some(timeout))
 }
 
 pub fn consent_answer(socket: &Path, user: &str, password: Option<&str>, dismiss: bool) -> Result<Outcome> {
@@ -348,28 +399,30 @@ pub fn consent_answer(socket: &Path, user: &str, password: Option<&str>, dismiss
         Some(pw) => serde_json::json!({ "user": user, "consent_password": pw }),
         None => serde_json::json!({ "user": user, "consent_dismiss": dismiss }),
     };
-    send(socket, body, Duration::from_secs(3))
+    send(socket, body, Some(Duration::from_secs(3)))
 }
 
-pub fn ask_consent(socket: &Path, user: &str, timeout: Duration) -> Result<Outcome> {
-    send(socket, serde_json::json!({ "user": user, "consent": true, "budget": timeout.as_secs_f32() }), timeout)
+/// A consent request: the reply comes when the user answers the window, or
+/// never (the daemon ends it only if this socket hangs up). No deadline.
+pub fn ask_consent(socket: &Path, user: &str) -> Result<Outcome> {
+    send(socket, serde_json::json!({ "user": user, "consent": true }), None)
 }
 
 pub fn ping(socket: &Path, user: &str) -> Result<Outcome> {
-    send(socket, serde_json::json!({ "user": user, "ping": true }), Duration::from_secs(3))
+    send(socket, serde_json::json!({ "user": user, "ping": true }), Some(Duration::from_secs(3)))
 }
 
 pub fn enroll(socket: &Path, user: &str, label: &str, seconds: f32, count: usize) -> Result<Outcome> {
-    send(socket, serde_json::json!({ "user": user, "enroll": label, "seconds": seconds, "count": count }), Duration::from_secs_f32(seconds + 15.0))
+    send(socket, serde_json::json!({ "user": user, "enroll": label, "seconds": seconds, "count": count }), Some(Duration::from_secs_f32(seconds + 15.0)))
 }
 
 pub fn delete_templates(socket: &Path, user: &str) -> Result<Outcome> {
-    send(socket, serde_json::json!({ "user": user, "delete_templates": true }), Duration::from_secs(3))
+    send(socket, serde_json::json!({ "user": user, "delete_templates": true }), Some(Duration::from_secs(3)))
 }
 
-pub fn send(socket: &Path, body: serde_json::Value, timeout: Duration) -> Result<Outcome> {
+pub fn send(socket: &Path, body: serde_json::Value, timeout: Option<Duration>) -> Result<Outcome> {
     let mut stream = UnixStream::connect(socket).with_context(|| format!("connect {}", socket.display()))?;
-    stream.set_read_timeout(Some(timeout))?;
+    stream.set_read_timeout(timeout)?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let req = body.to_string() + "\n";
     stream.write_all(req.as_bytes())?;
