@@ -296,6 +296,9 @@ impl Authenticator {
                 (None, Outcome::NoFace { .. }) if lost_after.is_some() => return Round::FaceLost,
                 (None, Outcome::NoMatch { .. }) | (None, Outcome::NoFace { .. }) => {
                     let _ = dialog_cell.borrow_mut().show("scanning", "Face not recognised. Look at the camera, or type your password.", caller_ref, total);
+                    if let Some(r) = self.wait_for_attention(&user, &answers, lost_after) {
+                        return r;
+                    }
                     continue;
                 }
                 // A liveness refusal is a verdict for a plain attempt, but the
@@ -304,6 +307,9 @@ impl Authenticator {
                 (None, Outcome::Denied { reason, .. }) if reason != "password" => {
                     log::info!("consent: scan refused ({}); the window keeps waiting", reason);
                     let _ = dialog_cell.borrow_mut().show("scanning", "Not accepted. Look straight at the camera, or type your password.", caller_ref, total);
+                    if let Some(r) = self.wait_for_attention(&user, &answers, lost_after) {
+                        return r;
+                    }
                     continue;
                 }
                 _ => {
@@ -318,6 +324,45 @@ impl Authenticator {
     }
 
     /// Turn a gesture and a face outcome into the verdict, show it, notify.
+    /// Waiting is not scanning. After a round that found nobody to accept,
+    /// the camera stays off but for a short look every two seconds, like the
+    /// presence watch's, until a face is turned to the camera (then the next
+    /// round scans it), the window answers (the next round takes the answer),
+    /// or nobody has been there for the presence away time (the user left).
+    fn wait_for_attention(&mut self, user: &str, answers: &Answers, lost_after: Option<Duration>) -> Option<Round> {
+        let look = crate::presence::PresenceConfig { user: user.to_string(), ..Default::default() };
+        let mut unseen_since = Instant::now();
+        let mut looks = 0u32;
+        loop {
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_millis(200));
+                if answers.lock().map(|m| m.contains_key(user)).unwrap_or(false) {
+                    return None;
+                }
+            }
+            looks += 1;
+            match crate::presence::observe(self, &look, false) {
+                Ok(o) if o.face && o.attentive => {
+                    log::info!("consent: a face turned to the camera after {} looks; scanning", looks);
+                    return None;
+                }
+                Ok(o) => {
+                    if o.face {
+                        unseen_since = Instant::now();
+                    } else if let Some(l) = lost_after {
+                        {
+                            if unseen_since.elapsed() > l {
+                                log::info!("consent: nobody for {:.0}s while waiting; the user left", l.as_secs_f32());
+                                return Some(Round::FaceLost);
+                            }
+                        }
+                    }
+                }
+                Err(e) => log::warn!("consent: look while waiting: {}", e),
+            }
+        }
+    }
+
     pub fn consent_finish(&mut self, s: &mut ConsentSession, gesture: Option<Gesture>, outcome: Outcome) -> Outcome {
         let user = s.user.as_str();
         let caller = &s.caller;

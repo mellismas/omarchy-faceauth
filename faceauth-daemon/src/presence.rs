@@ -230,11 +230,11 @@ pub fn run(auth: Arc<Mutex<Authenticator>>, cfg: PresenceConfig) {
     }
 }
 
-struct Observation {
-    face: bool,
-    attentive: bool,
+pub(crate) struct Observation {
+    pub(crate) face: bool,
+    pub(crate) attentive: bool,
     /// Some(true/false) when an identity check ran.
-    identity: Option<bool>,
+    pub(crate) identity: Option<bool>,
 }
 
 /// Is the machine running on its battery? True when a battery is present
@@ -260,7 +260,7 @@ fn on_battery_now() -> bool {
 }
 
 /// One short look: open the camera, LEDs on, a few frames, detect, maybe identify, close.
-fn observe(a: &mut Authenticator, cfg: &PresenceConfig, identify: bool) -> Result<Observation> {
+pub(crate) fn observe(a: &mut Authenticator, cfg: &PresenceConfig, identify: bool) -> Result<Observation> {
     use crate::capture::IrCapture;
     let mut cap = IrCapture::open_at(&a.cfg, a.last_exposure)?;
     if let Some(i) = &cap.illuminator {

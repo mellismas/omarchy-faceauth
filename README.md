@@ -759,3 +759,45 @@ cloned descriptor shares). Both now mean "still waiting". Measured: a CLI
 request killed at 3 s ends with `requester gone` at 2.6 s and the window is
 hidden; the install dialog sat unanswered ten minutes and still took the
 password.
+
+## 2026-09-21, evening: requests queue
+
+A second consent request arriving while one is open used to get "busy" and
+fall to the password. Now it waits its turn on a lock held for the whole
+first request (parked spells included), then opens its own window;
+`consent: request from pid N waits its turn behind another` in the log, and
+a requester that hangs up while queued ends there. The polkit requester is
+named as the oldest pkexec (or run0) of the user's that no window has named
+yet, since polkit serves in order; each is named once (`SERVED`).
+
+Known upstream limit: two polkit requests within about half a second of each
+other race inside Quickshell's agent (0.3.1), which makes a flow of both at
+once and loses the second's completion; that pkexec hangs until the shell
+restarts. Requests a few seconds apart are served in order.
+
+**Waiting is not scanning.** During a seven-minute unanswered wait the camera
+streamed and strobed without pause: a face it could not accept was always in
+view (the user at the other desk, seen at an angle), so every 20 s scan round
+ended in no match or a liveness refusal and the next began at once. Now a
+round that finds nobody to accept is followed by the presence watch's short
+look every two seconds (camera open 450 ms, no identity), and the next scan
+round starts only when a face is turned to the camera; nobody at all for the
+presence away time ends the round as the user leaving. `consent: a face
+turned to the camera after N looks; scanning` in the log.
+
+**Shell crash, agent lost.** Quickshell 0.3.1 crashed twice today (SIGSEGV,
+identical stacks): polkitd cancels an authentication, libpolkit-agent fires
+the request's cancellable, and Quickshell's cancel callback uses a request
+it has freed. Quickshell's frames are stripped on Arch, so that much is the
+shape of the stack, not a symbol. The first time the cancel was ours (the
+daemon's request killed a pkexec left hanging by the concurrent-requests
+race); the second had no polkit activity for 15 s before it. After the crash
+handler relaunches the shell, the relaunch asks polkitd for the agent slot
+while the crashed instance is still being dumped and still holds it, gets
+"an authentication agent already exists", and never asks again: every pkexec
+after that failed for want of an agent, which is what the invisible password
+prompt and the queued request that never surfaced were. Fixed on the Omarchy
+side: the agent lives in a Loader and is made afresh every three seconds
+while unregistered (measured with a stub holding the slot: registered within
+eight seconds of its release). The crash and the single registration attempt
+are upstream Quickshell matters.
