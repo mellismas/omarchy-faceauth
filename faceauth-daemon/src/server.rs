@@ -230,7 +230,14 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
                 let mut b = [0u8; 1];
                 loop {
                     match recv(probe.as_raw_fd(), &mut b, MsgFlags::MSG_PEEK) {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) => break,
+                        // A signal (the daemon reaps the window's helper
+                        // processes) interrupts the wait; it is not a hang-up.
+                        Err(nix::errno::Errno::EINTR) => continue,
+                        Err(e) => {
+                            log::warn!("consent: request socket: {}", e);
+                            break;
+                        }
                         Ok(_) => std::thread::sleep(Duration::from_millis(200)), // unexpected extra bytes; not our concern
                     }
                 }
