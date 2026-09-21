@@ -308,6 +308,8 @@ impl NodDetector {
     /// Filtered face centre may end a pulse this fraction of its width from
     /// where it began (twice that vertically, since a nod moves the box).
     const SHIFT_TOL: f32 = 0.10;
+    /// The face must have been still this long before the first pulse.
+    const STILL_S: f32 = 1.0;
     /// Excursion threshold as a multiple of the noise floor.
     pub const JITTER_MULT: f32 = 4.0;
     /// The largest excursion ever required, however jittery the baseline.
@@ -339,6 +341,33 @@ impl NodDetector {
         self.up_thr = self.down_thr / 2.0;
     }
 
+    /// Did the face box end the span `from..=to` somewhere other than it
+    /// began? The box flickers between two fits on alternate frames and rides
+    /// up and down with a nod itself, so the test is the change of the
+    /// three-frame median from the start of the span to its end, not the
+    /// spread of the raw boxes.
+    fn moved(&self, from: f32, to: f32, why: &str) -> bool {
+        let window: Vec<&(f32, f32, f32, f32)> = self.motion.iter().filter(|m| m.0 >= from && m.0 <= to).collect();
+        if window.len() < 6 {
+            return false;
+        }
+        let med = |i: usize, f: fn(&(f32, f32, f32, f32)) -> f32| {
+            let mut v = [f(window[i]), f(window[i + 1]), f(window[i + 2])];
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[1]
+        };
+        let last = window.len() - 3;
+        let (w0, w1) = (med(0, |m| m.1), med(last, |m| m.1));
+        let (x0, x1) = (med(0, |m| m.2), med(last, |m| m.2));
+        let (y0, y1) = (med(0, |m| m.3), med(last, |m| m.3));
+        let w = w0.max(w1).max(1.0);
+        let moved = (w1 - w0).abs() / w > Self::WIDTH_TOL || (x1 - x0).abs() / w > Self::SHIFT_TOL || (y1 - y0).abs() / w > Self::SHIFT_TOL * 2.0;
+        if moved {
+            log::debug!("consent: pulse rejected, {} (width {:.0} to {:.0}, x {:.0} to {:.0}, y {:.0} to {:.0})", why, w0, w1, x0, x1, y0, y1);
+        }
+        moved
+    }
+
     /// A completed excursion: count it as a pulse if it has the shape of a
     /// nod, and the gesture if it pairs with a recent one.
     fn complete(&mut self, t: f32) -> bool {
@@ -350,27 +379,17 @@ impl NodDetector {
         }
         // A nod turns the head; the face ends the pulse the same size and
         // place it began. A lean, a slump or a shift carries it somewhere
-        // else, and its pitch wobble is not a nod. The box flickers between
-        // two fits on alternate frames and rides up and down with the nod
-        // itself, so the test is the change of the three-frame median from
-        // the start of the pulse to its end, not the spread of the raw boxes.
-        let window: Vec<&(f32, f32, f32, f32)> = self.motion.iter().filter(|m| m.0 >= since - 0.3 && m.0 <= t).collect();
-        if window.len() >= 6 {
-            let med = |i: usize, f: fn(&(f32, f32, f32, f32)) -> f32| {
-                let mut v = [f(window[i]), f(window[i + 1]), f(window[i + 2])];
-                v.sort_by(|a, b| a.total_cmp(b));
-                v[1]
-            };
-            let last = window.len() - 3;
-            let (w0, w1) = (med(0, |m| m.1), med(last, |m| m.1));
-            let (x0, x1) = (med(0, |m| m.2), med(last, |m| m.2));
-            let (y0, y1) = (med(0, |m| m.3), med(last, |m| m.3));
-            let w = w0.max(w1).max(1.0);
-            if (w1 - w0).abs() / w > Self::WIDTH_TOL || (x1 - x0).abs() / w > Self::SHIFT_TOL || (y1 - y0).abs() / w > Self::SHIFT_TOL * 2.0 {
-                log::debug!("consent: pulse rejected, the face moved (width {:.0} to {:.0}, x {:.0} to {:.0}, y {:.0} to {:.0})", w0, w1, x0, x1, y0, y1);
-                self.pulses.clear();
-                return false;
-            }
+        // else, and its pitch wobble is not a nod.
+        if self.moved(since - 0.3, t, "the face moved") {
+            self.pulses.clear();
+            return false;
+        }
+        // The first pulse of a pair must follow a still second: someone who
+        // has only just sat down or turned to the screen, glancing between
+        // it and the keyboard, has not nodded yet. A face seen for less than
+        // that second has not been still either.
+        if self.pulses.is_empty() && (self.motion.first().map(|m| m.0 > since - Self::STILL_S + 0.2).unwrap_or(false) || self.moved(since - Self::STILL_S, since, "the face had just arrived")) {
+            return false;
         }
         if self.pulses.last().map(|l| since - l < Self::GAP_MIN_S).unwrap_or(false) {
             return false;
@@ -582,6 +601,16 @@ mod nod_tests {
             let hit = d.push_with(f[0], i as f32 / 28.0, Some((f[1], f[2], f[3])));
             eprintln!("{:3} p {:.3} w {:.0} y {:.0} base {:.3} e {:+.3} thr {:.3} out {:?} pulses {} {}", i, f[0], f[1], f[3], d.base.unwrap_or(0.0), f[0] - d.base.unwrap_or(f[0]), d.down_thr, d.out_since.is_some(), d.pulses.len(), if hit { "NOD" } else { "" });
         }
+    }
+
+    /// Recorded 2026-09-21: the user slid into the chair and turned to the
+    /// screen (the box moved 100 px sideways and grew a third over 1.4 s),
+    /// then glanced twice between the window and the terminal. No nod; the
+    /// old gate approved. Must count zero: the face was not yet still.
+    #[test]
+    fn glances_on_arrival_are_not_a_nod() {
+        let (nods, at) = run_geom(include_str!("../traces/2026-09-21-1144-false-nod-no-nod.txt"), 28.0);
+        assert_eq!(nods, 0, "counted at {:?}", at);
     }
 
     /// The trace that approved an install on 2026-09-19 with no nod: landmark

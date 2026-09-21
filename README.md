@@ -634,3 +634,12 @@ where the first nod swung the pitch only 0.01 (under the 0.015 floor) though
 the box centre rode 14 px, and the second swung 0.04. Possible follow-up: use
 the box's vertical ride, normalised by width, as a second nod signal for very
 light nods.
+
+Later the same morning a request was approved with no nod: the user slid into
+the chair and turned to the screen (box 100 px sideways, a third larger, over
+1.4 s), then glanced twice between the window and the terminal, at 0.06 to
+0.07 swing with the box still. By pitch alone that is a nod pair. Now the
+first pulse of a pair only counts if the box has been still for the second
+before it (same median test), and a face seen for less than that second has
+not been still. That trace is a test and counts zero; the missed-nod trace
+still counts.
