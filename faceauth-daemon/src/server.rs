@@ -76,6 +76,9 @@ struct Request {
     /// From the consent window: the token the daemon put in its payload.
     #[serde(default)]
     consent_token: Option<String>,
+    /// Root only: a calibration round for "nod" or "shake".
+    #[serde(default)]
+    calibrate: Option<String>,
     /// From the polkit agent: what the request it is about to serve is.
     #[serde(default)]
     context_action: Option<String>,
@@ -240,7 +243,7 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
             m.insert(req.user.clone(), answer);
         }
         log::info!("consent answer for {} from uid {}: {}", req.user, cred.uid(), if req.consent_dismiss { "dismiss" } else { "password" });
-        return reply(&mut stream, &Outcome::Pong { version: env!("CARGO_PKG_VERSION").into(), model: String::new(), templates: 0, sealed: false, unbound: 0 });
+        return reply(&mut stream, &Outcome::Pong { version: env!("CARGO_PKG_VERSION").into(), model: String::new(), templates: 0, sealed: false, unbound: 0, floors: None });
     }
     if req.ping {
         let outcome = match take() {
@@ -253,11 +256,20 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
     // ask (the setup command runs them under sudo, behind the password), so no
     // unprivileged process, and nothing reaching a locked session over ssh,
     // can enrol a new face or erase the enrolled one.
-    if req.enroll.is_some() || req.delete_templates {
+    if req.enroll.is_some() || req.delete_templates || req.calibrate.is_some() {
         if cred.uid() != 0 {
             log::warn!("uid {} asked to change templates for {}: refused", cred.uid(), req.user);
             return reply(&mut stream, &Outcome::Error { message: "not permitted: enrolment and deletion require root".into() });
         }
+    }
+    if let Some(gesture) = &req.calibrate {
+        let gesture = if gesture == "shake" { "shake" } else { "nod" };
+        log::info!("calibration ({}) for {} (uid {})", gesture, req.user, cred.uid());
+        let outcome = match take() {
+            Some(mut a) => a.calibrate(&req.user, gesture, req.seconds.unwrap_or(8.0).clamp(4.0, 20.0)),
+            None => Outcome::Error { message: "busy".into() },
+        };
+        return reply(&mut stream, &outcome);
     }
     if let Some(label) = &req.enroll {
         log::info!("enrolment for {} (uid {}, label {:?})", req.user, cred.uid(), label);
@@ -754,6 +766,11 @@ pub fn consent_answer(socket: &Path, user: &str, password: Option<&str>, dismiss
         None => serde_json::json!({ "user": user, "consent_dismiss": dismiss, "consent_token": token }),
     };
     send(socket, body, Some(Duration::from_secs(3)))
+}
+
+/// Root: one calibration round for "nod" or "shake".
+pub fn calibrate(socket: &Path, user: &str, gesture: &str, seconds: f32) -> Result<Outcome> {
+    send(socket, serde_json::json!({ "user": user, "calibrate": gesture, "seconds": seconds }), Some(Duration::from_secs(90)))
 }
 
 /// From the polkit agent: what the request it is about to serve is.

@@ -498,9 +498,12 @@ impl Oscillation {
     /// Default rest: the last leg of a gesture ends at rest, and a glance
     /// holds. The slow top of a real nod is not rest: it keeps creeping.
     const REST_S: f32 = 0.5;
-    /// Not moving at all: frame-to-frame change under this fraction of the
-    /// floor.
-    const REST_STEP: f32 = 0.35;
+    /// Not moving at all: frame-to-frame change under this, in signal units
+    /// (face widths per frame). Absolute, not a fraction of the floor: at a
+    /// calibrated floor of 0.129 a fraction became 0.045, above a nod's own
+    /// frame-to-frame motion, and the user's nods were cleared as "rest"
+    /// (recorded). A settling head wobbles 0.01; a turnaround moves 0.03+.
+    const REST_STEP: f32 = 0.02;
     /// Filtered samples that must advance the extreme within a leg. 1 is
     /// off: the recorded nods from a jittery face box are not clean ramps,
     /// and fit flicker is handled before the detector (`FlickerFilter`).
@@ -723,7 +726,7 @@ impl Oscillation {
                 // Not moving at all: a step at the still-face noise level, an
                 // absolute of the floor (a still face moves 0.003 of a width
                 // between frames; a slow turnaround moves more).
-                let still = self.last_step < self.min_thr * Self::REST_STEP;
+                let still = self.last_step < Self::REST_STEP;
                 if further {
                     self.cand = (p, t);
                     self.steps += 1;
@@ -957,9 +960,15 @@ impl NodDetector {
     pub const YAW_QUIET: f32 = 0.25;
 
     pub fn new() -> Self {
+        Self::with_floor(Self::MIN_DOWN)
+    }
+
+    /// With this person's floor (never below the default).
+    pub fn with_floor(floor: f32) -> Self {
+        let floor = floor.max(Self::MIN_DOWN);
         // A nod rides the box up and down: the vertical allowance is doubled.
         // Legs to a second: deliberate nods measured 0.87 s and were refused at 0.8.
-        NodDetector { inner: Oscillation::new("nod", Self::MIN_DOWN, Self::MAX_DOWN, 1.0, 0.10, 0.30, 0.5, false), nods: 0, yaw: Vec::new() }
+        NodDetector { inner: Oscillation::new("nod", floor, Self::MAX_DOWN.max(floor), 1.0, 0.10, 0.30, 0.5, false), nods: 0, yaw: Vec::new() }
     }
 
     pub fn idle(&self, t: f32) -> bool {
@@ -1025,6 +1034,12 @@ impl ShakeDetector {
     pub const MAX_TURN: f32 = 0.10;
 
     pub fn new() -> Self {
+        Self::with_floor(Self::MIN_TURN)
+    }
+
+    /// With this person's floor (never above the default, never below 0.03).
+    pub fn with_floor(floor: f32) -> Self {
+        let floor = floor.clamp(0.03, Self::MIN_TURN);
         // A shake slides the box sideways by a fifth of its width (measured
         // 2026-09-22: 15 px on an 80 px face) and its legs run to a second.
         // A shake swings about 0.35 each way; a turn to another monitor
@@ -1032,7 +1047,7 @@ impl ShakeDetector {
         // No both-sides rule: the integrated image position drifts between
         // gestures, so "centre" is not well defined; a glance is caught by
         // its hold (the rest rule) and its size.
-        let mut inner = Oscillation::new("shake", Self::MIN_TURN, Self::MAX_TURN, 1.0, 0.60, 0.30, 1.5, false);
+        let mut inner = Oscillation::new("shake", floor, Self::MAX_TURN, 1.0, 0.60, 0.30, 1.5, false);
         // The box narrows by 7% as the head turns (recorded): not the body moving.
         inner.width_tol = 0.15;
         ShakeDetector { inner, shakes: 0 }
@@ -1049,6 +1064,60 @@ impl ShakeDetector {
         }
         hit
     }
+}
+
+/// A calibration round: watch the face for `seconds` and report how far it
+/// moved, vertically and sideways, as the largest range of the accumulated
+/// image motion over any 1.5 s (face widths). Nothing is decided; the
+/// recording is always saved (root-only) under `cal-<gesture>`.
+pub fn measure_motion(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, user: &str, gesture: &str, seconds: f32) -> Result<(f32, f32)> {
+    let t0 = Instant::now();
+    let mut trace: Vec<String> = Vec::new();
+    let mut forced = cfg.clone();
+    forced.gesture_trace = true;
+    let label: &'static str = if gesture == "shake" { "cal-shake" } else { "cal-nod" };
+    let _saver = TraceSaver { cfg: &forced, user: user.to_string(), trace: &trace as *const Vec<String>, label: std::cell::Cell::new(label) };
+    let mut prev: Option<(Grey, [f32; 4])> = None;
+    let (mut pos_x, mut pos_y) = (0f32, 0f32);
+    let mut series: Vec<(f32, f32, f32)> = Vec::new();
+    while t0.elapsed().as_secs_f32() < seconds {
+        let Some(img) = cap.next(Duration::from_secs(1))? else { continue };
+        let faces = pipeline.detector.detect(&img, cfg.min_detection)?;
+        let Some(face) = faces.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) else { continue };
+        let t = t0.elapsed().as_secs_f32();
+        if let Some((pimg, pbox)) = &prev {
+            let region = faceauth_engine::motion::Region::around(*pbox, 0.2, img.width, img.height);
+            let (dx, dy) = faceauth_engine::motion::shift(pimg, &img, region, 24);
+            pos_x += dx / face.bbox[2].max(1.0);
+            pos_y += dy / face.bbox[2].max(1.0);
+        }
+        prev = Some((img.clone(), face.bbox));
+        let pose = pose::pose(&face.landmarks);
+        let geom = (face.bbox[2], face.bbox[0] + face.bbox[2] / 2.0, face.bbox[1] + face.bbox[3] / 2.0);
+        let l = &face.landmarks;
+        if trace.len() < 1200 {
+            trace.push(format!("{:.2}/{:.3}/{:+.3}/{:.0}/{:.0}/{:.0}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.2}/{:+.3}/{:+.3}", t, pose.pitch, pose.yaw, geom.0, geom.1, geom.2, l[0][0], l[0][1], l[1][0], l[1][1], l[2][0], l[2][1], l[3][0], l[3][1], l[4][0], l[4][1], face.score, pos_x, pos_y));
+        }
+        series.push((t, pos_x, pos_y));
+    }
+    let range = |pick: fn(&(f32, f32, f32)) -> f32| -> f32 {
+        let mut best = 0f32;
+        for i in 0..series.len() {
+            let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+            for s in &series[i..] {
+                if s.0 - series[i].0 > 1.5 {
+                    break;
+                }
+                lo = lo.min(pick(s));
+                hi = hi.max(pick(s));
+            }
+            if hi > lo {
+                best = best.max(hi - lo);
+            }
+        }
+        best
+    };
+    Ok((range(|s| s.2), range(|s| s.1)))
 }
 
 /// Writes a round's per-frame recording when the round ends, if
@@ -1099,13 +1168,13 @@ impl Drop for TraceSaver<'_> {
     }
 }
 
-pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, window: Duration, nods_needed: usize, answers: Option<(&Answers, &str)>, lost_after: Option<Duration>) -> Result<Gesture> {
+pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, window: Duration, nods_needed: usize, answers: Option<(&Answers, &str)>, lost_after: Option<Duration>, floors: (f32, f32)) -> Result<Gesture> {
     let min_detection = cfg.min_detection;
     let user_name = answers.map(|(_, u)| u.to_string()).unwrap_or_else(|| "unknown".into());
     let t0 = Instant::now();
     let mut last_face = Instant::now();
-    let mut det = NodDetector::new();
-    let mut shake = ShakeDetector::new();
+    let mut det = NodDetector::with_floor(floors.0);
+    let mut shake = ShakeDetector::with_floor(floors.1);
     // The scan that matched the face just ran with the face steadily in
     // view: that counts as the still second a first leg must follow.
     det.inner.prior_still = 1.0;
@@ -1533,8 +1602,10 @@ mod shake_tests {
         }
         fn apply(&self, nod: &mut NodDetector, shake: &mut ShakeDetector) {
             nod.inner.min_thr = self.nod_min;
+            nod.inner.max_thr = nod.inner.max_thr.max(self.nod_min);
             nod.inner.thr = self.nod_min;
             shake.inner.min_thr = self.shake_min;
+            shake.inner.max_thr = shake.inner.max_thr.max(self.shake_min);
             shake.inner.thr = self.shake_min;
             for o in [&mut nod.inner, &mut shake.inner] {
                 o.rest_s = self.rest_s;
@@ -1812,6 +1883,22 @@ mod shake_tests {
             println!("{:5.2} p {:.3} y {:+.3} w {:.0} cy {:.0} | nod base {:.3} thr {:.3} dir {:+} steps {} legs {} | shake base {:+.3} thr {:.3} dir {:+} legs {} {}{}",
                 f[0], p, f[2], f[3], f[5], nod.inner.base.unwrap_or(0.0), nod.inner.thr, nod.inner.dir, nod.inner.steps, nod.inner.legs.len(),
                 shake.inner.base.unwrap_or(0.0), shake.inner.thr, shake.inner.dir, shake.inner.legs.len(), if nd { "NOD" } else { "" }, if sh { "SHAKE" } else { "" });
+        }
+    }
+
+    /// Recorded at the reference user's first calibrated floor (0.129): two
+    /// double nods (at 4 s and 34 s) that the floor-relative rest bar
+    /// cleared as "rest". Both must count at that floor and at the default.
+    #[test]
+    fn the_users_nods_count_at_their_calibrated_floor() {
+        let text = include_str!("../traces/2026-09-22-user-nods-at-calibrated-floor.txt");
+        // Both count up to the per-person cap (0.09); at 0.10 the second
+        // drops out, which is why the cap is where it is.
+        for floor in [0.06f32, 0.08, 0.09] {
+            let cfg = Cfg { nod_min: floor, ..Cfg::default_cfg() };
+            let (shakes, nods, _, nod_at) = replay_cfg(text, cfg);
+            assert!(nods >= 4, "floor {}: nods {} at {:?}", floor, nods, nod_at);
+            assert_eq!(shakes, 0);
         }
     }
 

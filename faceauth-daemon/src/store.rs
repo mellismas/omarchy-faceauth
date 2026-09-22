@@ -74,11 +74,53 @@ pub struct UserTemplates {
     /// Which recognition model produced these; a model change invalidates them.
     pub model: String,
     pub templates: Vec<Template>,
+    /// This person's gesture sizes, measured at enrolment.
+    #[serde(default)]
+    pub gesture: GestureCal,
+}
+
+/// How far this person's face moves, in face widths, when they nod and
+/// when they shake, from calibration rounds (each a recorded double
+/// gesture). The floors derive from these: the nod's only ever rises above
+/// the default (a lower floor is where false approvals live), the shake's
+/// only ever falls below it (a false refusal costs a password prompt).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct GestureCal {
+    pub nod: Vec<f32>,
+    pub shake: Vec<f32>,
+}
+
+impl GestureCal {
+    fn typical(v: &[f32]) -> Option<f32> {
+        if v.is_empty() {
+            return None;
+        }
+        let mut s = v.to_vec();
+        s.sort_by(|a, b| a.total_cmp(b));
+        Some(s[s.len() / 2])
+    }
+
+    /// (nod floor, shake floor) for this person, given the defaults.
+    pub fn floors(&self, default_nod: f32, default_shake: f32) -> (f32, f32) {
+        // 0.4 of the peak-to-peak, capped: the detector sees single legs, which
+        // run 0.14 to 0.21 on a 0.26 nod (recorded), and the floor must sit
+        // clearly under the smallest of them.
+        // Capped at 0.09: on the reference user's recording, both nods count
+        // at every floor up to 0.09 and one drops out at 0.10 (its first
+        // departure from rest is the small leg).
+        let nod = Self::typical(&self.nod).map(|a| (a * 0.4).clamp(default_nod, 0.09)).unwrap_or(default_nod);
+        let shake = Self::typical(&self.shake).map(|a| (a * 0.5).clamp(0.03, default_shake)).unwrap_or(default_shake);
+        (nod, shake)
+    }
+
+    pub fn is_calibrated(&self) -> bool {
+        !self.nod.is_empty() && !self.shake.is_empty()
+    }
 }
 
 impl UserTemplates {
     pub fn new(user: &str, model: &str) -> Self {
-        UserTemplates { version: FORMAT_VERSION, user: user.to_string(), uid: current_uid(user), model: model.to_string(), templates: Vec::new() }
+        UserTemplates { version: FORMAT_VERSION, user: user.to_string(), uid: current_uid(user), model: model.to_string(), templates: Vec::new(), gesture: GestureCal::default() }
     }
 
     /// Best cosine similarity of `embedding` against every template, and which one.
@@ -543,6 +585,33 @@ mod tests {
         let only_bound = UserTemplates { templates: vec![tmpl(vec![1.0, 0.0], 1, Some("ipu3:x"))], ..u.clone() };
         assert_eq!(only_bound.usable_on("uvc:y"), 0);
         assert!(only_bound.best_match_on(&[1.0, 0.0], "uvc:y").is_none());
+    }
+
+    #[test]
+    fn calibration_floors_only_tighten_the_nod_and_loosen_the_shake() {
+        let none = GestureCal::default();
+        assert_eq!(none.floors(0.06, 0.06), (0.06, 0.06));
+        assert!(!none.is_calibrated());
+        // A big nodder: floor rises to half the typical swing, capped.
+        let big = GestureCal { nod: vec![0.30, 0.26, 0.40], shake: vec![0.20, 0.24] };
+        let (n, s) = big.floors(0.06, 0.06);
+        assert!((n - 0.09).abs() < 1e-6, "{}", n); // 0.30 * 0.4 = 0.12, capped at 0.09
+        assert!((s - 0.06).abs() < 1e-6, "{}", s); // 0.22 * 0.5 = 0.11 > default: stays at default
+        // A light nodder: never below the default.
+        let light = GestureCal { nod: vec![0.08, 0.09], shake: vec![0.08, 0.07] };
+        let (n, s) = light.floors(0.06, 0.06);
+        assert!((n - 0.06).abs() < 1e-6, "{}", n);
+        assert!((s - 0.04).abs() < 1e-6, "{}", s); // 0.08 * 0.5, above the 0.03 minimum
+        // Stored with the templates and read back.
+        let dir = temp("cal");
+        let store = Store::open_with(&dir, Sealing::Plain("test".into())).unwrap();
+        let mut u = UserTemplates::new("alice", "glintr100");
+        u.uid = None;
+        u.templates.push(tmpl(vec![1.0, 0.0], 1, None));
+        u.gesture = light.clone();
+        store.save(&u).unwrap();
+        assert_eq!(store.load("alice").unwrap().unwrap().gesture, light);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

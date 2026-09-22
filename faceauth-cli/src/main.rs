@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth auth [--user NAME] [--socket PATH] [--consent]   (asks a running faceauthd; --consent = window + nod)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there?)\n  faceauth enroll [--user NAME] [--label TEXT] [--seconds N] [--count N]   (through the daemon)\n  faceauth enroll --store DIR ...                   (direct camera access, development)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] --token T (--dismiss | password on stdin)   (from the consent window)\n  faceauth consent-context --action ID --message TEXT [--cookie C]   (from the polkit agent, as a request starts)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence                                (current state)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
+        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth auth [--user NAME] [--socket PATH] [--consent]   (asks a running faceauthd; --consent = window + nod)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there?)\n  faceauth enroll [--user NAME] [--label TEXT] [--seconds N] [--count N]   (through the daemon)\n  faceauth enroll --store DIR ...                   (direct camera access, development)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] --token T (--dismiss | password on stdin)   (from the consent window)\n  faceauth consent-context --action ID --message TEXT [--cookie C]   (from the polkit agent, as a request starts)\n  faceauth calibrate [--user NAME] [--rounds N]   (root; two nods and two shakes, stored with the templates)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence                                (current state)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
     );
     std::process::exit(2)
 }
@@ -83,6 +83,31 @@ fn main() -> Result<()> {
             std::fs::write(&cfg_path, toml::to_string_pretty(&doc)?).with_context(|| format!("write {} (run as root)", cfg_path))?;
             let st = std::process::Command::new("systemctl").args(["restart", "faceauth.service"]).status();
             println!("presence watch {} for {} (away after {} s); service restart: {}", mode, user, away, st.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()));
+            Ok(())
+        }
+        ["calibrate", rest @ ..] => {
+            // Root: two nods and two shakes, each a recorded round, stored with
+            // the templates; the person's floors derive from them.
+            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
+            let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
+            let rounds: usize = opt(rest, "--rounds").unwrap_or("2").parse()?;
+            println!("Calibrating gestures for {}: the window will ask for {} nods and {} shakes, one round at a time.", user, rounds, rounds);
+            let mut last = None;
+            for gesture in ["nod", "shake"] {
+                for i in 1..=rounds {
+                    let o = faceauth_daemon::server::calibrate(&socket, &user, gesture, 8.0)?;
+                    match &o {
+                        faceauth_daemon::auth::Outcome::Calibrated { amplitude, stored, nod_floor, shake_floor, .. } => {
+                            println!("  {} {}/{}: moved {:.2} of a face width{}", gesture, i, rounds, amplitude, if *stored { "" } else { " (too small to count; not stored)" });
+                            last = Some((*nod_floor, *shake_floor));
+                        }
+                        other => println!("  {} {}/{}: {}", gesture, i, rounds, serde_json::to_string(other)?),
+                    }
+                }
+            }
+            if let Some((n, s)) = last {
+                println!("Floors for {}: nod {:.3}, shake {:.3} (defaults {:.3} / {:.3}).", user, n, s, faceauth_daemon::consent::NodDetector::MIN_DOWN, faceauth_daemon::consent::ShakeDetector::MIN_TURN);
+            }
             Ok(())
         }
         ["consent-context", rest @ ..] => {
@@ -1023,11 +1048,12 @@ fn doctor(rest: &[&str]) -> Result<()> {
     // daemon
     let socket = PathBuf::from("/run/faceauth/sock");
     match faceauth_daemon::server::ping(&socket, &user) {
-        Ok(faceauth_daemon::auth::Outcome::Pong { version, model, templates, sealed, unbound }) => {
+        Ok(faceauth_daemon::auth::Outcome::Pong { version, model, templates, sealed, unbound, floors }) => {
             push("daemon.running", "pass", format!("faceauthd {} answering on {}", version, socket.display()));
             push("templates.user", if templates > 0 { "pass" } else { "warn" }, format!("{} template(s) for {} ({})", templates, user, model));
             if templates > 0 {
                 push("templates.at_rest", if sealed { "pass" } else { "warn" }, if sealed { "sealed to the TPM, root-only: a copy is useless off this machine, and only root can open one here".into() } else { "plaintext at rest (root 0600): the daemon could not seal (its log says why)".into() });
+                push("gestures.calibrated", if floors.is_some() { "pass" } else { "info" }, match floors { Some((n, s)) => format!("this user's floors: nod {:.3}, shake {:.3}", n, s), None => "default floors (run 'sudo faceauth calibrate' for this user's own)".into() });
                 push("templates.camera", if unbound == 0 { "pass" } else { "warn" }, if unbound == 0 { "every template is bound to the camera that enrolled it".into() } else { format!("{} of {} template(s) predate camera binding and match on any camera; the next enrolment binds them", unbound, templates) });
             }
         }

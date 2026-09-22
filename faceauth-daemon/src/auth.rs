@@ -55,6 +55,9 @@ pub enum Outcome {
         /// Templates from before camera binding, which match on any camera.
         #[serde(default)]
         unbound: usize,
+        /// This user's gesture floors (nod, shake) if calibrated.
+        #[serde(default)]
+        floors: Option<(f32, f32)>,
     },
     /// Enrolment result.
     Enrolled { added: usize, total: usize, consistency_min: f32, consistency_mean: f32, path: String },
@@ -62,6 +65,8 @@ pub enum Outcome {
     Deleted,
     /// A polkit context was noted for the request the agent is serving.
     Noted,
+    /// A calibration round's measurement.
+    Calibrated { gesture: String, amplitude: f32, stored: bool, nod_floor: f32, shake_floor: f32 },
     /// Too many failed attempts for this user recently; try again later.
     Cooldown { seconds: u64 },
     /// The face matched but the consent gesture did not come (or the window
@@ -195,7 +200,8 @@ impl Authenticator {
         let loaded = self.store.load(user).ok().flatten();
         let templates = loaded.as_ref().map(|t| t.templates.len()).unwrap_or(0);
         let unbound = loaded.as_ref().map(|t| t.templates.iter().filter(|x| x.device.is_none()).count()).unwrap_or(0);
-        Outcome::Pong { version: env!("CARGO_PKG_VERSION").to_string(), model: faceauth_engine::embed::AURAFACE_FILE.to_string(), templates, sealed: self.store.is_sealed(user), unbound }
+        let floors = loaded.as_ref().filter(|t| t.gesture.is_calibrated()).map(|t| t.gesture.floors(crate::consent::NodDetector::MIN_DOWN, crate::consent::ShakeDetector::MIN_TURN));
+        Outcome::Pong { version: env!("CARGO_PKG_VERSION").to_string(), model: faceauth_engine::embed::AURAFACE_FILE.to_string(), templates, sealed: self.store.is_sealed(user), unbound, floors }
     }
 
     /// Enrol: capture `count` embeddings over `seconds`, spaced across the
@@ -328,6 +334,7 @@ impl Authenticator {
         let started = s.started;
         let lost_after = if cfg.presence.enabled && cfg.presence.user == s.user { Some(Duration::from_secs_f32(cfg.presence.away_seconds)) } else { None };
         let msg = format!("Recognised. Nod {} times to allow this, shake your head to refuse, or type your password.", cfg.consent_nods);
+        let floors = s.templates.gesture.floors(crate::consent::NodDetector::MIN_DOWN, crate::consent::ShakeDetector::MIN_TURN);
         let dialog_cell = std::cell::RefCell::new(&mut s.dialog);
         let caller_ref = &s.caller;
         let gesture_cell: std::cell::RefCell<Option<Gesture>> = std::cell::RefCell::new(None);
@@ -344,7 +351,7 @@ impl Authenticator {
             let mut hook = |cap: &mut IrCapture, pipeline: &mut Pipeline| -> Result<bool> {
                 let _ = dialog_cell.borrow_mut().show("nod", &msg, caller_ref, total);
                 let left = total - started.elapsed().as_secs_f32();
-                let g = wait_for_nods(cap, pipeline, &cfg, Duration::from_secs_f32(left.max(1.0)), cfg.consent_nods, Some((&answers, &user)), lost_after)?;
+                let g = wait_for_nods(cap, pipeline, &cfg, Duration::from_secs_f32(left.max(1.0)), cfg.consent_nods, Some((&answers, &user)), lost_after, floors)?;
                 let ok = matches!(g, Gesture::Nodded | Gesture::Password(_));
                 *gesture_cell.borrow_mut() = Some(g);
                 Ok(ok)
@@ -389,6 +396,56 @@ impl Authenticator {
         }
         drop(dialog_cell);
         Round::Done(self.consent_finish(s, gesture, outcome))
+    }
+
+    /// A calibration round for one gesture: the window asks for it, the face
+    /// must match, then the motion is measured for `seconds` and stored with
+    /// the templates. Root only (the server enforces it). Nothing is decided.
+    pub fn calibrate(&mut self, user: &str, gesture: &str, seconds: f32) -> Outcome {
+        let mut u = match self.store.load(user) {
+            Ok(Some(t)) => t,
+            Ok(None) => return Outcome::NotEnrolled,
+            Err(e) => return Outcome::Error { message: e.to_string() },
+        };
+        let view = u.clone();
+        let cfg = self.cfg.clone();
+        let caller = crate::consent::CallerInfo { command: format!("Calibration: {} twice, naturally", if gesture == "shake" { "shake your head" } else { "nod" }), via: "calibration".into(), ..Default::default() };
+        let mut dialog = crate::consent::Dialog::new(&cfg, user);
+        if let Err(e) = dialog.show("scanning", "Look at the camera.", &caller, seconds) {
+            return Outcome::Error { message: format!("no window to calibrate in: {}", e) };
+        }
+        let dialog_cell = std::cell::RefCell::new(&mut dialog);
+        let measured: std::cell::Cell<Option<(f32, f32)>> = std::cell::Cell::new(None);
+        let msg = if gesture == "shake" { "Recognised. Shake your head twice, the way you would to say no." } else { "Recognised. Nod twice, the way you would to say yes." };
+        let mut hook = |cap: &mut IrCapture, pipeline: &mut Pipeline| -> Result<bool> {
+            let _ = dialog_cell.borrow_mut().show("nod", msg, &caller, seconds);
+            let m = crate::consent::measure_motion(cap, pipeline, &cfg, user, gesture, seconds)?;
+            measured.set(Some(m));
+            Ok(false)
+        };
+        let scan = self.run_with_answers(&view, Some(&mut hook), cfg.consent_scan_seconds, None);
+        drop(dialog_cell);
+        dialog.hide();
+        let Some((dy, dx)) = measured.get() else {
+            return match scan {
+                Ok(o @ Outcome::NoFace { .. }) | Ok(o @ Outcome::NoMatch { .. }) | Ok(o @ Outcome::Denied { .. }) => o,
+                Ok(o) => Outcome::Error { message: format!("calibration did not run: {:?}", o) },
+                Err(e) => Outcome::Error { message: e.to_string() },
+            };
+        };
+        let (amplitude, floor_default) = if gesture == "shake" { (dx, crate::consent::ShakeDetector::MIN_TURN) } else { (dy, crate::consent::NodDetector::MIN_DOWN) };
+        // Below the default floor nothing would ever count: the sample is
+        // reported but not stored, so a missed attempt cannot lower a floor.
+        let stored = amplitude >= floor_default;
+        if stored {
+            if gesture == "shake" { u.gesture.shake.push(amplitude) } else { u.gesture.nod.push(amplitude) }
+            if let Err(e) = self.store.save(&u) {
+                return Outcome::Error { message: e.to_string() };
+            }
+        }
+        let (nf, sf) = u.gesture.floors(crate::consent::NodDetector::MIN_DOWN, crate::consent::ShakeDetector::MIN_TURN);
+        log::info!("calibration for {}: {} moved {:.3} (stored: {}); floors now nod {:.3} shake {:.3}", user, gesture, amplitude, stored, nf, sf);
+        Outcome::Calibrated { gesture: gesture.to_string(), amplitude, stored, nod_floor: nf, shake_floor: sf }
     }
 
     /// Turn a gesture and a face outcome into the verdict, show it, notify.

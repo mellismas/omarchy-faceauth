@@ -1131,3 +1131,43 @@ windows, on full-length recordings. The sweep, re-ranked to prefer the
 highest floors among the fully-correct settings, puts the nod floor at
 0.06 (from 0.04; talking moves 0.036, the light nod 0.17) and the shake at
 0.06. Installed and approved by nod at the new floor.
+
+## 2026-09-22, evening: calibration at enrolment
+
+`faceauth calibrate` (root; the Omarchy setup runs it right after the
+verification scan) raises the window four times, asks for two nods and two
+head shakes, and for each measures how far the face moved (the largest
+range of the image-motion signal over any 1.5 s, the same measure the
+batteries are surveyed with) with the daemon deciding nothing. Each round's
+recording is saved to the root-only gestures directory as `cal-nod` or
+`cal-shake`. The amplitudes are stored with the person's templates
+(`GestureCal`), and their floors derive from the median: the nod's floor is
+half the typical nod, never below the default and capped at 0.15, so it only
+ever tightens the approval gesture; the shake's is half the typical shake,
+never above the default and never below 0.03, so it only ever loosens the
+refusal. A round that moved less than the default floor is reported but not
+stored, so a missed attempt cannot lower anything. `doctor` reports the
+person's floors (`gestures.calibrated`).
+
+First run, the reference user: nods 0.26 and 0.26, shakes 0.33 and 0.36;
+floors nod 0.129, shake 0.060. A casual nod recorded earlier at 0.106 would
+sit under that floor; the light nod of the clean battery (0.17) clears it.
+The factor is one number if that trade turns out wrong.
+
+Then the first live nod at that floor was missed, twice, and the recording
+of it (two clean double nods, legs 0.14 to 0.21) showed the "rest" bar was a
+fraction of the floor: at 0.129 it was 0.045 per frame, above a nod's own
+motion, and the sequence was cleared as resting. It is an absolute 0.02 now.
+The per-person factor is 0.4 of the peak-to-peak (the detector sees single
+legs) and capped at 0.09: on that recording both nods count at every floor
+up to 0.09 and one drops out at 0.10, its first departure from rest being
+the small leg. The reference user's floor is 0.09.
+
+**Camera binding, closed on the reference machine.** An Add Look through
+the daemon (`faceauth enroll --label desk`) added ten templates and stamped
+the twenty earlier ones with the IR sensor's identity (`ipu3:ov7251
+3-0060`); `doctor`'s `templates.camera` row passes. The pairwise
+self-consistency minimum fell to 0.10 with the new look, one frame caught
+off angle; a match still needs two frames over the threshold, so it costs
+nothing on its own, and it is the look to delete and redo if unlocks ever
+slow down.
