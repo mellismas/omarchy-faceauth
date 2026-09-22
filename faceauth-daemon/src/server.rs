@@ -10,8 +10,9 @@
 //! request while one runs waits its turn (the camera is one resource).
 
 use crate::auth::{Authenticator, Outcome};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+use std::os::fd::AsFd;
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -73,6 +74,16 @@ struct Request {
     /// From the consent window: dismiss the pending request.
     #[serde(default)]
     consent_dismiss: bool,
+    /// From the consent window: the token the daemon put in its payload.
+    #[serde(default)]
+    consent_token: Option<String>,
+    /// From the polkit agent: what the request it is about to serve is.
+    #[serde(default)]
+    context_action: Option<String>,
+    #[serde(default)]
+    context_message: Option<String>,
+    #[serde(default)]
+    context_cookie: Option<String>,
 }
 
 pub fn serve(auth: Arc<Mutex<Authenticator>>, socket: &Path) -> Result<()> {
@@ -130,6 +141,19 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
         log::warn!("uid {} asked about {}: refused", cred.uid(), req.user);
         return reply(&mut stream, &Outcome::Error { message: "not permitted".into() });
     }
+    // Face authentication is local by definition: the camera sees whoever is
+    // at the machine, which says nothing about a caller reaching it over the
+    // network. Every request, the probes and window answers included, must
+    // come from a caller shown to be local; anything unprovable is remote,
+    // and the caller's PAM stack falls through to its password.
+    let peer_pidfd = getsockopt(&stream, nix::sys::socket::sockopt::PeerPidfd).ok();
+    match locality(cred.pid(), peer_pidfd.as_ref(), &req.user) {
+        Locality::Local => {}
+        Locality::Remote(why) => {
+            log::warn!("request for {} from pid {} (uid {}) refused: {}", req.user, cred.pid(), cred.uid(), why);
+            return reply(&mut stream, &Outcome::Error { message: format!("face authentication is local only: {}", why) });
+        }
+    }
     // Take the camera, or say "busy" instead of queueing behind another
     // attempt: the callers (PAM, the lock screen) retry on their own terms.
     let take = || -> Option<std::sync::MutexGuard<'_, Authenticator>> {
@@ -147,6 +171,22 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
             }
         }
     };
+    // The polkit agent, before its helper's PAM request arrives, says what
+    // the request is. Queued per user in arrival order, from the agent's
+    // own uid, single use, and only from a local caller (the gate above).
+    if let Some(action) = &req.context_action {
+        let clip = |s: &str| s.chars().filter(|c| !c.is_control()).take(300).collect::<String>();
+        let ctx = crate::consent::PolkitContext { action: clip(action), message: clip(req.context_message.as_deref().unwrap_or("")), cookie: clip(req.context_cookie.as_deref().unwrap_or("")), uid: cred.uid(), at: Instant::now() };
+        log::info!("polkit context from the agent (uid {}, pid {}): {} {}", cred.uid(), cred.pid(), ctx.action, ctx.message);
+        if let Ok(mut m) = crate::consent::CONTEXTS.lock() {
+            let q = m.entry(cred.uid()).or_default();
+            q.push_back(ctx);
+            while q.len() > 8 {
+                q.pop_front();
+            }
+        }
+        return reply(&mut stream, &Outcome::Noted);
+    }
     // Answers to a pending consent request must not wait for the camera lock:
     // the consent flow holds it. They go through the shared answer slot.
     if req.consent_password.is_some() || req.consent_dismiss {
@@ -158,12 +198,18 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
         if !is_pending {
             return reply(&mut stream, &Outcome::Error { message: "no pending request".into() });
         }
+        // Only the window the daemon summoned holds the token; a process
+        // that merely reaches the socket cannot cancel or answer a request.
+        if !crate::consent::Dialog::token_matches(&req.user, req.consent_token.as_deref()) {
+            log::warn!("consent answer for {} from uid {} pid {} without the request's token: refused", req.user, cred.uid(), cred.pid());
+            return reply(&mut stream, &Outcome::Error { message: "no pending request".into() });
+        }
         let answer = if req.consent_dismiss { crate::consent::Answer::Dismiss } else { crate::consent::Answer::Password(req.consent_password.clone().unwrap_or_default()) };
         if let Ok(mut m) = answers.lock() {
             m.insert(req.user.clone(), answer);
         }
         log::info!("consent answer for {} from uid {}: {}", req.user, cred.uid(), if req.consent_dismiss { "dismiss" } else { "password" });
-        return reply(&mut stream, &Outcome::Pong { version: env!("CARGO_PKG_VERSION").into(), model: String::new(), templates: 0, sealed: false });
+        return reply(&mut stream, &Outcome::Pong { version: env!("CARGO_PKG_VERSION").into(), model: String::new(), templates: 0, sealed: false, unbound: 0 });
     }
     if req.ping {
         let outcome = match take() {
@@ -210,14 +256,6 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
         };
         log::debug!("probe for {}: {:?}", req.user, outcome);
         return reply(&mut stream, &outcome);
-    }
-    // Face authentication is local by definition: the camera sees whoever is
-    // at the machine, which says nothing about a caller reaching it over the
-    // network. A request from a remote session is refused before any window
-    // or camera, and the caller's stack falls through to its password.
-    if let Some(why) = remote_caller(cred.pid()) {
-        log::warn!("attempt for {} from pid {} refused: {}", req.user, cred.pid(), why);
-        return reply(&mut stream, &Outcome::Error { message: format!("face authentication is local only: {}", why) });
     }
     log::info!("attempt for {} (uid {}, pid {}{})", req.user, cred.uid(), cred.pid(), if req.consent { ", consent" } else { "" });
     let outcome = if req.consent {
@@ -306,49 +344,130 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
             None => Outcome::Error { message: "busy".into() },
         }
     };
-    log::info!("attempt for {}: {:?}", req.user, outcome);
-    // Scores stay in the log; only root gets them on the wire.
+    // Scores go to root peers only, and not to the journal (readable by
+    // wheel on Omarchy): the info line carries the redacted outcome.
+    log::info!("attempt for {}: {:?}", req.user, outcome.clone().redacted());
+    log::debug!("attempt for {}: {:?}", req.user, outcome);
     let outcome = if cred.uid() == 0 { outcome } else { outcome.redacted() };
     reply(&mut stream, &outcome)
 }
 
-/// Why `pid` counts as a remote caller, if it does: an sshd in its ancestry
-/// (the shell of an SSH login, or anything it started), or a logind session
-/// that logind itself marks remote (which also covers a tmux or screen server
-/// left behind by an SSH login and attached locally later). A process in no
-/// logind session at all (the desktop's user services, the lock screen's PAM
-/// helper) is local.
-fn remote_caller(pid: i32) -> Option<String> {
+/// Where a request comes from, as far as the daemon can prove it.
+pub enum Locality {
+    Local,
+    Remote(String),
+}
+
+/// A positive, fail-closed check: a caller is local when the daemon can show
+/// it is, and remote otherwise (any read error, timeout or unfamiliar shape).
+///
+/// 1. Any `sshd` or `sshd-session` in the parent chain: remote.
+/// 2. Root in `/system.slice/`: local (the daemon's own helpers, root's cron).
+/// 3. In a logind session scope (`session-N.scope`): local only if logind
+///    says that session is not remote and is on a seat.
+/// 4. Inside the target user's own manager (`user-<uid>.slice/user@<uid>.service`,
+///    where every desktop app and the lock screen's PAM helper lives, with no
+///    session scope of its own): local only if that user has a live session on
+///    a seat that logind does not mark remote.
+/// 5. Anything else: remote.
+///
+/// The concession in step 4, written here rather than discovered later: a
+/// same-uid process inside the user manager counts as local whenever the
+/// user has a local session, and provenance cannot tell a same-uid remote
+/// shell that asked the manager to fork for it (`systemd-run --user`) from a
+/// local one. What stands between that and root is the consent window, which
+/// names the requester, and the nod, which a remote shell cannot produce.
+///
+/// `pidfd`, when the kernel gives one (SO_PEERPIDFD), is checked after the
+/// reads: a caller that exits before its /proc is read is not local.
+fn locality(pid: i32, pidfd: Option<&std::os::fd::OwnedFd>, target_user: &str) -> Locality {
+    match locality_inner(pid, target_user) {
+        Ok(l) => {
+            if let (Locality::Local, Some(fd)) = (&l, pidfd) {
+                if process_exited(fd) {
+                    return Locality::Remote("caller exited before it could be verified".into());
+                }
+            }
+            l
+        }
+        Err(e) => Locality::Remote(format!("cannot verify the caller: {}", e)),
+    }
+}
+
+fn locality_inner(pid: i32, target_user: &str) -> Result<Locality> {
+    // 1. Ancestry. The chain must reach init; a break means the caller (or a
+    // parent) vanished mid-read, which is not a demonstration of anything.
     let mut p = pid;
-    for _ in 0..64 {
-        let Some(pp) = crate::consent::ppid_of(p) else { break };
+    for _ in 0..128 {
+        let pp = crate::consent::ppid_of(p).ok_or_else(|| anyhow::anyhow!("process {} unreadable", p))?;
         if pp <= 1 {
             break;
         }
         let comm = crate::consent::comm_of(pp);
         if is_ssh_comm(&comm) {
-            return Some(format!("started under {} (pid {})", comm, pp));
+            return Ok(Locality::Remote(format!("started under {} (pid {})", comm, pp)));
         }
         p = pp;
     }
-    let cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", pid)).unwrap_or_default();
-    if let Some(id) = session_id_from_cgroup(&cgroup) {
-        let out = std::process::Command::new("/usr/bin/timeout")
-            .args(["5", "/usr/bin/loginctl", "show-session", &id, "-p", "Remote", "--value"])
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .output();
-        match out {
-            Ok(o) if o.status.success() => {
-                if String::from_utf8_lossy(&o.stdout).trim() == "yes" {
-                    return Some(format!("logind session {} is remote", id));
-                }
-            }
-            Ok(o) => log::debug!("loginctl show-session {}: {}", id, String::from_utf8_lossy(&o.stderr).trim()),
-            Err(e) => log::debug!("loginctl: {}", e),
-        }
+    let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).context("read caller status")?;
+    let real_uid: u32 = status.lines().find_map(|l| l.strip_prefix("Uid:")).and_then(|v| v.split_whitespace().next()).and_then(|s| s.parse().ok()).ok_or_else(|| anyhow::anyhow!("no uid in status"))?;
+    let cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", pid)).context("read caller cgroup")?;
+    let path = cgroup.lines().find_map(|l| l.splitn(3, ':').nth(2)).ok_or_else(|| anyhow::anyhow!("no cgroup path"))?.to_string();
+    // 2. Root's own services.
+    if real_uid == 0 && path.starts_with("/system.slice/") {
+        return Ok(Locality::Local);
     }
-    None
+    // 3. A logind session of its own.
+    if let Some(id) = session_id_from_cgroup(&cgroup) {
+        return Ok(match session_is_local(&id)? {
+            true => Locality::Local,
+            false => Locality::Remote(format!("logind session {} is remote or seatless", id)),
+        });
+    }
+    // 4. The target user's manager.
+    let target_uid = user_uid(target_user).ok_or_else(|| anyhow::anyhow!("unknown user {}", target_user))?;
+    if path.starts_with(&format!("/user.slice/user-{}.slice/user@{}.service/", target_uid, target_uid)) {
+        let sessions = loginctl(&["show-user", &target_uid.to_string(), "-p", "Sessions", "--value"])?;
+        for id in sessions.split_whitespace() {
+            if session_is_local(id)? {
+                return Ok(Locality::Local);
+            }
+        }
+        return Ok(Locality::Remote(format!("{} has no local session on a seat", target_user)));
+    }
+    Ok(Locality::Remote(format!("caller in {} is not a session of {}", path.trim(), target_user)))
+}
+
+/// Does logind put this session on a seat, not remote, as a user session?
+fn session_is_local(id: &str) -> Result<bool> {
+    let out = loginctl(&["show-session", id, "-p", "Remote", "-p", "Seat", "-p", "Class"])?;
+    let get = |k: &str| out.lines().find_map(|l| l.strip_prefix(k).and_then(|r| r.strip_prefix('='))).unwrap_or("").trim().to_string();
+    Ok(get("Remote") == "no" && !get("Seat").is_empty() && get("Class") == "user")
+}
+
+fn loginctl(args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("/usr/bin/timeout")
+        .args(["-k", "2", "5", "/usr/bin/loginctl"])
+        .args(args)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .context("run loginctl")?;
+    if !out.status.success() {
+        bail!("loginctl {}: {} {}", args.join(" "), out.status, String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// A pidfd polls readable once its process has exited.
+fn process_exited(fd: &std::os::fd::OwnedFd) -> bool {
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    let mut fds = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
+    match poll(&mut fds, PollTimeout::ZERO) {
+        Ok(n) if n > 0 => true,
+        Ok(_) => false,
+        Err(_) => true,
+    }
 }
 
 /// OpenSSH's per-connection processes: `sshd` up to 9.7, `sshd-session`
@@ -376,7 +495,7 @@ fn session_id_from_cgroup(cgroup: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod remote_tests {
+mod locality_tests {
     use super::*;
 
     #[test]
@@ -384,28 +503,54 @@ mod remote_tests {
         assert!(is_ssh_comm("sshd"));
         assert!(is_ssh_comm("sshd-session"));
         assert!(!is_ssh_comm("bash"));
-        assert!(!is_ssh_comm("sshd-agent")); // not an OpenSSH process; a lookalike is not a remote login
+        assert!(!is_ssh_comm("sshd-agent"));
     }
 
     #[test]
     fn session_ids_from_cgroups() {
         assert_eq!(session_id_from_cgroup("0::/user.slice/user-1000.slice/session-3.scope\n"), Some("3".into()));
         assert_eq!(session_id_from_cgroup("0::/user.slice/user-1000.slice/session-c1.scope"), Some("c1".into()));
-        // The desktop's app scope: no logind session, so local.
+        // The desktop's app scope and systemd-run --user: no logind session of their own.
         assert_eq!(session_id_from_cgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-graphical.slice/app-Hyprland-xdg\\x2dterminal\\x2dexec-af100da6.scope"), None);
+        assert_eq!(session_id_from_cgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/run-p193148-i205978.service"), None);
         assert_eq!(session_id_from_cgroup("0::/system.slice/faceauth.service"), None);
         assert_eq!(session_id_from_cgroup("0::/user.slice/session-.scope"), None);
     }
 
     #[test]
-    fn this_test_process_is_local() {
-        // cargo test runs from a terminal or CI, never over a path this should call remote
-        // unless the developer is on SSH, in which case the refusal is the point.
-        let r = remote_caller(std::process::id() as i32);
+    fn a_vanished_caller_is_not_local() {
+        // A pid that cannot exist: every read fails, and failure is remote.
+        match locality(i32::MAX - 1, None, "root") {
+            Locality::Remote(why) => assert!(why.contains("cannot verify"), "{}", why),
+            Locality::Local => panic!("an unreadable caller must not be local"),
+        }
+    }
+
+    #[test]
+    fn a_process_that_exited_is_not_local() {
+        use std::os::fd::FromRawFd;
+        let child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) };
+        assert!(raw >= 0, "pidfd_open");
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
+        let mut child = child;
+        child.wait().unwrap();
+        assert!(process_exited(&fd));
+    }
+
+    /// This test process is local when the developer is at the machine and
+    /// remote over SSH; either way the answer must be the true one.
+    #[test]
+    fn this_test_process_is_classified() {
+        let me = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        let r = locality(std::process::id() as i32, None, &me);
         if std::env::var_os("SSH_CONNECTION").is_some() {
-            assert!(r.is_some(), "running over SSH should be detected");
-        } else {
-            assert!(r.is_none(), "{:?}", r);
+            assert!(matches!(r, Locality::Remote(_)), "running over SSH should be remote");
+        } else if std::path::Path::new("/run/systemd/seats/seat0").exists() {
+            match r {
+                Locality::Local => {}
+                Locality::Remote(why) => panic!("a shell on the console should be local: {}", why),
+            }
         }
     }
 }
@@ -568,12 +713,17 @@ fn request(socket: &Path, user: &str, probe: bool, timeout: Duration) -> Result<
     send(socket, serde_json::json!({ "user": user, "probe": probe }), Some(timeout))
 }
 
-pub fn consent_answer(socket: &Path, user: &str, password: Option<&str>, dismiss: bool) -> Result<Outcome> {
+pub fn consent_answer(socket: &Path, user: &str, password: Option<&str>, dismiss: bool, token: Option<&str>) -> Result<Outcome> {
     let body = match password {
-        Some(pw) => serde_json::json!({ "user": user, "consent_password": pw }),
-        None => serde_json::json!({ "user": user, "consent_dismiss": dismiss }),
+        Some(pw) => serde_json::json!({ "user": user, "consent_password": pw, "consent_token": token }),
+        None => serde_json::json!({ "user": user, "consent_dismiss": dismiss, "consent_token": token }),
     };
     send(socket, body, Some(Duration::from_secs(3)))
+}
+
+/// From the polkit agent: what the request it is about to serve is.
+pub fn consent_context(socket: &Path, user: &str, action: &str, message: &str, cookie: &str) -> Result<Outcome> {
+    send(socket, serde_json::json!({ "user": user, "context_action": action, "context_message": message, "context_cookie": cookie }), Some(Duration::from_secs(3)))
 }
 
 /// A consent request: the reply comes when the user answers the window, or

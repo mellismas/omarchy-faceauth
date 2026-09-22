@@ -14,6 +14,11 @@ pub struct Pose {
     pub pitch: f32,
     /// Eye-line tilt in radians; 0 is level.
     pub roll: f32,
+    /// Vertical nose position below the eye line, in inter-eye distances:
+    /// the pitch measure that does not involve the mouth. About 0.5 level,
+    /// higher looking down. Steady to a thousandth per frame on a still
+    /// face, unmoved by talking; a light nod swings it by 0.03.
+    pub nose_pitch: f32,
     pub inter_eye: f32,
 }
 
@@ -35,7 +40,8 @@ pub fn pose(l: &[[f32; 2]; 5]) -> Pose {
     let m = rot(mouth_mid, eye_mid);
     let yaw = n[0] / inter_eye;
     let pitch = if m[1].abs() > 1.0 { n[1] / m[1] } else { 0.5 };
-    Pose { yaw, pitch, roll, inter_eye }
+    let nose_pitch = n[1] / inter_eye;
+    Pose { yaw, pitch, roll, inter_eye, nose_pitch }
 }
 
 /// Facing the camera closely enough to count as attention.

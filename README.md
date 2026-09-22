@@ -378,7 +378,7 @@ PASS    models.file          face_detection_yunet_2023mar.onnx: verified, MIT
 PASS    models.file          glintr100.onnx: verified, Apache-2.0
 PASS    daemon.running       faceauthd 0.1.0 answering on /run/faceauth/sock
 PASS    templates.user       10 template(s) for mellis (glintr100.onnx)
-WARN    templates.at_rest    templates are plaintext at rest (root 0600); TPM sealing not implemented
+WARN    templates.at_rest    templates are plaintext at rest (root 0600); TPM sealing not implemented   (as of this section; sealed since 2026-09-21, see below)
 PASS    pam.sudo             wired, prompt (Enter to scan)
 PASS    pam.polkit           wired, prompt (Enter to scan)
 PASS    pam.lock             wired, closed by pam_deny
@@ -436,7 +436,9 @@ Accepted for now, and written into the threat model rather than hidden:
 - **No impostor distribution yet.** All evidence is one subject and one print.
   Before this ships as a sudo factor it needs other people's faces measured.
 - Templates outlive an account of the same name (no uid in the file); TPM
-  sealing waits on a machine that has one.
+  sealing waits on a machine that has one. (Both fixed since: the file
+  carries the uid, and templates are sealed on a machine with a TPM; see
+  2026-09-21, night.)
 
 Lesson from the verification itself: never give an ad-hoc `systemd-run` test
 `RuntimeDirectory=faceauth`; systemd removes that directory when the transient
@@ -840,59 +842,123 @@ each user's template JSON through `systemd-creds encrypt --with-key=tpm2
 crates, no crypto of our own: systemd is already a dependency and its
 credential format is AES-256-GCM under a key only this TPM unwraps. No PCR
 policy in this first cut, so a kernel or firmware update does not strand the
-templates; binding to PCR 7 can come once Secure Boot is on. There is no
-recovery key anywhere on disk, on purpose: Facelock's TPM mode keeps a
-plaintext copy of its key beside the sealed one (and its reseal command
-recommends it), which reduces the TPM to file permissions. Here a template
-that cannot be unsealed is re-enrolled, twelve seconds. A plaintext
+templates; binding to PCR 7 can come once Secure Boot is on.
+
+What that buys, precisely, because the first draft of this section claimed
+more than the first cut delivered: a copy of the file is useless anywhere but
+this machine (a backup, an imaged partition, a support tarball, a synced
+folder), and on this machine only root can open it. The first cut sealed
+system-scoped credentials, and PID 1 serves those to any local caller over
+`/run/systemd/io.systemd.Credentials` (mode 0666): the review unsealed a
+blob as the ordinary user, and minted one. So the credential is now scoped
+to root (`--uid=0`), which systemd allows only with the host secret in the
+mix (`--with-key=host+tpm2`; `/var/lib/systemd/credential.secret`, root-only,
+0400). Measured: root and the daemon's sandbox open the blob; the user gets
+`InteractiveAuthenticationRequired` trying to open or to mint one. The trade
+is that one root-only secret file on disk, which is worth it: a program that
+can read it is already root. Older system-scoped blobs are still read and
+re-sealed root-only on first load. A live USB booted on this hardware, once
+the LUKS volume is unlocked, still unseals (nothing binds to boot state, and
+the host secret is on the volume). The thief with the powered-off laptop
+gets nothing, because the root volume needs its passphrase; that holds only
+while it does (enrolling the LUKS key in the TPM for convenience would end
+it).
+
+There is no recovery key anywhere on disk, on purpose: Facelock's TPM mode
+keeps a plaintext copy of its key beside the sealed one (and its reseal
+command recommends it), which reduces the TPM to file permissions. Here a
+template that cannot be unsealed is re-enrolled: enrolment sets an unreadable
+blob aside as `<user>.cred.unreadable-<time>` and starts fresh, so a cleared
+TPM, a firmware reset, or Windows clearing the security processor means
+re-enrolment and nothing else; the password path is unaffected. Sealing is
+sticky: a daemon that finds a sealed file but failed its TPM probe at start
+(which happened once tonight, before the unit allowed `/dev/tpmrm0`) refuses
+to write plaintext over it, re-trying the TPM once first. A plaintext
 `<user>.json` met by a store that can seal is sealed on first load and the
-plaintext removed; on a machine without a working TPM the store stays
-plaintext and `doctor` and enrolment say so. Unsealing costs about a second
-of TPM time, so the daemon caches templates against the file they came from.
-The daemon's sandbox needed one line: `DeviceAllow=/dev/tpmrm0 rw`. A stale
-copy of the unit in `/etc/systemd/system` from the first dev install shadowed
-the packaged one for a while (moved aside to `/var/backups/faceauth`).
+plaintext unlinked from the live tree. Unlinked, not erased: snapper took a
+snapshot of `/` this morning, `/var/lib` is inside it, and the pre-migration
+plaintext sits in `/.snapshots/3` until that snapshot is deleted; on a
+copy-on-write filesystem free-block residue is a second copy no overwrite
+reliably removes. A machine that ever held plaintext templates should be
+treated as still holding them until its old snapshots are gone. Unsealing
+costs about a second of TPM time, so the daemon caches templates against the
+file they came from; the cache is memory, and the unit now sets `LimitCORE=0`
+so a crash does not write it to disk. Swap (a 15.5 GiB swapfile behind zram
+here) and hibernation can still put daemon memory on the encrypted volume;
+accepted in writing rather than closed. Templates per user are capped at 40,
+because a sealed credential tops out at 1 MiB (about 90 templates) and the
+plaintext path should not behave differently. The daemon's sandbox needed
+one line: `DeviceAllow=/dev/tpmrm0 rw`. A stale copy of the unit in
+`/etc/systemd/system` from the first dev install shadowed the packaged one
+for a while (moved aside to `/var/backups/faceauth`).
 
 Measured: `mellis.json` (221 KB) became `mellis.cred` (299 KB, 0600) on the
 first ping after the restart; a fresh daemon's first attempt paid 1.8 s for
 the unseal, the next 0.57 s; a copy of the blob renamed to another user does
-not open (name-bound). `doctor` now reports `templates.at_rest` as PASS,
-sealed, from the daemon's own answer.
+not open. `doctor` reports `templates.at_rest` from the daemon's own answer.
 
-**Face authentication is local only.** A request whose caller was started
-under `sshd` or `sshd-session`, or sits in a logind session that logind marks
-remote, is refused by the daemon before any window or camera, and the PAM
-stack falls through to its password. The check is the daemon's, from `/proc`
-and logind, not the module's: the module runs inside the caller's process,
-where environment and PAM items are the caller's to set. (The module does
-also abstain when `PAM_RHOST` is set, as the cheap first gate.) A process in
-no logind session at all, which is every desktop app under `user@.service`
-and the lock screen's PAM helper, is local. That last point is the trap
-#11612 fell into: Facelock refuses any caller without a resolvable logind
-session, Quickshell's PAM helper has none, and the PR's fix was to turn
-Facelock's remote check off in its one global config file, which also turns it
-off for sudo and polkit.
+**Face authentication is local only, as far as it can be shown.** The first
+cut of this check asked two negative questions (an `sshd` in the ancestry? a
+logind session marked remote?) and the review of it walked past both with one
+command: `systemd-run --user --pipe sudo ...` from an SSH shell is forked by
+the user's own manager, so no sshd is above it and it sits in `app.slice`
+with no session scope. Rewritten as a positive, fail-closed check, above
+every request type (probes, pings and window answers included), from
+`/proc` and logind rather than from anything the caller controls: an sshd
+ancestor is remote; root in `system.slice` is local; a process in a logind
+session scope is local only if logind puts that session on a seat and not
+remote; a process inside the target user's own manager (every desktop app,
+and the lock screen's PAM helper, which has no session scope of its own) is
+local only if that user has a live session on a seat that logind does not
+mark remote; anything else, and any read error, timeout or vanished caller
+(the peer pidfd is polled after the reads), is remote. The concession is
+written in the code comment rather than left to be found: a same-uid process
+inside the user manager counts as local whenever the user has a local
+session, and provenance cannot separate a same-uid remote shell that borrowed
+the manager's fork from a local one. What stands between that and root is
+the consent window, which names the requester, and the nod, which a remote
+shell cannot produce. The trap #11612 fell into is the same one: Facelock
+refuses any caller without a resolvable logind session, Quickshell's helper
+has none, and the PR's fix was to turn the check off globally.
+
+Window answers now carry a per-request token. The daemon puts it in the
+payload it summons the window with, the window hands it back with every
+dismissal or password, and an answer without it is refused: a process that
+can reach the socket but did not see the window cannot cancel or answer a
+request (the review cancelled a live parked request with one unprivileged
+socket write before this).
 
 Measured, sshd started for the test and stopped after: `ssh localhost sudo
-true` with a pty put `attempt for mellis from pid 136186 refused: started
-under sshd-session (pid 136184)` in the journal and a password prompt on the
-SSH side, no window on the desktop. (`sudo -n` proves nothing: sudo refuses
-non-interactive password auth before it calls PAM at all.)
+true` with a pty put `refused: started under sshd-session (pid 136184)` in
+the journal and a password prompt on the SSH side, no window on the desktop.
+(`sudo -n` proves nothing: sudo refuses non-interactive password auth before
+it calls PAM at all.) The positive check's other branches are unit-tested
+against recorded cgroup strings and the running test process.
 
 **Templates are bound to the camera that enrolled them.** Each template
 records `IrCapture::identity` (`ipu3:<sensor entity>` on IPU3 machines,
-`uvc:<driver>:<card>:<bus>` elsewhere) and only matches on that camera; an
-attempt on a camera with nothing usable is an error, logged with both names,
-so a camera swapped in for the enrolled one has nothing to match against.
-Templates from before this (no device) match anywhere until re-enrolled.
-Adopted from Facelock, which has it on by default.
+`uvc:<driver>:<card>:<bus>` elsewhere) and only matches on that camera, in
+attempts and in the presence watch; an attempt on a camera with nothing
+usable is an error, logged with both names, so a camera swapped in for the
+enrolled one has nothing to match against. Templates from before this carry
+no device and match anywhere, which on this machine was all twenty of them,
+so the binding was inert until re-enrolment; and since enrolment appends, one
+unbound template would keep the door open for every camera. Enrolment
+through the daemon now binds any unbound templates to the camera it just
+used (they were enrolled on this machine's one IR camera), and `doctor` has a
+`templates.camera` row that says how many are unbound. Adopted from Facelock,
+which has it on by default.
 
-**No scores for callers.** Match and no-match replies carry the best cosine
-score only to root; any other peer (the lock screen's helper, the CLI as a
-user) gets the verdict, frames and time. A score visible to an unprivileged
-process is a hill-climbing oracle for tuning a spoof. Scores stay in the
-daemon's log. Measured: `faceauth auth` as the user now answers
-`{"result":"match","frames":2,"elapsed_ms":1771}`.
+**No scores for callers, and none in the journal.** Match and no-match
+replies carry the best cosine score only to root; any other peer (the lock
+screen's helper, the CLI as a user) gets the verdict, frames and time. A score
+visible to an unprivileged process is a hill-climbing oracle for tuning a
+spoof. The first cut kept the scores in the daemon's log, which on Omarchy is
+readable by group `wheel`, so the owner's account read every per-frame trail
+with threshold markers and the presence watch's identity score every few
+seconds, with exposure and gain: strictly more than the wire ever gave. Those
+lines are debug now; info carries counts. Measured: `faceauth auth` as the
+user answers `{"result":"match","frames":2,"elapsed_ms":1771}`.
 
 For the record, two things the comparison first flagged as gaps and were not:
 the daemon already rate-limits (five failures in a minute, counted only when a
@@ -902,3 +968,74 @@ with "ir" in their names matched a name heuristic. And one honest limit,
 stated because a reviewer will find it: the flash-response liveness gate has
 been measured against a phone screen and a paper print, not against a video
 rendered on a display an IR camera can see. It is not claimed to stop that.
+
+## 2026-09-22: a head shake refuses, and the nod is re-tuned on a recorded battery
+
+**The shake.** A refusal by gesture, the pair to the nod: two head shakes
+(left-right-left-right, or starting on the other side) at the consent
+window end the request as refused and take the window down, the same as the
+Dismiss button. Both gestures are read by one detector (`Oscillation` in
+`consent.rs`): four legs of alternating direction, each a clear excursion,
+done together within a short span, from a head that was still just before
+and does not move its face elsewhere meanwhile. A rest is allowed only at
+the midpoint, between the two motions; a rest after the first or third leg
+is what a glance does (it turns, holds, comes back) and ends the sequence.
+A shake must swing to both sides of centre, since a glance goes one way
+and returns, and has a size ceiling, since a turn to another monitor
+measures far past any shake. A shake is the safe direction (a false one
+costs a password prompt), so its floor sits lower than the nod's.
+
+**What went wrong first, in order.** The first detector build approved
+root twice with the user sitting still: the face-detector fit flickered
+between two solutions, which steps the mouth-based pitch measure by 0.02 to
+0.05 for a frame (or holds it for four), and four such steps within the
+span read as legs. A filter on those jumps fixed the recorded cases and
+then, in the calibration battery, turned out to throw away the middle of
+real shakes (the box narrows as the head turns, which looked like the same
+jump). A nod was also mis-read from the perspective wobble of a shake
+(fixed: a nod requires yaw to stay quiet over its span), and a "no rest
+mid-gesture" rule refused the beat between the user's two nods (fixed: the
+midpoint rest).
+
+**The battery.** Twenty labelled consent windows through the CLI (which
+grants nothing), each about 14 s: still (2), nod (3), slow nod, light nod,
+shake (3), slow shake, glance (2), look down (2), read, lean in, talk, a
+single nod, a single shake. Every frame is recorded at debug level as
+`t/pitch/yaw/width/cx/cy` plus the five landmarks and the detector score,
+so any pose measure can be evaluated offline from the same recording; the
+recordings live in `faceauth-daemon/traces/cal/` and replay in
+`cal_report` (per file, with rejection reasons under `RUST_LOG=debug`),
+`cal_dump` (per frame) and `cal_sweep` (a grid over the tunables, ranked by
+zero false positives then sensitivity). The first thing the battery showed
+was that the mouth-based pitch is the wrong signal: on a still face it
+wanders as much in a second and a half as a nod moves it, and talking moves
+the mouth landmarks it depends on (talking read as four nods). The nose's
+position below the eye line, in inter-eye distances, is steady to a
+thousandth per frame on a still face and unmoved by talking; the nod
+detector reads that now. On it, every filter variant cost real gestures
+and bought no safety, so there is none: the shape rules carry it.
+
+**Where it stands** (the battery is the regression suite,
+`calibration_battery_holds`): zero false positives on every non-gesture
+recording, including talking, reading, both look-downs, both glances, the
+lean and the singles; three of five nod recordings and four of four shakes
+count. The two missed nods are a noisy small zigzag and the light nod,
+whose swing (0.02) sits under the floor (0.025); lowering the floor is
+where false approvals live, so they stay missed until per-person
+calibration at enrolment (two nods and two shakes recorded, thresholds
+raised toward the person's own amplitude for the nod, loosened for the
+shake, the shape rules fixed) can set the floor from their samples rather
+than from one user's. Live on the tuned build: the install approved by nod
+in 3.3 s, a labelled polkit request in 3.1 s.
+
+**The window names the request.** polkit's PAM helper carries nothing
+about the request, and on polkit 127 it is socket-activated by systemd, so
+it is not even the agent's child; the daemon's process search named
+requests "a polkit action" often. The agent, which hears the action id and
+the message from polkitd, now tells the daemon as each request starts
+(`faceauth consent-context`, queued per user in arrival order, single use;
+polkit serves one request per agent at a time, in that order), and the
+window shows polkit's own message: "Authentication is needed to run
+`/usr/bin/true …` as the super user". Measured on the first try after the
+fix landed (the first version keyed on the helper's parent pid, which is
+systemd, and never matched).

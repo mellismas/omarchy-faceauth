@@ -52,11 +52,16 @@ pub enum Outcome {
         /// Whether this user's templates rest sealed to the TPM.
         #[serde(default)]
         sealed: bool,
+        /// Templates from before camera binding, which match on any camera.
+        #[serde(default)]
+        unbound: usize,
     },
     /// Enrolment result.
     Enrolled { added: usize, total: usize, consistency_min: f32, consistency_mean: f32, path: String },
     /// Templates deleted.
     Deleted,
+    /// A polkit context was noted for the request the agent is serving.
+    Noted,
     /// Too many failed attempts for this user recently; try again later.
     Cooldown { seconds: u64 },
     /// The face matched but the consent gesture did not come (or the window
@@ -141,6 +146,9 @@ impl Authenticator {
         let pipeline = Pipeline::load(&cfg.models_dir)?;
         let store = Store::open(&cfg.store_dir)?;
         log::info!("templates rest {}", store.sealing().describe());
+        if let crate::store::Sealing::Plain(_) = store.sealing() {
+            log::warn!("templates would be written in plaintext (see above); a store that already holds sealed templates refuses to downgrade");
+        }
         Ok(Authenticator { cfg, pipeline, store, last_match: Default::default(), failures: Default::default(), answers: Default::default(), pending: Default::default(), last_consent: Default::default(), session_locked_at: None, last_exposure: None })
     }
 
@@ -184,8 +192,10 @@ impl Authenticator {
     }
 
     pub fn ping(&self, user: &str) -> Outcome {
-        let templates = self.store.load(user).ok().flatten().map(|t| t.templates.len()).unwrap_or(0);
-        Outcome::Pong { version: env!("CARGO_PKG_VERSION").to_string(), model: faceauth_engine::embed::AURAFACE_FILE.to_string(), templates, sealed: self.store.is_sealed(user) }
+        let loaded = self.store.load(user).ok().flatten();
+        let templates = loaded.as_ref().map(|t| t.templates.len()).unwrap_or(0);
+        let unbound = loaded.as_ref().map(|t| t.templates.iter().filter(|x| x.device.is_none()).count()).unwrap_or(0);
+        Outcome::Pong { version: env!("CARGO_PKG_VERSION").to_string(), model: faceauth_engine::embed::AURAFACE_FILE.to_string(), templates, sealed: self.store.is_sealed(user), unbound }
     }
 
     /// Enrol: capture `count` embeddings over `seconds`, spaced across the
@@ -200,7 +210,19 @@ impl Authenticator {
 
     fn run_enroll(&mut self, user: &str, label: &str, seconds: f32, count: usize) -> Result<Outcome> {
         use crate::store::{now_secs, Template, UserTemplates};
-        let mut u = self.store.load(user)?.unwrap_or_else(|| UserTemplates::new(user, faceauth_engine::embed::AURAFACE_FILE));
+        // Enrolment is the recovery path for a blob this machine can no longer
+        // open (a cleared TPM, a firmware reset): set it aside and start fresh.
+        let existing = match self.store.load(user) {
+            Ok(t) => t,
+            Err(e) => match self.store.set_aside_unreadable(user)? {
+                Some(aside) => {
+                    log::warn!("enrolment for {}: existing templates unreadable ({}); set aside as {} and starting fresh", user, e, aside.display());
+                    None
+                }
+                None => return Err(e),
+            },
+        };
+        let mut u = existing.unwrap_or_else(|| UserTemplates::new(user, faceauth_engine::embed::AURAFACE_FILE));
         if u.model != faceauth_engine::embed::AURAFACE_FILE {
             return Ok(Outcome::Error { message: format!("existing templates are for model {}; delete them first", u.model) });
         }
@@ -240,6 +262,17 @@ impl Authenticator {
         }
         let now = now_secs();
         let added = samples.len();
+        // Templates from before camera binding match on any camera. They were
+        // enrolled on this machine's IR camera, which the enrolment running
+        // now has just used, so bind them to it rather than leave one unbound
+        // template holding the door open for every camera.
+        let legacy = u.templates.iter().filter(|t| t.device.is_none()).count();
+        if legacy > 0 {
+            for t in u.templates.iter_mut().filter(|t| t.device.is_none()) {
+                t.device = Some(device.clone());
+            }
+            log::info!("enrolment for {}: {} earlier template(s) bound to {}", user, legacy, device);
+        }
         for (e, q, w) in samples {
             u.templates.push(Template { embedding: e, quality: q, face_width: w, created: now, label: label.to_string(), device: Some(device.clone()) });
         }
@@ -294,7 +327,7 @@ impl Authenticator {
         let total = s.total;
         let started = s.started;
         let lost_after = if cfg.presence.enabled && cfg.presence.user == s.user { Some(Duration::from_secs_f32(cfg.presence.away_seconds)) } else { None };
-        let msg = format!("Recognised. Nod {} times to allow this, or type your password.", cfg.consent_nods);
+        let msg = format!("Recognised. Nod {} times to allow this, shake your head to refuse, or type your password.", cfg.consent_nods);
         let dialog_cell = std::cell::RefCell::new(&mut s.dialog);
         let caller_ref = &s.caller;
         let gesture_cell: std::cell::RefCell<Option<Gesture>> = std::cell::RefCell::new(None);
@@ -419,6 +452,7 @@ impl Authenticator {
             // the module ignores it and the terminal password is the floor.
             (Some(Gesture::Timeout), o @ Outcome::Match { .. }) => Outcome::ConsentDenied { reason: "no answer".into(), elapsed_ms: elapsed_of(&o) },
             (Some(Gesture::Dismissed), o) => Outcome::ConsentDenied { reason: "dismissed".into(), elapsed_ms: elapsed_of(&o) },
+            (Some(Gesture::Shaken), o) => Outcome::ConsentDenied { reason: "shaken".into(), elapsed_ms: elapsed_of(&o) },
             (Some(Gesture::Password(_)), o) if !password_ok => Outcome::ConsentDenied { reason: "wrong password".into(), elapsed_ms: elapsed_of(&o) },
             (_, o) => o,
         };
@@ -433,19 +467,24 @@ impl Authenticator {
                 notify(&self.cfg, user, &format!("Root access granted by {}", how), &format!("{}\n{}", caller.command, caller.parents));
                 log::info!("consent granted ({}) for {}: {} [{}]", how, user, caller.command, caller.parents);
             }
-            Outcome::ConsentDenied { reason, .. } if matches!(gesture, Some(Gesture::Dismissed)) || reason == "dismissed" => {
-                // The user closed the window; do not put it back up with a
-                // verdict on it.
+            Outcome::ConsentDenied { reason, .. } if matches!(gesture, Some(Gesture::Dismissed | Gesture::Shaken)) || reason == "dismissed" || reason == "shaken" => {
+                // The user closed the window, or shook their head at it: the
+                // answer is no, and the window goes away without a verdict on it.
                 s.dialog.hide();
-                log::warn!("consent refused for {}: {} [{}] (dismissed)", user, caller.command, caller.parents);
+                let how = if reason == "shaken" { "Refused by head shake" } else { "Refused: dismissed" };
+                notify(&self.cfg, user, how, &format!("{}\n{}", caller.command, caller.parents));
+                log::warn!("consent refused for {}: {} [{}] ({})", user, caller.command, caller.parents, reason);
             }
             Outcome::ConsentDenied { .. } => {
                 let why = match gesture { Some(Gesture::Password(_)) => "Wrong password. Refused.", _ => "No answer. Refused." };
                 s.dialog.show_final("denied", &format!("{} Kill or block the requester, or dismiss.", why), caller);
+                let how = match gesture { Some(Gesture::Password(_)) => "Refused: wrong password", _ => "Refused: no answer" };
+                notify(&self.cfg, user, how, &format!("{}\n{}", caller.command, caller.parents));
                 log::warn!("consent refused for {}: {} [{}] ({})", user, caller.command, caller.parents, why);
             }
             _ => {
                 s.dialog.show_final("denied", "Refused. Kill or block the requester, or dismiss.", caller);
+                notify(&self.cfg, user, "Refused", &format!("{}\n{}", caller.command, caller.parents));
             }
         }
         outcome
@@ -650,7 +689,11 @@ impl Authenticator {
             }
             log::debug!("frame {} score {:.3} matches {}/{}", scored, score, matches, self.cfg.required_matches);
             if matches >= self.cfg.required_matches {
-                log::info!("attempt detail: {} | frames {} lit {} faces {} nosignal {} scored {} matches {} | scores {}", settle_info, n_frames, n_lit, n_faces, n_nosignal, scored, matches, score_trail.join(" "));
+                // Scores (and the exposure they came at) are debug-only: the
+                // journal is readable by wheel on Omarchy, so at info it would
+                // be the tuning oracle the wire no longer is.
+                log::info!("attempt detail: frames {} lit {} faces {} nosignal {} scored {} matches {}", n_frames, n_lit, n_faces, n_nosignal, scored, matches);
+                log::debug!("attempt scores: {} | {}", settle_info, score_trail.join(" "));
                 if let Some(hook) = after_match {
                     // Steady light and free-running exposure for the gesture.
                     if let Some(i) = &cap.illuminator {
@@ -668,7 +711,8 @@ impl Authenticator {
                 return Ok(Outcome::Match { score: Some(best), frames: scored, elapsed_ms: ms(t0) });
             }
         }
-        log::info!("attempt detail: {} | frames {} lit {} faces {} nosignal {} scored {} matches {} | scores {}", if settle_info.is_empty() { "never settled".to_string() } else { settle_info.clone() }, n_frames, n_lit, n_faces, n_nosignal, scored, matches, score_trail.join(" "));
+        log::info!("attempt detail: frames {} lit {} faces {} nosignal {} scored {} matches {}{}", n_frames, n_lit, n_faces, n_nosignal, scored, matches, if settle_info.is_empty() { " (never settled)" } else { "" });
+        log::debug!("attempt scores: {} | {}", settle_info, score_trail.join(" "));
         cap.stop()?;
         if scored == 0 {
             Ok(Outcome::NoFace { elapsed_ms: ms(t0) })

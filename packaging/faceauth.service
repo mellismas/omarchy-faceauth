@@ -36,6 +36,8 @@ ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
+# Inert while User=root (hidepid exempts the procfs gid), kept for the day
+# the daemon runs as its own user; the locality check does not rely on it.
 ProtectProc=invisible
 RestrictNamespaces=yes
 RestrictSUIDSGID=yes
@@ -54,6 +56,8 @@ DeviceAllow=char-media rw
 DeviceAllow=/dev/tpmrm0 rw
 ReadWritePaths=/var/lib/faceauth /run/faceauth
 UMask=0077
+# Unsealed templates live in memory; a core dump would write them to disk.
+LimitCORE=0
 # The recognition model is ~700 MB resident; a runaway is killed well before
 # the system is.
 MemoryMax=1536M

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth auth [--user NAME] [--socket PATH] [--consent]   (asks a running faceauthd; --consent = window + nod)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there?)\n  faceauth enroll [--user NAME] [--label TEXT] [--seconds N] [--count N]   (through the daemon)\n  faceauth enroll --store DIR ...                   (direct camera access, development)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] (--dismiss | password on stdin)   (from the consent window)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence                                (current state)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
+        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth auth [--user NAME] [--socket PATH] [--consent]   (asks a running faceauthd; --consent = window + nod)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there?)\n  faceauth enroll [--user NAME] [--label TEXT] [--seconds N] [--count N]   (through the daemon)\n  faceauth enroll --store DIR ...                   (direct camera access, development)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] --token T (--dismiss | password on stdin)   (from the consent window)\n  faceauth consent-context --action ID --message TEXT [--cookie C]   (from the polkit agent, as a request starts)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence                                (current state)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
     );
     std::process::exit(2)
 }
@@ -85,16 +85,27 @@ fn main() -> Result<()> {
             println!("presence watch {} for {} (away after {} s); service restart: {}", mode, user, away, st.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()));
             Ok(())
         }
+        ["consent-context", rest @ ..] => {
+            // From the polkit agent: the action and message polkitd gave it.
+            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
+            let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
+            let o = faceauth_daemon::server::consent_context(&socket, &user, opt(rest, "--action").unwrap_or(""), opt(rest, "--message").unwrap_or(""), opt(rest, "--cookie").unwrap_or(""))?;
+            println!("{}", serde_json::to_string(&o)?);
+            Ok(())
+        }
         ["consent-answer", rest @ ..] => {
             let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
             let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
+            // The token came with the window's payload; without it the daemon
+            // treats the answer as nobody's.
+            let token = opt(rest, "--token");
             let o = if rest.contains(&"--dismiss") {
-                faceauth_daemon::server::consent_answer(&socket, &user, None, true)?
+                faceauth_daemon::server::consent_answer(&socket, &user, None, true, token)?
             } else {
                 let mut pw = String::new();
                 std::io::stdin().read_line(&mut pw)?;
                 let pw = pw.trim_end_matches(['\n', '\r']).to_string();
-                let r = faceauth_daemon::server::consent_answer(&socket, &user, Some(&pw), false);
+                let r = faceauth_daemon::server::consent_answer(&socket, &user, Some(&pw), false, token);
                 drop(pw);
                 r?
             };
@@ -651,9 +662,9 @@ fn enroll(rest: &[&str]) -> Result<()> {
 /// What the saved path says about how the templates rest.
 fn at_rest_note(path: &str) -> String {
     if path.ends_with(".cred") {
-        "Templates are sealed to this machine's TPM; nothing on disk can read them without it.".into()
+        "Templates are sealed to this machine's TPM, root-only: a copy is useless anywhere else, and only root can open one here.".into()
     } else {
-        "Note: templates are plaintext at rest (root 0600); this machine has no working TPM to seal them.".into()
+        "Note: templates are plaintext at rest (root 0600): the daemon could not seal them (its log says why).".into()
     }
 }
 
@@ -1012,11 +1023,12 @@ fn doctor(rest: &[&str]) -> Result<()> {
     // daemon
     let socket = PathBuf::from("/run/faceauth/sock");
     match faceauth_daemon::server::ping(&socket, &user) {
-        Ok(faceauth_daemon::auth::Outcome::Pong { version, model, templates, sealed }) => {
+        Ok(faceauth_daemon::auth::Outcome::Pong { version, model, templates, sealed, unbound }) => {
             push("daemon.running", "pass", format!("faceauthd {} answering on {}", version, socket.display()));
             push("templates.user", if templates > 0 { "pass" } else { "warn" }, format!("{} template(s) for {} ({})", templates, user, model));
             if templates > 0 {
-                push("templates.at_rest", if sealed { "pass" } else { "warn" }, if sealed { "sealed to the TPM (systemd-creds, bound to the user name, no PCR policy; re-enrol is the only recovery)".into() } else { "plaintext at rest (root 0600): no working TPM to seal them".into() });
+                push("templates.at_rest", if sealed { "pass" } else { "warn" }, if sealed { "sealed to the TPM, root-only: a copy is useless off this machine, and only root can open one here".into() } else { "plaintext at rest (root 0600): the daemon could not seal (its log says why)".into() });
+                push("templates.camera", if unbound == 0 { "pass" } else { "warn" }, if unbound == 0 { "every template is bound to the camera that enrolled it".into() } else { format!("{} of {} template(s) predate camera binding and match on any camera; the next enrolment binds them", unbound, templates) });
             }
         }
         Ok(o) => push("daemon.running", "warn", format!("unexpected reply {}", serde_json::to_string(&o).unwrap_or_default())),

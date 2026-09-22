@@ -20,7 +20,7 @@ faceauth-camera = { version = "0.1.0", path = "../faceauth-camera" }
 faceauth-engine = { version = "0.1.0", path = "../faceauth-engine" }
 libc.workspace = true
 log.workspace = true
-nix = { workspace = true, features = ["socket", "user", "fs"] }
+nix = { workspace = true, features = ["socket", "user", "fs", "poll"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 toml.workspace = true

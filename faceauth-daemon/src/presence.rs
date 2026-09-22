@@ -290,12 +290,22 @@ pub(crate) fn observe(a: &mut Authenticator, cfg: &PresenceConfig, identify: boo
     let identity = if identify {
         let crop = faceauth_engine::align::align_112(&img, &face.landmarks);
         let e = a.pipeline.embedder.embed(&crop)?;
-        let score = match a.store.load(&cfg.user)? {
-            Some(t) => t.best_match(&e).map(|(s, _)| s).unwrap_or(-1.0),
-            None => -1.0,
+        // Templates only count on the camera they were enrolled on, and a
+        // store that cannot be read is nobody, not everybody: the check fails
+        // closed rather than skipping the tick with identity still assumed.
+        let score = match a.store.load(&cfg.user) {
+            Ok(Some(t)) => t.best_match_on(&e, &cap.identity).map(|(s, _)| s).unwrap_or(-1.0),
+            Ok(None) => -1.0,
+            Err(e) => {
+                log::warn!("presence: templates unreadable, identity check fails: {}", e);
+                -1.0
+            }
         };
         if score < a.cfg.accept_threshold {
-            log::info!("presence: identity check failed, score {:.2} (exp {} gain {}, face {:.2})", score, cap.exposure.exposure, cap.exposure.gain, face.score);
+            // The score itself stays at debug: the journal is readable by
+            // wheel on Omarchy, and a scored stream is a tuning oracle.
+            log::info!("presence: identity check failed");
+            log::debug!("presence: identity score {:.2} (exp {} gain {}, face {:.2})", score, cap.exposure.exposure, cap.exposure.gain, face.score);
         }
         Some(score >= a.cfg.accept_threshold)
     } else {
