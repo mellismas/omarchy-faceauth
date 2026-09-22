@@ -1097,3 +1097,37 @@ the adapted threshold.
 shakes, at zero false positives, and skips any recording without the motion
 fields. The earlier corpora are kept under `~/Work/fa-build/` (round 1
 without landmarks, round 2 with, round 3 with the pre-gradient motion).
+
+**Recording, and a corpus from a phone call.** Per-frame recording is now a
+config knob (`gesture_trace`), written to `<store_dir>/gestures/`, root-only,
+newest sixty kept, and nothing per-frame goes to the journal at any level
+(the debug override that put head pose there during tuning is gone).
+`gesture_record_only` recognises gestures without acting on them, so a
+battery captures each gesture to its rest; the battery script sets both,
+runs the twenty windows, restores the config and collects the recordings.
+The first run with it was recorded while the user was on a phone call, by
+accident; kept as `traces/cal-phone` on purpose, as the corpus for varying
+conditions: talking through it, phone in hand, attention elsewhere, the
+still windows moving 0.04 vertically and 0.30 sideways. It sets no floors
+(a nod window there may not hold a deliberate nod) and its test asks only
+the safety question, which holds: no non-gesture window produces a
+gesture, and no gesture window reads as the other. Under that distraction
+two of five nod windows and two of four shake windows still counted. The
+clean battery, for the floors, is still to be recorded.
+
+**The clean battery, and the floors with margin.** Recorded off the phone,
+in record-only mode, every window its full 14 s. Three fixes came out of
+it before the floors could be read: the first frames of a round, before
+exposure settles, produced ±17 px sideways spikes (a correlation peak at the
+search edge; a peak at the edge or a weak one now reads as no motion); the
+replay fed the nod's quiet-head rule the image-motion x instead of the
+landmark yaw the daemon uses, and a nod slides the box sideways as well as
+down, so two nods were refused as "turned"; and the shake's both-sides rule
+measured "centre" as the integrated position at the first leg's start,
+which drifts between gestures, so two shakes read as one-sided (a glance is
+caught by its hold and its size; the rule is off). After those: six of six
+nod windows, four of four shakes, nothing from the eleven non-gesture
+windows, on full-length recordings. The sweep, re-ranked to prefer the
+highest floors among the fully-correct settings, puts the nod floor at
+0.06 (from 0.04; talking moves 0.036, the light nod 0.17) and the shake at
+0.06. Installed and approved by nod at the new floor.

@@ -44,6 +44,15 @@ pub struct Config {
     pub consent_seconds: f32,
     /// Nods required.
     pub consent_nods: usize,
+    /// Write each consent round's per-frame gesture recording (head pose,
+    /// landmarks, image motion; never images) to `<store_dir>/gestures/`,
+    /// root-only, newest sixty kept. Off by default; calibration turns it on.
+    /// Nothing per-frame ever goes to the journal.
+    pub gesture_trace: bool,
+    /// Recognise gestures but never act on them: the window waits until it
+    /// is answered or the requester gives up. For recording a calibration
+    /// battery to each gesture's rest.
+    pub gesture_record_only: bool,
 }
 
 impl Default for Config {
@@ -67,6 +76,8 @@ impl Default for Config {
             consent_scan_seconds: 20.0,
             consent_seconds: 90.0,
             consent_nods: 2,
+            gesture_trace: false,
+            gesture_record_only: false,
         }
     }
 }

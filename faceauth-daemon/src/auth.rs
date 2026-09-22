@@ -344,7 +344,7 @@ impl Authenticator {
             let mut hook = |cap: &mut IrCapture, pipeline: &mut Pipeline| -> Result<bool> {
                 let _ = dialog_cell.borrow_mut().show("nod", &msg, caller_ref, total);
                 let left = total - started.elapsed().as_secs_f32();
-                let g = wait_for_nods(cap, pipeline, cfg.min_detection, Duration::from_secs_f32(left.max(1.0)), cfg.consent_nods, Some((&answers, &user)), lost_after)?;
+                let g = wait_for_nods(cap, pipeline, &cfg, Duration::from_secs_f32(left.max(1.0)), cfg.consent_nods, Some((&answers, &user)), lost_after)?;
                 let ok = matches!(g, Gesture::Nodded | Gesture::Password(_));
                 *gesture_cell.borrow_mut() = Some(g);
                 Ok(ok)

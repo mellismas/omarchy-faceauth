@@ -102,6 +102,12 @@ fn best_shift(a: &[f32], b: &[f32], max: isize) -> f32 {
             bi = i;
         }
     }
+    // A peak at the search edge or a weak one is not a measurement: the
+    // first frames of a round, before exposure settles, produced +-17 px
+    // spikes this way on a still face (recorded). Report no motion instead.
+    if bi == 0 || bi + 1 >= scores.len() || bs < 0.3 {
+        return 0.0;
+    }
     let mut shift = bi as f32 - max as f32;
     if bi > 0 && bi + 1 < scores.len() {
         let (l, c, r) = (scores[bi - 1], scores[bi], scores[bi + 1]);
