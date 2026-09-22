@@ -2,7 +2,7 @@
 models_dir = "/usr/share/faceauth/models"
 store_dir = "/var/lib/faceauth"
 socket = "/run/faceauth/sock"
-accept_threshold = 0.70     # cosine similarity; see src/README.md for the measurements behind it
+accept_threshold = 0.70     # cosine similarity; docs/DEVELOPMENT.md has the measurements behind it
 required_matches = 2        # frames at or above the threshold within one attempt
 attempt_timeout = 6.0       # seconds
 min_detection = 0.6
@@ -11,6 +11,10 @@ liveness_required = true    # refuse to authenticate when the gate cannot run; f
 # ir_video = "/dev/video2"  # override camera detection (UVC IR cameras go here)
 # ir_subdev = "/dev/v4l-subdev7"
 ir_orientation = [true, true, true]   # transpose, flip_x, flip_y: Surface Book 2 mounting
+
+consent_nods = 2            # nods that approve a request; two head shakes refuse
+gesture_trace = false       # write each consent round's per-frame recording to <store_dir>/gestures (root-only; for tuning)
+gesture_record_only = false # recognise gestures but never act on them (for recording a calibration battery)
 
 [presence]
 enabled = false             # auto-lock when the enrolled user leaves; opt-in
