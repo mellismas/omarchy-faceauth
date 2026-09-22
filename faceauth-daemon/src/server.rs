@@ -15,7 +15,6 @@ use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use std::os::fd::AsFd;
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -86,6 +85,35 @@ struct Request {
     context_cookie: Option<String>,
 }
 
+/// Who may connect: root, and the enrolled users, by ACL on the socket
+/// (mode 0660 plus a read-write entry per enrolled uid). Any other account
+/// is refused by the kernel before a byte is read. No group, so no re-login
+/// at setup: enrolment itself grants access, deletion revokes it.
+pub fn apply_socket_acl(socket: &Path, users: &[String]) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o660)) {
+        log::warn!("socket mode: {}", e);
+        return;
+    }
+    let mut spec = String::from("u::rw,g::rw,o::-");
+    for u in users {
+        if let Some(uid) = user_uid(u) {
+            spec.push_str(&format!(",u:{}:rw", uid));
+        }
+    }
+    match std::process::Command::new("/usr/bin/setfacl").arg("--set").arg(&spec).arg(socket).env_clear().env("PATH", "/usr/bin:/bin").output() {
+        Ok(o) if o.status.success() => log::info!("socket open to root and {} enrolled user(s): {}", users.len(), users.join(" ")),
+        Ok(o) => log::warn!("setfacl: {} {}; socket stays root-only", o.status, String::from_utf8_lossy(&o.stderr).trim()),
+        Err(e) => log::warn!("setfacl: {}; socket stays root-only", e),
+    }
+}
+
+fn refresh_socket_acl(auth: &Mutex<Authenticator>) {
+    if let Ok(a) = auth.lock() {
+        apply_socket_acl(&a.cfg.socket, &a.store.enrolled_users());
+    }
+}
+
 pub fn serve(auth: Arc<Mutex<Authenticator>>, socket: &Path) -> Result<()> {
     if let Some(dir) = socket.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
@@ -93,7 +121,10 @@ pub fn serve(auth: Arc<Mutex<Authenticator>>, socket: &Path) -> Result<()> {
     let _ = std::fs::remove_file(socket);
     let listener = UnixListener::bind(socket).with_context(|| format!("bind {}", socket.display()))?;
     // World-connectable; the peer-credential check below is the access control.
-    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o666))?;
+    {
+        let users = auth.lock().map(|a| a.store.enrolled_users()).unwrap_or_default();
+        apply_socket_acl(socket, &users);
+    }
     log::info!("listening on {}", socket.display());
     for conn in listener.incoming() {
         let stream = match conn {
@@ -235,6 +266,9 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
             None => Outcome::Error { message: "busy".into() },
         };
         log::info!("enrolment for {}: {:?}", req.user, outcome);
+        if matches!(outcome, Outcome::Enrolled { .. }) {
+            refresh_socket_acl(auth);
+        }
         return reply(&mut stream, &outcome);
     }
     if req.delete_templates {
@@ -247,6 +281,7 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
             None => Outcome::Error { message: "busy".into() },
         };
         log::info!("templates for {} deleted by uid {}: {:?}", req.user, cred.uid(), outcome);
+        refresh_socket_acl(auth);
         return reply(&mut stream, &outcome);
     }
     if req.probe {

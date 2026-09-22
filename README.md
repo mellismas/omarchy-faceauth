@@ -1039,3 +1039,61 @@ window shows polkit's own message: "Authentication is needed to run
 `/usr/bin/true …` as the super user". Measured on the first try after the
 fix landed (the first version keyed on the helper's parent pid, which is
 systemd, and never matched).
+
+**The socket is open to root and the enrolled users only.** It was 0666 with
+the daemon's own uid check as the only guard; the review asked for 0660 and
+a group. A group would need a re-login at setup, so the daemon sets an ACL
+instead: mode 0660, plus a read-write entry for each user with templates,
+applied at start and refreshed on every enrolment and deletion. Any other
+account is refused by the kernel before a byte is read. One consequence a
+reviewer will want stated: a caller that is uid 0 is trusted for enrolment
+and deletion, and any setuid-root binary the user can run is uid 0 to the
+socket. On a stock system those are sudo, pkexec and polkit's helper, each
+of which authenticates first; a setuid binary that does not is a problem
+for the whole machine, not this daemon.
+
+## 2026-09-22, afternoon: gestures read from image motion
+
+Two more false approvals on a still face ended the landmark path. The
+second was on the nose-to-eye measure itself: the detector fit flipped
+between two solutions 0.09 apart, each held for three or four frames, with
+the face box unmoved, and no rule on that signal (a ramp through the middle,
+box co-motion, a stricter arrival, regularity; all swept over the battery)
+separated it from a real nod without losing most real nods. The signal
+reports where a landmark was placed, not whether anything moved.
+
+The gestures are now read from real image motion: between the frames looked
+at, the face region's row and column brightness profiles are cross-correlated
+(as gradients, so the illuminator's fixed falloff does not pin the shift at
+zero; that was the first cut's failure, measured on a live nod at a
+hundredth of a width and fixed with a synthetic-vignette test) to find how
+far the pixels shifted, sub-pixel by a parabola through the peak. The shifts
+accumulate into a position in face widths, vertical for the nod detector and
+horizontal for the shake detector; the four-leg shape rules are unchanged.
+A fit flip changes no pixels and measures zero. Talking moves the mouth
+only, which a whole-region profile barely sees.
+
+The battery, re-recorded with the new signal in every frame
+(`traces/cal`, fields 17 and 18): a still face moves 0.003 of its width,
+talking 0.036, reading 0.08 and looking down 0.15 (single legs with holds,
+which the shape rules refuse), the user's light nod 0.106, natural nods
+0.20 to 0.28, shakes 0.18 to 0.24 sideways. Live, on the untuned first cut,
+every nod recording was approved (slow and light included) and every shake
+refused, with nothing from the twelve non-gesture windows; offline the same,
+and a sweep finds the full result at every setting of the other tunables
+with the floors at 0.03 and 0.04. The floor ships at 0.04 for the nod and 0.06 for the shake, the
+values the battery was recorded under: a gesture recording ends at the live
+decision, so a higher floor (0.05 was tried, for margin over talking) loses
+the last leg of recordings that were cut at 0.04, and cannot be judged from
+them. The next battery is to be recorded with the daemon not deciding (a
+high `consent_nods` in the config), so each gesture is captured to its rest
+and the floors can be set with margin. Also found on the way: the adaptive
+noise floor, built for the jittery landmark signal, learned from a nod's own
+frames when they fell just under the threshold and raised it mid-gesture;
+it now learns only from steps well below the floor, and "rest" is an
+absolute stillness (0.35 of the floor per frame: a settling head wobbles 0.01, a turnaround moves 0.03 or more) rather than a fraction of
+the adapted threshold.
+`calibration_battery_holds` now requires five of five nods and four of four
+shakes, at zero false positives, and skips any recording without the motion
+fields. The earlier corpora are kept under `~/Work/fa-build/` (round 1
+without landmarks, round 2 with, round 3 with the pre-gradient motion).

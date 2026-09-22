@@ -446,6 +446,17 @@ impl Store {
         Ok(Some(aside))
     }
 
+    /// Users with templates on disk (sealed or plain): the accounts allowed
+    /// to talk to the daemon's socket.
+    pub fn enrolled_users(&self) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(&self.dir)
+            .map(|rd| rd.flatten().filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".cred").or_else(|| n.strip_suffix(".json"))).map(String::from)).collect())
+            .unwrap_or_default();
+        v.sort();
+        v.dedup();
+        v
+    }
+
     pub fn delete(&self, user: &str) -> Result<bool> {
         let mut any = false;
         for p in [self.sealed_path_for(user)?, self.path_for(user)?] {
@@ -579,7 +590,9 @@ mod tests {
     /// a skip a failure.
     #[test]
     fn sealed_roundtrip_when_this_machine_can() {
-        let sealing = Sealing::detect();
+        // As a user, the probe makes PID 1 ask polkit, which raises a consent
+        // window on the desktop: only root probes.
+        let sealing = if nix::unistd::geteuid().is_root() { Sealing::detect() } else { Sealing::Plain("not root".into()) };
         let Sealing::Tpm = sealing else {
             if std::env::var("FACEAUTH_REQUIRE_TPM").as_deref() == Ok("1") {
                 panic!("FACEAUTH_REQUIRE_TPM=1 and this machine cannot seal: {}", sealing.describe());
