@@ -1146,3 +1146,72 @@ second wall clock; a handler panic returns its connection slot;
 in a `RefCell`. Not in this round: the gesture-phase checks (continuity
 on the matched box, the box-moves-with-the-leg rule, a strobed confirm
 before approval), which are round two with the calibration battery.
+
+**Round two, the gesture window, 2026-09-22.** Three changes close C1 as
+narrowed with the reviewing session. The gesture loop follows the box the
+scan matched (`consent::track`: a detection continues it when its centre
+moved less than half a face width and its width is within 30 percent; two
+that fit are ambiguous; other faces are ignored; a single face back for a
+second is adopted, since the confirm still has to match it). The
+box-moves-with-the-leg rule is on for both detectors at 0.04 face widths.
+Its first measurement, the box at the leg's two timing instants, undercounted
+real nods because the filtered signal lags the head: the calibrated-floor
+recording lost its first double nod at 0.015. Measured as the box's swing
+over the leg with 0.2 s either side, every recorded nod and shake in
+`traces/cal` holds up to 0.08, the calibrated-floor recording through 0.03
+and beyond, the phone corpus stays safe at every value, the red team's
+frozen box is refused from 0.02, and the waggled board passes the detector
+at every value (by design). After the second nod `auth::confirm` freezes the
+exposure, strobes again, and needs two lit/unlit pairs on the followed box
+to pass the flash gate and match the templates; a gate refusal or a
+non-match is `ConsentDenied` and a charged failure, no signal asks for the
+face again. The request no longer expires: `consent_seconds` is the nod
+window after each match, and when it passes unanswered the round waits for
+attention the way a failed scan does and re-arms. The window is two lines,
+what and who, each provable or labelled. `traces/redteam/` holds the two
+synthetic traces and is not part of the recorded corpus.
+
+**Dismiss is deny, 2026-09-22.** The first live shake on the polkit path
+showed the leftover from before the window had a password box: a shake made
+the daemon refuse, the module returned ignore, and polkit moved to its own
+password dialog. Mike's intent was that the window is the whole conversation
+(type the password there or gesture), so a shake, a dismissal, Escape, or a
+failed confirm is now `Outcome::Refused`, the module maps it to
+`PAM_AUTH_ERR` on consent lines only, and the consent lines carry
+`[success=done auth_err=die default=ignore]`. Everything that is not a
+decision (no window, requester gone, cooldown, remote, errors) stays ignore.
+sudo retries a failed authentication three times, each a new request from
+the same process, so the daemon keeps the refusal per (pid, start time) for
+thirty seconds and answers the retries without a window. The lines installed
+on the reference machine are edited by hand (root shell); the setup script
+writes the new control for fresh installs.
+
+**Sudo keeps its prompt, 2026-09-22.** The first live sudo deny printed ten
+"Sorry, try again" lines (this box sets ten tries) and stopped, which reads
+as a failure, not an answer. Mike's call: for sudo the earlier behaviour was
+right, a shake means "not by face" and the terminal prompt follows; a
+non-interactive sudo then fails once on its own. Polkit keeps the deny,
+since its retry never ends without the agent's cancel. `refusal()` in
+auth.rs picks by the caller's lane; the sudo consent line goes back to
+`sufficient`, the polkit line keeps the control. The sticky refusal for
+sudo retries stays in the code and is never hit.
+
+**Round two live, 2026-09-22 evening.** On the installed build: nod
+approvals with the confirm live in 0.55 s (2 pairs matched); a shake
+refuses; polkit's deny is the agent's cancel after a PAM failure in face
+mode with a sticky five-second refusal so the retried helper gets no window,
+and the dialog stays hidden through the instant before the cancel lands;
+sudo keeps its terminal prompt on a shake. The cooldown held after five
+reflectance refusals of the print, and fell to polkit's password dialog by
+design (a hold is the lane being unavailable, not a no). The hand-held
+print waggle never reached the confirm: the print's box swung about two
+face widths and its width changed by half, so every leg was thrown out by
+the size ceiling and the width tolerance, and the sideways drift read as a
+shake (recorded, `traces/print/`). A nod-scale print waggle, which is the
+confirm's case, is not recorded yet. The re-arm cycle after an unanswered
+nod window was exercised live later the same night: 90 s in view with no
+nod, the attention wait, a turn to the camera after four looks, a rescan,
+two nods, the confirm, approval. Found on the way: the locality check
+listed a logind session the daemon's own `systemd-run --machine` call had
+just opened and closed, and a lookup that failed on it made sudo's retry
+"unverifiable"; a vanished session is now skipped.

@@ -45,15 +45,18 @@ pub struct CallerInfo {
     pub pid: i32,
     pub exe: String,
     pub cmdline: String,
-    /// The command being elevated as far as /proc shows it (sudo's
-    /// arguments; the polkit requester's name and pid). Never text the
-    /// requesting side supplied about itself.
+    /// What is being asked. When `verified` it is the daemon's own reading
+    /// of the requesting process's command line (sudo's, pkexec's). When
+    /// not, it is what the requesting side said about itself: for a plain
+    /// polkit action, the message and action id the agent relayed. Any
+    /// process of the user's can send that, so the window labels it.
     pub command: String,
-    /// What the requesting side says the request is: for polkit, the message
-    /// and action id the agent relayed from polkitd. Any process of the
-    /// user's can send one, so the window shows it as unverified.
-    pub claim: String,
-    /// The chain above it: "alacritty (3910) <- bash (3921)".
+    pub verified: bool,
+    /// Who asked: the requesting process and pid, then its parents
+    /// ("sudo (pid 3011002)  from  bash (2990241) <- foot (13950)"), or the
+    /// polkit helper's pid with a note that the asking process was not found.
+    pub who: String,
+    /// The chain above the requester: "alacritty (3910) <- bash (3921)".
     pub parents: String,
     /// The process to kill if the user says no: the requester, not the helper.
     pub kill_pid: i32,
@@ -66,10 +69,12 @@ fn read_proc(pid: i32, what: &str) -> Option<String> {
 
 /// Text for the window: no control characters (a newline or a bidi override
 /// in a command line would let the requester write its own description) and
-/// at most 300 characters. Applied to everything read from /proc or sent by
-/// the polkit agent before it reaches the window or the log.
+/// a cap that only a pathological command line reaches; the window wraps
+/// and never elides, so what is shown is the whole thing. Applied to
+/// everything read from /proc or sent by the polkit agent before it reaches
+/// the window or the log.
 pub fn clip(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control() && !matches!(*c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')).take(300).collect()
+    s.chars().filter(|c| !c.is_control() && !matches!(*c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')).take(2000).collect()
 }
 
 fn exe_of(pid: i32) -> String {
@@ -91,7 +96,7 @@ fn real_uid_of(pid: i32) -> Option<u32> {
     read_proc(pid, "status")?.lines().find_map(|l| l.strip_prefix("Uid:")).and_then(|v| v.split_whitespace().next()).and_then(|s| s.parse().ok())
 }
 
-fn starttime_of(pid: i32) -> u64 {
+pub(crate) fn starttime_of(pid: i32) -> u64 {
     read_proc(pid, "stat").and_then(|s| s.rsplit(')').next().and_then(|r| r.split_whitespace().nth(19).and_then(|v| v.parse().ok()))).unwrap_or(0)
 }
 
@@ -208,30 +213,43 @@ impl CallerInfo {
                     info.kill_pid = p;
                     // cmdline of a setuid process may be unreadable too; fall back to its name.
                     let cl = clip(&read_proc(p, "cmdline").unwrap_or_default());
-                    info.command = if cl.is_empty() { format!("{} (pid {}, arguments not readable)", comm_of(p), p) } else { format!("{} (pid {})", cl, p) };
+                    let name = comm_of(p);
+                    info.command = if cl.is_empty() { format!("{} (arguments not readable)", name) } else { cl };
+                    info.verified = true;
                     info.parents = parent_chain(p);
+                    info.who = format!("{} (pid {})  from  {}", name, p, info.parents);
                 }
                 None => {
-                    info.command = "a polkit action (requester not found)".into();
+                    info.who = format!("polkit helper (pid {}); the asking process could not be found", pid);
                 }
             }
             // The agent's context is the requesting side's own account of
-            // itself: any process of the user's can send one, and the
-            // helper carries nothing to check it against. It is shown as a
-            // claim, never as the request's name.
+            // itself: any process of the user's can send one, and the helper
+            // carries nothing to check it against. It names the request only
+            // when nothing provable does, and then the window labels it.
             match context {
                 Some(c) => {
-                    log::info!("consent: polkit helper pid {} named {}; the agent relayed: {} ({})", pid, info.command, c.message.trim(), c.action);
-                    info.claim = clip(&format!("{} [{}]", c.message.trim(), c.action));
+                    let relayed = clip(&format!("{} [{}]", c.message.trim(), c.action));
+                    if info.verified {
+                        log::info!("consent: polkit helper pid {} named {}; the agent relayed: {}", pid, info.command, relayed);
+                    } else {
+                        log::info!("consent: polkit helper pid {}: requester not found; the agent relayed (unverified): {}", pid, relayed);
+                        info.command = relayed;
+                    }
                 }
                 None => {
                     log::warn!("consent: no context from the polkit agent for helper pid {}; naming by process search only", pid);
+                    if !info.verified {
+                        info.command = "a polkit action (no description was given)".into();
+                    }
                 }
             }
         } else {
             info.via = base.clone();
             info.command = clip(&cmdline);
+            info.verified = true;
             info.parents = parent_chain(pid);
+            info.who = format!("{} (pid {})  from  {}", base, pid, info.parents);
         }
         info
     }
@@ -399,6 +417,10 @@ pub enum Gesture {
     Timeout,
     /// No face for the presence watch's away time: the user left.
     FaceLost,
+    /// The nods came, but the confirm after them could not read the strobe.
+    ConfirmUnclear,
+    /// The nods came, but the confirm refused: not a live enrolled face.
+    ConfirmFailed(String),
 }
 
 /// One gesture axis as a pure state machine over (signal, time) samples, so
@@ -512,6 +534,12 @@ impl Oscillation {
     /// Default span: the user's two nods, with the beat between them, span
     /// up to about three seconds.
     pub const SPAN_S: f32 = 3.0;
+    /// Box movement along the gesture axis each leg must carry, in face
+    /// widths. Swept 2026-09-22 over the calibration corpus and the
+    /// calibrated-floor recording: every recorded nod and shake holds up to
+    /// 0.08, a box that does not move is refused from 0.02, and a detector
+    /// fit flip moved the box 0.011. 0.04 sits between with margin both ways.
+    pub const CO_MOTION: f32 = 0.04;
     /// A leg shorter than this is a flicker (default). A quick nod's leg is
     /// 0.06 s (recorded); one-frame spikes are gone in the median already.
     const LEG_MIN_S: f32 = 0.05;
@@ -791,31 +819,28 @@ impl Oscillation {
                 let carried = match self.co_motion {
                     None => true,
                     Some((axis, min)) => {
-                        let at = |when: f32| -> Option<(f32, f32, f32)> {
-                            // median of the three motion samples nearest `when`
-                            let mut near: Vec<&(f32, f32, f32, f32)> = self.motion.iter().collect();
-                            near.sort_by(|a, b| (a.0 - when).abs().total_cmp(&(b.0 - when).abs()));
-                            let k: Vec<&(f32, f32, f32, f32)> = near.into_iter().take(3).collect();
-                            if k.is_empty() {
-                                return None;
+                        // The box's swing along the axis across the leg,
+                        // with a margin either side: the filtered signal
+                        // lags the head, so the instants the leg is timed
+                        // by fall inside the box's own movement.
+                        let (lo_t, hi_t) = (start - 0.2, ct + 0.2);
+                        let mut lo = f32::MAX;
+                        let mut hi = f32::MIN;
+                        let mut w = 1.0f32;
+                        for m in self.motion.iter().filter(|m| m.0 >= lo_t && m.0 <= hi_t) {
+                            let v = if axis == 1 { m.2 } else { m.3 };
+                            lo = lo.min(v);
+                            hi = hi.max(v);
+                            w = w.max(m.1);
+                        }
+                        if lo > hi {
+                            true
+                        } else {
+                            let moved = (hi - lo) / w;
+                            if moved < min {
+                                log::debug!("consent: {} leg rejected, the box did not move with it ({:.3} of width)", self.name, moved);
                             }
-                            let med = |f: fn(&(f32, f32, f32, f32)) -> f32| {
-                                let mut v: Vec<f32> = k.iter().map(|m| f(m)).collect();
-                                v.sort_by(|a, b| a.total_cmp(b));
-                                v[v.len() / 2]
-                            };
-                            Some((med(|m| m.1), med(|m| m.2), med(|m| m.3)))
-                        };
-                        match (at(start), at(ct)) {
-                            (Some(a), Some(b)) => {
-                                let w = a.0.max(b.0).max(1.0);
-                                let moved = if axis == 1 { (b.1 - a.1).abs() / w } else { (b.2 - a.2).abs() / w };
-                                if moved < min {
-                                    log::debug!("consent: {} leg rejected, the box did not move with it ({:.3} of width)", self.name, moved);
-                                }
-                                moved >= min
-                            }
-                            _ => true,
+                            moved >= min
                         }
                     }
                 };
@@ -990,7 +1015,12 @@ impl NodDetector {
         let floor = floor.max(Self::MIN_DOWN);
         // A nod rides the box up and down: the vertical allowance is doubled.
         // Legs to a second: deliberate nods measured 0.87 s and were refused at 0.8.
-        NodDetector { inner: Oscillation::new("nod", floor, Self::MAX_DOWN.max(floor), 1.0, 0.10, 0.30, 0.5, false), nods: 0, yaw: Vec::new() }
+        let mut inner = Oscillation::new("nod", floor, Self::MAX_DOWN.max(floor), 1.0, 0.10, 0.30, 0.5, false);
+        // The box must ride each leg: a head that nods carries its box,
+        // a detector fit that flips does not (1 px through a recorded flip,
+        // 9 to 16 px through real nods). See `Oscillation::CO_MOTION`.
+        inner.co_motion = Some((2, Oscillation::CO_MOTION));
+        NodDetector { inner, nods: 0, yaw: Vec::new() }
     }
 
     pub fn idle(&self, t: f32) -> bool {
@@ -1072,6 +1102,8 @@ impl ShakeDetector {
         let mut inner = Oscillation::new("shake", floor, Self::MAX_TURN, 1.0, 0.60, 0.30, 1.5, false);
         // The box narrows by 7% as the head turns (recorded): not the body moving.
         inner.width_tol = 0.15;
+        // The box must slide with each leg (see the nod detector).
+        inner.co_motion = Some((1, Oscillation::CO_MOTION));
         ShakeDetector { inner, shakes: 0 }
     }
 
@@ -1187,7 +1219,44 @@ impl Drop for TraceSaver<'_> {
     }
 }
 
-pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, window: Duration, nods_needed: usize, answers: Option<(&Answers, &str)>, lost_after: Option<Duration>, floors: (f32, f32)) -> Result<Gesture> {
+/// Which detection in a frame is the face being followed.
+#[derive(Debug, PartialEq)]
+pub enum Track {
+    /// The followed face, by index into the detections.
+    Found(usize),
+    /// No detection continues the followed box.
+    Lost,
+    /// Two detections could each be it: the gesture pauses.
+    Ambiguous,
+}
+
+/// Follow `tracked` through `faces`: the detection whose centre moved less
+/// than half a face width and whose width is within 30 percent continues
+/// it. A second detection that also fits, or overlaps it, is ambiguous.
+/// Other faces in the frame are ignored (the one that matched is the one
+/// that answers).
+pub fn track(faces: &[faceauth_engine::Face], tracked: [f32; 4]) -> Track {
+    let (tw, tcx, tcy) = (tracked[2].max(1.0), tracked[0] + tracked[2] / 2.0, tracked[1] + tracked[3] / 2.0);
+    let fits = |b: &[f32; 4]| -> bool {
+        let (cx, cy) = (b[0] + b[2] / 2.0, b[1] + b[3] / 2.0);
+        let dist = ((cx - tcx).powi(2) + (cy - tcy).powi(2)).sqrt();
+        let ratio = b[2] / tw;
+        dist < 0.5 * tw && (0.7..=1.43).contains(&ratio)
+    };
+    let mut candidates: Vec<(usize, f32)> = faces.iter().enumerate().filter(|(_, f)| fits(&f.bbox)).map(|(i, f)| {
+        let (cx, cy) = (f.bbox[0] + f.bbox[2] / 2.0, f.bbox[1] + f.bbox[3] / 2.0);
+        (i, ((cx - tcx).powi(2) + (cy - tcy).powi(2)).sqrt())
+    }).collect();
+    candidates.sort_by(|a, b| a.1.total_cmp(&b.1));
+    match candidates.len() {
+        0 => Track::Lost,
+        1 => Track::Found(candidates[0].0),
+        _ => Track::Ambiguous,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, window: Duration, nods_needed: usize, answers: Option<(&Answers, &str)>, lost_after: Option<Duration>, floors: (f32, f32), start: Option<[f32; 4]>) -> Result<(Gesture, Option<[f32; 4]>)> {
     let min_detection = cfg.min_detection;
     let user_name = answers.map(|(_, u)| u.to_string()).unwrap_or_else(|| "unknown".into());
     let t0 = Instant::now();
@@ -1210,6 +1279,11 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config,
     let label = &saver.label;
     let trace = &saver.trace;
     let mut frame_no = 0usize;
+    // The face being followed: the one the scan matched. A detection that
+    // does not continue it is not the answerer, however well it scores.
+    let mut tracked: Option<[f32; 4]> = start;
+    let mut lost_since: Option<Instant> = None;
+    let mut paused_logged = false;
     let summary = |det: &NodDetector, shake: &ShakeDetector, t: f32| format!("{} nods, {} shakes in {:.1}s, thresholds {:.3}/{:.3}", det.nods, shake.shakes, t, det.inner.thr, shake.inner.thr);
     while t0.elapsed() < window {
         if let Some((answers, user)) = answers {
@@ -1217,17 +1291,17 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config,
                 Some(Answer::Password(pw)) => {
                     log::info!("consent: password answer after {}", summary(&det, &shake, t0.elapsed().as_secs_f32()));
                     label.set("password");
-                    return Ok(Gesture::Password(pw));
+                    return Ok((Gesture::Password(pw), tracked));
                 }
                 Some(Answer::Dismiss) => {
                     log::info!("consent: dismissed after {}", summary(&det, &shake, t0.elapsed().as_secs_f32()));
                     label.set("dismissed");
-                    return Ok(Gesture::Dismissed);
+                    return Ok((Gesture::Dismissed, tracked));
                 }
                 Some(Answer::Gone) => {
                     log::info!("consent: requester gone after {}", summary(&det, &shake, t0.elapsed().as_secs_f32()));
                     label.set("gone");
-                    return Ok(Gesture::Gone);
+                    return Ok((Gesture::Gone, tracked));
                 }
                 None => {}
             }
@@ -1236,7 +1310,7 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config,
             if last_face.elapsed() > l {
                 log::info!("consent: no face for {:.0}s after {} nods; the user left", l.as_secs_f32(), det.nods);
                 label.set("face-lost");
-                return Ok(Gesture::FaceLost);
+                return Ok((Gesture::FaceLost, tracked));
             }
         }
         let Some(img) = cap.next(Duration::from_secs(1))? else { continue };
@@ -1250,7 +1324,41 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config,
             continue;
         }
         let faces = pipeline.detector.detect(&img, min_detection)?;
-        let Some(face) = faces.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) else { continue };
+        if faces.is_empty() {
+            continue;
+        }
+        let face = match tracked {
+            None => faces.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)).unwrap(),
+            Some(tb) => match track(&faces, tb) {
+                Track::Found(i) => {
+                    lost_since = None;
+                    paused_logged = false;
+                    faces.into_iter().nth(i).unwrap()
+                }
+                other => {
+                    // The followed face is not there, or cannot be told from
+                    // another: nothing counts meanwhile, and a nod begun
+                    // before is forgotten. A single face back for a second
+                    // is adopted (the user moved); the confirm at the end
+                    // still has to match it.
+                    last_face = Instant::now();
+                    if !paused_logged {
+                        log::info!("consent: gesture paused, the matched face is {}", if other == Track::Lost { "not in view" } else { "one of two" });
+                        paused_logged = true;
+                    }
+                    det = NodDetector::with_floor(floors.0);
+                    shake = ShakeDetector::with_floor(floors.1);
+                    prev = None;
+                    let since = *lost_since.get_or_insert(Instant::now());
+                    if other == Track::Lost && faces.len() == 1 && since.elapsed() > Duration::from_secs(1) {
+                        tracked = Some(faces[0].bbox);
+                        log::info!("consent: following the one face in view again");
+                    }
+                    continue;
+                }
+            },
+        };
+        tracked = Some(face.bbox);
         last_face = Instant::now();
         let pose = pose::pose(&face.landmarks);
         let geom = (face.bbox[2], face.bbox[0] + face.bbox[2] / 2.0, face.bbox[1] + face.bbox[3] / 2.0);
@@ -1281,7 +1389,7 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config,
             } else {
                 log::info!("consent: head shake, refused after {}", summary(&det, &shake, t));
                 label.set("shaken");
-                return Ok(Gesture::Shaken);
+                return Ok((Gesture::Shaken, tracked));
             }
         }
         if det.push_full(pos_y, Some(pose.yaw), t, Some(geom)) {
@@ -1292,14 +1400,51 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config,
                 } else {
                     log::info!("consent: {}", summary(&det, &shake, t));
                     label.set("nodded");
-                    return Ok(Gesture::Nodded);
+                    return Ok((Gesture::Nodded, tracked));
                 }
             }
         }
     }
     log::info!("consent: timed out, {} ({} face frames)", summary(&det, &shake, window.as_secs_f32()), trace.borrow().len());
     label.set("timeout");
-    Ok(Gesture::Timeout)
+    Ok((Gesture::Timeout, tracked))
+}
+
+#[cfg(test)]
+mod track_tests {
+    use super::{track, Track};
+    use faceauth_engine::Face;
+
+    fn face(x: f32, y: f32, w: f32, score: f32) -> Face {
+        Face { bbox: [x, y, w, w * 1.2], score, landmarks: [[0.0; 2]; 5], embedding: None }
+    }
+
+    #[test]
+    fn the_matched_box_is_followed_through_a_nod_sized_move() {
+        let t = [200.0, 300.0, 90.0, 108.0];
+        assert_eq!(track(&[face(205.0, 318.0, 92.0, 0.7)], t), Track::Found(0), "moved 18 px down on a 90 px face: the same head");
+        assert_eq!(track(&[face(200.0, 300.0, 100.0, 0.7)], t), Track::Found(0), "came a little closer");
+    }
+
+    #[test]
+    fn a_face_elsewhere_or_of_another_size_is_not_it() {
+        let t = [200.0, 300.0, 90.0, 108.0];
+        assert_eq!(track(&[face(300.0, 300.0, 90.0, 0.9)], t), Track::Lost, "a face width away is someone else, however well it scores");
+        assert_eq!(track(&[face(200.0, 300.0, 50.0, 0.9)], t), Track::Lost, "half the size is not the same head");
+        assert_eq!(track(&[], t), Track::Lost);
+    }
+
+    #[test]
+    fn the_followed_face_is_chosen_over_a_better_scoring_stranger() {
+        let t = [200.0, 300.0, 90.0, 108.0];
+        assert_eq!(track(&[face(400.0, 300.0, 120.0, 0.95), face(203.0, 305.0, 90.0, 0.6)], t), Track::Found(1));
+    }
+
+    #[test]
+    fn two_faces_that_both_fit_are_ambiguous() {
+        let t = [200.0, 300.0, 90.0, 108.0];
+        assert_eq!(track(&[face(205.0, 300.0, 90.0, 0.7), face(230.0, 310.0, 85.0, 0.7)], t), Track::Ambiguous);
+    }
 }
 
 #[cfg(test)]
@@ -1311,7 +1456,7 @@ mod window_text_tests {
         assert_eq!(clip("sudo /bin/sh -c true\nRoutine update\nNo action needed"), "sudo /bin/sh -c trueRoutine updateNo action needed");
         assert_eq!(clip("ls \u{202E}txt.sh"), "ls txt.sh");
         assert_eq!(clip("a\u{200B}b\u{2066}c\tD"), "abcD");
-        assert_eq!(clip(&"x".repeat(400)).chars().count(), 300);
+        assert_eq!(clip(&"x".repeat(2500)).chars().count(), 2000);
         assert_eq!(clip("plain command --flag"), "plain command --flag");
     }
 
@@ -1647,7 +1792,7 @@ mod shake_tests {
 
     impl Cfg {
         fn default_cfg() -> Cfg {
-            Cfg { nod_min: NodDetector::MIN_DOWN, shake_min: ShakeDetector::MIN_TURN, rest_s: super::Oscillation::REST_S, span_s: super::Oscillation::SPAN_S, rev_frames: super::Oscillation::REV_FRAMES, leg_max: 1.0, regular: None, filter: "none", min_steps: 1, prior_still: 1.0, need_ramp: false, co_nod: 0.0, co_shake: 0.0 }
+            Cfg { nod_min: NodDetector::MIN_DOWN, shake_min: ShakeDetector::MIN_TURN, rest_s: super::Oscillation::REST_S, span_s: super::Oscillation::SPAN_S, rev_frames: super::Oscillation::REV_FRAMES, leg_max: 1.0, regular: None, filter: "none", min_steps: 1, prior_still: 1.0, need_ramp: false, co_nod: super::Oscillation::CO_MOTION, co_shake: super::Oscillation::CO_MOTION }
         }
         fn apply(&self, nod: &mut NodDetector, shake: &mut ShakeDetector) {
             nod.inner.min_thr = self.nod_min;
@@ -1829,6 +1974,68 @@ mod shake_tests {
         assert!(shakes_n >= 4 && shakes_hit == shakes_n, "shakes {}/{}", shakes_hit, shakes_n);
     }
 
+    /// Sweep the box-moves-with-the-leg rule over the recorded corpus and
+    /// the red team's synthetic traces: which thresholds keep every real
+    /// gesture, and which refuse a box that does not move. Prints a table.
+    #[test]
+    fn co_motion_sweep() {
+        let load = |dir: &str| -> Vec<(String, String)> {
+            let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).collect();
+            files.sort();
+            files.into_iter().filter(|p| p.extension().map(|e| e == "txt").unwrap_or(false)).map(|p| (p.file_name().unwrap().to_string_lossy().to_string(), std::fs::read_to_string(&p).unwrap())).filter(|(_, t)| t.split_whitespace().next().map(|tok| tok.split('/').count() >= 19).unwrap_or(false)).collect()
+        };
+        let cal = load(concat!(env!("CARGO_MANIFEST_DIR"), "/traces/cal"));
+        let phone = load(concat!(env!("CARGO_MANIFEST_DIR"), "/traces/cal-phone"));
+        let red = load(concat!(env!("CARGO_MANIFEST_DIR"), "/traces/redteam"));
+        eprintln!("co_nod  co_shake  cal nods  cal shakes  cal fp  phone fp  frozen-box nods  waggled-board nods");
+        for &co in &[0.0f32, 0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10, 0.12, 0.14] {
+            let cfg = Cfg { filter: "none", co_nod: co, co_shake: co, ..Cfg::default_cfg() };
+            let (mut nh, mut nn, mut sh, mut sn, mut fp) = (0, 0, 0, 0, 0);
+            for (name, text) in &cal {
+                let (shakes, nods, _, _) = replay_cfg(text, cfg);
+                let (wn, ws) = expected(name);
+                if wn { nn += 1; if nods >= 2 { nh += 1; } if shakes > 0 { fp += 1; } }
+                else if ws { sn += 1; if shakes >= 2 { sh += 1; } if nods > 0 { fp += 1; } }
+                else if nods > 0 || shakes > 0 { fp += 1; }
+            }
+            let mut pfp = 0;
+            for (name, text) in &phone {
+                let (shakes, nods, _, _) = replay_cfg(text, cfg);
+                let (wn, ws) = expected(name);
+                if (wn && shakes > 0) || (ws && nods > 0) || (!wn && !ws && (nods > 0 || shakes > 0)) { pfp += 1; }
+            }
+            let r = |n: &str| red.iter().find(|(f, _)| f == n).map(|(_, t)| replay_cfg(t, cfg).1).unwrap_or(usize::MAX);
+            eprintln!("{:<7} {:<9} {:>2}/{:<6} {:>2}/{:<8} {:>5} {:>8} {:>15} {:>19}", co, co, nh, nn, sh, sn, fp, pfp, r("frozen-box.txt"), r("waggled-board.txt"));
+        }
+    }
+
+    /// The red team's synthetic traces (traces/redteam, never part of the
+    /// recorded corpus). A box that does not move while the motion figure
+    /// oscillates is not a head, and the live rule refuses it. A waggled
+    /// board moves its box with it and passes the detector by design: the
+    /// strobed confirm after the nods is what refuses that one.
+    #[test]
+    fn a_frozen_box_is_not_a_nod_and_a_waggled_board_is_left_to_the_confirm() {
+        let cfg = Cfg { filter: "none", ..Cfg::default_cfg() };
+        let frozen = include_str!("../traces/redteam/frozen-box.txt");
+        let (shakes, nods, _, _) = replay_cfg(frozen, cfg);
+        assert_eq!((nods, shakes), (0, 0), "a frozen box read as a gesture");
+        let board = include_str!("../traces/redteam/waggled-board.txt");
+        let (_, nods, _, _) = replay_cfg(board, cfg);
+        assert!(nods >= 2, "the waggled board is meant to pass the detector (the confirm refuses it); it read {} nods", nods);
+    }
+
+    /// A hand-held print waggled over the matched face (traces/print,
+    /// recorded 2026-09-22): its box swings about two face widths, and the
+    /// detector counts no nod from it at any point.
+    #[test]
+    fn a_hand_held_print_waggle_is_not_a_nod() {
+        let cfg = Cfg { filter: "none", ..Cfg::default_cfg() };
+        let text = include_str!("../traces/print/2026-09-22-print-waggle-handheld.txt");
+        let (_, nods, _, _) = replay_cfg(text, cfg);
+        assert_eq!(nods, 0, "a print waggled by hand read as a nod");
+    }
+
     /// The phone-call corpus (traces/cal-phone): recorded under distraction,
     /// so it sets no floors, but no non-gesture window may read as a
     /// gesture, and no gesture window may read as the other gesture.
@@ -1938,6 +2145,18 @@ mod shake_tests {
     /// Recorded at the reference user's first calibrated floor (0.129): two
     /// double nods (at 4 s and 34 s) that the floor-relative rest bar
     /// cleared as "rest". Both must count at that floor and at the default.
+    /// The same recording against the box-motion rule: prints the nods
+    /// counted at each threshold (the 4 s pair and the 34 s pair).
+    #[test]
+    fn co_motion_sweep_on_the_calibrated_floor_recording() {
+        let text = include_str!("../traces/2026-09-22-user-nods-at-calibrated-floor.txt");
+        for co in [0.0f32, 0.005, 0.01, 0.015, 0.02, 0.03] {
+            let cfg = Cfg { nod_min: 0.09, co_nod: co, ..Cfg::default_cfg() };
+            let (_, nods, _, nod_at) = replay_cfg(text, cfg);
+            eprintln!("co {:<6} nods {} at {:?}", co, nods, nod_at);
+        }
+    }
+
     #[test]
     fn the_users_nods_count_at_their_calibrated_floor() {
         let text = include_str!("../traces/2026-09-22-user-nods-at-calibrated-floor.txt");

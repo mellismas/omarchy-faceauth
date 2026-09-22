@@ -33,6 +33,17 @@ static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static ANSWERS: std::sync::LazyLock<crate::consent::Answers> = std::sync::LazyLock::new(Default::default);
 /// Held by the consent request whose turn it is; the others wait on it.
 static CONSENT_TURN: Mutex<()> = Mutex::new(());
+/// Requesters (pid, start time) the user refused, and when. sudo retries a
+/// failed authentication (three tries by default), each a new request from
+/// the same process: the refusal stands for those retries without a window.
+static REFUSED: Mutex<Vec<((i32, u64), Instant)>> = Mutex::new(Vec::new());
+const REFUSAL_STANDS: Duration = Duration::from_secs(30);
+/// Polkit asks again after a failure, through a fresh helper, until the
+/// agent cancels the request (which it does on a face refusal, a moment
+/// later). A refusal for a user's polkit request stands for this long, so
+/// the helper that arrives in that moment is refused without a window.
+static POLKIT_REFUSED: Mutex<Vec<(u32, Instant)>> = Mutex::new(Vec::new());
+const POLKIT_REFUSAL_STANDS: Duration = Duration::from_secs(5);
 /// The daemon's config, for notices sent while the authenticator is busy
 /// with another request (its mutex is held for a whole consent round).
 static CFG: std::sync::OnceLock<crate::config::Config> = std::sync::OnceLock::new();
@@ -364,7 +375,25 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
     log::info!("attempt for {} (uid {}, pid {}{})", req.user, cred.uid(), cred.pid(), if req.consent { ", consent" } else { "" });
     let outcome = if req.consent {
         let uid = user_uid(&req.user).unwrap_or(cred.uid());
+        let key = (cred.pid(), crate::consent::starttime_of(cred.pid()));
+        if let Ok(mut r) = REFUSED.lock() {
+            r.retain(|(_, at)| at.elapsed() < REFUSAL_STANDS);
+            if r.iter().any(|(k, _)| *k == key) {
+                log::info!("consent: pid {} was refused moments ago; the refusal stands", cred.pid());
+                return reply(&mut stream, &Outcome::Refused { reason: "refused already".into(), elapsed_ms: 0 });
+            }
+        }
         let caller = crate::consent::CallerInfo::from_pid(cred.pid(), uid);
+        let via_polkit = caller.via == "polkit";
+        if via_polkit {
+            if let Ok(mut r) = POLKIT_REFUSED.lock() {
+                r.retain(|(_, at)| at.elapsed() < POLKIT_REFUSAL_STANDS);
+                if r.iter().any(|(u, _)| *u == uid) {
+                    log::info!("consent: polkit asked again for uid {} right after a refusal; the refusal stands", uid);
+                    return reply(&mut stream, &Outcome::Refused { reason: "refused already".into(), elapsed_ms: 0 });
+                }
+            }
+        }
         // The requester may not wait for an answer (sudo interrupted, the
         // polkit helper gone): a hang-up on its socket ends the request and
         // takes the window down with it.
@@ -440,6 +469,16 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
         };
         let outcome = consent_rounds(&take, &req.user, caller, req.budget.filter(|b| b.is_finite()), &gone);
         active.store(false, std::sync::atomic::Ordering::SeqCst);
+        if matches!(outcome, Outcome::Refused { .. }) {
+            if let Ok(mut r) = REFUSED.lock() {
+                r.push((key, Instant::now()));
+            }
+            if via_polkit {
+                if let Ok(mut r) = POLKIT_REFUSED.lock() {
+                    r.push((uid, Instant::now()));
+                }
+            }
+        }
         // A hang-up noticed after the verdict must not haunt the next request.
         if let Ok(mut m) = ANSWERS.lock() {
             if matches!(m.get(&req.user), Some(crate::consent::Answer::Gone)) {
@@ -557,8 +596,16 @@ fn locality_inner(pid: i32, target_user: &str) -> Result<Locality> {
     if path.starts_with(&format!("/user.slice/user-{}.slice/user@{}.service/", target_uid, target_uid)) {
         let sessions = loginctl(&["show-user", &target_uid.to_string(), "-p", "Sessions", "--value"])?;
         for id in sessions.split_whitespace() {
-            if session_is_local(id)? {
-                return Ok(Locality::Local);
+            match session_is_local(id) {
+                Ok(true) => return Ok(Locality::Local),
+                Ok(false) => {}
+                // A session in the list that logind no longer knows: the
+                // daemon's own `systemd-run --machine` calls (a notice, the
+                // window) each open a session for an instant, and a request
+                // arriving in that instant (sudo's retry) lists it. It says
+                // nothing about the caller; the other sessions do.
+                Err(e) if e.to_string().contains("known") => log::debug!("locality: session {} vanished while checking: {}", id, e),
+                Err(e) => return Err(e),
             }
         }
         return Ok(Locality::Remote(format!("{} has no local session on a seat", target_user)));

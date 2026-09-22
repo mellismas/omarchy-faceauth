@@ -69,9 +69,18 @@ pub enum Outcome {
     Calibrated { gesture: String, amplitude: f32, stored: bool, nod_floor: f32, shake_floor: f32 },
     /// Too many failed attempts for this user recently; try again later.
     Cooldown { seconds: u64 },
-    /// The face matched but the consent gesture did not come (or the window
-    /// could not be shown): elevation refused.
+    /// The consent request ended without an answer that could count: no
+    /// window to ask in, the requester gone, no answer inside a caller's
+    /// budget. Not a decision; the module ignores it and the caller's stack
+    /// falls to its password.
     ConsentDenied { reason: String, elapsed_ms: u64 },
+    /// The user said no to a polkit request: a head shake, the window
+    /// dismissed, or the confirm after the nods refused. The module fails
+    /// the stack on it and the agent cancels the request, so no other prompt
+    /// follows. A sudo request gets `ConsentDenied` for the same answer
+    /// instead: sudo's terminal prompt is where a password goes next, and a
+    /// failure there would only make sudo ask again, ten times.
+    Refused { reason: String, elapsed_ms: u64 },
 }
 
 impl Outcome {
@@ -85,10 +94,14 @@ impl Outcome {
     }
 }
 
-/// The longest a caller may ask a consent request to stay open, and the
-/// default when it asks for nothing: the config's `consent_seconds`, capped
-/// here so every duration derived from it stays representable.
+/// The longest a caller with a limit of its own (the CLI) may ask a consent
+/// request to stay open.
 pub const MAX_BUDGET: f32 = 3600.0;
+/// A request from the PAM module has no deadline: like the lock screen it
+/// waits, looking for attention, until it is answered or the requester goes
+/// away. About four months, so every duration derived from it stays
+/// representable.
+pub const NO_DEADLINE: f32 = 1.0e7;
 
 pub struct ConsentSession {
     pub user: String,
@@ -351,13 +364,14 @@ impl Authenticator {
     /// summoned; the caller shows it when the request resumes.
     pub fn consent_begin(&mut self, user: &str, caller: crate::consent::CallerInfo, budget: Option<f32>, open_window: bool) -> std::result::Result<ConsentSession, Outcome> {
         // A caller with a limit of its own (the CLI) sets the budget, minus a
-        // margin so it always sees the verdict; anything else (the PAM
-        // module) gets the configured window. When it runs out the request
-        // is refused and the caller's stack falls to its password: a window
-        // left up for hours would be approved by a nod meant for something else.
+        // margin so it always sees the verdict. The PAM module sets none and
+        // the request has no deadline: gestures are read for
+        // `consent_seconds` after each match, and when that passes unanswered
+        // the camera drops to the presence rhythm and an attentive face
+        // re-arms it, as the lock screen does.
         let total = match budget {
             Some(b) if b.is_finite() => (b - 3.0).clamp(5.0, MAX_BUDGET),
-            _ => self.cfg.consent_seconds.clamp(10.0, MAX_BUDGET),
+            _ => NO_DEADLINE,
         };
         let mut dialog = match Dialog::new(&self.cfg, user) {
             Ok(d) => d,
@@ -374,7 +388,7 @@ impl Authenticator {
             return Err(Outcome::Cooldown { seconds: hold.as_secs().max(1) });
         }
         if open_window {
-            if let Err(e) = dialog.show("scanning", "Look at the camera.", &caller, total) {
+            if let Err(e) = dialog.show("scanning", "Look at the camera.", &caller, 0.0) {
                 log::warn!("consent: no window for {}: {}", user, e);
                 return Err(Outcome::ConsentDenied { reason: "no graphical session to ask in".into(), elapsed_ms: 0 });
             }
@@ -418,10 +432,24 @@ impl Authenticator {
                 gesture = Some(Gesture::Timeout);
                 break;
             }
-            let mut hook = |cap: &mut IrCapture, pipeline: &mut Pipeline| -> Result<bool> {
-                let _ = dialog_cell.borrow_mut().show("nod", &msg, caller_ref, total);
+            let templates_ref = &s.templates;
+            let mut hook = |cap: &mut IrCapture, pipeline: &mut Pipeline, matched: &faceauth_engine::Face| -> Result<bool> {
+                let _ = dialog_cell.borrow_mut().show("nod", &msg, caller_ref, 0.0);
                 let left = total - started.elapsed().as_secs_f32();
-                let g = wait_for_nods(cap, pipeline, &cfg, Duration::from_secs_f32(left.max(1.0)), cfg.consent_nods, Some((&answers, &user)), lost_after, floors)?;
+                let window = cfg.consent_seconds.clamp(10.0, MAX_BUDGET).min(left).max(1.0);
+                let (g, followed) = wait_for_nods(cap, pipeline, &cfg, Duration::from_secs_f32(window), cfg.consent_nods, Some((&answers, &user)), lost_after, floors, Some(matched.bbox))?;
+                let g = if g == Gesture::Nodded {
+                    // The nods came from the followed box; before they count,
+                    // that box must be live and enrolled, right now.
+                    let _ = dialog_cell.borrow_mut().show("confirming", "Confirming.", caller_ref, 0.0);
+                    match confirm(cap, pipeline, &cfg, templates_ref, followed.unwrap_or(matched.bbox))? {
+                        Confirm::Live => Gesture::Nodded,
+                        Confirm::NoSignal => Gesture::ConfirmUnclear,
+                        Confirm::Refused(why) => Gesture::ConfirmFailed(why),
+                    }
+                } else {
+                    g
+                };
                 let ok = matches!(g, Gesture::Nodded | Gesture::Password(_));
                 *gesture_cell.borrow_mut() = Some(g);
                 Ok(ok)
@@ -439,6 +467,40 @@ impl Authenticator {
                 (None, Outcome::ConsentDenied { reason, .. }) if reason == "requester gone" => return Round::Done(o.clone()),
                 (Some(Gesture::FaceLost), _) => return Round::FaceLost,
                 (None, Outcome::NoFace { .. }) if lost_after.is_some() => return Round::FaceLost,
+                // The confirm could not read the strobe (a bright room, the
+                // user leaned away): not a refusal. Ask for the face and go
+                // round again.
+                (Some(Gesture::ConfirmUnclear), _) => {
+                    log::info!("consent: the confirm saw no strobe signal; asking for the face again");
+                    let _ = dialog_cell.borrow_mut().show("scanning", "Could not confirm. Face the camera and nod again, or type your password.", caller_ref, 0.0);
+                    if let Some(r) = self.wait_for_attention(&user, &answers, lost_after) {
+                        return r;
+                    }
+                    continue;
+                }
+                // The confirm refused: the thing that nodded is not a live
+                // enrolled face. A failure, charged like a refused scan.
+                (Some(Gesture::ConfirmFailed(why)), _) => {
+                    log::warn!("consent: the confirm after the nods refused ({})", why);
+                    let hold = self.charge(&user);
+                    outcome = match hold {
+                        Some(h) => Outcome::Cooldown { seconds: h.as_secs().max(1) },
+                        None => refusal(&s.caller, format!("confirm: {}", why), started.elapsed().as_millis() as u64),
+                    };
+                    gesture = g;
+                    break;
+                }
+                // The nod window passed with nobody answering: no verdict.
+                // The camera drops to the presence rhythm and an attentive
+                // face re-arms the request, the lock screen's cycle.
+                (Some(Gesture::Timeout), _) if total >= NO_DEADLINE => {
+                    log::info!("consent: no answer in the nod window; waiting for attention");
+                    let _ = dialog_cell.borrow_mut().show("scanning", "Look at the camera to nod, or type your password.", caller_ref, 0.0);
+                    if let Some(r) = self.wait_for_attention(&user, &answers, lost_after) {
+                        return r;
+                    }
+                    continue;
+                }
                 (None, Outcome::NoMatch { .. }) | (None, Outcome::NoFace { .. }) => {
                     if matches!(o, Outcome::NoMatch { .. }) {
                         if let Some(hold) = self.charge(&user) {
@@ -448,7 +510,7 @@ impl Authenticator {
                             break;
                         }
                     }
-                    let _ = dialog_cell.borrow_mut().show("scanning", "Face not recognised. Look at the camera, or type your password.", caller_ref, total);
+                    let _ = dialog_cell.borrow_mut().show("scanning", "Face not recognised. Look at the camera, or type your password.", caller_ref, 0.0);
                     if let Some(r) = self.wait_for_attention(&user, &answers, lost_after) {
                         return r;
                     }
@@ -465,7 +527,7 @@ impl Authenticator {
                         gesture = None;
                         break;
                     }
-                    let _ = dialog_cell.borrow_mut().show("scanning", "Not accepted. Look straight at the camera, or type your password.", caller_ref, total);
+                    let _ = dialog_cell.borrow_mut().show("scanning", "Not accepted. Look straight at the camera, or type your password.", caller_ref, 0.0);
                     if let Some(r) = self.wait_for_attention(&user, &answers, lost_after) {
                         return r;
                     }
@@ -504,7 +566,7 @@ impl Authenticator {
         let dialog_cell = std::cell::RefCell::new(&mut dialog);
         let measured: std::cell::Cell<Option<(f32, f32)>> = std::cell::Cell::new(None);
         let msg = if gesture == "shake" { "Recognised. Shake your head twice, the way you would to say no." } else { "Recognised. Nod twice, the way you would to say yes." };
-        let mut hook = |cap: &mut IrCapture, pipeline: &mut Pipeline| -> Result<bool> {
+        let mut hook = |cap: &mut IrCapture, pipeline: &mut Pipeline, _matched: &faceauth_engine::Face| -> Result<bool> {
             let _ = dialog_cell.borrow_mut().show("nod", msg, &caller, seconds);
             let m = crate::consent::measure_motion(cap, pipeline, &cfg, user, gesture, seconds)?;
             measured.set(Some(m));
@@ -595,8 +657,11 @@ impl Authenticator {
             // Anything that is not an approval ends as a consent refusal, so
             // the module ignores it and the terminal password is the floor.
             (Some(Gesture::Timeout), o @ Outcome::Match { .. }) => Outcome::ConsentDenied { reason: "no answer".into(), elapsed_ms: elapsed_of(&o) },
-            (Some(Gesture::Dismissed), o) => Outcome::ConsentDenied { reason: "dismissed".into(), elapsed_ms: elapsed_of(&o) },
-            (Some(Gesture::Shaken), o) => Outcome::ConsentDenied { reason: "shaken".into(), elapsed_ms: elapsed_of(&o) },
+            // A shake or a dismissal is the answer no: the window had the
+            // password box, so closing it without either is a refusal that
+            // ends the request, not a hand-off to another prompt.
+            (Some(Gesture::Dismissed), o) => refusal(caller, "dismissed".into(), elapsed_of(&o)),
+            (Some(Gesture::Shaken), o) => refusal(caller, "shaken".into(), elapsed_of(&o)),
             (Some(Gesture::Password(_)), o) if !password_ok => {
                 // A face was seen and the password behind it was wrong: it
                 // counts against the same budget as a failed scan.
@@ -616,12 +681,17 @@ impl Authenticator {
                 notify(&self.cfg, user, &format!("Root access granted by {}", how), &format!("{}\n{}", caller.command, caller.parents));
                 log::info!("consent granted ({}) for {}: {} [{}]", how, user, caller.command, caller.parents);
             }
-            Outcome::ConsentDenied { reason, .. } if matches!(gesture, Some(Gesture::Dismissed | Gesture::Shaken)) || reason == "dismissed" || reason == "shaken" => {
+            Outcome::Refused { reason, .. } | Outcome::ConsentDenied { reason, .. } if reason == "shaken" || reason == "dismissed" => {
                 // The user closed the window, or shook their head at it: the
                 // answer is no, and the window goes away without a verdict on it.
                 s.dialog.hide();
                 let how = if reason == "shaken" { "Refused by head shake" } else { "Refused: dismissed" };
                 notify(&self.cfg, user, how, &format!("{}\n{}", caller.command, caller.parents));
+                log::warn!("consent refused for {}: {} [{}] ({})", user, caller.command, caller.parents, reason);
+            }
+            Outcome::Refused { reason, .. } | Outcome::ConsentDenied { reason, .. } if reason.starts_with("confirm: ") => {
+                s.dialog.show_final("denied", "The nod did not come from a live, enrolled face. Refused.", caller);
+                notify(&self.cfg, user, "Refused: the nod was not a live, enrolled face", &format!("{}\n{}", caller.command, caller.parents));
                 log::warn!("consent refused for {}: {} [{}] ({})", user, caller.command, caller.parents, reason);
             }
             Outcome::Cooldown { seconds } => {
@@ -694,11 +764,11 @@ impl Authenticator {
     /// the outcome is returned; `Ok(false)` from it turns the match into
     /// `ConsentDenied`. Keeping the camera open avoids the two-to-three second
     /// restart that would otherwise eat the start of a consent gesture.
-    fn run_with(&mut self, templates: &UserTemplates, after_match: Option<&mut dyn FnMut(&mut IrCapture, &mut Pipeline) -> Result<bool>>, timeout_seconds: f32) -> Result<Outcome> {
+    fn run_with(&mut self, templates: &UserTemplates, after_match: Option<&mut dyn FnMut(&mut IrCapture, &mut Pipeline, &faceauth_engine::Face) -> Result<bool>>, timeout_seconds: f32) -> Result<Outcome> {
         self.run_with_answers(templates, after_match, timeout_seconds, None)
     }
 
-    fn run_with_answers(&mut self, templates: &UserTemplates, after_match: Option<&mut dyn FnMut(&mut IrCapture, &mut Pipeline) -> Result<bool>>, timeout_seconds: f32, answers: Option<&(Answers, String)>) -> Result<Outcome> {
+    fn run_with_answers(&mut self, templates: &UserTemplates, after_match: Option<&mut dyn FnMut(&mut IrCapture, &mut Pipeline, &faceauth_engine::Face) -> Result<bool>>, timeout_seconds: f32, answers: Option<&(Answers, String)>) -> Result<Outcome> {
         let t0 = Instant::now();
         let deadline = Duration::from_secs_f32(timeout_seconds);
         let ms = |t: Instant| t.elapsed().as_millis() as u64;
@@ -859,7 +929,7 @@ impl Authenticator {
                         i.set(true)?;
                     }
                     cap.freeze_exposure(false);
-                    let ok = hook(&mut cap, &mut self.pipeline)?;
+                    let ok = hook(&mut cap, &mut self.pipeline, face)?;
                     cap.stop()?;
                     if !ok {
                         return Ok(Outcome::ConsentDenied { reason: "no nod".into(), elapsed_ms: ms(t0) });
@@ -881,9 +951,103 @@ impl Authenticator {
     }
 }
 
+/// The user's no, as the caller's lane can take it: polkit gets a refusal
+/// that ends the request; sudo gets a fall-through to its own prompt.
+fn refusal(caller: &crate::consent::CallerInfo, reason: String, elapsed_ms: u64) -> Outcome {
+    if caller.via == "polkit" {
+        Outcome::Refused { reason, elapsed_ms }
+    } else {
+        Outcome::ConsentDenied { reason, elapsed_ms }
+    }
+}
+
+/// The confirm's verdict.
+pub enum Confirm {
+    /// Two strobed pairs passed the flash gate and matched the templates.
+    Live,
+    /// Every pair read no strobe signal: nothing to decide on.
+    NoSignal,
+    /// The gate refused, or the face did not match.
+    Refused(String),
+}
+
+/// How long the confirm may take before it gives up.
+const CONFIRM_SECONDS: f32 = 2.5;
+
+/// After the nods: is the followed box a live, enrolled face right now?
+/// The illuminator goes back to the alternating pattern and the exposure is
+/// frozen; lit frames are gated against their unlit predecessor and embedded,
+/// and two pairs at or above the accept threshold say yes. One gate refusal
+/// or one non-match says no. Pairs with no signal are skipped; if that is
+/// all there was, nothing is decided.
+pub fn confirm(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, templates: &UserTemplates, followed: [f32; 4]) -> Result<Confirm> {
+    if cap.illuminator.is_none() {
+        // No strobe control: the scan already ran ungated under the
+        // administrator's explicit setting, and so does this.
+        return Ok(if cfg.liveness_required { Confirm::Refused("no strobe control".into()) } else { Confirm::Live });
+    }
+    cap.freeze_exposure(true);
+    cap.illuminator.as_ref().unwrap().set_pattern(0xaa)?;
+    let t0 = Instant::now();
+    let device = cap.identity.clone();
+    let mut prev: Option<(Grey, f64)> = None;
+    let mut tracked = followed;
+    let (mut passed, mut nosignal, mut pairs) = (0usize, 0usize, 0usize);
+    let verdict = loop {
+        if t0.elapsed().as_secs_f32() > CONFIRM_SECONDS {
+            break if pairs == 0 || nosignal == pairs { Confirm::NoSignal } else { Confirm::Refused("no match within the confirm window".into()) };
+        }
+        let Some(img) = cap.next(Duration::from_secs(1))? else { continue };
+        let mean = img.data.iter().map(|&v| v as f64).sum::<f64>() / img.data.len() as f64;
+        let Some((p_img, p_mean)) = prev.replace((img.clone(), mean)) else { continue };
+        if t0.elapsed() < Duration::from_millis(150) || mean < p_mean * 1.15 {
+            continue;
+        }
+        let faces = pipeline.analyse(&img, cfg.min_detection, 1)?;
+        let Some(face) = faces.first() else { continue };
+        // The embedded face must be the followed one, not whichever scored best.
+        match crate::consent::track(std::slice::from_ref(face), tracked) {
+            crate::consent::Track::Found(_) => {}
+            _ => {
+                log::debug!("confirm: the scored face is not the followed box");
+                continue;
+            }
+        }
+        tracked = face.bbox;
+        pairs += 1;
+        let fr = FlashResponse::measure(&img, &p_img, face, cap.exposure.exposure, cap.exposure.gain.max(16));
+        match fr.verdict() {
+            Verdict::Pass => {}
+            Verdict::NoSignal => {
+                nosignal += 1;
+                continue;
+            }
+            v => {
+                log::warn!("confirm: liveness denied: {:?} {:?}", v, fr);
+                break Confirm::Refused(format!("{:?}", v));
+            }
+        }
+        let Some(e) = &face.embedding else { continue };
+        match templates.best_match_on(e, &device) {
+            Some((score, _)) if score >= cfg.accept_threshold => {
+                passed += 1;
+                log::debug!("confirm: pair {} matched", passed);
+                if passed >= 2 {
+                    break Confirm::Live;
+                }
+            }
+            Some(_) => break Confirm::Refused("the face that nodded does not match".into()),
+            None => break Confirm::Refused("no template for this camera".into()),
+        }
+    };
+    cap.illuminator.as_ref().unwrap().set(true)?;
+    log::info!("confirm: {} in {:.2}s ({} pairs, {} no signal, {} matched)", match &verdict { Confirm::Live => "live".to_string(), Confirm::NoSignal => "no signal".to_string(), Confirm::Refused(w) => format!("refused: {}", w) }, t0.elapsed().as_secs_f32(), pairs, nosignal, passed);
+    Ok(verdict)
+}
+
 fn elapsed_of(o: &Outcome) -> u64 {
     match o {
-        Outcome::Match { elapsed_ms, .. } | Outcome::NoMatch { elapsed_ms, .. } | Outcome::NoFace { elapsed_ms, .. } | Outcome::Denied { elapsed_ms, .. } | Outcome::ConsentDenied { elapsed_ms, .. } => *elapsed_ms,
+        Outcome::Match { elapsed_ms, .. } | Outcome::NoMatch { elapsed_ms, .. } | Outcome::NoFace { elapsed_ms, .. } | Outcome::Denied { elapsed_ms, .. } | Outcome::ConsentDenied { elapsed_ms, .. } | Outcome::Refused { elapsed_ms, .. } => *elapsed_ms,
         _ => 0,
     }
 }

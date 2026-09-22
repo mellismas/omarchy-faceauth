@@ -4,13 +4,18 @@
 //! camera is the user being authenticated, and maps the answer:
 //!
 //! - match                        -> PAM_SUCCESS
+//! - refused                      -> PAM_AUTH_ERR (consent lines only: a head
+//!   shake, a dismissed window, or a confirm after the nods that failed)
 //! - anything else, any failure   -> PAM_IGNORE
 //!
 //! No camera, no models, no templates, no image data in this process. Every
 //! failure path is PAM_IGNORE so that under `sufficient` or
 //! `[success=done default=ignore]` the stack falls through to the password;
 //! lockout is structurally impossible from here. Panics are caught and become
-//! PAM_IGNORE too.
+//! PAM_IGNORE too. The one deliberate answer, a refusal, is PAM_AUTH_ERR so
+//! that a consent line written as `[success=done auth_err=die default=ignore]`
+//! ends the stack on it: the window had the password box, so closing it
+//! without a password or a nod is the answer no, and no other prompt follows.
 //!
 //! Module arguments (in the PAM line): `socket=/run/faceauth/sock`,
 //! `timeout=8` (seconds to wait for the daemon's reply), and `prompt`, which
@@ -31,6 +36,7 @@ const PAM_SUCCESS: c_int = 0;
 /// PAM_RHOST: set by network services (sshd) to the remote host name.
 const PAM_RHOST: c_int = 4;
 const PAM_IGNORE: c_int = 25;
+const PAM_AUTH_ERR: c_int = 7;
 const PAM_AUTHTOK: c_int = 6;
 const PAM_CONV: c_int = 5;
 const PAM_PROMPT_ECHO_OFF: c_int = 1;
@@ -185,12 +191,20 @@ fn parse_args(argc: c_int, argv: *const *const c_char) -> Args {
 }
 
 /// The whole conversation with the daemon. Any error is `false`.
-fn daemon_says_match(socket: &Path, user: &str, timeout: Duration, consent: bool) -> bool {
-    let Ok(mut stream) = UnixStream::connect(socket) else { return false };
+/// What the daemon said, as far as this module cares.
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum Said {
+    Match,
+    Refused,
+    Other,
+}
+
+fn daemon_says(socket: &Path, user: &str, timeout: Duration, consent: bool) -> Said {
+    let Ok(mut stream) = UnixStream::connect(socket) else { return Said::Other };
     // A consent request has no deadline: the daemon answers when the user does.
     let read_timeout = if consent { None } else { Some(timeout) };
     if stream.set_read_timeout(read_timeout).is_err() || stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
-        return false;
+        return Said::Other;
     }
     // A tiny hand-built JSON object: the user name is escaped for quotes and backslashes.
     let escaped: String = user.chars().flat_map(|c| match c {
@@ -201,18 +215,29 @@ fn daemon_says_match(socket: &Path, user: &str, timeout: Duration, consent: bool
     }).collect();
     let req = if consent { format!("{{\"user\":\"{}\",\"consent\":true}}\n", escaped) } else { format!("{{\"user\":\"{}\"}}\n", escaped) };
     if stream.write_all(req.as_bytes()).is_err() {
-        return false;
+        return Said::Other;
     }
     let mut line = String::new();
     let mut reader = BufReader::new(stream).take(MAX_REPLY as u64);
     if reader.read_line(&mut line).is_err() {
-        return false;
+        return Said::Other;
     }
-    // The daemon serialises the tag first: the reply must BEGIN with the
-    // match object, so no later field (which may echo request bytes) can
-    // ever make a non-match read as one.
+    classify(&line, consent)
+}
+
+/// The daemon serialises the tag first: the reply must BEGIN with the match
+/// object, so no later field (which may echo request bytes) can ever make a
+/// non-match read as one. A refusal is read the same way, and only on a
+/// consent line: a plain scan has no answer no.
+fn classify(line: &str, consent: bool) -> Said {
     let t = line.trim_start();
-    t.starts_with("{\"result\":\"match\",") || t == "{\"result\":\"match\"}"
+    if t.starts_with("{\"result\":\"match\",") || t == "{\"result\":\"match\"}" {
+        Said::Match
+    } else if consent && t.starts_with("{\"result\":\"refused\",") {
+        Said::Refused
+    } else {
+        Said::Other
+    }
 }
 
 fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char) -> c_int {
@@ -263,12 +288,12 @@ fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char
             Err(()) => return PAM_IGNORE,
         }
     }
-    let ok = daemon_says_match(Path::new(&args.socket), &user, args.timeout, args.consent);
-    log(&format!("user {}: {} after {} ms", sanitise(&user), if ok { "match, success" } else { "no match or no daemon, ignore" }, t0.elapsed().as_millis()));
-    if ok {
-        PAM_SUCCESS
-    } else {
-        PAM_IGNORE
+    let said = daemon_says(Path::new(&args.socket), &user, args.timeout, args.consent);
+    log(&format!("user {}: {} after {} ms", sanitise(&user), match said { Said::Match => "match, success", Said::Refused => "refused by the user, auth error", Said::Other => "no match or no daemon, ignore" }, t0.elapsed().as_millis()));
+    match said {
+        Said::Match => PAM_SUCCESS,
+        Said::Refused => PAM_AUTH_ERR,
+        Said::Other => PAM_IGNORE,
     }
 }
 
@@ -295,8 +320,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn replies_are_read_by_their_leading_tag_only() {
+        assert_eq!(classify("{\"result\":\"match\",\"frames\":2}", true), Said::Match);
+        assert_eq!(classify("{\"result\":\"refused\",\"reason\":\"shaken\",\"elapsed_ms\":5}", true), Said::Refused);
+        assert_eq!(classify("{\"result\":\"refused\",\"reason\":\"shaken\"}", false), Said::Other, "a plain scan has no refusal");
+        assert_eq!(classify("{\"result\":\"consent_denied\",\"reason\":\"no answer\"}", true), Said::Other);
+        assert_eq!(classify("{\"result\":\"no_match\",\"message\":\"{\\\"result\\\":\\\"match\\\",\"}", true), Said::Other);
+        assert_eq!(classify("", true), Said::Other);
+    }
+
+    #[test]
     fn no_daemon_is_not_a_match() {
-        assert!(!daemon_says_match(Path::new("/nonexistent/faceauth.sock"), "alice", Duration::from_secs(1), false));
+        assert_eq!(daemon_says(Path::new("/nonexistent/faceauth.sock"), "alice", Duration::from_secs(1), false), Said::Other);
     }
 
     #[test]

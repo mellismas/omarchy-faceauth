@@ -19,18 +19,25 @@ on its own: the PAM stacks are written only by `omarchy setup security face`.
   face module and closed by `pam_deny`. Looking at the machine is the act;
   there is no prompt. While the panel is blank the daemon takes one short look
   every two seconds and wakes it only for an attentive face.
-- **`sudo` and polkit.** Every request opens a window that names the process
-  asking and its parents as the daemon reads them from `/proc`. For polkit
-  the agent also relays polkit's own message; any process of yours could
-  send one, so the window shows it below, marked unverified, never as the
-  request's name. Nothing elevates until the face matches and the daemon
-  sees two nods; two head shakes refuse; the password typed into the window
-  approves. Buttons dismiss, deny and kill the requester, or block it for ten
-  minutes. The window waits for `consent_seconds` (90 by default), then the
-  request is refused and the terminal password is the floor; if you walk
-  away the session locks and the request resumes when your face unlocks it.
-  Requests queue and get the window in turn, and a waiting one is announced
-  by a desktop notice. Every approval and every refusal posts a notice.
+- **`sudo` and polkit.** Every request opens a window with two lines: what
+  is being asked, and who asked. For `sudo` and for `pkexec` the first line
+  is the full command line as the daemon reads it from `/proc` ("Run as
+  root: ..."); the second is the requesting process, its pid and its
+  parents. For any other polkit action the daemon has nothing to read (the
+  helper is polkit's and polkit does not say who asked), so the first line
+  is polkit's own description as the agent relayed it, labelled
+  "Unverified:", and the second says the asking process was not found.
+  Nothing is elided. Nothing elevates until the face matches, the daemon
+  sees two nods from that same face, and a strobed confirm shows it live
+  and enrolled; two head shakes refuse; the password typed into the window
+  approves. Buttons dismiss, deny and kill the requester, or block it for
+  ten minutes. The request has no deadline: nods are read for
+  `consent_seconds` (90 by default) after a match, then the camera drops to
+  the presence rhythm and an attentive face re-arms it, the lock screen's
+  cycle; if you walk away the session locks and the request resumes when
+  your face unlocks it. Requests queue and get the window in turn, and a
+  waiting one is announced by a desktop notice. Every approval and every
+  refusal posts a notice.
 - **Gestures.** Both are read from real image motion of the face between
   frames (how far its pixels shifted, vertically for the nod, sideways for
   the shake), not from landmark angles, because a face detector's fit can
@@ -44,7 +51,14 @@ on its own: the PAM stacks are written only by `omarchy setup security face`.
   every two seconds (five on battery); lock when the camera has not seen the
   enrolled user for the away time.
 - **Every failure falls back to the password**, from a covered camera to a
-  stopped service: the module returns `PAM_IGNORE` for everything but a match.
+  stopped service: the module returns `PAM_IGNORE` for everything but a
+  match and one other thing. On a polkit consent line the answer no (a head
+  shake, a dismissed window, a confirm that refused) is `PAM_AUTH_ERR`, the
+  line is written `[success=done auth_err=die default=ignore]`, and the
+  agent cancels the request on it, so polkit reports "Not authorized" and
+  no password dialog follows. A sudo request takes the same answer as "not
+  by face": the terminal prompt is where a password goes next, and a
+  failure there would only make sudo ask again.
 
 ## What it defends against, and what it does not
 
@@ -56,7 +70,14 @@ on its own: the PAM stacks are written only by `omarchy setup security face`.
   head's background stays dark.
 - **Elevation is never passive.** A face in front of the camera approves
   nothing; the nod is measured by the daemon on its own camera, and no key,
-  click or socket message stands in for it. Window answers carry a
+  click or socket message stands in for it. The nod is read from the face
+  that matched: the daemon follows that box through the gesture and ignores
+  other faces, a nod whose box does not move with it is not a nod (image
+  motion inside a still box is not a head), and after the second nod the
+  illuminator strobes again and two lit/unlit pairs must pass the flash
+  gate and match the templates on that box before anything is approved. A
+  print held up and waggled passes the detector and fails the confirm.
+  Window answers carry a
   per-request token, handed to the window in its payload and returned on
   the answer's stdin. It is readable by a process running as you (the
   payload is an argument to the summon), which buys that process a

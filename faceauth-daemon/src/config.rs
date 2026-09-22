@@ -40,10 +40,10 @@ pub struct Config {
     /// Seconds the scan waits for a face during a consent request (the window
     /// is up; the user may not be looking yet).
     pub consent_scan_seconds: f32,
-    /// Seconds a sudo or polkit consent request stays open, scanning and
-    /// nod included, when the caller sets no budget of its own (the PAM
-    /// module never does). Then it is refused and the stack falls to the
-    /// password. Clamped to 10..3600.
+    /// Seconds the nod is read for after each match of a sudo or polkit
+    /// consent request. When it passes unanswered the camera drops to the
+    /// presence rhythm and an attentive face re-arms a fresh scan; the
+    /// request itself has no deadline. Clamped to 10..3600.
     pub consent_seconds: f32,
     /// Nods required.
     pub consent_nods: usize,
