@@ -13,6 +13,7 @@ liveness_required = true    # refuse to authenticate when the gate cannot run; f
 ir_orientation = [true, true, true]   # transpose, flip_x, flip_y: Surface Book 2 mounting
 
 consent_nods = 2            # nods that approve a request; two head shakes refuse
+consent_seconds = 90        # a sudo/polkit request is refused after this long unanswered; the password prompt is then the floor
 gesture_trace = false       # write each consent round's per-frame recording to <store_dir>/gestures (root-only; for tuning)
 gesture_record_only = false # recognise gestures but never act on them (for recording a calibration battery)
 

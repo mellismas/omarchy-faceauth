@@ -85,10 +85,10 @@ impl Outcome {
     }
 }
 
-/// A consent request that outlives one turn with the camera.
-/// "Wait for the user" as a finite number of seconds: about four months, so
-/// every duration derived from it stays representable.
-pub const NO_BUDGET: f32 = 1.0e7;
+/// The longest a caller may ask a consent request to stay open, and the
+/// default when it asks for nothing: the config's `consent_seconds`, capped
+/// here so every duration derived from it stays representable.
+pub const MAX_BUDGET: f32 = 3600.0;
 
 pub struct ConsentSession {
     pub user: String,
@@ -124,7 +124,7 @@ pub struct Authenticator {
     /// When the last attempt matched, per user; the presence watch resumes on it.
     pub last_match: std::collections::HashMap<String, Instant>,
     /// Recent failed attempts per user, for the cooldown.
-    failures: std::collections::HashMap<String, Vec<Instant>>,
+    failures: std::collections::HashMap<String, Strikes>,
     /// Answers from the consent window, shared with the server threads.
     pub answers: Answers,
     /// Users with a consent request in flight (the window is up).
@@ -145,6 +145,62 @@ pub struct Authenticator {
 const COOLDOWN_FAILURES: usize = 5;
 const COOLDOWN_WINDOW: Duration = Duration::from_secs(60);
 const COOLDOWN_HOLD: Duration = Duration::from_secs(30);
+/// Each hold served without a match in between doubles the next, up to this
+/// many doublings (30 s, 60 s, 120 s, 240 s, 480 s).
+const COOLDOWN_MAX_DOUBLINGS: u32 = 4;
+/// This long without a failure, and the escalation is forgotten.
+const COOLDOWN_QUIET: Duration = Duration::from_secs(600);
+
+/// A user's recent failures and the holds they have earned. A match clears
+/// it. Shared by the lock-screen lane and the consent lane: a print held up
+/// to either gets the same five tries and the same escalating holds.
+#[derive(Default)]
+pub struct Strikes {
+    times: Vec<Instant>,
+    last: Option<Instant>,
+    /// The hold in force, if one is.
+    until: Option<Instant>,
+    /// Holds served since the last match (or the last quiet spell).
+    holds: u32,
+}
+
+impl Strikes {
+    fn charge(&mut self, now: Instant) {
+        if self.holds > 0 && self.last.map(|l| now.duration_since(l) >= COOLDOWN_QUIET).unwrap_or(true) {
+            // A long quiet spell forgets the escalation, not the failure.
+            self.holds = 0;
+        }
+        self.times.push(now);
+        self.last = Some(now);
+    }
+
+    /// The hold in force, if any. The first hold takes `COOLDOWN_FAILURES`
+    /// failures inside the window; once one has been served, every further
+    /// failure starts the next hold at once, twice as long as the last, until
+    /// a match or `COOLDOWN_QUIET` without a failure.
+    fn hold(&mut self, now: Instant) -> Option<Duration> {
+        if let Some(u) = self.until {
+            if now < u {
+                return Some(u - now);
+            }
+            // Served. The failures are spent; the next one starts a longer hold.
+            self.until = None;
+            self.holds = self.holds.saturating_add(1);
+            self.times.clear();
+        }
+        self.times.retain(|t| now.duration_since(*t) < COOLDOWN_WINDOW);
+        let needed = if self.holds > 0 { 1 } else { COOLDOWN_FAILURES };
+        if self.times.len() < needed {
+            return None;
+        }
+        let last = self.times.last().copied().unwrap_or(now);
+        let length = COOLDOWN_HOLD * 2u32.pow(self.holds.min(COOLDOWN_MAX_DOUBLINGS));
+        let until = last + length;
+        self.until = Some(until);
+        self.times.clear();
+        Some(until.saturating_duration_since(now))
+    }
+}
 
 impl Authenticator {
     pub fn new(cfg: Config) -> Result<Self> {
@@ -294,9 +350,31 @@ impl Authenticator {
     /// With `open_window` false (the session is locked) the window is not
     /// summoned; the caller shows it when the request resumes.
     pub fn consent_begin(&mut self, user: &str, caller: crate::consent::CallerInfo, budget: Option<f32>, open_window: bool) -> std::result::Result<ConsentSession, Outcome> {
-        let mut dialog = Dialog::new(&self.cfg, user);
+        // A caller with a limit of its own (the CLI) sets the budget, minus a
+        // margin so it always sees the verdict; anything else (the PAM
+        // module) gets the configured window. When it runs out the request
+        // is refused and the caller's stack falls to its password: a window
+        // left up for hours would be approved by a nod meant for something else.
+        let total = match budget {
+            Some(b) if b.is_finite() => (b - 3.0).clamp(5.0, MAX_BUDGET),
+            _ => self.cfg.consent_seconds.clamp(10.0, MAX_BUDGET),
+        };
+        let mut dialog = match Dialog::new(&self.cfg, user) {
+            Ok(d) => d,
+            Err(e) => return Err(Outcome::Error { message: e.to_string() }),
+        };
+        // The cooldown counts the lock screen's failures and this lane's
+        // together: the lane that grants root gets no more tries than the one
+        // that opens the session.
+        if let Some(hold) = self.hold_for(user) {
+            log::warn!("consent for {} refused: {} recent failures, {}s of hold left", user, COOLDOWN_FAILURES, hold.as_secs());
+            if open_window {
+                dialog.show_final("denied", &format!("Too many failed attempts. Try again in {} seconds, or use your password.", hold.as_secs().max(1)), &caller);
+            }
+            return Err(Outcome::Cooldown { seconds: hold.as_secs().max(1) });
+        }
         if open_window {
-            if let Err(e) = dialog.show("scanning", "Look at the camera.", &caller, 0.0) {
+            if let Err(e) = dialog.show("scanning", "Look at the camera.", &caller, total) {
                 log::warn!("consent: no window for {}: {}", user, e);
                 return Err(Outcome::ConsentDenied { reason: "no graphical session to ask in".into(), elapsed_ms: 0 });
             }
@@ -311,14 +389,6 @@ impl Authenticator {
             p.insert(user.to_string());
         }
         self.last_consent.insert(user.to_string(), Instant::now());
-        // A caller with a limit of its own (the CLI) sets the budget, minus a
-        // margin so it always sees the verdict. The PAM module sets none: the
-        // window waits until it is answered, and the only way it ends without
-        // an answer is the user dismissing it or the requester going away.
-        let total = match budget {
-            Some(b) => (b - 3.0).max(5.0),
-            None => NO_BUDGET,
-        };
         Ok(ConsentSession { user: user.to_string(), caller, dialog, started: Instant::now(), total, templates, pending: Arc::clone(&self.pending), locked_at: None })
     }
 
@@ -370,6 +440,14 @@ impl Authenticator {
                 (Some(Gesture::FaceLost), _) => return Round::FaceLost,
                 (None, Outcome::NoFace { .. }) if lost_after.is_some() => return Round::FaceLost,
                 (None, Outcome::NoMatch { .. }) | (None, Outcome::NoFace { .. }) => {
+                    if matches!(o, Outcome::NoMatch { .. }) {
+                        if let Some(hold) = self.charge(&user) {
+                            log::warn!("consent for {}: too many failed scans; {}s of hold", user, hold.as_secs());
+                            outcome = Outcome::Cooldown { seconds: hold.as_secs().max(1) };
+                            gesture = None;
+                            break;
+                        }
+                    }
                     let _ = dialog_cell.borrow_mut().show("scanning", "Face not recognised. Look at the camera, or type your password.", caller_ref, total);
                     if let Some(r) = self.wait_for_attention(&user, &answers, lost_after) {
                         return r;
@@ -381,6 +459,12 @@ impl Authenticator {
                 // approved by it), and the log keeps the refusal.
                 (None, Outcome::Denied { reason, .. }) if reason != "password" => {
                     log::info!("consent: scan refused ({}); the window keeps waiting", reason);
+                    if let Some(hold) = self.charge(&user) {
+                        log::warn!("consent for {}: too many refused scans; {}s of hold", user, hold.as_secs());
+                        outcome = Outcome::Cooldown { seconds: hold.as_secs().max(1) };
+                        gesture = None;
+                        break;
+                    }
                     let _ = dialog_cell.borrow_mut().show("scanning", "Not accepted. Look straight at the camera, or type your password.", caller_ref, total);
                     if let Some(r) = self.wait_for_attention(&user, &answers, lost_after) {
                         return r;
@@ -410,7 +494,10 @@ impl Authenticator {
         let view = u.clone();
         let cfg = self.cfg.clone();
         let caller = crate::consent::CallerInfo { command: format!("Calibration: {} twice, naturally", if gesture == "shake" { "shake your head" } else { "nod" }), via: "calibration".into(), ..Default::default() };
-        let mut dialog = crate::consent::Dialog::new(&cfg, user);
+        let mut dialog = match crate::consent::Dialog::new(&cfg, user) {
+            Ok(d) => d,
+            Err(e) => return Outcome::Error { message: e.to_string() },
+        };
         if let Err(e) = dialog.show("scanning", "Look at the camera.", &caller, seconds) {
             return Outcome::Error { message: format!("no window to calibrate in: {}", e) };
         }
@@ -510,7 +597,12 @@ impl Authenticator {
             (Some(Gesture::Timeout), o @ Outcome::Match { .. }) => Outcome::ConsentDenied { reason: "no answer".into(), elapsed_ms: elapsed_of(&o) },
             (Some(Gesture::Dismissed), o) => Outcome::ConsentDenied { reason: "dismissed".into(), elapsed_ms: elapsed_of(&o) },
             (Some(Gesture::Shaken), o) => Outcome::ConsentDenied { reason: "shaken".into(), elapsed_ms: elapsed_of(&o) },
-            (Some(Gesture::Password(_)), o) if !password_ok => Outcome::ConsentDenied { reason: "wrong password".into(), elapsed_ms: elapsed_of(&o) },
+            (Some(Gesture::Password(_)), o) if !password_ok => {
+                // A face was seen and the password behind it was wrong: it
+                // counts against the same budget as a failed scan.
+                let _ = self.charge(user);
+                Outcome::ConsentDenied { reason: "wrong password".into(), elapsed_ms: elapsed_of(&o) }
+            }
             (_, o) => o,
         };
         let outcome = if password_ok { Outcome::Match { score: Some(1.0), frames: 0, elapsed_ms: s.started.elapsed().as_millis() as u64 } } else { outcome };
@@ -531,6 +623,11 @@ impl Authenticator {
                 let how = if reason == "shaken" { "Refused by head shake" } else { "Refused: dismissed" };
                 notify(&self.cfg, user, how, &format!("{}\n{}", caller.command, caller.parents));
                 log::warn!("consent refused for {}: {} [{}] ({})", user, caller.command, caller.parents, reason);
+            }
+            Outcome::Cooldown { seconds } => {
+                s.dialog.show_final("denied", &format!("Too many failed attempts. Try again in {} seconds, or use your password.", seconds), caller);
+                notify(&self.cfg, user, "Refused: too many failed attempts", &format!("{}\n{}", caller.command, caller.parents));
+                log::warn!("consent refused for {}: {} [{}] (cooldown {}s)", user, caller.command, caller.parents, seconds);
             }
             Outcome::ConsentDenied { .. } => {
                 let why = match gesture { Some(Gesture::Password(_)) => "Wrong password. Refused.", _ => "No answer. Refused." };
@@ -554,16 +651,8 @@ impl Authenticator {
             Err(e) => return Outcome::Error { message: e.to_string() },
         };
         // Cooldown: a print held up at the lock screen does not get unlimited tries.
-        let now = Instant::now();
-        let fails = self.failures.entry(user.to_string()).or_default();
-        fails.retain(|t| now.duration_since(*t) < COOLDOWN_WINDOW);
-        if fails.len() >= COOLDOWN_FAILURES {
-            let last = fails.last().copied().unwrap_or(now);
-            let hold = COOLDOWN_HOLD.saturating_sub(now.duration_since(last));
-            if !hold.is_zero() {
-                return Outcome::Cooldown { seconds: hold.as_secs().max(1) };
-            }
-            fails.clear();
+        if let Some(hold) = self.hold_for(user) {
+            return Outcome::Cooldown { seconds: hold.as_secs().max(1) };
         }
         match self.run(&templates) {
             Ok(o) => {
@@ -573,7 +662,7 @@ impl Authenticator {
                         self.failures.remove(user);
                     }
                     Outcome::NoMatch { .. } | Outcome::Denied { .. } => {
-                        self.failures.entry(user.to_string()).or_default().push(Instant::now());
+                        let _ = self.charge(user);
                     }
                     _ => {}
                 }
@@ -581,6 +670,19 @@ impl Authenticator {
             }
             Err(e) => Outcome::Error { message: e.to_string() },
         }
+    }
+
+    /// The hold this user is under, if any.
+    fn hold_for(&mut self, user: &str) -> Option<Duration> {
+        self.failures.entry(user.to_string()).or_default().hold(Instant::now())
+    }
+
+    /// Record a failure where a face was seen; the hold it starts, if any.
+    fn charge(&mut self, user: &str) -> Option<Duration> {
+        let now = Instant::now();
+        let s = self.failures.entry(user.to_string()).or_default();
+        s.charge(now);
+        s.hold(now)
     }
 
     fn run(&mut self, templates: &UserTemplates) -> Result<Outcome> {
@@ -783,5 +885,68 @@ fn elapsed_of(o: &Outcome) -> u64 {
     match o {
         Outcome::Match { elapsed_ms, .. } | Outcome::NoMatch { elapsed_ms, .. } | Outcome::NoFace { elapsed_ms, .. } | Outcome::Denied { elapsed_ms, .. } | Outcome::ConsentDenied { elapsed_ms, .. } => *elapsed_ms,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod strikes_tests {
+    use super::*;
+
+    fn t(secs: u64) -> Instant {
+        // A fixed origin far enough in the past that every test time is after it.
+        static ORIGIN: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(|| Instant::now() - Duration::from_secs(100_000));
+        *ORIGIN + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn five_failures_in_a_minute_start_a_hold() {
+        let mut s = Strikes::default();
+        for i in 0..4 {
+            s.charge(t(i));
+            assert_eq!(s.hold(t(i)), None, "four failures are free");
+        }
+        s.charge(t(4));
+        let hold = s.hold(t(4)).expect("the fifth starts a hold");
+        assert_eq!(hold, COOLDOWN_HOLD);
+        assert_eq!(s.hold(t(4 + 10)), Some(COOLDOWN_HOLD - Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn each_served_hold_doubles_the_next() {
+        let mut s = Strikes::default();
+        for i in 0..5 {
+            s.charge(t(i));
+        }
+        assert_eq!(s.hold(t(4)), Some(COOLDOWN_HOLD));
+        // Served in full: free again, but the next failure is not a fresh budget.
+        assert_eq!(s.hold(t(4 + 30)), None);
+        s.charge(t(35));
+        assert_eq!(s.hold(t(35)), Some(COOLDOWN_HOLD * 2), "one failure after a served hold starts the next, twice as long");
+        assert_eq!(s.hold(t(35 + 60)), None);
+        s.charge(t(96));
+        assert_eq!(s.hold(t(96)), Some(COOLDOWN_HOLD * 4));
+        // Ten quiet minutes and the escalation is forgotten: five tries again.
+        assert_eq!(s.hold(t(96 + 120)), None);
+        s.charge(t(96 + 120 + 600));
+        assert_eq!(s.hold(t(96 + 120 + 600)), None);
+    }
+
+    #[test]
+    fn the_doubling_is_capped() {
+        let mut s = Strikes { last: Some(t(0)), holds: 40, ..Default::default() };
+        for i in 0..5 {
+            s.charge(t(i));
+        }
+        assert_eq!(s.hold(t(4)), Some(COOLDOWN_HOLD * 16));
+    }
+
+    #[test]
+    fn failures_older_than_the_window_do_not_count() {
+        let mut s = Strikes::default();
+        for i in 0..4 {
+            s.charge(t(i));
+        }
+        s.charge(t(70));
+        assert_eq!(s.hold(t(70)), None, "four of the five are over a minute old");
     }
 }

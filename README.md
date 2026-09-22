@@ -19,15 +19,18 @@ on its own: the PAM stacks are written only by `omarchy setup security face`.
   face module and closed by `pam_deny`. Looking at the machine is the act;
   there is no prompt. While the panel is blank the daemon takes one short look
   every two seconds and wakes it only for an attentive face.
-- **`sudo` and polkit.** Every request opens a window that names the command
-  and the process asking (polkit requests are named from polkit's own
-  message, handed to the daemon by the agent as the request starts). Nothing
-  elevates until the face matches and the daemon sees two nods; two head
-  shakes refuse; the password typed into the window approves. Buttons dismiss,
-  deny and kill the requester, or block it for ten minutes. The window waits
-  without a time limit; if you walk away the session locks and the request
-  resumes when your face unlocks it. Requests queue and get their windows in
-  turn. Every approval and every refusal posts a desktop notice.
+- **`sudo` and polkit.** Every request opens a window that names the process
+  asking and its parents as the daemon reads them from `/proc`. For polkit
+  the agent also relays polkit's own message; any process of yours could
+  send one, so the window shows it below, marked unverified, never as the
+  request's name. Nothing elevates until the face matches and the daemon
+  sees two nods; two head shakes refuse; the password typed into the window
+  approves. Buttons dismiss, deny and kill the requester, or block it for ten
+  minutes. The window waits for `consent_seconds` (90 by default), then the
+  request is refused and the terminal password is the floor; if you walk
+  away the session locks and the request resumes when your face unlocks it.
+  Requests queue and get the window in turn, and a waiting one is announced
+  by a desktop notice. Every approval and every refusal posts a notice.
 - **Gestures.** Both are read from real image motion of the face between
   frames (how far its pixels shifted, vertically for the nod, sideways for
   the shake), not from landmark angles, because a face detector's fit can
@@ -54,7 +57,10 @@ on its own: the PAM stacks are written only by `omarchy setup security face`.
 - **Elevation is never passive.** A face in front of the camera approves
   nothing; the nod is measured by the daemon on its own camera, and no key,
   click or socket message stands in for it. Window answers carry a
-  per-request token that only the window the daemon summoned holds.
+  per-request token, handed to the window in its payload and returned on
+  the answer's stdin. It is readable by a process running as you (the
+  payload is an argument to the summon), which buys that process a
+  dismissal or one password check, never an approval.
 - **Remote callers.** A request whose caller the daemon cannot show to be
   local (an `sshd` in its ancestry, a logind session marked remote, or any
   shape it cannot verify) is refused before any window or camera. A same-uid
@@ -75,8 +81,12 @@ on its own: the PAM stacks are written only by `omarchy setup security face`.
 - **The socket** is open to root and the enrolled users only (mode 0660 plus
   an access-list entry per enrolled uid). Match scores go to root callers
   only, never to the journal.
-- **Rate limit**: five failed attempts in a minute, counted only when a face
-  was seen, then a thirty-second hold.
+- **Rate limit**, shared by the lock screen and the consent window: five
+  failed attempts in a minute, counted only when a face was seen (a
+  non-match, a liveness refusal, a wrong password behind a match), then a
+  thirty-second hold. Once a hold has been served every further failure
+  starts the next at once, twice as long, up to eight minutes, until a
+  match or ten quiet minutes.
 - **Not defended**: a look-alike, a 3D mask, malware already running as you
   with your password, a video rendered on a display the IR camera can see
   (not measured; not claimed), and anything a setuid-root binary you can run

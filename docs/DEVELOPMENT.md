@@ -1124,3 +1124,25 @@ and answers an error (PAM_IGNORE at the module) before taking the camera
 when every lid is closed. No lid at all reads as open. The lock lane is
 not gated: an instant ignore there would spin the lock screen's retry
 timer, and its probe mode already covers a dark camera.
+
+**Red team round one, 2026-09-22.** A second adversarial review (pack
+`design/security-review-20260922-redteam.html`) found the consent lane
+without a rate limit, the polkit window naming the request from the
+agent's relayed text, the sudo command line reaching the window unclipped,
+the answer token on argv, and a request with no deadline. Fixed in the
+daemon: the cooldown is one `Strikes` per user shared by both lanes, with
+escalating holds once one has been served; consent requests charge a
+failure on a non-matching scan, a liveness refusal and a wrong password;
+`CallerInfo.command` is only what `/proc` shows and the agent's text
+travels as `claim`; `clip` strips control and direction-override
+characters from everything that reaches the window; `consent_seconds` is
+the acceptance window when the module sets no budget (it never does) and
+the wire budget is clamped to an hour; the answer token comes back on
+stdin and the summon unit carries a description so the journal prints
+that instead of the payload; the token compare is constant time and a
+missing `/dev/urandom` fails the request; the request line has a five
+second wall clock; a handler panic returns its connection slot;
+`notify` no longer builds a `Dialog`; the trace recorder owns its buffer
+in a `RefCell`. Not in this round: the gesture-phase checks (continuity
+on the matched box, the box-moves-with-the-leg rule, a strobed confirm
+before approval), which are round two with the calibration battery.

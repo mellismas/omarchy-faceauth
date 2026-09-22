@@ -45,8 +45,14 @@ pub struct CallerInfo {
     pub pid: i32,
     pub exe: String,
     pub cmdline: String,
-    /// The command being elevated, when it can be named (sudo's arguments, pkexec's).
+    /// The command being elevated as far as /proc shows it (sudo's
+    /// arguments; the polkit requester's name and pid). Never text the
+    /// requesting side supplied about itself.
     pub command: String,
+    /// What the requesting side says the request is: for polkit, the message
+    /// and action id the agent relayed from polkitd. Any process of the
+    /// user's can send one, so the window shows it as unverified.
+    pub claim: String,
     /// The chain above it: "alacritty (3910) <- bash (3921)".
     pub parents: String,
     /// The process to kill if the user says no: the requester, not the helper.
@@ -56,6 +62,14 @@ pub struct CallerInfo {
 
 fn read_proc(pid: i32, what: &str) -> Option<String> {
     std::fs::read(format!("/proc/{}/{}", pid, what)).ok().map(|b| String::from_utf8_lossy(&b).replace('\0', " ").trim().to_string())
+}
+
+/// Text for the window: no control characters (a newline or a bidi override
+/// in a command line would let the requester write its own description) and
+/// at most 300 characters. Applied to everything read from /proc or sent by
+/// the polkit agent before it reaches the window or the log.
+pub fn clip(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control() && !matches!(*c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')).take(300).collect()
 }
 
 fn exe_of(pid: i32) -> String {
@@ -70,7 +84,7 @@ pub(crate) fn ppid_of(pid: i32) -> Option<i32> {
 }
 
 pub(crate) fn comm_of(pid: i32) -> String {
-    read_proc(pid, "comm").unwrap_or_default()
+    clip(&read_proc(pid, "comm").unwrap_or_default())
 }
 
 fn real_uid_of(pid: i32) -> Option<u32> {
@@ -87,13 +101,14 @@ fn starttime_of(pid: i32) -> u64 {
 /// but did not see the window cannot cancel or answer the request.
 pub static TOKENS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, String>>> = std::sync::LazyLock::new(Default::default);
 
-fn fresh_token() -> String {
+/// Sixteen random bytes as hex, or nothing: a token that could not be drawn
+/// from the kernel is not a token, and the request fails rather than run
+/// with a guessable one.
+fn fresh_token() -> Option<String> {
+    use std::io::Read;
     let mut b = [0u8; 16];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        let _ = f.read_exact(&mut b);
-    }
-    b.iter().map(|x| format!("{:02x}", x)).collect()
+    std::fs::File::open("/dev/urandom").ok()?.read_exact(&mut b).ok()?;
+    Some(b.iter().map(|x| format!("{:02x}", x)).collect())
 }
 
 /// What a polkit request is, as the agent heard it from polkitd: the action
@@ -192,28 +207,30 @@ impl CallerInfo {
                     served.retain(|&(sp, st)| std::path::Path::new(&format!("/proc/{}", sp)).exists() && starttime_of(sp) == st);
                     info.kill_pid = p;
                     // cmdline of a setuid process may be unreadable too; fall back to its name.
-                    let cl = read_proc(p, "cmdline").unwrap_or_default();
-                    info.command = if cl.is_empty() { format!("{} (arguments not readable)", comm_of(p)) } else { cl };
+                    let cl = clip(&read_proc(p, "cmdline").unwrap_or_default());
+                    info.command = if cl.is_empty() { format!("{} (pid {}, arguments not readable)", comm_of(p), p) } else { format!("{} (pid {})", cl, p) };
                     info.parents = parent_chain(p);
                 }
                 None => {
-                    info.command = "a polkit action".into();
+                    info.command = "a polkit action (requester not found)".into();
                 }
             }
+            // The agent's context is the requesting side's own account of
+            // itself: any process of the user's can send one, and the
+            // helper carries nothing to check it against. It is shown as a
+            // claim, never as the request's name.
             match context {
                 Some(c) => {
-                    log::info!("consent: polkit request named by the agent: {} ({})", c.message.trim(), c.action);
-                    info.command = c.message.trim().to_string();
-                    info.via = format!("polkit {}", c.action);
+                    log::info!("consent: polkit helper pid {} named {}; the agent relayed: {} ({})", pid, info.command, c.message.trim(), c.action);
+                    info.claim = clip(&format!("{} [{}]", c.message.trim(), c.action));
                 }
                 None => {
                     log::warn!("consent: no context from the polkit agent for helper pid {}; naming by process search only", pid);
-                    info.command = format!("{} (the polkit agent gave no details)", info.command);
                 }
             }
         } else {
             info.via = base.clone();
-            info.command = cmdline.clone();
+            info.command = clip(&cmdline);
             info.parents = parent_chain(pid);
         }
         info
@@ -254,18 +271,22 @@ struct Payload<'a> {
 }
 
 impl Dialog {
-    pub fn new(cfg: &Config, user: &str) -> Self {
-        let token = fresh_token();
+    pub fn new(cfg: &Config, user: &str) -> Result<Self> {
+        let token = fresh_token().ok_or_else(|| anyhow!("no randomness for the answer token"))?;
         if let Ok(mut t) = TOKENS.lock() {
             t.insert(user.to_string(), token.clone());
         }
-        Dialog { cfg: cfg.clone(), user: user.to_string(), open: false, token }
+        Ok(Dialog { cfg: cfg.clone(), user: user.to_string(), open: false, token })
     }
 
-    /// Does `token` answer this user's live request?
+    /// Does `token` answer this user's live request? Compared in constant
+    /// time; a wrong token and no request read the same.
     pub fn token_matches(user: &str, token: Option<&str>) -> bool {
         match (TOKENS.lock(), token) {
-            (Ok(t), Some(tok)) => t.get(user).map(|have| have == tok).unwrap_or(false),
+            (Ok(t), Some(tok)) => t.get(user).map(|have| {
+                let (a, b) = (have.as_bytes(), tok.as_bytes());
+                a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+            }).unwrap_or(false),
             _ => false,
         }
     }
@@ -277,8 +298,10 @@ impl Dialog {
                 .and_then(|t| t.lines().find_map(|l| l.strip_prefix("OMARCHY_PATH=").map(|v| v.trim_matches('"').to_string())))
                 .unwrap_or_else(|| "/usr/share/omarchy".into())
         });
+        // The unit's description is what the journal prints on start; the
+        // default is the command line, payload and token included.
         let status = std::process::Command::new("/usr/bin/timeout")
-            .args(["5", "/usr/bin/systemd-run", "--quiet", "--wait", "--collect", "--user"])
+            .args(["5", "/usr/bin/systemd-run", "--quiet", "--wait", "--collect", "--user", "--description=omarchy-faceauth window"])
             .arg(format!("--machine={}@.host", self.user))
             .arg(format!("-EOMARCHY_PATH={}", omarchy_path))
             .arg("/usr/bin/omarchy-shell")
@@ -346,11 +369,10 @@ pub fn session_locked(user: &str) -> bool {
 }
 
 pub fn notify(cfg: &Config, user: &str, title: &str, body: &str) {
-    let d = Dialog::new(cfg, user);
     let omarchy_path = cfg.omarchy_path.clone().unwrap_or_else(|| "/usr/share/omarchy".into());
     let _ = std::process::Command::new("/usr/bin/timeout")
-        .args(["5", "/usr/bin/systemd-run", "--quiet", "--collect", "--user"])
-        .arg(format!("--machine={}@.host", d.user))
+        .args(["5", "/usr/bin/systemd-run", "--quiet", "--collect", "--user", "--description=omarchy-faceauth notice"])
+        .arg(format!("--machine={}@.host", user))
         .arg(format!("-EOMARCHY_PATH={}", omarchy_path))
         .args(["/usr/bin/omarchy-notification-send", title, body])
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
@@ -1072,11 +1094,11 @@ impl ShakeDetector {
 /// recording is always saved (root-only) under `cal-<gesture>`.
 pub fn measure_motion(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, user: &str, gesture: &str, seconds: f32) -> Result<(f32, f32)> {
     let t0 = Instant::now();
-    let mut trace: Vec<String> = Vec::new();
     let mut forced = cfg.clone();
     forced.gesture_trace = true;
     let label: &'static str = if gesture == "shake" { "cal-shake" } else { "cal-nod" };
-    let _saver = TraceSaver { cfg: &forced, user: user.to_string(), trace: &trace as *const Vec<String>, label: std::cell::Cell::new(label) };
+    let saver = TraceSaver { cfg: &forced, user: user.to_string(), trace: Default::default(), label: std::cell::Cell::new(label) };
+    let trace = &saver.trace;
     let mut prev: Option<(Grey, [f32; 4])> = None;
     let (mut pos_x, mut pos_y) = (0f32, 0f32);
     let mut series: Vec<(f32, f32, f32)> = Vec::new();
@@ -1095,8 +1117,8 @@ pub fn measure_motion(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config
         let pose = pose::pose(&face.landmarks);
         let geom = (face.bbox[2], face.bbox[0] + face.bbox[2] / 2.0, face.bbox[1] + face.bbox[3] / 2.0);
         let l = &face.landmarks;
-        if trace.len() < 1200 {
-            trace.push(format!("{:.2}/{:.3}/{:+.3}/{:.0}/{:.0}/{:.0}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.2}/{:+.3}/{:+.3}", t, pose.pitch, pose.yaw, geom.0, geom.1, geom.2, l[0][0], l[0][1], l[1][0], l[1][1], l[2][0], l[2][1], l[3][0], l[3][1], l[4][0], l[4][1], face.score, pos_x, pos_y));
+        if trace.borrow().len() < 1200 {
+            trace.borrow_mut().push(format!("{:.2}/{:.3}/{:+.3}/{:.0}/{:.0}/{:.0}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.2}/{:+.3}/{:+.3}", t, pose.pitch, pose.yaw, geom.0, geom.1, geom.2, l[0][0], l[0][1], l[1][0], l[1][1], l[2][0], l[2][1], l[3][0], l[3][1], l[4][0], l[4][1], face.score, pos_x, pos_y));
         }
         series.push((t, pos_x, pos_y));
     }
@@ -1128,7 +1150,7 @@ pub fn measure_motion(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config
 struct TraceSaver<'a> {
     cfg: &'a Config,
     user: String,
-    trace: *const Vec<String>,
+    trace: std::cell::RefCell<Vec<String>>,
     label: std::cell::Cell<&'static str>,
 }
 
@@ -1137,10 +1159,7 @@ impl Drop for TraceSaver<'_> {
         if !self.cfg.gesture_trace {
             return;
         }
-        // SAFETY: the Vec is a local of the same scope declared before this
-        // guard, so it is still alive when the guard drops (locals drop in
-        // reverse order of declaration).
-        let trace = unsafe { &*self.trace };
+        let trace = self.trace.borrow();
         if trace.is_empty() {
             return;
         }
@@ -1187,9 +1206,9 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config,
     // Per-frame recording: the raw material for tuning both detectors.
     // Saved to the root-only gestures directory when the round ends, if
     // enabled; never to the journal (it is per-frame head pose).
-    let mut trace: Vec<String> = Vec::new();
-    let _saver = TraceSaver { cfg, user: user_name.clone(), trace: &trace as *const Vec<String>, label: std::cell::Cell::new("ended") };
-    let label = &_saver.label;
+    let saver = TraceSaver { cfg, user: user_name.clone(), trace: Default::default(), label: std::cell::Cell::new("ended") };
+    let label = &saver.label;
+    let trace = &saver.trace;
     let mut frame_no = 0usize;
     let summary = |det: &NodDetector, shake: &ShakeDetector, t: f32| format!("{} nods, {} shakes in {:.1}s, thresholds {:.3}/{:.3}", det.nods, shake.shakes, t, det.inner.thr, shake.inner.thr);
     while t0.elapsed() < window {
@@ -1242,13 +1261,13 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config,
             pos_y += dy / face.bbox[2].max(1.0);
         }
         prev = Some((img.clone(), face.bbox));
-        if trace.len() < 1200 {
+        if trace.borrow().len() < 1200 {
             // t/pitch/yaw/width/cx/cy, then the five landmarks (right eye,
             // left eye, nose, right mouth, left mouth) and the detector score:
             // enough to evaluate any pose measure offline from a recording.
             let l = &face.landmarks;
             // ... then the accumulated image motion (x, y) in face widths.
-            trace.push(format!("{:.2}/{:.3}/{:+.3}/{:.0}/{:.0}/{:.0}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.2}/{:+.3}/{:+.3}", t, pose.pitch, pose.yaw, geom.0, geom.1, geom.2, l[0][0], l[0][1], l[1][0], l[1][1], l[2][0], l[2][1], l[3][0], l[3][1], l[4][0], l[4][1], face.score, pos_x, pos_y));
+            trace.borrow_mut().push(format!("{:.2}/{:.3}/{:+.3}/{:.0}/{:.0}/{:.0}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.2}/{:+.3}/{:+.3}", t, pose.pitch, pose.yaw, geom.0, geom.1, geom.2, l[0][0], l[0][1], l[1][0], l[1][1], l[2][0], l[2][1], l[3][0], l[3][1], l[4][0], l[4][1], face.score, pos_x, pos_y));
         }
         // Nods are read from the nose's position below the eye line, not
         // the mouth-based pitch: the mouth landmarks jitter most in IR and
@@ -1278,9 +1297,39 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config,
             }
         }
     }
-    log::info!("consent: timed out, {} ({} face frames)", summary(&det, &shake, window.as_secs_f32()), trace.len());
+    log::info!("consent: timed out, {} ({} face frames)", summary(&det, &shake, window.as_secs_f32()), trace.borrow().len());
     label.set("timeout");
     Ok(Gesture::Timeout)
+}
+
+#[cfg(test)]
+mod window_text_tests {
+    use super::{clip, Dialog, TOKENS};
+
+    #[test]
+    fn clip_drops_line_breaks_and_direction_overrides() {
+        assert_eq!(clip("sudo /bin/sh -c true\nRoutine update\nNo action needed"), "sudo /bin/sh -c trueRoutine updateNo action needed");
+        assert_eq!(clip("ls \u{202E}txt.sh"), "ls txt.sh");
+        assert_eq!(clip("a\u{200B}b\u{2066}c\tD"), "abcD");
+        assert_eq!(clip(&"x".repeat(400)).chars().count(), 300);
+        assert_eq!(clip("plain command --flag"), "plain command --flag");
+    }
+
+    #[test]
+    fn a_token_matches_only_itself_and_only_while_the_request_lives() {
+        let user = "window-text-test-user";
+        let cfg = crate::config::Config::default();
+        assert!(!Dialog::token_matches(user, Some("anything")), "no request, no match");
+        let d = Dialog::new(&cfg, user).unwrap();
+        let tok = TOKENS.lock().unwrap().get(user).cloned().unwrap();
+        assert_eq!(tok.len(), 32);
+        assert!(Dialog::token_matches(user, Some(&tok)));
+        assert!(!Dialog::token_matches(user, Some(&tok[..31])));
+        assert!(!Dialog::token_matches(user, Some(&format!("{}0", tok))));
+        assert!(!Dialog::token_matches(user, None));
+        drop(d);
+        assert!(!Dialog::token_matches(user, Some(&tok)), "the token dies with the request");
+    }
 }
 
 #[cfg(test)]

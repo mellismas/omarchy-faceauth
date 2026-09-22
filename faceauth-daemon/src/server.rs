@@ -14,7 +14,7 @@ use anyhow::{bail, Context, Result};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use std::os::fd::AsFd;
 use serde::Deserialize;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -33,6 +33,9 @@ static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static ANSWERS: std::sync::LazyLock<crate::consent::Answers> = std::sync::LazyLock::new(Default::default);
 /// Held by the consent request whose turn it is; the others wait on it.
 static CONSENT_TURN: Mutex<()> = Mutex::new(());
+/// The daemon's config, for notices sent while the authenticator is busy
+/// with another request (its mutex is held for a whole consent round).
+static CFG: std::sync::OnceLock<crate::config::Config> = std::sync::OnceLock::new();
 static PENDING: std::sync::LazyLock<Arc<Mutex<std::collections::HashSet<String>>>> = std::sync::LazyLock::new(Default::default);
 
 /// Wire the authenticator's answer slot and pending set to the server's statics.
@@ -128,6 +131,9 @@ pub fn serve(auth: Arc<Mutex<Authenticator>>, socket: &Path) -> Result<()> {
         let users = auth.lock().map(|a| a.store.enrolled_users()).unwrap_or_default();
         apply_socket_acl(socket, &users);
     }
+    if let Ok(a) = auth.lock() {
+        let _ = CFG.set(a.cfg.clone());
+    }
     log::info!("listening on {}", socket.display());
     for conn in listener.incoming() {
         let stream = match conn {
@@ -145,27 +151,70 @@ pub fn serve(auth: Arc<Mutex<Authenticator>>, socket: &Path) -> Result<()> {
         }
         let auth = Arc::clone(&auth);
         std::thread::spawn(move || {
+            // The slot is given back on every exit, a panic's unwind included:
+            // a handler that dies must not hold a slot for the daemon's life.
+            let _slot = Slot;
             if let Err(e) = handle(stream, &auth) {
                 log::warn!("connection: {}", e);
             }
-            ACTIVE.fetch_sub(1, Ordering::SeqCst);
         });
     }
     Ok(())
 }
 
+struct Slot;
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        ACTIVE.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The whole request line must arrive within this, however slowly its
+/// bytes come: a peer feeding one byte per read timeout would otherwise
+/// hold a connection slot for as long as it liked.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Read one line of at most `MAX_REQUEST` bytes within `REQUEST_DEADLINE`.
+fn read_request(stream: &mut UnixStream) -> Result<Option<String>> {
+    use std::io::Read;
+    let start = Instant::now();
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let left = REQUEST_DEADLINE.saturating_sub(start.elapsed());
+        if left.is_zero() {
+            return Ok(None);
+        }
+        stream.set_read_timeout(Some(left))?;
+        match stream.read(&mut byte) {
+            Ok(0) => return Ok(None),
+            Ok(_) => {
+                buf.push(byte[0]);
+                if byte[0] == b'\n' {
+                    return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+                }
+                if buf.len() as u64 >= MAX_REQUEST {
+                    return Ok(None);
+                }
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let cred = getsockopt(&stream, PeerCredentials).context("peer credentials")?;
     // Bounded read before anything else: a peer that never sends a newline
-    // cannot grow this, and the error never echoes the peer's bytes back.
-    let mut line = String::new();
-    let mut reader = BufReader::new(stream.try_clone()?).take(MAX_REQUEST);
-    reader.read_line(&mut line)?;
-    if !line.ends_with('\n') {
+    // cannot grow this, one that dribbles cannot stretch it, and the error
+    // never echoes the peer's bytes back.
+    let Some(line) = read_request(&mut stream)? else {
         return reply(&mut stream, &Outcome::Error { message: "bad request".into() });
-    }
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let req: Request = match serde_json::from_str(line.trim()) {
         Ok(r) => r,
         Err(_) => return reply(&mut stream, &Outcome::Error { message: "bad request".into() }),
@@ -217,7 +266,7 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
     // the request is. Queued per user in arrival order, from the agent's
     // own uid, single use, and only from a local caller (the gate above).
     if let Some(action) = &req.context_action {
-        let clip = |s: &str| s.chars().filter(|c| !c.is_control()).take(300).collect::<String>();
+        let clip = crate::consent::clip;
         let ctx = crate::consent::PolkitContext { action: clip(action), message: clip(req.context_message.as_deref().unwrap_or("")), cookie: clip(req.context_cookie.as_deref().unwrap_or("")), uid: cred.uid(), at: Instant::now() };
         log::info!("polkit context from the agent (uid {}, pid {}): {} {}", cred.uid(), cred.pid(), ctx.action, ctx.message);
         if let Ok(mut m) = crate::consent::CONTEXTS.lock() {
@@ -378,13 +427,18 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
                         if !waited {
                             waited = true;
                             log::info!("consent: request from pid {} waits its turn behind another", cred.pid());
+                            // The window shows one request at a time; the one
+                            // waiting is announced so it is not a silent hang.
+                            if let Some(cfg) = CFG.get() {
+                                crate::consent::notify(cfg, &req.user, "Another request is waiting", &format!("{}\n{}\nIt gets the window after the one on screen is answered.", caller.command, caller.parents));
+                            }
                         }
                         std::thread::sleep(Duration::from_millis(300));
                     }
                 }
             }
         };
-        let outcome = consent_rounds(&take, &req.user, caller, req.budget, &gone);
+        let outcome = consent_rounds(&take, &req.user, caller, req.budget.filter(|b| b.is_finite()), &gone);
         active.store(false, std::sync::atomic::Ordering::SeqCst);
         // A hang-up noticed after the verdict must not haunt the next request.
         if let Ok(mut m) = ANSWERS.lock() {
@@ -566,6 +620,52 @@ fn session_id_from_cgroup(cgroup: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod request_read_tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn a_whole_line_is_read() {
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        a.write_all(b"{\"user\":\"x\"}\n").unwrap();
+        assert_eq!(read_request(&mut b).unwrap().as_deref(), Some("{\"user\":\"x\"}\n"));
+    }
+
+    #[test]
+    fn a_line_over_the_limit_or_without_a_newline_is_refused() {
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        a.write_all(&vec![b'x'; MAX_REQUEST as usize + 10]).unwrap();
+        assert_eq!(read_request(&mut b).unwrap(), None);
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        a.write_all(b"no newline").unwrap();
+        drop(a);
+        assert_eq!(read_request(&mut b).unwrap(), None);
+    }
+
+    /// The deadline is for the whole line: bytes that keep arriving do not
+    /// keep resetting it.
+    #[test]
+    fn dribbled_bytes_do_not_stretch_the_deadline() {
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        let writer = std::thread::spawn(move || {
+            for _ in 0..40 {
+                if a.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        });
+        let start = Instant::now();
+        assert_eq!(read_request(&mut b).unwrap(), None);
+        let took = start.elapsed();
+        assert!(took >= REQUEST_DEADLINE - Duration::from_millis(100) && took < REQUEST_DEADLINE + Duration::from_secs(1), "took {:?}", took);
+        drop(b);
+        writer.join().unwrap();
+    }
 }
 
 #[cfg(test)]
