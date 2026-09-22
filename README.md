@@ -60,6 +60,12 @@ on its own: the PAM stacks are written only by `omarchy setup security face`.
   shape it cannot verify) is refused before any window or camera. A same-uid
   process inside your own desktop session counts as local; what stands
   between that and root is the window naming the request, and the nod.
+- **Lid closed.** The camera is in the lid, so a consent request with it
+  closed is answered before the camera is taken and the stack falls through
+  to the password at once, as the fingerprint stack does through its PAM
+  gate. The check lives in the daemon rather than the stack so nothing
+  else's setup or removal can strip it. The lock screen is not gated: it
+  has its own presence handling.
 - **Templates** are 512-number embeddings, never images, root-only in
   `/var/lib/faceauth`, sealed to the TPM as a root-scoped systemd credential
   when the machine has one (a copy is useless anywhere else, and only root

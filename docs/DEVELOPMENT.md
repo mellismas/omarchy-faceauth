@@ -1113,3 +1113,14 @@ self-consistency minimum fell to 0.10 with the new look, one frame caught
 off angle; a match still needs two frames over the threshold, so it costs
 nothing on its own, and it is the look to delete and redo if unlocks ever
 slow down.
+
+**Lid gate in the daemon, 2026-09-22.** Fingerprint skips its reader with
+a `pam_exec omarchy-hw-laptop-closed` line above `pam_fprintd`. Putting the
+same line above the face line was tried and reverted: the fingerprint
+removal script deletes every line naming that helper, ours included, so
+removing fingerprint after face would silently take the face gate with it.
+The daemon now reads `/proc/acpi/button/lid/*/state` on a consent request
+and answers an error (PAM_IGNORE at the module) before taking the camera
+when every lid is closed. No lid at all reads as open. The lock lane is
+not gated: an instant ignore there would spin the lock screen's retry
+timer, and its probe mode already covers a dark camera.

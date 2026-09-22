@@ -188,6 +188,14 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
             return reply(&mut stream, &Outcome::Error { message: format!("face authentication is local only: {}", why) });
         }
     }
+    // The camera is in the lid. With it closed there is nobody to nod, so a
+    // consent request is answered before the camera is taken and the caller's
+    // stack falls through to its password at once. Only consent: the lock
+    // screen has its own presence handling and retries on its own timer.
+    if req.consent && lid_closed() {
+        log::info!("consent request for {} from pid {} with the lid closed: falls through to the password", req.user, cred.pid());
+        return reply(&mut stream, &Outcome::Error { message: "the lid is closed".into() });
+    }
     // Take the camera, or say "busy" instead of queueing behind another
     // attempt: the callers (PAM, the lock screen) retry on their own terms.
     let take = || -> Option<std::sync::MutexGuard<'_, Authenticator>> {
@@ -399,6 +407,25 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
     reply(&mut stream, &outcome)
 }
 
+/// Whether every lid the firmware reports is closed, read the way
+/// `omarchy-hw-laptop-closed` reads it. No lid at all (a desktop) is open.
+fn lid_closed() -> bool {
+    lid_closed_in(std::path::Path::new("/proc/acpi/button/lid"))
+}
+
+fn lid_closed_in(dir: &std::path::Path) -> bool {
+    let Ok(lids) = std::fs::read_dir(dir) else { return false };
+    let mut seen = false;
+    for lid in lids.flatten() {
+        let Ok(state) = std::fs::read_to_string(lid.path().join("state")) else { continue };
+        seen = true;
+        if !state.contains("closed") {
+            return false;
+        }
+    }
+    seen
+}
+
 /// Where a request comes from, as far as the daemon can prove it.
 pub enum Locality {
     Local,
@@ -539,6 +566,54 @@ fn session_id_from_cgroup(cgroup: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod lid_tests {
+    use super::lid_closed_in;
+
+    struct Lids(std::path::PathBuf);
+    impl Lids {
+        fn path(&self) -> &std::path::Path { &self.0 }
+    }
+    impl Drop for Lids {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    fn lids(states: &[&str]) -> Lids {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("faceauth-lid-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        for (i, st) in states.iter().enumerate() {
+            let p = d.join(format!("LID{}", i));
+            std::fs::create_dir(&p).unwrap();
+            std::fs::write(p.join("state"), format!("state:      {}\n", st)).unwrap();
+        }
+        Lids(d)
+    }
+
+    #[test]
+    fn a_closed_lid_is_closed() {
+        assert!(lid_closed_in(lids(&["closed"]).path()));
+    }
+
+    #[test]
+    fn an_open_lid_a_missing_lid_and_an_unreadable_one_are_open() {
+        assert!(!lid_closed_in(lids(&["open"]).path()));
+        assert!(!lid_closed_in(lids(&[]).path()));
+        assert!(!lid_closed_in(std::path::Path::new("/nonexistent/lid")));
+        let d = lids(&["closed"]);
+        std::fs::remove_file(d.path().join("LID0/state")).unwrap();
+        assert!(!lid_closed_in(d.path()));
+    }
+
+    #[test]
+    fn two_lids_are_closed_only_when_both_are() {
+        assert!(!lid_closed_in(lids(&["closed", "open"]).path()));
+        assert!(lid_closed_in(lids(&["closed", "closed"]).path()));
+    }
 }
 
 #[cfg(test)]
