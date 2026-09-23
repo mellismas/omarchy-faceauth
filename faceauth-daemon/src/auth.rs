@@ -608,10 +608,12 @@ impl Authenticator {
                 (dy, dx, stored)
             }
             // An everyday movement: both axes are kept, however small, since
-            // what matters is how far under the floors it stays.
+            // what matters is how far under the floors it stays. The
+            // numbers-only fields of the earlier format go with the save.
             _ => {
-                u.gesture.still_nod.push(dy);
-                u.gesture.still_shake.push(dx);
+                u.gesture.everyday.push(crate::store::EverydayRound { kind: gesture.to_string(), dy, dx });
+                u.gesture.still_nod.clear();
+                u.gesture.still_shake.clear();
                 (dy, dx, true)
             }
         };

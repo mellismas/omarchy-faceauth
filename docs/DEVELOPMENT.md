@@ -1339,3 +1339,17 @@ apart and what to do. The CLI opens with the plain explanation of why the
 rounds are recorded (Mike's earlier ask: no accidental approvals or
 refusals of something harmful; motion, never images; root-only). Records
 from before these fields read unchanged.
+
+**Only the jittery rounds raise a floor, 2026-09-22 late.** The first
+nine-round run on the reference user: reading 0.04 to 0.06 vertical,
+talking up to 0.05 vertical and 0.20 sideways, a glance at the keyboard
+0.13 vertical, a lean-in 0.27 vertical, a look aside 0.50 sideways. Raising
+floors to 1.5 times all of those gave nod 0.15 and shake 0.12, half the
+user's own gestures, with nod legs recorded at 0.14 to 0.21: nods would
+have failed. The glance, the lean and the look aside are as big as a
+gesture and are refused by shape (one leg; a hold at the bottom or the
+side), not by size. Everyday rounds are now stored by kind
+(`EverydayRound`), only `read` and `talk` (`FLOOR_KINDS`) raise a floor, the
+others are recorded and reported as shape-handled, and the numbers-only
+fields of the format that lived for an hour are ignored and dropped on the
+next save. With that the user's floors return to 0.09 and 0.06.

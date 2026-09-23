@@ -116,8 +116,10 @@ fn main() -> Result<()> {
                             let what = match gesture { "nod" => "nod", "shake" => "shake", "read" => "reading", "glance" => "glance at the keyboard", "talk" => "talking", "lean" => "leaning in", _ => "look to the side" };
                             if matches!(gesture, "nod" | "shake") {
                                 println!("  {} {}/{}: moved {:.2} of a face width{}", what, i, rounds, amplitude, if *stored { "" } else { " (too small to count; not stored)" });
+                            } else if faceauth_daemon::store::FLOOR_KINDS.contains(&gesture) {
+                                println!("  {}: moved up to {:.2} vertically, {:.2} sideways (the floors stand clear of this)", what, amplitude, sideways);
                             } else {
-                                println!("  {}: moved up to {:.2} vertically, {:.2} sideways", what, amplitude, sideways);
+                                println!("  {}: moved up to {:.2} vertically, {:.2} sideways (a big single move; refused by its shape, not its size)", what, amplitude, sideways);
                             }
                             last = Some((*nod_floor, *shake_floor, *nod_margin, *shake_margin));
                         }

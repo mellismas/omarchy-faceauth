@@ -88,15 +88,31 @@ pub struct UserTemplates {
 pub struct GestureCal {
     pub nod: Vec<f32>,
     pub shake: Vec<f32>,
-    /// Largest vertical excursion in each everyday-movement round (reading,
-    /// a glance at the keyboard, talking): what a nod must stand clear of.
+    /// Everyday-movement rounds: what the person does when not gesturing,
+    /// each with its largest vertical and horizontal excursion.
     #[serde(default)]
+    pub everyday: Vec<EverydayRound>,
+    /// From a short-lived earlier format that kept only the numbers; ignored
+    /// once `everyday` has rounds, and dropped on the next save.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub still_nod: Vec<f32>,
-    /// Largest horizontal excursion in the same rounds: what a shake must
-    /// stand clear of.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub still_shake: Vec<f32>,
 }
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct EverydayRound {
+    pub kind: String,
+    pub dy: f32,
+    pub dx: f32,
+}
+
+/// The everyday rounds whose size a floor must stand clear of: the small,
+/// jittery ones. A glance at the keyboard, a lean-in and a look aside are as
+/// big as a gesture and are refused by the detector's shape rules (one leg,
+/// a hold at the bottom or the side), not by size; their numbers are kept
+/// and reported, never used to raise a floor.
+pub const FLOOR_KINDS: [&str; 2] = ["read", "talk"];
 
 impl GestureCal {
     fn typical(v: &[f32]) -> Option<f32> {
@@ -132,13 +148,23 @@ impl GestureCal {
         let mut shake = Self::typical(&self.shake).map(|a| (a * 0.5).clamp(0.03, default_shake)).unwrap_or(default_shake);
         // Everyday movement pushes a floor up, never down: whatever this
         // person does while reading or talking must stay under it.
-        if let Some(still) = Self::largest(&self.still_nod) {
+        let (still_y, still_x) = self.jitter();
+        if let Some(still) = still_y {
             nod = nod.max((still * Self::STILL_MARGIN).min(Self::NOD_FLOOR_MAX));
         }
-        if let Some(still) = Self::largest(&self.still_shake) {
+        if let Some(still) = still_x {
             shake = shake.max((still * Self::STILL_MARGIN).min(Self::SHAKE_FLOOR_MAX));
         }
         (nod, shake)
+    }
+
+    /// The largest vertical and horizontal excursion among the jittery
+    /// everyday rounds (`FLOOR_KINDS`), the ones a floor stands clear of.
+    fn jitter(&self) -> (Option<f32>, Option<f32>) {
+        let rounds: Vec<&EverydayRound> = self.everyday.iter().filter(|r| FLOOR_KINDS.contains(&r.kind.as_str())).collect();
+        let ys: Vec<f32> = rounds.iter().map(|r| r.dy).collect();
+        let xs: Vec<f32> = rounds.iter().map(|r| r.dx).collect();
+        (Self::largest(&ys), Self::largest(&xs))
     }
 
     /// How many times larger this person's typical gesture is than their
@@ -146,12 +172,13 @@ impl GestureCal {
     /// have been recorded. Under 2.0 the two are not cleanly separable and
     /// the setup says so.
     pub fn margins(&self) -> (Option<f32>, Option<f32>) {
-        let m = |g: &[f32], s: &[f32]| match (Self::typical(g), Self::largest(s)) {
+        let (sy, sx) = self.jitter();
+        let m = |g: &[f32], s: Option<f32>| match (Self::typical(g), s) {
             (Some(g), Some(s)) if s > 0.0 => Some(g / s),
             (Some(_), Some(_)) => Some(f32::INFINITY),
             _ => None,
         };
-        (m(&self.nod, &self.still_nod), m(&self.shake, &self.still_shake))
+        (m(&self.nod, sy), m(&self.shake, sx))
     }
 
     pub fn is_calibrated(&self) -> bool {
@@ -630,8 +657,9 @@ mod tests {
 
     #[test]
     fn everyday_movement_raises_a_floor_and_sets_the_margin() {
+        let ev = |kind: &str, dy: f32, dx: f32| EverydayRound { kind: kind.into(), dy, dx };
         // Reading bobs 0.05 vertically: 1.5x is 0.075, above the 0.06 default.
-        let g = GestureCal { nod: vec![0.26, 0.30], shake: vec![0.33, 0.36], still_nod: vec![0.02, 0.05], still_shake: vec![0.03], ..Default::default() };
+        let g = GestureCal { nod: vec![0.26, 0.30], shake: vec![0.33, 0.36], everyday: vec![ev("read", 0.02, 0.03), ev("talk", 0.05, 0.02)], ..Default::default() };
         let (n, s) = g.floors(0.06, 0.06);
         assert!((n - 0.09).abs() < 1e-6, "{}", n); // 0.28 * 0.4 = 0.112 capped 0.09; 0.075 from reading is below that
         assert!((s - 0.06).abs() < 1e-6, "{}", s);
@@ -639,15 +667,24 @@ mod tests {
         // "typical" is the upper median: 0.30 of [0.26, 0.30], 0.36 of [0.33, 0.36].
         assert!((mn.unwrap() - 0.30 / 0.05).abs() < 1e-3, "{:?}", mn);
         assert!((ms.unwrap() - 0.36 / 0.03).abs() < 1e-3, "{:?}", ms);
+        // A big single move (a lean-in of 0.27, a look aside of 0.50) never raises a floor:
+        // the detector refuses those by shape, and a floor that size would refuse the nod.
+        let mover = GestureCal { nod: vec![0.26], shake: vec![0.22], everyday: vec![ev("read", 0.04, 0.03), ev("glance", 0.13, 0.04), ev("lean", 0.27, 0.08), ev("aside", 0.10, 0.50)], ..Default::default() };
+        let (n, s) = mover.floors(0.06, 0.06);
+        assert!((n - 0.09).abs() < 1e-6, "{}", n);
+        assert!((s - 0.06).abs() < 1e-6, "{}", s);
         // A restless reader: 0.10 vertical while reading pushes the nod floor to 0.15 (the cap).
-        let restless = GestureCal { nod: vec![0.20], shake: vec![0.30], still_nod: vec![0.10, 0.12], still_shake: vec![0.09], ..Default::default() };
+        let restless = GestureCal { nod: vec![0.20], shake: vec![0.30], everyday: vec![ev("read", 0.10, 0.02), ev("talk", 0.12, 0.09)], ..Default::default() };
         let (n, s) = restless.floors(0.06, 0.06);
         assert!((n - 0.15).abs() < 1e-6, "{}", n); // 0.12 * 1.5 = 0.18 capped at 0.15
         assert!((s - 0.12).abs() < 1e-6, "{}", s); // 0.09 * 1.5 = 0.135 capped at 0.12
         assert!(restless.margins().0.unwrap() < 2.0, "not separable");
-        // A record from before these rounds existed still reads.
+        // A record from before these rounds existed still reads, and one from
+        // the short-lived numbers-only format reads but raises nothing.
         let old: GestureCal = serde_json::from_str(r#"{"nod":[0.2],"shake":[0.3]}"#).unwrap();
-        assert!(old.still_nod.is_empty() && old.margins() == (None, None));
+        assert!(old.everyday.is_empty() && old.margins() == (None, None));
+        let numbers: GestureCal = serde_json::from_str(r#"{"nod":[0.26],"shake":[0.22],"still_nod":[0.27],"still_shake":[0.5]}"#).unwrap();
+        assert_eq!(numbers.floors(0.06, 0.06), (0.09, 0.06));
     }
 
     #[test]
