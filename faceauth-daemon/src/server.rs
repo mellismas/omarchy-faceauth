@@ -87,6 +87,9 @@ struct Request {
     /// From the consent window: dismiss the pending request.
     #[serde(default)]
     consent_dismiss: bool,
+    /// From the consent window: it has drawn the request the token names.
+    #[serde(default)]
+    consent_ack: bool,
     /// From the consent window: the token the daemon put in its payload.
     #[serde(default)]
     consent_token: Option<String>,
@@ -106,6 +109,12 @@ struct Request {
     context_message: Option<String>,
     #[serde(default)]
     context_cookie: Option<String>,
+    /// From the polkit agent: polkitd's caller and subject pids, when its
+    /// Quickshell exposes the request's details.
+    #[serde(default)]
+    context_caller_pid: Option<i32>,
+    #[serde(default)]
+    context_subject_pid: Option<i32>,
 }
 
 /// Who may connect: root, and the enrolled users, by ACL on the socket
@@ -254,13 +263,16 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
     // come from a caller shown to be local; anything unprovable is remote,
     // and the caller's PAM stack falls through to its password.
     let peer_pidfd = getsockopt(&stream, nix::sys::socket::sockopt::PeerPidfd).ok();
-    match locality(cred.pid(), peer_pidfd.as_ref(), &req.user) {
-        Locality::Local => {}
+    let agent = match locality(cred.pid(), peer_pidfd.as_ref(), &req.user) {
+        Locality::Local(agent) => agent,
         Locality::Remote(why) => {
             log::warn!("request for {} from pid {} (uid {}) refused: {}", req.user, cred.pid(), cred.uid(), why);
             return reply(&mut stream, &Outcome::Error { message: format!("face authentication is local only: {}", why) });
         }
-    }
+    };
+    // The peer as a kernel fact, for a polkit agent's context: its pid and
+    // the pidfs id systemd writes into the helper instance it connects.
+    let peer = peer_pidfd.as_ref().and_then(|fd| nix::sys::stat::fstat(fd).ok()).map(|st| crate::consent::AgentPeer { pid: cred.pid(), id: st.st_ino });
     // The camera is in the lid. With it closed there is nobody to nod, so a
     // consent request is answered before the camera is taken and the caller's
     // stack falls through to its password at once. Only consent: the lock
@@ -287,12 +299,14 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
         }
     };
     // The polkit agent, before its helper's PAM request arrives, says what
-    // the request is. Queued per user in arrival order, from the agent's
-    // own uid, single use, and only from a local caller (the gate above).
+    // the request is. Queued per user in arrival order, single use, only
+    // from a local caller (the gate above), and served only to a request
+    // whose helper was connected by this very peer: the agent process must
+    // send it itself, over its own connection.
     if let Some(action) = &req.context_action {
         let clip = crate::consent::clip;
-        let ctx = crate::consent::PolkitContext { action: clip(action), message: clip(req.context_message.as_deref().unwrap_or("")), cookie: clip(req.context_cookie.as_deref().unwrap_or("")), uid: cred.uid(), at: Instant::now() };
-        log::info!("polkit context from the agent (uid {}, pid {}): {} {}", cred.uid(), cred.pid(), ctx.action, ctx.message);
+        let ctx = crate::consent::PolkitContext { action: clip(action), message: clip(req.context_message.as_deref().unwrap_or("")), cookie: clip(req.context_cookie.as_deref().unwrap_or("")), uid: cred.uid(), agent: peer, caller_pid: req.context_caller_pid, subject_pid: req.context_subject_pid, at: Instant::now() };
+        log::info!("polkit context from uid {} pid {}: {} {} (caller pid {:?}, subject pid {:?})", cred.uid(), cred.pid(), ctx.action, ctx.message, ctx.caller_pid, ctx.subject_pid);
         if let Ok(mut m) = crate::consent::CONTEXTS.lock() {
             let q = m.entry(cred.uid()).or_default();
             q.push_back(ctx);
@@ -304,13 +318,15 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
     }
     // Answers to a pending consent request must not wait for the camera lock:
     // the consent flow holds it. They go through the shared answer slot.
-    if req.consent_password.is_some() || req.consent_dismiss {
+    if req.consent_password.is_some() || req.consent_dismiss || req.consent_ack {
         // No lock: read the shared handles through a short-lived try_lock on
         // the authenticator is impossible while consent runs, so they live in
         // the server's own copies (see `serve`).
         let (answers, pending) = (&ANSWERS, &PENDING);
+        // The acknowledgement arrives during the first show, before the
+        // request is marked pending; its token is the whole check.
         let is_pending = pending.lock().map(|p| p.contains(&req.user)).unwrap_or(false);
-        if !is_pending {
+        if !is_pending && !req.consent_ack {
             return reply(&mut stream, &Outcome::Error { message: "no pending request".into() });
         }
         // Only the window the daemon summoned holds the token; a process
@@ -318,6 +334,11 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
         if !crate::consent::Dialog::token_matches(&req.user, req.consent_token.as_deref()) {
             log::warn!("consent answer for {} from uid {} pid {} without the request's token: refused", req.user, cred.uid(), cred.pid());
             return reply(&mut stream, &Outcome::Error { message: "no pending request".into() });
+        }
+        if req.consent_ack {
+            crate::consent::ack(&req.user, req.consent_token.as_deref());
+            log::info!("consent window for {} (uid {}, pid {}) acknowledged the request", req.user, cred.uid(), cred.pid());
+            return reply(&mut stream, &Outcome::Noted);
         }
         let answer = if req.consent_dismiss { crate::consent::Answer::Dismiss } else { crate::consent::Answer::Password(req.consent_password.clone().unwrap_or_default()) };
         if let Ok(mut m) = answers.lock() {
@@ -403,8 +424,22 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
                 return reply(&mut stream, &Outcome::Refused { reason: "refused already".into(), elapsed_ms: 0 });
             }
         }
-        let caller = crate::consent::CallerInfo::from_pid(cred.pid(), uid);
+        let caller = crate::consent::CallerInfo::from_pid(cred.pid(), uid, agent);
         let via_polkit = caller.via == "polkit";
+        // polkitd named the requesting process: it has to be local too, not
+        // only the agent that is serving it. A pkexec from an SSH shell
+        // served by a text agent is refused at the agent; one that reached
+        // the desktop's agent by other means is refused here.
+        if let Some(rp) = caller.requester {
+            let pidfd = pidfd_open(rp);
+            match locality(rp, pidfd.as_ref(), &req.user) {
+                Locality::Local(_) => {}
+                Locality::Remote(why) => {
+                    log::warn!("consent for {}: polkit requester pid {} refused: {}", req.user, rp, why);
+                    return reply(&mut stream, &Outcome::Error { message: format!("face authentication is local only: {}", why) });
+                }
+            }
+        }
         if via_polkit {
             if let Ok(mut r) = POLKIT_REFUSED.lock() {
                 r.retain(|(_, at)| at.elapsed() < POLKIT_REFUSAL_STANDS);
@@ -541,7 +576,8 @@ fn lid_closed_in(dir: &std::path::Path) -> bool {
 
 /// Where a request comes from, as far as the daemon can prove it.
 pub enum Locality {
-    Local,
+    /// Local; for polkit's helper, with the agent that connected it.
+    Local(Option<crate::consent::AgentPeer>),
     Remote(String),
 }
 
@@ -549,9 +585,17 @@ pub enum Locality {
 /// it is, and remote otherwise (any read error, timeout or unfamiliar shape).
 ///
 /// 1. Any `sshd` or `sshd-session` in the parent chain: remote.
-/// 2. Root in `/system.slice/`: local (the daemon's own helpers, root's cron).
+/// 2. Root in `/system.slice/`: only polkit's authentication helper is
+///    followed, and no other root service is local. On polkit 127 the helper
+///    is socket-activated per connection, and systemd names the instance
+///    after the peer that connected it (`<n>-<cookie>-<pid>_<pidfd id>-<uid>`,
+///    from SO_PEERCRED and the peer's pidfs inode): the agent that is serving
+///    the request. The check moves to that agent, pinned by its pidfd id, and
+///    the answer is the agent's. Omarchy's shell is in the user's session;
+///    `pkexec` from an SSH shell, which registers its own text agent, is
+///    under `sshd-session` and refused. The helper itself is never local.
 /// 3. In a logind session scope (`session-N.scope`): local only if logind
-///    says that session is not remote and is on a seat.
+///    says that session is the target user's, not remote, and on a seat.
 /// 4. Inside the target user's own manager (`user-<uid>.slice/user@<uid>.service`,
 ///    where every desktop app and the lock screen's PAM helper lives, with no
 ///    session scope of its own): local only if that user has a live session on
@@ -568,32 +612,86 @@ pub enum Locality {
 /// `pidfd`, when the kernel gives one (SO_PEERPIDFD), is checked after the
 /// reads: a caller that exits before its /proc is read is not local.
 fn locality(pid: i32, pidfd: Option<&std::os::fd::OwnedFd>, target_user: &str) -> Locality {
-    match locality_inner(pid, target_user) {
-        Ok(Locality::Local) => match pidfd {
+    match locality_inner(&LiveProcs, pid, target_user) {
+        Ok(Locality::Local(agent)) => match pidfd {
             // The /proc reads above were of a live process only if it is
             // still the same process now; without a pidfd to prove that,
             // a reused pid could have been laundered into local.
             None => Locality::Remote("no peer pidfd to pin the caller".into()),
             Some(fd) if process_exited(fd) => Locality::Remote("caller exited before it could be verified".into()),
-            Some(_) => Locality::Local,
+            Some(_) => Locality::Local(agent),
         },
         Ok(l) => l,
         Err(e) => Locality::Remote(format!("cannot verify the caller: {}", e)),
     }
 }
 
-fn locality_inner(pid: i32, target_user: &str) -> Result<Locality> {
+/// What the locality check reads: /proc and logind for the daemon, a table
+/// for the tests.
+pub(crate) trait ProcView {
+    fn ppid(&self, pid: i32) -> Option<i32>;
+    fn comm(&self, pid: i32) -> String;
+    fn real_uid(&self, pid: i32) -> Option<u32>;
+    /// The cgroup listing as `/proc/<pid>/cgroup` prints it.
+    fn cgroup(&self, pid: i32) -> Option<String>;
+    /// The pidfs inode of a live process (what systemd writes into a
+    /// socket-activated instance name); None when the process is gone.
+    fn pidfd_id(&self, pid: i32) -> Option<u64>;
+    fn user_uid(&self, name: &str) -> Option<u32>;
+    /// logind's session ids for a uid, whitespace separated.
+    fn user_sessions(&self, uid: u32) -> Result<String>;
+    /// logind's view of a session: (uid, remote, seat, class).
+    fn session(&self, id: &str) -> Result<(Option<u32>, bool, String, String)>;
+}
+
+struct LiveProcs;
+
+/// A pidfd for a live process, or None when it is gone.
+fn pidfd_open(pid: i32) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if raw < 0 {
+        return None;
+    }
+    Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) })
+}
+
+impl ProcView for LiveProcs {
+    fn ppid(&self, pid: i32) -> Option<i32> { crate::consent::ppid_of(pid) }
+    fn comm(&self, pid: i32) -> String { crate::consent::comm_of(pid) }
+    fn real_uid(&self, pid: i32) -> Option<u32> {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
+        status.lines().find_map(|l| l.strip_prefix("Uid:")).and_then(|v| v.split_whitespace().next()).and_then(|s| s.parse().ok())
+    }
+    fn cgroup(&self, pid: i32) -> Option<String> { std::fs::read_to_string(format!("/proc/{}/cgroup", pid)).ok() }
+    fn pidfd_id(&self, pid: i32) -> Option<u64> {
+        nix::sys::stat::fstat(&pidfd_open(pid)?).ok().map(|st| st.st_ino)
+    }
+    fn user_uid(&self, name: &str) -> Option<u32> { user_uid(name) }
+    fn user_sessions(&self, uid: u32) -> Result<String> { loginctl(&["show-user", &uid.to_string(), "-p", "Sessions", "--value"]) }
+    fn session(&self, id: &str) -> Result<(Option<u32>, bool, String, String)> {
+        let out = loginctl(&["show-session", id, "-p", "User", "-p", "Remote", "-p", "Seat", "-p", "Class"])?;
+        let get = |k: &str| out.lines().find_map(|l| l.strip_prefix(k).and_then(|r| r.strip_prefix('='))).unwrap_or("").trim().to_string();
+        Ok((get("User").parse().ok(), get("Remote") != "no", get("Seat"), get("Class")))
+    }
+}
+
+fn locality_inner(v: &dyn ProcView, pid: i32, target_user: &str) -> Result<Locality> {
+    locality_of(v, pid, target_user, false)
+}
+
+fn locality_of(v: &dyn ProcView, pid: i32, target_user: &str, via_helper: bool) -> Result<Locality> {
     // 1. Ancestry. The chain must reach init; a break means the caller (or a
     // parent) vanished mid-read, which is not a demonstration of anything.
     let mut p = pid;
     let mut reached_init = false;
     for _ in 0..128 {
-        let pp = crate::consent::ppid_of(p).ok_or_else(|| anyhow::anyhow!("process {} unreadable", p))?;
+        let pp = v.ppid(p).ok_or_else(|| anyhow::anyhow!("process {} unreadable", p))?;
         if pp <= 1 {
             reached_init = true;
             break;
         }
-        let comm = crate::consent::comm_of(pp);
+        let comm = v.comm(pp);
         if is_ssh_comm(&comm) {
             return Ok(Locality::Remote(format!("started under {} (pid {})", comm, pp)));
         }
@@ -604,29 +702,53 @@ fn locality_inner(pid: i32, target_user: &str) -> Result<Locality> {
         // check has looked all the way through; it does not vouch for it.
         return Ok(Locality::Remote("ancestry deeper than 128 without reaching init".into()));
     }
-    let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).context("read caller status")?;
-    let real_uid: u32 = status.lines().find_map(|l| l.strip_prefix("Uid:")).and_then(|v| v.split_whitespace().next()).and_then(|s| s.parse().ok()).ok_or_else(|| anyhow::anyhow!("no uid in status"))?;
-    let cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", pid)).context("read caller cgroup")?;
+    let real_uid = v.real_uid(pid).ok_or_else(|| anyhow::anyhow!("no uid for process {}", pid))?;
+    let cgroup = v.cgroup(pid).ok_or_else(|| anyhow::anyhow!("no cgroup for process {}", pid))?;
     let path = cgroup.lines().find_map(|l| l.splitn(3, ':').nth(2)).ok_or_else(|| anyhow::anyhow!("no cgroup path"))?.to_string();
-    // 2. Root's own services.
+    let target_uid = v.user_uid(target_user).ok_or_else(|| anyhow::anyhow!("unknown user {}", target_user))?;
+    // 2. Root's services: only polkit's helper, and only through to the
+    // agent that connected it.
     if real_uid == 0 && path.starts_with("/system.slice/") {
-        return Ok(Locality::Local);
+        let unit = path.trim().rsplit('/').next().unwrap_or("").to_string();
+        let Some(instance) = polkit_helper_instance(&unit) else {
+            return Ok(Locality::Remote(format!("root service {} is not a session", unit)));
+        };
+        if via_helper {
+            return Ok(Locality::Remote("a polkit helper connected by another polkit helper".into()));
+        }
+        let Some((agent, id)) = helper_peer(instance) else {
+            return Ok(Locality::Remote(format!("polkit helper instance {} does not name its agent", instance)));
+        };
+        let Some(id) = id else {
+            return Ok(Locality::Remote(format!("polkit helper instance {} carries no pidfd id to pin its agent", instance)));
+        };
+        if v.pidfd_id(agent) != Some(id) {
+            return Ok(Locality::Remote(format!("the agent (pid {}) that connected polkit helper {} is gone", agent, instance)));
+        }
+        log::debug!("locality: polkit helper {} was connected by agent pid {}; checking the agent", instance, agent);
+        return match locality_of(v, agent, target_user, true)? {
+            Locality::Local(_) => Ok(Locality::Local(Some(crate::consent::AgentPeer { pid: agent, id }))),
+            Locality::Remote(why) => Ok(Locality::Remote(format!("polkit agent pid {}: {}", agent, why))),
+        };
     }
-    // 3. A logind session of its own.
+    // 3. A logind session of its own, which must be the target user's.
     if let Some(id) = session_id_from_cgroup(&cgroup) {
-        return Ok(match session_is_local(&id)? {
-            true => Locality::Local,
+        let (uid, remote, seat, class) = v.session(&id)?;
+        if uid != Some(target_uid) {
+            return Ok(Locality::Remote(format!("logind session {} is not {}'s", id, target_user)));
+        }
+        return Ok(match !remote && !seat.is_empty() && class == "user" {
+            true => Locality::Local(None),
             false => Locality::Remote(format!("logind session {} is remote or seatless", id)),
         });
     }
     // 4. The target user's manager.
-    let target_uid = user_uid(target_user).ok_or_else(|| anyhow::anyhow!("unknown user {}", target_user))?;
     if path.starts_with(&format!("/user.slice/user-{}.slice/user@{}.service/", target_uid, target_uid)) {
-        let sessions = loginctl(&["show-user", &target_uid.to_string(), "-p", "Sessions", "--value"])?;
+        let sessions = v.user_sessions(target_uid)?;
         for id in sessions.split_whitespace() {
-            match session_is_local(id) {
-                Ok(true) => return Ok(Locality::Local),
-                Ok(false) => {}
+            match v.session(id) {
+                Ok((_, remote, seat, class)) if !remote && !seat.is_empty() && class == "user" => return Ok(Locality::Local(None)),
+                Ok(_) => {}
                 // A session in the list that logind no longer knows: the
                 // daemon's own `systemd-run --machine` calls (a notice, the
                 // window) each open a session for an instant, and a request
@@ -641,11 +763,26 @@ fn locality_inner(pid: i32, target_user: &str) -> Result<Locality> {
     Ok(Locality::Remote(format!("caller in {} is not a session of {}", path.trim(), target_user)))
 }
 
-/// Does logind put this session on a seat, not remote, as a user session?
-fn session_is_local(id: &str) -> Result<bool> {
-    let out = loginctl(&["show-session", id, "-p", "Remote", "-p", "Seat", "-p", "Class"])?;
-    let get = |k: &str| out.lines().find_map(|l| l.strip_prefix(k).and_then(|r| r.strip_prefix('='))).unwrap_or("").trim().to_string();
-    Ok(get("Remote") == "no" && !get("Seat").is_empty() && get("Class") == "user")
+/// The instance of a `polkit-agent-helper@<instance>.service` unit name.
+fn polkit_helper_instance(unit: &str) -> Option<&str> {
+    unit.strip_prefix("polkit-agent-helper@")?.strip_suffix(".service").filter(|i| !i.is_empty())
+}
+
+/// The peer systemd wrote into a socket-activated instance name,
+/// `<n>-<cookie>-<pid>_<pidfd id>-<uid>` (or `<n>-<cookie>-<pid>-<uid>` from
+/// a systemd without pidfd ids): the pid and the id. Anything else is None.
+fn helper_peer(instance: &str) -> Option<(i32, Option<u64>)> {
+    let parts: Vec<&str> = instance.split('-').collect();
+    if parts.len() != 4 || !parts.iter().all(|p| !p.is_empty()) {
+        return None;
+    }
+    parts[0].parse::<u64>().ok()?;
+    parts[1].parse::<u64>().ok()?;
+    parts[3].parse::<u32>().ok()?;
+    match parts[2].split_once('_') {
+        Some((pid, id)) => Some((pid.parse().ok()?, Some(id.parse().ok()?))),
+        None => Some((parts[2].parse().ok()?, None)),
+    }
 }
 
 fn loginctl(args: &[&str]) -> Result<String> {
@@ -825,12 +962,121 @@ mod locality_tests {
         assert_eq!(session_id_from_cgroup("0::/user.slice/session-.scope"), None);
     }
 
+    /// A process table the check reads instead of /proc and logind.
+    struct Table {
+        procs: std::collections::HashMap<i32, (i32, &'static str, u32, &'static str, Option<u64>)>,
+        sessions: std::collections::HashMap<&'static str, (Option<u32>, bool, &'static str, &'static str)>,
+        user_sessions: &'static str,
+    }
+    impl Table {
+        fn new() -> Table {
+            let mut t = Table { procs: Default::default(), sessions: Default::default(), user_sessions: "3" };
+            t.sessions.insert("3", (Some(1000), false, "seat0", "user"));
+            t.sessions.insert("7", (Some(1000), true, "", "user"));
+            t.sessions.insert("9", (Some(1001), false, "seat0", "user"));
+            t.procs.insert(1, (0, "systemd", 0, "0::/init.scope\n", Some(1)));
+            t
+        }
+        fn add(&mut self, pid: i32, ppid: i32, comm: &'static str, uid: u32, cgroup: &'static str) -> &mut Table {
+            self.procs.insert(pid, (ppid, comm, uid, cgroup, Some(pid as u64 * 10)));
+            self
+        }
+    }
+    impl ProcView for Table {
+        fn ppid(&self, pid: i32) -> Option<i32> { self.procs.get(&pid).map(|p| p.0) }
+        fn comm(&self, pid: i32) -> String { self.procs.get(&pid).map(|p| p.1.to_string()).unwrap_or_default() }
+        fn real_uid(&self, pid: i32) -> Option<u32> { self.procs.get(&pid).map(|p| p.2) }
+        fn cgroup(&self, pid: i32) -> Option<String> { self.procs.get(&pid).map(|p| p.3.to_string()) }
+        fn pidfd_id(&self, pid: i32) -> Option<u64> { self.procs.get(&pid).and_then(|p| p.4) }
+        fn user_uid(&self, name: &str) -> Option<u32> { match name { "mike" => Some(1000), "other" => Some(1001), _ => None } }
+        fn user_sessions(&self, _uid: u32) -> Result<String> { Ok(self.user_sessions.to_string()) }
+        fn session(&self, id: &str) -> Result<(Option<u32>, bool, String, String)> {
+            self.sessions.get(id).map(|s| (s.0, s.1, s.2.to_string(), s.3.to_string())).ok_or_else(|| anyhow::anyhow!("No session '{}' known", id))
+        }
+    }
+
+    const HELPER: &str = "0::/system.slice/system-polkit\\x2dagent\\x2dhelper.slice/polkit-agent-helper@306-8263-500_5000-1000.service\n";
+    const SHELL: &str = "0::/user.slice/user-1000.slice/user@1000.service/session.slice/wayland-wm@hyprland.desktop.service\n";
+    const SSH: &str = "0::/user.slice/user-1000.slice/session-7.scope\n";
+
+    fn remote(r: Result<Locality>) -> String {
+        match r.unwrap() {
+            Locality::Remote(why) => why,
+            Locality::Local(_) => panic!("expected remote"),
+        }
+    }
+
+    /// The desktop case: the helper's agent is the shell in the user's session.
+    #[test]
+    fn a_polkit_helper_is_as_local_as_the_agent_that_connected_it() {
+        let mut t = Table::new();
+        t.add(500, 1, "quickshell", 1000, SHELL).add(600, 1, "polkit-agent-he", 0, HELPER);
+        match locality_inner(&t, 600, "mike").unwrap() {
+            Locality::Local(agent) => assert_eq!(agent, Some(crate::consent::AgentPeer { pid: 500, id: 5000 })),
+            Locality::Remote(why) => panic!("{}", why),
+        }
+    }
+
+    /// pkexec over SSH registers its own text agent inside the SSH session;
+    /// the helper it connects must not be local (A1).
+    #[test]
+    fn a_polkit_helper_connected_from_an_ssh_session_is_remote() {
+        let mut t = Table::new();
+        t.add(400, 1, "sshd-session", 1000, SSH).add(500, 400, "pkexec", 0, SSH).add(600, 1, "polkit-agent-he", 0, HELPER);
+        let why = remote(locality_inner(&t, 600, "mike"));
+        assert!(why.contains("agent pid 500") && why.contains("sshd-session"), "{}", why);
+    }
+
+    /// The agent named by the instance is pinned by its pidfd id: a reused
+    /// pid, a gone agent, or an instance without the id is not followed.
+    #[test]
+    fn a_polkit_helper_whose_agent_cannot_be_pinned_is_remote() {
+        let mut t = Table::new();
+        t.add(600, 1, "polkit-agent-he", 0, HELPER);
+        assert!(remote(locality_inner(&t, 600, "mike")).contains("is gone"));
+        t.add(500, 1, "quickshell", 1000, SHELL);
+        t.procs.get_mut(&500).unwrap().4 = Some(5001);
+        assert!(remote(locality_inner(&t, 600, "mike")).contains("is gone"));
+        t.add(601, 1, "polkit-agent-he", 0, "0::/system.slice/system-polkit\\x2dagent\\x2dhelper.slice/polkit-agent-helper@306-8263-500-1000.service\n");
+        assert!(remote(locality_inner(&t, 601, "mike")).contains("no pidfd id"));
+        t.add(602, 1, "polkit-agent-he", 0, "0::/system.slice/system-polkit\\x2dagent\\x2dhelper.slice/polkit-agent-helper@garbage.service\n");
+        assert!(remote(locality_inner(&t, 602, "mike")).contains("does not name its agent"));
+    }
+
+    /// Root in system.slice is no longer local on its own.
+    #[test]
+    fn a_root_service_that_is_not_the_polkit_helper_is_remote() {
+        let mut t = Table::new();
+        t.add(700, 1, "cron", 0, "0::/system.slice/cronie.service\n");
+        assert!(remote(locality_inner(&t, 700, "mike")).contains("not a session"));
+    }
+
+    /// A session scope is local only when it is the target user's session.
+    #[test]
+    fn another_users_seated_session_is_not_local_for_the_target_user() {
+        let mut t = Table::new();
+        t.add(800, 1, "sudo", 1001, "0::/user.slice/user-1001.slice/session-9.scope\n");
+        assert!(matches!(locality_inner(&t, 800, "other").unwrap(), Locality::Local(None)));
+        assert!(remote(locality_inner(&t, 800, "mike")).contains("not mike's"));
+    }
+
+    #[test]
+    fn helper_instance_names_are_parsed_strictly() {
+        assert_eq!(helper_peer("306-8263-3747358_3757126-1000"), Some((3747358, Some(3757126))));
+        assert_eq!(helper_peer("23-1-42-0"), Some((42, None)));
+        assert_eq!(helper_peer("23"), None);
+        assert_eq!(helper_peer("a-b-c-d"), None);
+        assert_eq!(helper_peer("306-8263-3747358_x-1000"), None);
+        assert_eq!(polkit_helper_instance("polkit-agent-helper@23.service"), Some("23"));
+        assert_eq!(polkit_helper_instance("polkit.service"), None);
+    }
+
     #[test]
     fn a_caller_without_a_pidfd_is_not_local() {
         let me = std::env::var("USER").unwrap_or_else(|_| "root".into());
         match locality(std::process::id() as i32, None, &me) {
             Locality::Remote(why) => assert!(why.contains("pidfd"), "{}", why),
-            Locality::Local => panic!("no pidfd must not be local"),
+            Locality::Local(_) => panic!("no pidfd must not be local"),
         }
     }
 
@@ -839,7 +1085,7 @@ mod locality_tests {
         // A pid that cannot exist: every read fails, and failure is remote.
         match locality(i32::MAX - 1, None, "root") {
             Locality::Remote(why) => assert!(why.contains("cannot verify"), "{}", why),
-            Locality::Local => panic!("an unreadable caller must not be local"),
+            Locality::Local(_) => panic!("an unreadable caller must not be local"),
         }
     }
 
@@ -870,7 +1116,7 @@ mod locality_tests {
             assert!(matches!(r, Locality::Remote(_)), "running over SSH should be remote");
         } else if std::path::Path::new("/run/systemd/seats/seat0").exists() {
             match r {
-                Locality::Local => {}
+                Locality::Local(_) => {}
                 Locality::Remote(why) => panic!("a shell on the console should be local: {}", why),
             }
         }
@@ -1048,6 +1294,11 @@ pub fn probe(socket: &Path, user: &str, timeout: Duration) -> Result<Outcome> {
 
 fn request(socket: &Path, user: &str, probe: bool, timeout: Duration) -> Result<Outcome> {
     send(socket, serde_json::json!({ "user": user, "probe": probe }), Some(timeout))
+}
+
+/// From the consent window: it has drawn the request `token` names.
+pub fn consent_ack(socket: &Path, user: &str, token: Option<&str>) -> Result<Outcome> {
+    send(socket, serde_json::json!({ "user": user, "consent_ack": true, "consent_token": token }), Some(Duration::from_secs(3)))
 }
 
 pub fn consent_answer(socket: &Path, user: &str, password: Option<&str>, dismiss: bool, token: Option<&str>) -> Result<Outcome> {

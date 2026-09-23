@@ -424,7 +424,7 @@ impl Authenticator {
         if open_window {
             if let Err(e) = dialog.show("scanning", "Look at the camera.", &caller, 0.0) {
                 log::warn!("consent: no window for {}: {}", user, e);
-                return Err(Outcome::ConsentDenied { reason: "no graphical session to ask in".into(), elapsed_ms: 0 });
+                return Err(Outcome::ConsentDenied { reason: "the consent window did not open".into(), elapsed_ms: 0 });
             }
         }
         let templates = match self.store.load(user) {
@@ -483,10 +483,17 @@ impl Authenticator {
             }
             let templates_ref = &s.templates;
             let mut hook = |cap: &mut IrCapture, pipeline: &mut Pipeline, matched: &faceauth_engine::Face| -> Result<bool> {
-                let _ = dialog_cell.borrow_mut().show("nod", &msg, caller_ref, 0.0);
+                // No window the daemon can vouch for, no nods: the request
+                // ends and the caller's stack falls to its password.
+                if let Err(e) = dialog_cell.borrow_mut().show("nod", &msg, caller_ref, 0.0) {
+                    log::warn!("consent for {}: the window is not there to nod at: {}", user, e);
+                    *gesture_cell.borrow_mut() = Some(Gesture::NoWindow);
+                    return Ok(false);
+                }
                 let left = total - started.elapsed().as_secs_f32();
                 let window = cfg.consent_seconds.clamp(10.0, MAX_BUDGET).min(left).max(1.0);
-                let (g, followed) = wait_for_nods(cap, pipeline, &cfg, Duration::from_secs_f32(window), cfg.consent_nods, Some((&answers, &user)), lost_after, floors, Some(matched.bbox))?;
+                let dwell = dialog_cell.borrow().dwell_left(Instant::now());
+                let (g, followed) = wait_for_nods(cap, pipeline, &cfg, Duration::from_secs_f32(window), cfg.consent_nods, Some((&answers, &user)), lost_after, floors, Some(matched.bbox), dwell)?;
                 let g = if g == Gesture::Nodded {
                     // The nods came from the followed box; before they count,
                     // that box must be live and enrolled, right now.
@@ -513,6 +520,7 @@ impl Authenticator {
                 // Nobody is waiting for the verdict: no verdict, and the
                 // window comes down when the session drops.
                 (Some(Gesture::Gone), _) => return Round::Done(Outcome::ConsentDenied { reason: "requester gone".into(), elapsed_ms: started.elapsed().as_millis() as u64 }),
+                (Some(Gesture::NoWindow), _) => return Round::Done(Outcome::ConsentDenied { reason: "the consent window did not open".into(), elapsed_ms: started.elapsed().as_millis() as u64 }),
                 (None, Outcome::ConsentDenied { reason, .. }) if reason == "requester gone" => return Round::Done(o.clone()),
                 (Some(Gesture::FaceLost), _) => return Round::FaceLost,
                 (None, Outcome::NoFace { .. }) if lost_after.is_some() => return Round::FaceLost,

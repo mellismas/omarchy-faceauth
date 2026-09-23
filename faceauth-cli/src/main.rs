@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth auth [--user NAME] [--socket PATH] [--consent]   (asks a running faceauthd; --consent = window + nod)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there?)\n  faceauth enroll [--user NAME] [--label TEXT] [--seconds N] [--count N]   (through the daemon)\n  faceauth enroll --store DIR ...                   (direct camera access, development)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] [--dismiss]   (from the consent window; stdin: token line, then password line)\n  faceauth consent-context --action ID --message TEXT [--cookie C]   (from the polkit agent, as a request starts)\n  faceauth calibrate [--user NAME] [--gestures-only]   (root; two nods, two shakes and five everyday movements, stored with the templates)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence                                (current state)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
+        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth auth [--user NAME] [--socket PATH] [--consent]   (asks a running faceauthd; --consent = window + nod)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there?)\n  faceauth enroll [--user NAME] [--label TEXT] [--seconds N] [--count N]   (through the daemon)\n  faceauth enroll --store DIR ...                   (direct camera access, development)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] [--dismiss|--ack]   (from the consent window; stdin: token line, then password line)\n  faceauth consent-context --action ID --message TEXT [--cookie C]   (from the polkit agent, as a request starts)\n  faceauth calibrate [--user NAME] [--gestures-only]   (root; two nods, two shakes and five everyday movements, stored with the templates)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence                                (current state)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
     );
     std::process::exit(2)
 }
@@ -222,7 +222,9 @@ fn main() -> Result<()> {
             std::io::stdin().read_line(&mut token)?;
             let token = token.trim_end_matches(['\n', '\r']).to_string();
             let token = if token.is_empty() { None } else { Some(token.as_str()) };
-            let o = if rest.contains(&"--dismiss") {
+            let o = if rest.contains(&"--ack") {
+                faceauth_daemon::server::consent_ack(&socket, &user, token)?
+            } else if rest.contains(&"--dismiss") {
                 faceauth_daemon::server::consent_answer(&socket, &user, None, true, token)?
             } else {
                 let mut pw = String::new();

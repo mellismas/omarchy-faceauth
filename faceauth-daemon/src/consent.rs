@@ -61,6 +61,32 @@ pub struct CallerInfo {
     /// The process to kill if the user says no: the requester, not the helper.
     pub kill_pid: i32,
     pub via: String,
+    /// On the polkit lane, the requesting process as polkitd named it, when
+    /// it did: the server runs the locality check on it as well.
+    pub requester: Option<i32>,
+}
+
+fn real_uid_of(pid: i32) -> Option<u32> {
+    read_proc(pid, "status")?.lines().find_map(|l| l.strip_prefix("Uid:")).and_then(|v| v.split_whitespace().next()).and_then(|s| s.parse().ok())
+}
+
+fn cgroup_path_of(pid: i32) -> String {
+    read_proc(pid, "cgroup").and_then(|c| c.lines().find_map(|l| l.splitn(3, ':').nth(2).map(str::to_string))).unwrap_or_default()
+}
+
+/// Which process a polkit request is for, from polkitd's caller and
+/// subject pids. The caller is the process that asked polkitd, identified
+/// by its D-Bus credentials: `pkexec` itself, or a system service asking
+/// on behalf of the process it serves (systemd-timedated for timedatectl).
+/// In the second case the service vouches for the subject, so the subject
+/// is the requester; otherwise the caller is, and the subject is the
+/// caller's own claim about itself.
+pub fn polkit_requester(caller: Option<i32>, subject: Option<i32>, is_root_service: &dyn Fn(i32) -> bool) -> Option<i32> {
+    let caller = caller.filter(|p| *p > 1)?;
+    match (is_root_service(caller), subject.filter(|p| *p > 1)) {
+        (true, Some(s)) => Some(s),
+        _ => Some(caller),
+    }
 }
 
 fn read_proc(pid: i32, what: &str) -> Option<String> {
@@ -92,10 +118,6 @@ pub(crate) fn comm_of(pid: i32) -> String {
     clip(&read_proc(pid, "comm").unwrap_or_default())
 }
 
-fn real_uid_of(pid: i32) -> Option<u32> {
-    read_proc(pid, "status")?.lines().find_map(|l| l.strip_prefix("Uid:")).and_then(|v| v.split_whitespace().next()).and_then(|s| s.parse().ok())
-}
-
 pub(crate) fn starttime_of(pid: i32) -> u64 {
     read_proc(pid, "stat").and_then(|s| s.rsplit(')').next().and_then(|r| r.split_whitespace().nth(19).and_then(|v| v.parse().ok()))).unwrap_or(0)
 }
@@ -105,6 +127,35 @@ pub(crate) fn starttime_of(pid: i32) -> u64 {
 /// dismissal, a password) only with it: a process that can reach the socket
 /// but did not see the window cannot cancel or answer the request.
 pub static TOKENS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, String>>> = std::sync::LazyLock::new(Default::default);
+
+/// Per user, the token of the request whose window has said it is open.
+/// The daemon summons the window through the shell and hears "ok" from the
+/// shell, not from the window: a disabled plugin, a shell that answers for
+/// a window it does not have, or a window replaced by another summon all
+/// leave the shell's answer the same. So the window itself, once it has
+/// drawn the request, sends the token back; until that arrives no nod is
+/// read, and if it does not arrive the request falls to the password.
+pub static ACKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, String>>> = std::sync::LazyLock::new(Default::default);
+
+/// How long a summoned window has to acknowledge before the request is
+/// denied.
+pub const ACK_WAIT: Duration = Duration::from_secs(3);
+
+/// After the window acknowledges, how long before a nod leg counts: a nod
+/// already in motion when the card appeared was not a nod at this card.
+pub const ACK_DWELL: Duration = Duration::from_millis(1500);
+
+/// The window says it has drawn the request `token` names. True when that
+/// is this user's live request.
+pub fn ack(user: &str, token: Option<&str>) -> bool {
+    if !Dialog::token_matches(user, token) {
+        return false;
+    }
+    if let (Ok(mut a), Some(t)) = (ACKS.lock(), token) {
+        a.insert(user.to_string(), t.to_string());
+    }
+    true
+}
 
 /// Sixteen random bytes as hex, or nothing: a token that could not be drawn
 /// from the kernel is not a token, and the request fails rather than run
@@ -130,22 +181,40 @@ pub struct PolkitContext {
     pub message: String,
     pub cookie: String,
     pub uid: u32,
+    /// The peer that sent it, as the kernel reported it.
+    pub agent: Option<AgentPeer>,
+    /// polkitd's own details, when the agent's Quickshell exposes them:
+    /// the process that asked polkitd (from its D-Bus credentials) and the
+    /// process the authorization is for.
+    pub caller_pid: Option<i32>,
+    pub subject_pid: Option<i32>,
     pub at: Instant,
+}
+
+/// A process as a kernel fact: its pid and its pidfs inode, which outlives
+/// no process and is never reused. It is what systemd writes into the name
+/// of a socket-activated instance (polkit's helper) for the peer that
+/// connected it, and what the daemon reads from a peer's pidfd.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct AgentPeer {
+    pub pid: i32,
+    pub id: u64,
 }
 
 pub static CONTEXTS: std::sync::LazyLock<Mutex<std::collections::HashMap<u32, std::collections::VecDeque<PolkitContext>>>> = std::sync::LazyLock::new(Default::default);
 
-/// The oldest fresh context the user's agent registered, waiting briefly for
-/// one: the helper's PAM request and the agent's context race, and the
-/// context usually loses by a few dozen ms.
-fn take_polkit_context(uid: u32) -> Option<PolkitContext> {
+/// The oldest fresh context sent by this agent (the one that connected the
+/// request's helper), waiting briefly for one: the helper's PAM request and
+/// the agent's context race, and the context usually loses by a few dozen
+/// ms. A context from any other peer, however old, is never this request's.
+pub(crate) fn take_polkit_context(agent: AgentPeer) -> Option<PolkitContext> {
     let deadline = Instant::now() + Duration::from_millis(1500);
     loop {
         if let Ok(mut m) = CONTEXTS.lock() {
-            if let Some(q) = m.get_mut(&uid) {
+            for q in m.values_mut() {
                 q.retain(|c| c.at.elapsed() < Duration::from_secs(120));
-                if let Some(c) = q.pop_front() {
-                    return Some(c);
+                if let Some(i) = q.iter().position(|c| c.agent == Some(agent)) {
+                    return q.remove(i);
                 }
             }
         }
@@ -156,100 +225,89 @@ fn take_polkit_context(uid: u32) -> Option<PolkitContext> {
     }
 }
 
-/// The polkit requesters (pid, start time) already named by a window.
-static SERVED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(i32, u64)>>> = std::sync::LazyLock::new(Default::default);
-
 impl CallerInfo {
-    pub fn from_pid(pid: i32, user_uid: u32) -> CallerInfo {
+    pub fn from_pid(pid: i32, user_uid: u32, agent: Option<AgentPeer>) -> CallerInfo {
         let exe = exe_of(pid);
         let cmdline = read_proc(pid, "cmdline").unwrap_or_default();
-        let mut info = CallerInfo { pid, exe: exe.clone(), cmdline: cmdline.clone(), kill_pid: pid, ..Default::default() };
         // The helper is setuid, so its exe link is unreadable without ptrace
         // rights (this daemon has none); comm is readable but truncated to 15 bytes.
         let comm = comm_of(pid);
         let base = Path::new(&exe).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| comm.clone());
         if base == "polkit-agent-helper-1" || comm.starts_with("polkit-agent-he") {
-            // The helper is polkit's and carries nothing that names its
-            // requester. Polkit serves requests in order, so the one being
-            // served is the oldest pkexec (or run0) of the user's that this
-            // daemon has not named before; each is named once. Best effort.
-            info.via = "polkit".into();
-            // What the request is comes from the agent, which heard it from
-            // polkitd; the search below only finds the process to kill.
-            let context = take_polkit_context(user_uid);
-            let mut served = SERVED.lock().unwrap_or_else(|p| p.into_inner());
-            let mut best: Option<(u64, i32)> = None;
-            let mut seen: Vec<String> = Vec::new();
-            if let Ok(rd) = std::fs::read_dir("/proc") {
-                for e in rd.flatten() {
-                    let Some(p) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else { continue };
-                    if real_uid_of(p) != Some(user_uid) {
-                        continue;
-                    }
-                    // A setuid process (pkexec) hides its exe link from a reader
-                    // without ptrace rights, and this daemon has no capabilities;
-                    // comm is readable by everyone.
-                    let b = comm_of(p);
-                    if seen.len() < 40 {
-                        seen.push(format!("{}:{}", p, b));
-                    }
-                    if b == "pkexec" || b == "run0" {
-                        let t = starttime_of(p);
-                        if served.contains(&(p, t)) {
-                            continue;
-                        }
-                        if best.map(|(bt, _)| t < bt).unwrap_or(true) {
-                            best = Some((t, p));
-                        }
-                    }
-                }
+            let agent_comm = agent.map(|a| comm_of(a.pid)).unwrap_or_default();
+            let context = agent.and_then(take_polkit_context);
+            let mut info = CallerInfo::polkit(pid, user_uid, agent, &agent_comm, context);
+            info.exe = exe;
+            info.cmdline = cmdline;
+            return info;
+        }
+        CallerInfo { pid, exe: exe.clone(), cmdline: cmdline.clone(), kill_pid: pid, via: base.clone(), command: clip(&cmdline), verified: true, parents: parent_chain(pid), who: format!("{} (pid {})  from  {}", base, pid, parent_chain(pid)), requester: None }
+    }
+
+    /// A request through polkit's helper. The helper carries nothing that
+    /// names its requester. A scan of the user's processes for one named
+    /// `pkexec` is a guess any same-uid process can plant, so nothing found
+    /// that way is ever presented as verified. What can be trusted: which
+    /// agent connected the helper (read from the helper's unit name and
+    /// pinned by the locality check), and, when that agent's Quickshell
+    /// exposes them, the pids polkitd attached to the request. polkitd
+    /// takes the caller's pid from its D-Bus credentials, so the requester
+    /// resolved from it is read from /proc by this daemon, shown as
+    /// verified, and offered to kill; the server runs the locality check
+    /// on it too. Without those pids the request is described by the
+    /// agent's context, labelled by the window as the requesting side's
+    /// word, and there is nothing to kill.
+    pub fn polkit(pid: i32, user_uid: u32, agent: Option<AgentPeer>, agent_comm: &str, context: Option<PolkitContext>) -> CallerInfo {
+        let mut info = CallerInfo { pid, via: "polkit".into(), kill_pid: 0, verified: false, ..Default::default() };
+        let agent_text = match agent {
+            Some(a) => format!("agent {} (pid {})", clip(agent_comm), a.pid),
+            None => "agent not known".to_string(),
+        };
+        let Some(c) = context else {
+            log::warn!("consent: no context from the agent that connected polkit helper pid {}", pid);
+            info.command = "a polkit action (no description was given)".into();
+            info.who = format!("polkit's helper (pid {}), {}; polkit does not say which process asked", pid, agent_text);
+            return info;
+        };
+        let relayed = clip(&format!("{} [{}]", c.message.trim(), c.action));
+        let is_root_service = |p: i32| real_uid_of(p) == Some(0) && cgroup_path_of(p).starts_with("/system.slice/");
+        let requester = polkit_requester(c.caller_pid, c.subject_pid, &is_root_service);
+        // The requester must be the user's own process (polkitd allows a
+        // caller to ask for its own uid or, as root, for anyone), still
+        // there, with a command line to read.
+        let named = requester.and_then(|rp| {
+            let uid = real_uid_of(rp)?;
+            if uid != user_uid {
+                log::warn!("consent: polkit named requester pid {} with uid {}, not uid {}; not shown as verified", rp, uid, user_uid);
+                return None;
             }
-            log::debug!("consent: polkit requester search, uid {} processes: {}", user_uid, seen.join(" "));
-            match best {
-                Some((t, p)) => {
-                    served.insert((p, t));
-                    // Forget the ones that have gone; the set stays small.
-                    served.retain(|&(sp, st)| std::path::Path::new(&format!("/proc/{}", sp)).exists() && starttime_of(sp) == st);
-                    info.kill_pid = p;
-                    // cmdline of a setuid process may be unreadable too; fall back to its name.
-                    let cl = clip(&read_proc(p, "cmdline").unwrap_or_default());
-                    let name = comm_of(p);
-                    info.command = if cl.is_empty() { format!("{} (arguments not readable)", name) } else { cl };
-                    info.verified = true;
-                    info.parents = parent_chain(p);
-                    info.who = format!("{} (pid {})  from  {}", name, p, info.parents);
-                }
-                None => {
-                    info.who = format!("polkit helper (pid {}); the asking process could not be found", pid);
-                }
+            let cl = clip(&read_proc(rp, "cmdline").unwrap_or_default());
+            if cl.is_empty() {
+                return None;
             }
-            // The agent's context is the requesting side's own account of
-            // itself: any process of the user's can send one, and the helper
-            // carries nothing to check it against. It names the request only
-            // when nothing provable does, and then the window labels it.
-            match context {
-                Some(c) => {
-                    let relayed = clip(&format!("{} [{}]", c.message.trim(), c.action));
-                    if info.verified {
-                        log::info!("consent: polkit helper pid {} named {}; the agent relayed: {}", pid, info.command, relayed);
-                    } else {
-                        log::info!("consent: polkit helper pid {}: requester not found; the agent relayed (unverified): {}", pid, relayed);
-                        info.command = relayed;
-                    }
-                }
-                None => {
-                    log::warn!("consent: no context from the polkit agent for helper pid {}; naming by process search only", pid);
-                    if !info.verified {
-                        info.command = "a polkit action (no description was given)".into();
-                    }
-                }
+            Some((rp, cl))
+        });
+        match named {
+            Some((rp, cl)) => {
+                let name = comm_of(rp);
+                let parents = parent_chain(rp);
+                let asked = match (c.caller_pid, c.subject_pid) {
+                    (Some(cp), Some(sp)) if cp != sp && rp == sp => format!("; asked by {} (pid {})", comm_of(cp), cp),
+                    _ => String::new(),
+                };
+                log::info!("consent: polkit helper pid {}: requester {} (pid {}) named by polkitd; the agent relayed: {}", pid, name, rp, relayed);
+                info.command = cl;
+                info.verified = true;
+                info.kill_pid = rp;
+                info.requester = Some(rp);
+                info.parents = parents.clone();
+                info.who = format!("{} (pid {})  from  {}{}; via polkit, {}", name, rp, parents, asked, agent_text);
             }
-        } else {
-            info.via = base.clone();
-            info.command = clip(&cmdline);
-            info.verified = true;
-            info.parents = parent_chain(pid);
-            info.who = format!("{} (pid {})  from  {}", base, pid, info.parents);
+            None => {
+                log::info!("consent: polkit helper pid {}: no requester polkitd could name; the agent relayed (unverified): {}", pid, relayed);
+                info.command = relayed;
+                info.who = format!("polkit's helper (pid {}), {}; polkit does not say which process asked", pid, agent_text);
+            }
         }
         info
     }
@@ -277,6 +335,8 @@ pub struct Dialog {
     open: bool,
     /// The answer token for this request (see `TOKENS`).
     token: String,
+    /// When the window acknowledged this request (see `ACKS`).
+    acked_at: Option<Instant>,
 }
 
 #[derive(Serialize)]
@@ -294,7 +354,29 @@ impl Dialog {
         if let Ok(mut t) = TOKENS.lock() {
             t.insert(user.to_string(), token.clone());
         }
-        Ok(Dialog { cfg: cfg.clone(), user: user.to_string(), open: false, token })
+        if let Ok(mut a) = ACKS.lock() {
+            a.remove(user);
+        }
+        Ok(Dialog { cfg: cfg.clone(), user: user.to_string(), open: false, token, acked_at: None })
+    }
+
+    /// When the window acknowledged this request, if it has.
+    pub fn acked_at(&self) -> Option<Instant> {
+        self.acked_at
+    }
+
+    /// How long a nod must wait before it counts: until `ACK_DWELL` after
+    /// the acknowledgement, and the whole dwell when there is none.
+    pub fn dwell_left(&self, now: Instant) -> Duration {
+        match self.acked_at {
+            Some(at) => (at + ACK_DWELL).saturating_duration_since(now),
+            None => ACK_DWELL,
+        }
+    }
+
+    /// Has the window acknowledged this request?
+    fn acknowledged(&self) -> bool {
+        ACKS.lock().map(|a| a.get(&self.user).map(|t| t.as_bytes() == self.token.as_bytes()).unwrap_or(false)).unwrap_or(false)
     }
 
     /// Does `token` answer this user's live request? Compared in constant
@@ -335,17 +417,36 @@ impl Dialog {
 
     /// Show or update the window. Fails when there is no graphical session to
     /// show it in, which callers treat as "no consent possible".
+    /// The first show of a request also waits for the window's own
+    /// acknowledgement (`ACKS`); without one within `ACK_WAIT` there is no
+    /// window on screen that the daemon can vouch for, and that is an error.
     pub fn show(&mut self, state: &str, message: &str, caller: &CallerInfo, seconds: f32) -> Result<()> {
+        self.show_inner(state, message, caller, seconds, true)
+    }
+
+    fn show_inner(&mut self, state: &str, message: &str, caller: &CallerInfo, seconds: f32, need_ack: bool) -> Result<()> {
         let payload = serde_json::to_string(&Payload { state, message, caller, seconds, token: &self.token })?;
         self.shell(&["shell", "summon", "omarchy.faceauth", &payload])?;
         self.open = true;
+        if need_ack && self.acked_at.is_none() {
+            let deadline = Instant::now() + ACK_WAIT;
+            while !self.acknowledged() {
+                if Instant::now() > deadline {
+                    self.open = false;
+                    return Err(anyhow!("the consent window did not acknowledge the request within {:.0}s", ACK_WAIT.as_secs_f32()));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            self.acked_at = Some(Instant::now());
+            log::info!("consent: the window acknowledged the request for {}", self.user);
+        }
         Ok(())
     }
 
     /// A final state: the window keeps itself up for a while and closes on
     /// its own, so the daemon must not hide it (and must not wait).
     pub fn show_final(&mut self, state: &str, message: &str, caller: &CallerInfo) {
-        let _ = self.show(state, message, caller, 0.0);
+        let _ = self.show_inner(state, message, caller, 0.0, false);
         self.open = false;
     }
 
@@ -421,6 +522,8 @@ pub enum Gesture {
     ConfirmUnclear,
     /// The nods came, but the confirm refused: not a live enrolled face.
     ConfirmFailed(String),
+    /// The window could not be shown, or never acknowledged the request.
+    NoWindow,
 }
 
 /// One gesture axis as a pure state machine over (signal, time) samples, so
@@ -1002,6 +1105,11 @@ impl NodDetector {
     /// more, and its perspective wobble on the pitch measure (up to 0.12,
     /// measured 2026-09-22) would otherwise read as nods.
     pub const YAW_QUIET: f32 = 0.25;
+    /// A nod counts only from a head facing the camera (the presence
+    /// watch's attentive yaw): the mean yaw over the nod's span must be
+    /// within this. A head held turned toward another screen nods the same
+    /// way on the pitch axis, but it is not nodding at the card.
+    pub const YAW_FACING: f32 = 0.25;
 
     pub fn new() -> Self {
         Self::with_floor(Self::MIN_DOWN)
@@ -1047,6 +1155,11 @@ impl NodDetector {
         if let (Some(lo), Some(hi)) = (span.iter().cloned().reduce(f32::min), span.iter().cloned().reduce(f32::max)) {
             if hi - lo > Self::YAW_QUIET {
                 log::debug!("consent: nod rejected, the head turned meanwhile (yaw range {:.2})", hi - lo);
+                return false;
+            }
+            let mean = span.iter().sum::<f32>() / span.len() as f32;
+            if mean.abs() > Self::YAW_FACING {
+                log::debug!("consent: nod rejected, the head faced away (mean yaw {:.2})", mean);
                 return false;
             }
         }
@@ -1289,7 +1402,7 @@ pub fn track(faces: &[faceauth_engine::Face], tracked: [f32; 4]) -> Track {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, window: Duration, nods_needed: usize, answers: Option<(&Answers, &str)>, lost_after: Option<Duration>, floors: (f32, f32), start: Option<[f32; 4]>) -> Result<(Gesture, Option<[f32; 4]>)> {
+pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, window: Duration, nods_needed: usize, answers: Option<(&Answers, &str)>, lost_after: Option<Duration>, floors: (f32, f32), start: Option<[f32; 4]>, dwell: Duration) -> Result<(Gesture, Option<[f32; 4]>)> {
     let min_detection = cfg.min_detection;
     let user_name = answers.map(|(_, u)| u.to_string()).unwrap_or_else(|| "unknown".into());
     let t0 = Instant::now();
@@ -1317,6 +1430,13 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config,
     let mut tracked: Option<[f32; 4]> = start;
     let mut lost_since: Option<Instant> = None;
     let mut paused_logged = false;
+    // Until the dwell has passed frames are drained and nothing is read;
+    // when it ends the still second before a first leg is required afresh,
+    // so a nod already under way at a card that just appeared is not one.
+    let mut dwelt = dwell.is_zero();
+    if !dwelt {
+        log::debug!("consent: nods count only after a {:.1}s dwell", dwell.as_secs_f32());
+    }
     let summary = |det: &NodDetector, shake: &ShakeDetector, t: f32| format!("{} nods, {} shakes in {:.1}s, thresholds {:.3}/{:.3}", det.nods, shake.shakes, t, det.inner.thr, shake.inner.thr);
     while t0.elapsed() < window {
         if let Some((answers, user)) = answers {
@@ -1347,6 +1467,14 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config,
             }
         }
         let Some(img) = cap.next(Duration::from_secs(1))? else { continue };
+        if !dwelt {
+            if t0.elapsed() < dwell {
+                continue;
+            }
+            dwelt = true;
+            det.inner.prior_still = 0.0;
+            shake.inner.prior_still = 0.0;
+        }
         // Slow polling while the head is still: every other frame is looked
         // at (a leg leaves the rest for six or more frames, so its start
         // cannot slip between two), the rest are only drained. Once a
@@ -2238,5 +2366,175 @@ mod shake_tests {
         let mut t = Vec::new();
         for i in 0..120 { t.push(if i % 2 == 0 { 0.01 } else { -0.01 }); }
         assert_eq!(run(&t, 28.0).0, 0);
+    }
+}
+
+#[cfg(test)]
+mod polkit_context_tests {
+    use super::*;
+
+    fn ctx(uid: u32, agent: Option<AgentPeer>, action: &str) -> PolkitContext {
+        PolkitContext { action: action.into(), message: "m".into(), cookie: String::new(), uid, agent, caller_pid: None, subject_pid: None, at: Instant::now() }
+    }
+
+    /// A context serves only a request whose helper was connected by the
+    /// peer that sent it: not the oldest for the uid, and never one from a
+    /// process that merely runs as the user (A8, A5).
+    #[test]
+    fn a_context_is_matched_to_the_agent_that_sent_it_not_by_arrival_order() {
+        let planted = AgentPeer { pid: 900, id: 9000 };
+        let shell = AgentPeer { pid: 500, id: 5000 };
+        {
+            let mut m = CONTEXTS.lock().unwrap();
+            let q = m.entry(4242).or_default();
+            q.clear();
+            q.push_back(ctx(4242, Some(planted), "org.example.benign"));
+            q.push_back(ctx(4242, None, "org.example.anonymous"));
+            q.push_back(ctx(4242, Some(shell), "org.example.real"));
+        }
+        assert_eq!(take_polkit_context(shell).map(|c| c.action).as_deref(), Some("org.example.real"));
+        // A second request from the same agent finds nothing of its own,
+        // and does not fall back to what another peer left behind.
+        let t = Instant::now();
+        assert!(take_polkit_context(shell).is_none());
+        assert!(t.elapsed() >= Duration::from_millis(1400));
+        let left: Vec<String> = CONTEXTS.lock().unwrap().get(&4242).unwrap().iter().map(|c| c.action.clone()).collect();
+        assert_eq!(left, vec!["org.example.benign".to_string(), "org.example.anonymous".to_string()]);
+        CONTEXTS.lock().unwrap().remove(&4242);
+    }
+
+    /// Without polkitd's pids nothing on the polkit lane is verified,
+    /// whatever processes of the user's are named `pkexec`, and there is
+    /// nothing to kill.
+    #[test]
+    fn a_polkit_request_without_polkitds_pids_is_never_presented_as_verified() {
+        let agent = AgentPeer { pid: 500, id: 5000 };
+        let info = CallerInfo::polkit(600, 1000, Some(agent), "quickshell", Some(ctx(1000, Some(agent), "org.freedesktop.policykit.exec")));
+        assert!(!info.verified);
+        assert_eq!(info.kill_pid, 0);
+        assert_eq!(info.requester, None);
+        assert_eq!(info.via, "polkit");
+        assert!(info.who.contains("agent quickshell (pid 500)"), "{}", info.who);
+        assert!(info.command.ends_with("[org.freedesktop.policykit.exec]"), "{}", info.command);
+        let info = CallerInfo::polkit(600, 1000, None, "", None);
+        assert!(!info.verified && info.kill_pid == 0);
+        assert!(info.command.contains("no description"), "{}", info.command);
+    }
+
+    /// With polkitd's caller pid the requester is read from /proc by the
+    /// daemon: this test process stands in for pkexec.
+    #[test]
+    fn polkitds_caller_pid_names_a_verified_requester() {
+        let me = std::process::id() as i32;
+        let my_uid = nix::unistd::getuid().as_raw();
+        let agent = AgentPeer { pid: 500, id: 5000 };
+        let mut c = ctx(my_uid, Some(agent), "org.freedesktop.policykit.exec");
+        c.caller_pid = Some(me);
+        c.subject_pid = Some(me);
+        let info = CallerInfo::polkit(600, my_uid, Some(agent), "quickshell", Some(c.clone()));
+        assert!(info.verified, "{}", info.who);
+        assert_eq!(info.kill_pid, me);
+        assert_eq!(info.requester, Some(me));
+        assert!(info.command.contains("faceauth"), "{}", info.command);
+        assert!(info.who.contains(&format!("(pid {})", me)) && info.who.contains("via polkit, agent quickshell (pid 500)"), "{}", info.who);
+        // A requester of another uid is not the user's and is not shown as verified.
+        let info = CallerInfo::polkit(600, my_uid.wrapping_add(1), Some(agent), "quickshell", Some(c.clone()));
+        assert!(!info.verified && info.requester.is_none(), "{}", info.who);
+        // A requester that is gone: unverified.
+        c.caller_pid = Some(i32::MAX - 1);
+        let info = CallerInfo::polkit(600, my_uid, Some(agent), "quickshell", Some(c));
+        assert!(!info.verified && info.kill_pid == 0, "{}", info.who);
+    }
+
+    #[test]
+    fn the_requester_is_the_caller_unless_a_root_service_asked_for_a_subject() {
+        let root_service = |p: i32| p == 77;
+        assert_eq!(polkit_requester(Some(42), Some(42), &root_service), Some(42));
+        assert_eq!(polkit_requester(Some(42), Some(43), &root_service), Some(42), "a plain caller's subject claim is not followed");
+        assert_eq!(polkit_requester(Some(77), Some(43), &root_service), Some(43), "a root service vouches for its subject");
+        assert_eq!(polkit_requester(Some(77), None, &root_service), Some(77));
+        assert_eq!(polkit_requester(None, Some(43), &root_service), None, "no caller, nothing to trust");
+        assert_eq!(polkit_requester(Some(0), Some(43), &root_service), None);
+    }
+}
+
+#[cfg(test)]
+mod window_ack_tests {
+    use super::*;
+
+    /// The acknowledgement is accepted only with the live request's token,
+    /// and a new request forgets the last one's.
+    #[test]
+    fn an_acknowledgement_needs_the_live_token_and_is_per_request() {
+        let cfg = Config::default();
+        let user = "faceauth-ack-test-user";
+        let d = Dialog::new(&cfg, user).unwrap();
+        assert!(!d.acknowledged());
+        assert!(!ack(user, None));
+        assert!(!ack(user, Some("not-the-token")));
+        assert!(!d.acknowledged());
+        let token = TOKENS.lock().unwrap().get(user).cloned().unwrap();
+        assert!(ack(user, Some(&token)));
+        assert!(d.acknowledged());
+        assert_eq!(d.dwell_left(Instant::now()), ACK_DWELL, "no dwell has run before the show records the acknowledgement");
+        let d2 = Dialog::new(&cfg, user).unwrap();
+        assert!(!d2.acknowledged(), "a new request starts unacknowledged");
+        assert!(!ack(user, Some(&token)), "the old token no longer answers");
+        TOKENS.lock().unwrap().remove(user);
+        ACKS.lock().unwrap().remove(user);
+    }
+
+    #[test]
+    fn the_dwell_runs_from_the_acknowledgement() {
+        let cfg = Config::default();
+        let user = "faceauth-dwell-test-user";
+        let mut d = Dialog::new(&cfg, user).unwrap();
+        let at = Instant::now();
+        d.acked_at = Some(at);
+        assert_eq!(d.dwell_left(at), ACK_DWELL);
+        assert_eq!(d.dwell_left(at + Duration::from_millis(1000)), Duration::from_millis(500));
+        assert_eq!(d.dwell_left(at + Duration::from_secs(5)), Duration::ZERO);
+        TOKENS.lock().unwrap().remove(user);
+    }
+}
+
+#[cfg(test)]
+mod facing_gate_tests {
+    use super::{replay_round, CalFrame, NodDetector, ShakeDetector};
+
+    fn frames(text: &str, off: f32) -> Vec<CalFrame> {
+        text.split_whitespace().filter_map(|tok| {
+            let f: Vec<f32> = tok.split('/').filter_map(|v| v.parse().ok()).collect();
+            if f.len() != 19 { return None; }
+            Some(CalFrame { t: f[0], pos_x: f[17], pos_y: f[18], yaw: f[2] + off, geom: (f[3], f[4], f[5]) })
+        }).collect()
+    }
+
+    /// Every recorded nod still reads as recorded; the same nod with the
+    /// head held turned toward another screen (yaw offset 0.50 either way)
+    /// reads as nothing.
+    #[test]
+    fn a_nod_from_a_head_held_turned_does_not_count() {
+        let floors = (NodDetector::MIN_DOWN, ShakeDetector::MIN_TURN);
+        let mut bad = Vec::new();
+        for dir in ["cal", "cal-phone"] {
+            let d = format!("{}/traces/{}", env!("CARGO_MANIFEST_DIR"), dir);
+            let mut files: Vec<_> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().map(|e| e == "txt").unwrap_or(false)).collect();
+            files.sort();
+            for p in files {
+                let name = format!("{}/{}", dir, p.file_name().unwrap().to_string_lossy());
+                let text = std::fs::read_to_string(&p).unwrap();
+                let (n0, _) = replay_round(&frames(&text, 0.0), floors);
+                let (n5, _) = replay_round(&frames(&text, 0.50), floors);
+                let (nm5, _) = replay_round(&frames(&text, -0.50), floors);
+                if n5 != 0 || nm5 != 0 {
+                    bad.push(format!("{} nods with the head held turned: {}/{}", name, n5, nm5));
+                }
+                if dir == "cal" && name.contains("nod") && !name.contains("single") && n0 < 2 {
+                    bad.push(format!("{} lost its nods", name));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{:?}", bad);
     }
 }
