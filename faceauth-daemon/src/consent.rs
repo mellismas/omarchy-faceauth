@@ -465,10 +465,8 @@ pub struct Oscillation {
     /// two solutions is one jump (recorded 2026-09-22 on the nose measure:
     /// 0.09 in a frame, held three or four frames, and approved as a nod).
     pub min_steps: usize,
-    /// A leg must pass through its own middle: at least one sample strictly
-    /// between 20% and 80% of the way from where it began to its extreme. A
-    /// head moves through the in-between; a detector fit switching between
-    /// two solutions does not.
+    /// Test-only knob (off in every live detector): require the leg's samples
+    /// to pass through the middle band on their way to the extreme.
     pub need_ramp: bool,
     /// The whole face box must move with the leg: along x for a shake, y
     /// for a nod, by at least this fraction of the face width between the
@@ -482,9 +480,8 @@ pub struct Oscillation {
     leg_samples: Vec<f32>,
     /// The last few filtered samples (the frames just before a departure).
     recent: Vec<f32>,
-    /// The four legs' amplitudes, and their durations, must each be within
-    /// this ratio of one another (a deliberate gesture is even; talking and
-    /// fidgeting are not). None turns the rule off.
+    /// Test-only knob (off in every live detector): the four legs' amplitudes
+    /// and durations within this ratio of one another.
     pub regular: Option<f32>,
     /// The gesture must swing to both sides of the rest level (a shake
     /// does; a glance goes one way and returns; a nod may not rise above).
@@ -1123,13 +1120,14 @@ impl ShakeDetector {
 /// A calibration round: watch the face for `seconds` and report how far it
 /// moved, vertically and sideways, as the largest range of the accumulated
 /// image motion over any 1.5 s (face widths). Nothing is decided; the
-/// recording is always saved (root-only) under `cal-<gesture>`.
+/// recording is saved under `cal-<gesture>` when `gesture_trace` is on.
 pub fn measure_motion(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, user: &str, gesture: &str, seconds: f32) -> Result<(f32, f32)> {
     let t0 = Instant::now();
-    let mut forced = cfg.clone();
-    forced.gesture_trace = true;
+    // Recorded only when `gesture_trace` is on, like a consent round: the
+    // floors are what calibration keeps; a per-frame recording is a tuning
+    // aid, plaintext under the root-only gestures directory, not a template.
     let label: &'static str = if gesture == "shake" { "cal-shake" } else { "cal-nod" };
-    let saver = TraceSaver { cfg: &forced, user: user.to_string(), trace: Default::default(), label: std::cell::Cell::new(label) };
+    let saver = TraceSaver { cfg, user: user.to_string(), trace: Default::default(), label: std::cell::Cell::new(label) };
     let trace = &saver.trace;
     let mut prev: Option<(Grey, [f32; 4])> = None;
     let (mut pos_x, mut pos_y) = (0f32, 0f32);

@@ -191,6 +191,16 @@ fn parse_args(argc: c_int, argv: *const *const c_char) -> Args {
 }
 
 /// The whole conversation with the daemon. Any error is `false`.
+/// Is the process on the other end of `stream` running as root?
+fn peer_is_root(stream: &UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let mut cred = libc::ucred { pid: 0, uid: u32::MAX, gid: u32::MAX };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: a valid socket fd, a correctly sized out-buffer and its length.
+    let rc = unsafe { libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, &mut cred as *mut libc::ucred as *mut c_void, &mut len) };
+    rc == 0 && cred.uid == 0
+}
+
 /// What the daemon said, as far as this module cares.
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum Said {
@@ -201,6 +211,13 @@ enum Said {
 
 fn daemon_says(socket: &Path, user: &str, timeout: Duration, consent: bool) -> Said {
     let Ok(mut stream) = UnixStream::connect(socket) else { return Said::Other };
+    // The socket lives under a root-owned runtime directory, so nobody else
+    // can put a listener there; this check is the belt to that suspender. A
+    // peer that is not root is not the daemon, and its answers are nobody's.
+    if !peer_is_root(&stream) {
+        log("the socket's peer is not root; not the daemon, ignoring it");
+        return Said::Other;
+    }
     // A consent request has no deadline: the daemon answers when the user does.
     let read_timeout = if consent { None } else { Some(timeout) };
     if stream.set_read_timeout(read_timeout).is_err() || stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
@@ -327,6 +344,16 @@ mod tests {
         assert_eq!(classify("{\"result\":\"consent_denied\",\"reason\":\"no answer\"}", true), Said::Other);
         assert_eq!(classify("{\"result\":\"no_match\",\"message\":\"{\\\"result\\\":\\\"match\\\",\"}", true), Said::Other);
         assert_eq!(classify("", true), Said::Other);
+    }
+
+    #[test]
+    fn a_listener_that_is_not_root_is_not_the_daemon() {
+        // A socket pair: both ends are this test's uid, so the peer is root
+        // only when the test itself runs as root.
+        let (a, _b) = UnixStream::pair().unwrap();
+        // SAFETY: getuid has no preconditions.
+        let me_root = unsafe { libc::getuid() } == 0;
+        assert_eq!(peer_is_root(&a), me_root);
     }
 
     #[test]

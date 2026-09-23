@@ -30,8 +30,8 @@ on its own: the PAM stacks are written only by `omarchy setup security face`.
   Nothing is elided. Nothing elevates until the face matches, the daemon
   sees two nods from that same face, and a strobed confirm shows it live
   and enrolled; two head shakes refuse; the password typed into the window
-  approves. Buttons dismiss, deny and kill the requester, or block it for
-  ten minutes. The request has no deadline: nods are read for
+  approves. Buttons dismiss, or deny and kill the requester when the daemon
+  could name it. The request has no deadline: nods are read for
   `consent_seconds` (90 by default) after a match, then the camera drops to
   the presence rhythm and an attentive face re-arms it, the lock screen's
   cycle; if you walk away the session locks and the request resumes when
@@ -156,7 +156,8 @@ and `required_matches` (2); `liveness` and `liveness_required` (a print can
 pass on a camera without the strobe control if the latter is false);
 `ir_video` and `ir_subdev` to name a UVC IR camera instead of detecting an
 IPU3 one; `ir_orientation`; `consent_nods` (2); `gesture_trace` (write each
-consent round's per-frame recording, root-only, for tuning; off) and
+consent or calibration round's per-frame recording, plaintext under the
+root-only store, for tuning; off) and
 `gesture_record_only` (recognise but never act; for recording a battery);
 the `[presence]` table for the walk-away lock.
 
@@ -209,3 +210,12 @@ cargo test --release --locked        # FACEAUTH_REQUIRE_TPM=1 to insist on the s
 
 Concurrent IR+RGB capture and the illuminator on Intel IPU3 laptops need the
 two kernel patches shipped in `linux-omarchy`; a UVC IR camera needs nothing.
+
+## Where the shell lives
+
+The daemon summons the consent window through `omarchy-shell` in the user's
+manager, and finds Omarchy's tree the way Omarchy does: `OMARCHY_PATH` from
+`/etc/omarchy.conf`, else `/usr/share/omarchy`. A packaged install points
+at `/usr/share/omarchy`; a tree dev-linked from a home directory is the
+user's own choice and is writable by anything running as them, window
+included.

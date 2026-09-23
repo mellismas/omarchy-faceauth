@@ -976,7 +976,8 @@ fn models_fetch(rest: &[&str]) -> Result<()> {
         }
         println!("{}: downloading {} bytes from {}", name, size, url);
         let tmp = dir.join(format!("{}.part", name));
-        let status = std::process::Command::new("curl").args(["-sSL", "--fail", "-o"]).arg(&tmp).arg(url).status().context("run curl")?;
+        // Absolute paths and a clean environment: this runs as root.
+        let status = std::process::Command::new("/usr/bin/curl").env_clear().env("PATH", "/usr/bin:/bin").args(["-sSL", "--fail", "-o"]).arg(&tmp).arg(url).status().context("run curl")?;
         if !status.success() {
             println!("{}: download failed ({})", name, status);
             failed += 1;
@@ -1000,7 +1001,7 @@ fn models_fetch(rest: &[&str]) -> Result<()> {
 }
 
 fn sha256_file(p: &std::path::Path) -> Result<String> {
-    let out = std::process::Command::new("sha256sum").arg(p).output().context("run sha256sum")?;
+    let out = std::process::Command::new("/usr/bin/sha256sum").env_clear().env("PATH", "/usr/bin:/bin").arg(p).output().context("run sha256sum")?;
     let text = String::from_utf8_lossy(&out.stdout);
     Ok(text.split_whitespace().next().unwrap_or("").to_string())
 }

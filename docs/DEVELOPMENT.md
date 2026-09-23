@@ -1276,3 +1276,15 @@ chair empty -0.34, locked at ten seconds and unlocked by face. The threshold
 was set at 0.75 first and moved to 0.60 on those numbers, leaving room on
 the covered side and a wide gap to empty. The value is logged once per
 episode either way.
+
+**Small findings swept, 2026-09-22 late.** M6: the window's "Block 10 min"
+is gone (it keyed on the requester's exe, empty for polkit's helper and
+`/usr/bin/sudo` for every sudo); "Deny and kill" stays and shows only when
+the daemon could name the requester. L5: the module checks the socket's
+peer is root (SO_PEERCRED) before reading an answer. L7: calibration no
+longer forces a recording; recordings follow `gesture_trace` and the README
+says they are plaintext under the root-only store. L8: `models fetch` runs
+curl and sha256sum by absolute path with a clean environment. L1: the two
+shape rules that are off in every live detector are documented as test-only
+knobs. Packaging: the README states how the daemon finds Omarchy's tree and
+that a packaged install points at `/usr/share/omarchy`.
