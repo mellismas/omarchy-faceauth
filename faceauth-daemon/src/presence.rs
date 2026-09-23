@@ -2,9 +2,11 @@
 //!
 //! Low duty by construction: every `tick_seconds` the watch takes the camera
 //! for a fraction of a second, grabs a few frames with the illuminator on,
-//! detects on the last one and, every `identify_every` ticks, embeds it and
-//! checks it against the templates. The camera is closed between ticks, so an
-//! authentication attempt never waits for more than one tick.
+//! detects on the last one and, every `identify_every` ticks, strobes one
+//! lit/unlit pair through the flash gate and embeds the face to check it
+//! against the templates. A print that fails the gate is not the user, so
+//! it cannot keep the session marked present. The camera is closed between
+//! ticks, so an authentication attempt never waits for more than one tick.
 //!
 //! State: `Present` (enrolled user seen recently), `Away` (no face for
 //! `away_seconds`, session locked once on the transition), `Stranger` (a face
@@ -52,10 +54,10 @@ impl Default for PresenceConfig {
         PresenceConfig {
             enabled: false,
             user: String::new(),
-            tick_seconds: 2.0,
+            tick_seconds: 5.0,
             identify_every: 3,
-            battery_tick_seconds: 5.0,
-            battery_identify_every: 6,
+            battery_tick_seconds: 10.0,
+            battery_identify_every: 3,
             away_seconds: 20.0,
             require_attention: false,
             max_yaw: 0.25,
@@ -184,7 +186,10 @@ pub fn run(auth: Arc<Mutex<Authenticator>>, cfg: PresenceConfig) {
             if let (Some(f), Some(b)) = (obs.frame.as_ref(), obs.bbox) {
                 reference = Some((f.clone(), b));
             }
-        } else if partial_holds(now, last_full) {
+        } else if state == State::Present || state == State::Stranger {
+            log::info!("presence: the user's face is not seen this look (face {}, frame {}, last full sighting {})", obs.face, obs.frame.is_some(), last_full.map(|t| format!("{:.0}s ago", now.duration_since(t).as_secs_f32())).unwrap_or_else(|| "never".into()));
+        }
+        if !seen && partial_holds(now, last_full) {
             // The user's face is not seen: hidden, or detected but failing
             // identity (a hand over half of it does that too). Is the person
             // still in the chair? The shape under the last face box says: a
@@ -327,6 +332,15 @@ pub(crate) fn observe(a: &mut Authenticator, cfg: &PresenceConfig, identify: boo
     let p = pose::pose(&face.landmarks);
     let attentive = pose::is_attentive(&p, cfg.max_yaw, cfg.max_roll_degrees);
     let identity = if identify {
+        // Liveness first: one lit/unlit pair under the alternating pattern.
+        // A refusal is "not the user"; no signal (a bright room, a face far
+        // back) decides nothing and the embedding decides alone, as before.
+        if let Some(live) = strobe_pair(&mut cap, &a.cfg, &face)? {
+            if !live {
+                cap.stop()?;
+                return Ok(Observation { face: true, attentive, identity: Some(false), frame: Some(img), bbox: Some(face.bbox) });
+            }
+        }
         let crop = faceauth_engine::align::align_112(&img, &face.landmarks);
         let e = a.pipeline.embedder.embed(&crop)?;
         // Templates only count on the camera they were enrolled on, and a
@@ -361,6 +375,49 @@ pub(crate) fn observe(a: &mut Authenticator, cfg: &PresenceConfig, identify: boo
 /// the chin; short enough that a coat on the chair does not keep the
 /// machine open all evening.
 pub const PARTIAL_GRACE_S: f32 = 120.0;
+
+/// One strobed lit/unlit pair on the open camera, gated at `face`'s box:
+/// `Some(true)` passed, `Some(false)` refused, `None` no usable pair within
+/// the window (no signal, or the pattern never took). The gate's numbers
+/// are logged at debug either way, so real faces and prints build up a
+/// distribution for the thresholds.
+fn strobe_pair(cap: &mut crate::capture::IrCapture, cfg: &crate::config::Config, face: &faceauth_engine::Face) -> Result<Option<bool>> {
+    use faceauth_engine::liveness::{FlashResponse, Verdict};
+    if cap.illuminator.is_none() || !cfg.liveness {
+        return Ok(None);
+    }
+    cap.illuminator.as_ref().unwrap().set_pattern(0xaa)?;
+    let t0 = Instant::now();
+    let mut prev: Option<(Grey, f64)> = None;
+    let mut verdict = None;
+    while t0.elapsed() < Duration::from_millis(350) {
+        let Some(img) = cap.next(Duration::from_millis(200))? else { continue };
+        let mean = img.data.iter().map(|&v| v as f64).sum::<f64>() / img.data.len() as f64;
+        let Some((p_img, p_mean)) = prev.replace((img.clone(), mean)) else { continue };
+        if t0.elapsed() < Duration::from_millis(120) || mean < p_mean * 1.15 {
+            continue;
+        }
+        let fr = FlashResponse::measure(&img, &p_img, face, cap.exposure.exposure, cap.exposure.gain.max(16));
+        match fr.verdict() {
+            Verdict::Pass => {
+                log::debug!("presence liveness: pass {:?}", fr);
+                verdict = Some(true);
+            }
+            Verdict::NoSignal => {
+                log::debug!("presence liveness: no signal {:?}", fr);
+                continue;
+            }
+            v => {
+                log::info!("presence liveness: refused ({:?})", v);
+                log::debug!("presence liveness: refused {:?}", fr);
+                verdict = Some(false);
+            }
+        }
+        break;
+    }
+    cap.illuminator.as_ref().unwrap().set(true)?;
+    Ok(verdict)
+}
 
 /// How alike the region under the last face box must look, against the
 /// frame of the last full sighting, for "still there, face hidden".

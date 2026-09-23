@@ -1288,3 +1288,19 @@ curl and sha256sum by absolute path with a clean environment. L1: the two
 shape rules that are off in every live detector are documented as test-only
 knobs. Packaging: the README states how the daemon finds Omarchy's tree and
 that a packaged install points at `/usr/share/omarchy`.
+
+**Liveness in the presence look; slower ticks; locality edges, 2026-09-22
+late.** M7 in principle (no print has matched the embedding on this
+hardware: 0.37 to 0.56 against 0.70): the identity look now strobes one
+lit/unlit pair through the flash gate before the embedding counts, and a
+refusal is "not the user"; no signal decides nothing. The gate's numbers are
+logged at debug on every identity look, passes included, which is the M8
+collection. Mike's call on cadence: the tick goes from 2 s to 5 s on mains
+and 5 s to 10 s on battery, so camera duty falls to about 14 percent and 7
+percent even with the longer look, and a walk-away is noticed up to five
+seconds later. L6: an ancestry walk that never reaches init is remote, and
+a caller without a peer pidfd is remote (the /proc reads cannot be pinned to
+a live process without one). The cgroup session id was already checked
+against logind. H3's per-session marker is not built: the only thing that
+can draw a lookalike overlay is a process running as the user, which can
+also read whatever the daemon hands the window.

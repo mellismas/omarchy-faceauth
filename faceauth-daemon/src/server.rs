@@ -549,14 +549,15 @@ pub enum Locality {
 /// reads: a caller that exits before its /proc is read is not local.
 fn locality(pid: i32, pidfd: Option<&std::os::fd::OwnedFd>, target_user: &str) -> Locality {
     match locality_inner(pid, target_user) {
-        Ok(l) => {
-            if let (Locality::Local, Some(fd)) = (&l, pidfd) {
-                if process_exited(fd) {
-                    return Locality::Remote("caller exited before it could be verified".into());
-                }
-            }
-            l
-        }
+        Ok(Locality::Local) => match pidfd {
+            // The /proc reads above were of a live process only if it is
+            // still the same process now; without a pidfd to prove that,
+            // a reused pid could have been laundered into local.
+            None => Locality::Remote("no peer pidfd to pin the caller".into()),
+            Some(fd) if process_exited(fd) => Locality::Remote("caller exited before it could be verified".into()),
+            Some(_) => Locality::Local,
+        },
+        Ok(l) => l,
         Err(e) => Locality::Remote(format!("cannot verify the caller: {}", e)),
     }
 }
@@ -565,9 +566,11 @@ fn locality_inner(pid: i32, target_user: &str) -> Result<Locality> {
     // 1. Ancestry. The chain must reach init; a break means the caller (or a
     // parent) vanished mid-read, which is not a demonstration of anything.
     let mut p = pid;
+    let mut reached_init = false;
     for _ in 0..128 {
         let pp = crate::consent::ppid_of(p).ok_or_else(|| anyhow::anyhow!("process {} unreadable", p))?;
         if pp <= 1 {
+            reached_init = true;
             break;
         }
         let comm = crate::consent::comm_of(pp);
@@ -575,6 +578,11 @@ fn locality_inner(pid: i32, target_user: &str) -> Result<Locality> {
             return Ok(Locality::Remote(format!("started under {} (pid {})", comm, pp)));
         }
         p = pp;
+    }
+    if !reached_init {
+        // A chain deeper than any real desktop's is not something this
+        // check has looked all the way through; it does not vouch for it.
+        return Ok(Locality::Remote("ancestry deeper than 128 without reaching init".into()));
     }
     let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).context("read caller status")?;
     let real_uid: u32 = status.lines().find_map(|l| l.strip_prefix("Uid:")).and_then(|v| v.split_whitespace().next()).and_then(|s| s.parse().ok()).ok_or_else(|| anyhow::anyhow!("no uid in status"))?;
@@ -787,6 +795,15 @@ mod locality_tests {
     }
 
     #[test]
+    fn a_caller_without_a_pidfd_is_not_local() {
+        let me = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        match locality(std::process::id() as i32, None, &me) {
+            Locality::Remote(why) => assert!(why.contains("pidfd"), "{}", why),
+            Locality::Local => panic!("no pidfd must not be local"),
+        }
+    }
+
+    #[test]
     fn a_vanished_caller_is_not_local() {
         // A pid that cannot exist: every read fails, and failure is remote.
         match locality(i32::MAX - 1, None, "root") {
@@ -812,7 +829,12 @@ mod locality_tests {
     #[test]
     fn this_test_process_is_classified() {
         let me = std::env::var("USER").unwrap_or_else(|_| "root".into());
-        let r = locality(std::process::id() as i32, None, &me);
+        // With a pidfd of this very process, as the daemon would hold for a peer.
+        use std::os::fd::FromRawFd;
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id() as libc::pid_t, 0) };
+        assert!(raw >= 0, "pidfd_open");
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
+        let r = locality(std::process::id() as i32, Some(&fd), &me);
         if std::env::var_os("SSH_CONNECTION").is_some() {
             assert!(matches!(r, Locality::Remote(_)), "running over SSH should be remote");
         } else if std::path::Path::new("/run/systemd/seats/seat0").exists() {

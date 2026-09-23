@@ -48,8 +48,10 @@ on its own: the PAM stacks are written only by `omarchy setup security face`.
   shakes and sets the person's floors from them: the nod's only ever rises
   above the default, the shake's only ever falls below it.
 - **Walk-away lock** (opt-in, `sudo faceauth presence on`): one short look
-  every two seconds (five on battery); lock when the camera has not seen the
-  enrolled user for the away time. A hidden face is not absence on its own:
+  every five seconds (ten on battery), and on every third look a strobed
+  pair through the flash gate and an identity check; lock when the camera
+  has not seen the enrolled user for the away time. A print that fails the
+  gate is not the user and cannot keep the session marked present. A hidden face is not absence on its own:
   when no face clears the threshold, the shoulders and torso under where the
   face was are compared with the last full sighting, and while that shape
   is still in the chair (a hand over the chin while reading) the clock is

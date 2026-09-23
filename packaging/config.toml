@@ -20,8 +20,10 @@ gesture_record_only = false # recognise gestures but never act on them (for reco
 [presence]
 enabled = false             # auto-lock when the enrolled user leaves; opt-in
 user = ""                   # whose templates define "present"
-tick_seconds = 2.0          # one short look (about 0.45 s of camera) per tick
-identify_every = 3          # identity check every N ticks; detection every tick
+tick_seconds = 5.0          # one short look (about 0.45 s of camera, 0.8 s when it also checks identity and liveness) per tick; 10 s on battery
+identify_every = 3          # identity and liveness check every N ticks; detection every tick
+battery_tick_seconds = 10.0 # the tick on battery (0 keeps the mains tick)
+battery_identify_every = 3
 away_seconds = 20.0         # unseen for this long -> lock the session
 require_attention = false   # also require the face to be turned to the camera
 max_yaw = 0.25
