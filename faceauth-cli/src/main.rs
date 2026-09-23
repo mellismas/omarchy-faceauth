@@ -105,12 +105,14 @@ fn main() -> Result<()> {
             println!("on your behalf. Each round is a recording of head motion for a few seconds, never an");
             println!("image, stored root-only with your templates. The window will ask for each round.\n");
             let mut last = None;
+            let mut first = true;
             for (gesture, rounds, seconds) in faceauth_daemon::auth::CALIBRATION_ROUNDS {
                 if gestures_only && !matches!(gesture, "nod" | "shake") {
                     continue;
                 }
                 for i in 1..=rounds {
-                    let o = faceauth_daemon::server::calibrate(&socket, &user, gesture, seconds)?;
+                    let o = faceauth_daemon::server::calibrate(&socket, &user, gesture, seconds, first)?;
+                    first = false;
                     match &o {
                         faceauth_daemon::auth::Outcome::Calibrated { amplitude, sideways, stored, nod_floor, shake_floor, nod_margin, shake_margin, .. } => {
                             let what = match gesture { "nod" => "nod", "shake" => "shake", "read" => "reading", "glance" => "glance at the keyboard", "talk" => "talking", "lean" => "leaning in", _ => "look to the side" };
@@ -140,6 +142,26 @@ fn main() -> Result<()> {
                         }
                     }
                 }
+            }
+            // The proof: every round replayed through the real detectors at
+            // these floors, the way a request would read it.
+            println!("\nChecking every round against those floors...");
+            match faceauth_daemon::server::calibrate_verify(&socket, &user)? {
+                faceauth_daemon::auth::Outcome::Verified { rounds, all_ok, .. } => {
+                    for r in &rounds {
+                        let what = match r.kind.as_str() { "nod" => "nod", "shake" => "shake", "read" => "reading", "glance" => "glance at the keyboard", "talk" => "talking", "lean" => "leaning in", _ => "look to the side" };
+                        let read = match (r.nods, r.shakes) { (0, 0) => "nothing".to_string(), (n, 0) => format!("{} nod(s)", n), (0, s) => format!("{} shake(s)", s), (n, s) => format!("{} nod(s) and {} shake(s)", n, s) };
+                        println!("  {:<24} read as {:<24} {}", what, read, if r.ok { "ok" } else { "NOT OK" });
+                    }
+                    if all_ok {
+                        println!("\nEvery gesture round reads as its gesture and no everyday round reads as one. Calibration holds.");
+                    } else {
+                        println!("\nSome rounds do not read the way they should at these floors. Run this again, redoing the");
+                        println!("rounds marked NOT OK: a gesture that was not read wants to be a little clearer, and an");
+                        println!("everyday movement that read as a gesture wants to be as ordinary as you would really do it.");
+                    }
+                }
+                other => println!("  could not check: {}", serde_json::to_string(&other)?),
             }
             Ok(())
         }

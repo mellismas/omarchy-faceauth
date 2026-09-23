@@ -85,6 +85,9 @@ pub enum Outcome {
     },
     /// Too many failed attempts for this user recently; try again later.
     Cooldown { seconds: u64 },
+    /// Every round of a calibration session replayed through the detectors
+    /// at the floors it produced.
+    Verified { rounds: Vec<RoundCheck>, all_ok: bool, nod_floor: f32, shake_floor: f32 },
     /// The consent request ended without an answer that could count: no
     /// window to ask in, the requester gone, no answer inside a caller's
     /// budget. Not a decision; the module ignores it and the caller's stack
@@ -118,6 +121,17 @@ pub const MAX_BUDGET: f32 = 3600.0;
 /// away. About four months, so every duration derived from it stays
 /// representable.
 pub const NO_DEADLINE: f32 = 1.0e7;
+
+/// One calibration round replayed at the derived floors.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RoundCheck {
+    pub kind: String,
+    pub nods: usize,
+    pub shakes: usize,
+    /// A nod round read as nods and nothing else, a shake round as shakes and
+    /// nothing else, an everyday round as nothing.
+    pub ok: bool,
+}
 
 pub struct ConsentSession {
     pub user: String,
@@ -162,6 +176,9 @@ pub struct Authenticator {
     /// tick while one runs (the camera lock is held for the whole window), so
     /// it treats the flow as the user being there rather than as time unseen.
     pub last_consent: std::collections::HashMap<String, Instant>,
+    /// The rounds of the calibration session in progress, per user: kind and
+    /// frames, kept until the session is verified or a new one starts.
+    pub cal_rounds: std::collections::HashMap<String, Vec<(String, Vec<crate::consent::CalFrame>)>>,
     /// When a consent request locked the session (the user left mid-request);
     /// the presence watch adopts it instead of locking again.
     pub session_locked_at: Option<Instant>,
@@ -239,7 +256,7 @@ impl Authenticator {
         if let crate::store::Sealing::Plain(_) = store.sealing() {
             log::warn!("templates would be written in plaintext (see above); a store that already holds sealed templates refuses to downgrade");
         }
-        Ok(Authenticator { cfg, pipeline, store, last_match: Default::default(), failures: Default::default(), answers: Default::default(), pending: Default::default(), last_consent: Default::default(), session_locked_at: None, last_exposure: None })
+        Ok(Authenticator { cfg, pipeline, store, last_match: Default::default(), failures: Default::default(), answers: Default::default(), pending: Default::default(), last_consent: Default::default(), cal_rounds: Default::default(), session_locked_at: None, last_exposure: None })
     }
 
     /// One cheap look for the lock screen while its panel is blank: is anyone
@@ -557,7 +574,38 @@ impl Authenticator {
     /// A calibration round for one gesture: the window asks for it, the face
     /// must match, then the motion is measured for `seconds` and stored with
     /// the templates. Root only (the server enforces it). Nothing is decided.
-    pub fn calibrate(&mut self, user: &str, gesture: &str, seconds: f32) -> Outcome {
+    /// Replay every round of the user's calibration session at the floors
+    /// they produced, as the consent loop would read them.
+    pub fn calibrate_verify(&mut self, user: &str) -> Outcome {
+        let u = match self.store.load(user) {
+            Ok(Some(t)) => t,
+            Ok(None) => return Outcome::NotEnrolled,
+            Err(e) => return Outcome::Error { message: e.to_string() },
+        };
+        let floors = u.gesture.floors(crate::consent::NodDetector::MIN_DOWN, crate::consent::ShakeDetector::MIN_TURN);
+        let needed = self.cfg.consent_nods;
+        let rounds = self.cal_rounds.remove(user).unwrap_or_default();
+        let checks: Vec<RoundCheck> = rounds
+            .iter()
+            .map(|(kind, frames)| {
+                let (nods, shakes) = crate::consent::replay_round(frames, floors);
+                let ok = match kind.as_str() {
+                    "nod" => nods >= needed && shakes == 0,
+                    "shake" => shakes >= needed && nods == 0,
+                    _ => nods == 0 && shakes == 0,
+                };
+                RoundCheck { kind: kind.clone(), nods, shakes, ok }
+            })
+            .collect();
+        let all_ok = !checks.is_empty() && checks.iter().all(|c| c.ok);
+        log::info!("calibration verified for {}: {} round(s), all ok {}; floors nod {:.3} shake {:.3}: {}", user, checks.len(), all_ok, floors.0, floors.1, checks.iter().map(|c| format!("{} {}n/{}s{}", c.kind, c.nods, c.shakes, if c.ok { "" } else { "!" })).collect::<Vec<_>>().join(" "));
+        Outcome::Verified { rounds: checks, all_ok, nod_floor: floors.0, shake_floor: floors.1 }
+    }
+
+    pub fn calibrate(&mut self, user: &str, gesture: &str, seconds: f32, start: bool) -> Outcome {
+        if start {
+            self.cal_rounds.remove(user);
+        }
         let mut u = match self.store.load(user) {
             Ok(Some(t)) => t,
             Ok(None) => return Outcome::NotEnrolled,
@@ -575,24 +623,26 @@ impl Authenticator {
             return Outcome::Error { message: format!("no window to calibrate in: {}", e) };
         }
         let dialog_cell = std::cell::RefCell::new(&mut dialog);
-        let measured: std::cell::Cell<Option<(f32, f32)>> = std::cell::Cell::new(None);
+        let measured: std::cell::RefCell<Option<crate::consent::Measured>> = std::cell::RefCell::new(None);
         let msg = prompt;
         let mut hook = |cap: &mut IrCapture, pipeline: &mut Pipeline, _matched: &faceauth_engine::Face| -> Result<bool> {
             let _ = dialog_cell.borrow_mut().show("nod", msg, &caller, seconds);
             let m = crate::consent::measure_motion(cap, pipeline, &cfg, user, gesture, seconds)?;
-            measured.set(Some(m));
+            *measured.borrow_mut() = Some(m);
             Ok(false)
         };
         let scan = self.run_with_answers(&view, Some(&mut hook), cfg.consent_scan_seconds, None);
         drop(dialog_cell);
         dialog.hide();
-        let Some((dy, dx)) = measured.get() else {
+        let Some(m) = measured.borrow_mut().take() else {
             return match scan {
                 Ok(o @ Outcome::NoFace { .. }) | Ok(o @ Outcome::NoMatch { .. }) | Ok(o @ Outcome::Denied { .. }) => o,
                 Ok(o) => Outcome::Error { message: format!("calibration did not run: {:?}", o) },
                 Err(e) => Outcome::Error { message: e.to_string() },
             };
         };
+        let (dy, dx) = (m.dy, m.dx);
+        self.cal_rounds.entry(user.to_string()).or_default().push((gesture.to_string(), m.frames));
         let (amplitude, sideways, stored) = match gesture {
             "shake" => {
                 // Below the default floor nothing would ever count: the

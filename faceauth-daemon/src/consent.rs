@@ -1121,7 +1121,40 @@ impl ShakeDetector {
 /// moved, vertically and sideways, as the largest range of the accumulated
 /// image motion over any 1.5 s (face widths). Nothing is decided; the
 /// recording is saved under `cal-<gesture>` when `gesture_trace` is on.
-pub fn measure_motion(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, user: &str, gesture: &str, seconds: f32) -> Result<(f32, f32)> {
+/// One frame of a calibration round, enough to run the detectors on later.
+#[derive(Clone, Debug)]
+pub struct CalFrame {
+    pub t: f32,
+    pub pos_x: f32,
+    pub pos_y: f32,
+    pub yaw: f32,
+    pub geom: (f32, f32, f32),
+}
+
+/// A calibration round's measurement: the largest 1.5 s swing on each axis,
+/// and every frame, so the round can be replayed through the detectors once
+/// the floors are known.
+pub struct Measured {
+    pub dy: f32,
+    pub dx: f32,
+    pub frames: Vec<CalFrame>,
+}
+
+/// Run the live detectors over a recorded round at the given floors, as the
+/// consent loop would: how many nods and shakes it reads.
+pub fn replay_round(frames: &[CalFrame], floors: (f32, f32)) -> (usize, usize) {
+    let mut det = NodDetector::with_floor(floors.0);
+    let mut shake = ShakeDetector::with_floor(floors.1);
+    det.inner.prior_still = 1.0;
+    shake.inner.prior_still = 1.0;
+    for f in frames {
+        shake.push_with(f.pos_x, f.t, Some(f.geom));
+        det.push_full(f.pos_y, Some(f.yaw), f.t, Some(f.geom));
+    }
+    (det.nods, shake.shakes)
+}
+
+pub fn measure_motion(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, user: &str, gesture: &str, seconds: f32) -> Result<Measured> {
     let t0 = Instant::now();
     // Recorded only when `gesture_trace` is on, like a consent round: the
     // floors are what calibration keeps; a per-frame recording is a tuning
@@ -1132,6 +1165,7 @@ pub fn measure_motion(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config
     let mut prev: Option<(Grey, [f32; 4])> = None;
     let (mut pos_x, mut pos_y) = (0f32, 0f32);
     let mut series: Vec<(f32, f32, f32)> = Vec::new();
+    let mut frames: Vec<CalFrame> = Vec::new();
     while t0.elapsed().as_secs_f32() < seconds {
         let Some(img) = cap.next(Duration::from_secs(1))? else { continue };
         let faces = pipeline.detector.detect(&img, cfg.min_detection)?;
@@ -1151,6 +1185,7 @@ pub fn measure_motion(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config
             trace.borrow_mut().push(format!("{:.2}/{:.3}/{:+.3}/{:.0}/{:.0}/{:.0}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.2}/{:+.3}/{:+.3}", t, pose.pitch, pose.yaw, geom.0, geom.1, geom.2, l[0][0], l[0][1], l[1][0], l[1][1], l[2][0], l[2][1], l[3][0], l[3][1], l[4][0], l[4][1], face.score, pos_x, pos_y));
         }
         series.push((t, pos_x, pos_y));
+        frames.push(CalFrame { t, pos_x, pos_y, yaw: pose.yaw, geom });
     }
     let range = |pick: fn(&(f32, f32, f32)) -> f32| -> f32 {
         let mut best = 0f32;
@@ -1169,7 +1204,7 @@ pub fn measure_motion(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config
         }
         best
     };
-    Ok((range(|s| s.2), range(|s| s.1)))
+    Ok(Measured { dy: range(|s| s.2), dx: range(|s| s.1), frames })
 }
 
 /// Writes a round's per-frame recording when the round ends, if
@@ -1406,6 +1441,36 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config,
     log::info!("consent: timed out, {} ({} face frames)", summary(&det, &shake, window.as_secs_f32()), trace.borrow().len());
     label.set("timeout");
     Ok((Gesture::Timeout, tracked))
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::{replay_round, CalFrame, NodDetector, ShakeDetector};
+
+    /// A recorded round in the 19-field trace format, as frames.
+    fn frames(text: &str) -> Vec<CalFrame> {
+        text.split_whitespace()
+            .map(|tok| {
+                let f: Vec<f32> = tok.split('/').map(|v| v.parse().unwrap()).collect();
+                CalFrame { t: f[0], pos_x: f[17], pos_y: f[18], yaw: f[2], geom: (f[3], f[4], f[5]) }
+            })
+            .collect()
+    }
+
+    /// The verify step reads a recorded nod round as nods, a shake round as
+    /// shakes, and a reading round as nothing, at the default floors.
+    #[test]
+    fn the_verify_replay_reads_recorded_rounds_the_way_the_consent_loop_does() {
+        let floors = (NodDetector::MIN_DOWN, ShakeDetector::MIN_TURN);
+        let (n, s) = replay_round(&frames(include_str!("../traces/cal/03-nod.txt")), floors);
+        assert!(n >= 2 && s == 0, "nod round: {} nods, {} shakes", n, s);
+        let (n, s) = replay_round(&frames(include_str!("../traces/cal/08-shake.txt")), floors);
+        assert!(s >= 2 && n == 0, "shake round: {} nods, {} shakes", n, s);
+        let (n, s) = replay_round(&frames(include_str!("../traces/cal/16-read.txt")), floors);
+        assert_eq!((n, s), (0, 0), "reading round");
+        let (n, s) = replay_round(&frames(include_str!("../traces/cal/17-lean.txt")), floors);
+        assert_eq!((n, s), (0, 0), "lean round");
+    }
 }
 
 #[cfg(test)]

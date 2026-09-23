@@ -93,6 +93,10 @@ struct Request {
     /// Root only: a calibration round for "nod" or "shake".
     #[serde(default)]
     calibrate: Option<String>,
+    #[serde(default)]
+    calibrate_start: bool,
+    #[serde(default)]
+    calibrate_verify: bool,
     /// From the polkit agent: what the request it is about to serve is.
     #[serde(default)]
     context_action: Option<String>,
@@ -331,17 +335,24 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
     // ask (the setup command runs them under sudo, behind the password), so no
     // unprivileged process, and nothing reaching a locked session over ssh,
     // can enrol a new face or erase the enrolled one.
-    if req.enroll.is_some() || req.delete_templates || req.calibrate.is_some() {
+    if req.enroll.is_some() || req.delete_templates || req.calibrate.is_some() || req.calibrate_verify {
         if cred.uid() != 0 {
             log::warn!("uid {} asked to change templates for {}: refused", cred.uid(), req.user);
             return reply(&mut stream, &Outcome::Error { message: "not permitted: enrolment and deletion require root".into() });
         }
     }
+    if req.calibrate_verify {
+        let outcome = match take() {
+            Some(mut a) => a.calibrate_verify(&req.user),
+            None => Outcome::Error { message: "busy".into() },
+        };
+        return reply(&mut stream, &outcome);
+    }
     if let Some(gesture) = &req.calibrate {
         let gesture = match gesture.as_str() { "shake" => "shake", "read" => "read", "glance" => "glance", "talk" => "talk", "lean" => "lean", "aside" => "aside", _ => "nod" };
         log::info!("calibration ({}) for {} (uid {})", gesture, req.user, cred.uid());
         let outcome = match take() {
-            Some(mut a) => a.calibrate(&req.user, gesture, req.seconds.unwrap_or(8.0).clamp(4.0, 20.0)),
+            Some(mut a) => a.calibrate(&req.user, gesture, req.seconds.unwrap_or(8.0).clamp(4.0, 20.0), req.calibrate_start),
             None => Outcome::Error { message: "busy".into() },
         };
         return reply(&mut stream, &outcome);
@@ -1046,8 +1057,13 @@ pub fn consent_answer(socket: &Path, user: &str, password: Option<&str>, dismiss
 }
 
 /// Root: one calibration round for "nod" or "shake".
-pub fn calibrate(socket: &Path, user: &str, gesture: &str, seconds: f32) -> Result<Outcome> {
-    send(socket, serde_json::json!({ "user": user, "calibrate": gesture, "seconds": seconds }), Some(Duration::from_secs(90)))
+pub fn calibrate(socket: &Path, user: &str, gesture: &str, seconds: f32, start: bool) -> Result<Outcome> {
+    send(socket, serde_json::json!({ "user": user, "calibrate": gesture, "seconds": seconds, "calibrate_start": start }), Some(Duration::from_secs(90)))
+}
+
+/// Replay the session's rounds at the floors they produced.
+pub fn calibrate_verify(socket: &Path, user: &str) -> Result<Outcome> {
+    send(socket, serde_json::json!({ "user": user, "calibrate_verify": true }), Some(Duration::from_secs(30)))
 }
 
 /// From the polkit agent: what the request it is about to serve is.

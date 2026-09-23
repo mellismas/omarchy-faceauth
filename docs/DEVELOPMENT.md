@@ -1353,3 +1353,14 @@ side), not by size. Everyday rounds are now stored by kind
 others are recorded and reported as shape-handled, and the numbers-only
 fields of the format that lived for an hour are ignored and dropped on the
 next save. With that the user's floors return to 0.09 and 0.06.
+
+**Calibration proves itself, 2026-09-22 late.** Mike's ask: the calibrator
+has to give good results, not just numbers. Every round now keeps its frames
+in the daemon for the session (`CalFrame`, `Authenticator::cal_rounds`),
+and a final `calibrate_verify` request replays each round through fresh
+live detectors at the floors the session produced (`replay_round`), the way
+a consent request would read it: each nod round must read as nods and
+nothing else, each shake round as shakes and nothing else, each everyday
+round as nothing. The CLI prints the table and either "Calibration holds"
+or which rounds to redo and how. The replay is checked in a unit test
+against the recorded corpus (a nod, a shake, a read and a lean round).
