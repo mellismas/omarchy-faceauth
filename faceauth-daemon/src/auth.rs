@@ -1217,7 +1217,7 @@ pub fn calibration_text(gesture: &str) -> (&'static str, &'static str) {
         "shake" => ("shake your head twice, naturally", "Recognised. Shake your head twice, the way you would to say no."),
         "read" => ("read the screen for a few seconds", "Recognised. Just read this window for a few seconds, the way you normally read."),
         "glance" => ("look down at the keyboard and back, twice", "Recognised. Look down at your keyboard and back up at the screen, twice."),
-        "talk" => ("say a sentence or two", "Recognised. Say a sentence or two, as if to someone beside you."),
+        "talk" => ("say a sentence or two, facing the screen", "Recognised. Keep facing the screen and say a sentence or two out loud, as if on a call."),
         "lean" => ("lean in toward the screen and back, twice", "Recognised. Lean in toward the screen and sit back, twice."),
         "aside" => ("look over at something beside the screen and back, twice", "Recognised. Look over at something beside the screen and back, twice."),
         _ => ("nod twice, naturally", "Recognised. Nod twice, the way you would to say yes."),

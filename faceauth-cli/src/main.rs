@@ -99,7 +99,7 @@ fn main() -> Result<()> {
             println!("Calibrating for {}.\n", user);
             println!("Why: a nod approves root access and a head shake refuses it, so the daemon needs to");
             println!("know how you move. It records two nods and two shakes to learn the size of yours, and");
-            println!("then five ordinary movements (reading, a glance at the keyboard, talking, leaning in, a");
+            println!("then five ordinary movements (reading, a glance at the keyboard, talking to the screen, leaning in, a");
             println!("look to the side) to learn what");
             println!("must never count. That is how an everyday movement cannot approve or refuse something");
             println!("on your behalf. Each round is a recording of head motion for a few seconds, never an");

@@ -1378,3 +1378,10 @@ everyday round replays as that gesture, up to the caps, and stores the
 result as `nod_floor_min` / `shake_floor_min`; sizes are kept for the
 margins report only. The CLI's redo loop (Enter redoes the NOT OK rounds
 and withdraws what they stored; `a` accepts) came in the same change.
+
+**The talk round faces the screen, 2026-09-22 late.** Mike's point: "as if
+to someone beside you" invites a turn of the head toward where that someone
+would be, which is the look-aside round's movement, not talking. The talk
+round's 0.20 of sideways movement two runs earlier was that turn. The prompt
+now says to keep facing the screen and speak as if on a call; the look
+aside covers the turn.
