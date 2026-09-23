@@ -1192,7 +1192,7 @@ fn doctor(rest: &[&str]) -> Result<()> {
             Err(_) => push(id, "warn", "no file (not wired)".into()),
         }
     }
-    push("pam.faillock", "warn", "a face match bypasses pam_faillock and never resets its counter; a locked-out password stays locked out".into());
+    push("pam.faillock", "info", "a face match clears pam_faillock's bad-password lockout for the user, as a correct password would".into());
     // TPM
     let tpm = std::path::Path::new("/dev/tpmrm0").exists() || std::path::Path::new("/dev/tpm0").exists();
     push("tpm.present", if tpm { "pass" } else { "warn" }, if tpm { "TPM device present (templates.at_rest says whether the daemon can use it)".into() } else { "no TPM device; templates stay plaintext (root 0600)".into() });

@@ -1385,3 +1385,11 @@ would be, which is the look-aside round's movement, not talking. The talk
 round's 0.20 of sideways movement two runs earlier was that turn. The prompt
 now says to keep facing the screen and speak as if on a call; the look
 aside covers the turn.
+
+**faillock, 2026-09-22 late (M9).** Mike's call: a sufficient face match is
+proof a password guesser does not have, so a face success clears the
+account's bad-password lockout, and a locked-out account may still elevate
+or unlock by face. The daemon runs `faillock --user X --reset` after every
+face match (lock screen and consent by nod; a password typed into the
+window already goes through the normal stack). The doctor row is now
+informational.

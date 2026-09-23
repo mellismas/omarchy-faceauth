@@ -841,6 +841,9 @@ impl Authenticator {
                 self.last_match.insert(user.to_string(), Instant::now());
                 self.failures.remove(user);
                 let how = if *frames == 0 { "password" } else { "face and nod" };
+                if *frames > 0 {
+                    faillock_reset(user);
+                }
                 s.dialog.show_final("approved", "Allowed.", caller);
                 notify(&self.cfg, user, &format!("Root access granted by {}", how), &format!("{}\n{}", caller.command, caller.parents));
                 log::info!("consent granted ({}) for {}: {} [{}]", how, user, caller.command, caller.parents);
@@ -894,6 +897,7 @@ impl Authenticator {
                     Outcome::Match { .. } => {
                         self.last_match.insert(user.to_string(), Instant::now());
                         self.failures.remove(user);
+                        faillock_reset(user);
                     }
                     Outcome::NoMatch { .. } | Outcome::Denied { .. } => {
                         let _ = self.charge(user);
@@ -1112,6 +1116,18 @@ impl Authenticator {
         } else {
             Ok(Outcome::NoMatch { score: Some(best), frames: scored, elapsed_ms: ms(t0) })
         }
+    }
+}
+
+/// A face match is proof a password guesser does not have: it clears the
+/// account's bad-password lockout (pam_faillock), the way a correct
+/// password would, since our line answers before faillock's own reset
+/// module ever runs. Mike's call, 2026-09-22.
+fn faillock_reset(user: &str) {
+    match std::process::Command::new("/usr/bin/faillock").env_clear().env("PATH", "/usr/bin:/bin").args(["--user", user, "--reset"]).output() {
+        Ok(o) if o.status.success() => log::info!("faillock counter reset for {} after a face match", user),
+        Ok(o) => log::warn!("faillock --reset for {} exited {}: {}", user, o.status, String::from_utf8_lossy(&o.stderr).trim()),
+        Err(e) => log::warn!("faillock --reset for {}: {}", user, e),
     }
 }
 

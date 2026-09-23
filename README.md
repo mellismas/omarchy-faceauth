@@ -90,6 +90,10 @@ on its own: the PAM stacks are written only by `omarchy setup security face`.
   the answer's stdin. It is readable by a process running as you (the
   payload is an argument to the summon), which buys that process a
   dismissal or one password check, never an approval.
+- **Bad-password lockouts.** A face match clears the account's
+  `pam_faillock` counter, as a correct password would: the guesser who
+  caused the lockout does not have the face. Our line answers before
+  faillock's own reset module runs, so the daemon does it.
 - **Remote callers.** A request whose caller the daemon cannot show to be
   local (an `sshd` in its ancestry, a logind session marked remote, or any
   shape it cannot verify) is refused before any window or camera. A same-uid
