@@ -1393,3 +1393,11 @@ or unlock by face. The daemon runs `faillock --user X --reset` after every
 face match (lock screen and consent by nod; a password typed into the
 window already goes through the normal stack). The doctor row is now
 informational.
+
+**Live SSH check of the rewritten locality gate, 2026-09-22 late.** sshd was
+already enabled on the reference machine. `ssh localhost 'sudo true'`: the
+daemon refused the request as "started under sshd-session (pid N)", the
+module returned ignore in 0 ms, and sudo fell to its password path with no
+window. Repeated from a separate machine over Tailscale with the same
+result. The positive fail-closed check, installed that morning with unit
+coverage only, now has its live remote test.
