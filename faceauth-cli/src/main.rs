@@ -104,64 +104,103 @@ fn main() -> Result<()> {
             println!("must never count. That is how an everyday movement cannot approve or refuse something");
             println!("on your behalf. Each round is a recording of head motion for a few seconds, never an");
             println!("image, stored root-only with your templates. The window will ask for each round.\n");
-            let mut last = None;
-            let mut first = true;
-            for (gesture, rounds, seconds) in faceauth_daemon::auth::CALIBRATION_ROUNDS {
-                if gestures_only && !matches!(gesture, "nod" | "shake") {
-                    continue;
-                }
-                for i in 1..=rounds {
-                    let o = faceauth_daemon::server::calibrate(&socket, &user, gesture, seconds, first)?;
-                    first = false;
-                    match &o {
-                        faceauth_daemon::auth::Outcome::Calibrated { amplitude, sideways, stored, nod_floor, shake_floor, nod_margin, shake_margin, .. } => {
-                            let what = match gesture { "nod" => "nod", "shake" => "shake", "read" => "reading", "glance" => "glance at the keyboard", "talk" => "talking", "lean" => "leaning in", _ => "look to the side" };
-                            if matches!(gesture, "nod" | "shake") {
-                                println!("  {} {}/{}: moved {:.2} of a face width{}", what, i, rounds, amplitude, if *stored { "" } else { " (too small to count; not stored)" });
-                            } else if faceauth_daemon::store::FLOOR_KINDS.contains(&gesture) {
-                                println!("  {}: moved up to {:.2} vertically, {:.2} sideways (the floors stand clear of this)", what, amplitude, sideways);
-                            } else {
-                                println!("  {}: moved up to {:.2} vertically, {:.2} sideways (a big single move; refused by its shape, not its size)", what, amplitude, sideways);
+            let round_name = |kind: &str| match kind { "nod" => "nod", "shake" => "shake", "read" => "reading", "glance" => "glance at the keyboard", "talk" => "talking", "lean" => "leaning in", _ => "look to the side" };
+            // Run the rounds of `kinds`, then check every round of the session.
+            // A kind being redone replaces this session's earlier rounds of it.
+            let run = |kinds: &[&str], first_ever: bool, replace: bool| -> Result<Option<(Vec<faceauth_daemon::auth::RoundCheck>, bool)>> {
+                let mut last = None;
+                let mut first = first_ever;
+                for (gesture, rounds, seconds) in faceauth_daemon::auth::CALIBRATION_ROUNDS {
+                    if !kinds.contains(&gesture) {
+                        continue;
+                    }
+                    for i in 1..=rounds {
+                        // Replacing: the first round of a redone kind withdraws the earlier ones.
+                        let o = faceauth_daemon::server::calibrate(&socket, &user, gesture, seconds, first, replace && i == 1)?;
+                        first = false;
+                        match &o {
+                            faceauth_daemon::auth::Outcome::Calibrated { amplitude, sideways, stored, nod_floor, shake_floor, nod_margin, shake_margin, .. } => {
+                                let what = round_name(gesture);
+                                if matches!(gesture, "nod" | "shake") {
+                                    println!("  {} {}/{}: moved {:.2} of a face width{}", what, i, rounds, amplitude, if *stored { "" } else { " (too small to count; not stored)" });
+                                } else if faceauth_daemon::store::FLOOR_KINDS.contains(&gesture) {
+                                    println!("  {}: moved up to {:.2} vertically, {:.2} sideways (the floors stand clear of this)", what, amplitude, sideways);
+                                } else {
+                                    println!("  {}: moved up to {:.2} vertically, {:.2} sideways (a big single move; refused by its shape, not its size)", what, amplitude, sideways);
+                                }
+                                last = Some((*nod_floor, *shake_floor, *nod_margin, *shake_margin));
                             }
-                            last = Some((*nod_floor, *shake_floor, *nod_margin, *shake_margin));
-                        }
-                        other => println!("  {} {}/{}: {}", gesture, i, rounds, serde_json::to_string(other)?),
-                    }
-                }
-            }
-            if let Some((n, s, nm, sm)) = last {
-                println!("\nFloors for {}: nod {:.3}, shake {:.3} (defaults {:.3} / {:.3}).", user, n, s, faceauth_daemon::consent::NodDetector::MIN_DOWN, faceauth_daemon::consent::ShakeDetector::MIN_TURN);
-                for (name, m) in [("nod", nm), ("shake", sm)] {
-                    if let Some(m) = m {
-                        if m >= 2.0 {
-                            println!("Your {} is {:.1} times your largest everyday movement on that axis: clearly apart.", name, m);
-                        } else {
-                            println!("WARNING: your {} is only {:.1} times your largest everyday movement on that axis.", name, m);
-                            println!("  The floor has been raised to keep that movement from counting, so a {} now has to be", name);
-                            println!("  deliberate. If it stops being recognised, run this again with a bigger {} or a calmer read.", name);
+                            other => println!("  {} {}/{}: {}", gesture, i, rounds, serde_json::to_string(other)?),
                         }
                     }
                 }
-            }
-            // The proof: every round replayed through the real detectors at
-            // these floors, the way a request would read it.
-            println!("\nChecking every round against those floors...");
-            match faceauth_daemon::server::calibrate_verify(&socket, &user)? {
-                faceauth_daemon::auth::Outcome::Verified { rounds, all_ok, .. } => {
-                    for r in &rounds {
-                        let what = match r.kind.as_str() { "nod" => "nod", "shake" => "shake", "read" => "reading", "glance" => "glance at the keyboard", "talk" => "talking", "lean" => "leaning in", _ => "look to the side" };
-                        let read = match (r.nods, r.shakes) { (0, 0) => "nothing".to_string(), (n, 0) => format!("{} nod(s)", n), (0, s) => format!("{} shake(s)", s), (n, s) => format!("{} nod(s) and {} shake(s)", n, s) };
-                        println!("  {:<24} read as {:<24} {}", what, read, if r.ok { "ok" } else { "NOT OK" });
-                    }
-                    if all_ok {
-                        println!("\nEvery gesture round reads as its gesture and no everyday round reads as one. Calibration holds.");
-                    } else {
-                        println!("\nSome rounds do not read the way they should at these floors. Run this again, redoing the");
-                        println!("rounds marked NOT OK: a gesture that was not read wants to be a little clearer, and an");
-                        println!("everyday movement that read as a gesture wants to be as ordinary as you would really do it.");
+                if let Some((n, s, nm, sm)) = last {
+                    println!("\nFloors for {}: nod {:.3}, shake {:.3} (defaults {:.3} / {:.3}).", user, n, s, faceauth_daemon::consent::NodDetector::MIN_DOWN, faceauth_daemon::consent::ShakeDetector::MIN_TURN);
+                    for (name, m) in [("nod", nm), ("shake", sm)] {
+                        if let Some(m) = m {
+                            if m >= 2.0 {
+                                println!("Your {} is {:.1} times your largest everyday movement on that axis: clearly apart.", name, m);
+                            } else {
+                                println!("WARNING: your {} is only {:.1} times your largest everyday movement on that axis.", name, m);
+                                println!("  The floor has been raised to keep that movement from counting, so a {} now has to be", name);
+                                println!("  deliberate. If it stops being recognised, run this again with a bigger {} or a calmer read.", name);
+                            }
+                        }
                     }
                 }
-                other => println!("  could not check: {}", serde_json::to_string(&other)?),
+                // The proof: every round replayed through the real detectors at
+                // these floors, the way a request would read it.
+                println!("\nChecking every round against those floors...");
+                match faceauth_daemon::server::calibrate_verify(&socket, &user)? {
+                    faceauth_daemon::auth::Outcome::Verified { rounds, all_ok, nod_floor, shake_floor } => {
+                        println!("  floors after the everyday rounds: nod {:.3}, shake {:.3}", nod_floor, shake_floor);
+                        for r in &rounds {
+                            let read = match (r.nods, r.shakes) { (0, 0) => "nothing".to_string(), (n, 0) => format!("{} nod(s)", n), (0, s) => format!("{} shake(s)", s), (n, s) => format!("{} nod(s) and {} shake(s)", n, s) };
+                            println!("  {:<24} read as {:<24} {}", round_name(&r.kind), read, if r.ok { "ok" } else { "NOT OK" });
+                        }
+                        Ok(Some((rounds, all_ok)))
+                    }
+                    other => {
+                        println!("  could not check: {}", serde_json::to_string(&other)?);
+                        Ok(None)
+                    }
+                }
+            };
+            let all_kinds: Vec<&str> = faceauth_daemon::auth::CALIBRATION_ROUNDS.iter().map(|r| r.0).filter(|k| !gestures_only || matches!(*k, "nod" | "shake")).collect();
+            let mut result = run(&all_kinds, true, false)?;
+            let mut passes = 0;
+            loop {
+                let Some((rounds, all_ok)) = &result else { break };
+                if *all_ok {
+                    println!("\nEvery gesture round reads as its gesture and no everyday round reads as one. Calibration holds.");
+                    break;
+                }
+                let mut redo: Vec<&str> = Vec::new();
+                for r in rounds.iter().filter(|r| !r.ok) {
+                    let k: &str = match r.kind.as_str() { "nod" => "nod", "shake" => "shake", "read" => "read", "glance" => "glance", "talk" => "talk", "lean" => "lean", _ => "aside" };
+                    if !redo.contains(&k) {
+                        redo.push(k);
+                    }
+                }
+                println!("\nSome rounds do not read the way they should at these floors: {}.", redo.iter().map(|k| round_name(k)).collect::<Vec<_>>().join(", "));
+                println!("A gesture that was not read wants to be a little clearer; an everyday movement that read as a");
+                println!("gesture wants to be as ordinary as you would really do it.");
+                passes += 1;
+                if passes > 3 {
+                    println!("Three redos already; keeping what there is. Run this again later.");
+                    break;
+                }
+                print!("Redo those rounds now? [Enter = redo, a = accept as is and finish] ");
+                use std::io::Write as _;
+                std::io::stdout().flush()?;
+                let mut answer = String::new();
+                let interactive = std::io::stdin().read_line(&mut answer).map(|n| n > 0).unwrap_or(false);
+                if !interactive || answer.trim().eq_ignore_ascii_case("a") {
+                    println!("Kept as is.");
+                    break;
+                }
+                println!();
+                result = run(&redo, false, true)?;
             }
             Ok(())
         }

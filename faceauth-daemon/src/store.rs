@@ -92,6 +92,14 @@ pub struct GestureCal {
     /// each with its largest vertical and horizontal excursion.
     #[serde(default)]
     pub everyday: Vec<EverydayRound>,
+    /// Floors the verify step found necessary so that this person's
+    /// everyday rounds read as nothing when replayed through the detectors;
+    /// a floor never sits below its own. None until a session has been
+    /// verified.
+    #[serde(default)]
+    pub nod_floor_min: Option<f32>,
+    #[serde(default)]
+    pub shake_floor_min: Option<f32>,
     /// From a short-lived earlier format that kept only the numbers; ignored
     /// once `everyday` has rounds, and dropped on the next save.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -107,11 +115,13 @@ pub struct EverydayRound {
     pub dx: f32,
 }
 
-/// The everyday rounds whose size a floor must stand clear of: the small,
-/// jittery ones. A glance at the keyboard, a lean-in and a look aside are as
-/// big as a gesture and are refused by the detector's shape rules (one leg,
-/// a hold at the bottom or the side), not by size; their numbers are kept
-/// and reported, never used to raise a floor.
+/// The everyday rounds whose size is worth reporting against the gestures:
+/// the small, jittery ones. A glance at the keyboard, a lean-in and a look
+/// aside are as big as a gesture and are refused by the detector's shape
+/// rules (one leg, a hold at the bottom or the side), not by size. No
+/// round's size raises a floor by itself: the verify step replays every
+/// round through the detectors, and raises a floor only when an everyday
+/// round reads as a gesture, only as far as it takes.
 pub const FLOOR_KINDS: [&str; 2] = ["read", "talk"];
 
 impl GestureCal {
@@ -124,11 +134,9 @@ impl GestureCal {
         Some(s[s.len() / 2])
     }
 
-    /// The floor an everyday movement of this size demands: half again as
-    /// much, so the movement itself never reaches it. Capped so a nervous
-    /// reader still has a floor their nod can clear; past the cap the margin
-    /// says so.
-    pub const STILL_MARGIN: f32 = 1.5;
+    /// How far the verify step may raise a floor to keep everyday movement
+    /// from reading as a gesture. Past this the person's own gestures would
+    /// go with it, and the check says so instead.
     pub const NOD_FLOOR_MAX: f32 = 0.15;
     pub const SHAKE_FLOOR_MAX: f32 = 0.12;
 
@@ -146,15 +154,22 @@ impl GestureCal {
         // departure from rest is the small leg).
         let mut nod = Self::typical(&self.nod).map(|a| (a * 0.4).clamp(default_nod, 0.09)).unwrap_or(default_nod);
         let mut shake = Self::typical(&self.shake).map(|a| (a * 0.5).clamp(0.03, default_shake)).unwrap_or(default_shake);
-        // Everyday movement pushes a floor up, never down: whatever this
-        // person does while reading or talking must stay under it.
-        let (still_y, still_x) = self.jitter();
-        if let Some(still) = still_y {
-            nod = nod.max((still * Self::STILL_MARGIN).min(Self::NOD_FLOOR_MAX));
+        // Everyday movement pushes a floor up, never down: what the verify
+        // step found necessary for this person's own rounds to read as nothing.
+        if let Some(m) = self.nod_floor_min {
+            nod = nod.max(m.min(Self::NOD_FLOOR_MAX));
         }
-        if let Some(still) = still_x {
-            shake = shake.max((still * Self::STILL_MARGIN).min(Self::SHAKE_FLOOR_MAX));
+        if let Some(m) = self.shake_floor_min {
+            shake = shake.max(m.min(Self::SHAKE_FLOOR_MAX));
         }
+        (nod, shake)
+    }
+
+    /// The floors with no everyday adjustment: the starting point the
+    /// verify step raises from.
+    pub fn base_floors(&self, default_nod: f32, default_shake: f32) -> (f32, f32) {
+        let nod = Self::typical(&self.nod).map(|a| (a * 0.4).clamp(default_nod, 0.09)).unwrap_or(default_nod);
+        let shake = Self::typical(&self.shake).map(|a| (a * 0.5).clamp(0.03, default_shake)).unwrap_or(default_shake);
         (nod, shake)
     }
 
@@ -656,29 +671,23 @@ mod tests {
     }
 
     #[test]
-    fn everyday_movement_raises_a_floor_and_sets_the_margin() {
+    fn everyday_rounds_set_margins_and_only_the_verify_step_raises_a_floor() {
         let ev = |kind: &str, dy: f32, dx: f32| EverydayRound { kind: kind.into(), dy, dx };
-        // Reading bobs 0.05 vertically: 1.5x is 0.075, above the 0.06 default.
-        let g = GestureCal { nod: vec![0.26, 0.30], shake: vec![0.33, 0.36], everyday: vec![ev("read", 0.02, 0.03), ev("talk", 0.05, 0.02)], ..Default::default() };
-        let (n, s) = g.floors(0.06, 0.06);
-        assert!((n - 0.09).abs() < 1e-6, "{}", n); // 0.28 * 0.4 = 0.112 capped 0.09; 0.075 from reading is below that
-        assert!((s - 0.06).abs() < 1e-6, "{}", s);
+        // Sizes alone never move a floor: a talk round with a natural bob of
+        // 0.07 (recorded live) would have pushed the nod floor past the 0.09
+        // where a real nod drops out.
+        let g = GestureCal { nod: vec![0.26, 0.30], shake: vec![0.33, 0.36], everyday: vec![ev("read", 0.02, 0.03), ev("talk", 0.07, 0.02), ev("lean", 0.27, 0.08), ev("aside", 0.10, 0.50)], ..Default::default() };
+        assert_eq!(g.floors(0.06, 0.06), (0.09, 0.06));
         let (mn, ms) = g.margins();
         // "typical" is the upper median: 0.30 of [0.26, 0.30], 0.36 of [0.33, 0.36].
-        assert!((mn.unwrap() - 0.30 / 0.05).abs() < 1e-3, "{:?}", mn);
+        assert!((mn.unwrap() - 0.30 / 0.07).abs() < 1e-3, "{:?}", mn);
         assert!((ms.unwrap() - 0.36 / 0.03).abs() < 1e-3, "{:?}", ms);
-        // A big single move (a lean-in of 0.27, a look aside of 0.50) never raises a floor:
-        // the detector refuses those by shape, and a floor that size would refuse the nod.
-        let mover = GestureCal { nod: vec![0.26], shake: vec![0.22], everyday: vec![ev("read", 0.04, 0.03), ev("glance", 0.13, 0.04), ev("lean", 0.27, 0.08), ev("aside", 0.10, 0.50)], ..Default::default() };
-        let (n, s) = mover.floors(0.06, 0.06);
-        assert!((n - 0.09).abs() < 1e-6, "{}", n);
-        assert!((s - 0.06).abs() < 1e-6, "{}", s);
-        // A restless reader: 0.10 vertical while reading pushes the nod floor to 0.15 (the cap).
-        let restless = GestureCal { nod: vec![0.20], shake: vec![0.30], everyday: vec![ev("read", 0.10, 0.02), ev("talk", 0.12, 0.09)], ..Default::default() };
-        let (n, s) = restless.floors(0.06, 0.06);
-        assert!((n - 0.15).abs() < 1e-6, "{}", n); // 0.12 * 1.5 = 0.18 capped at 0.15
-        assert!((s - 0.12).abs() < 1e-6, "{}", s); // 0.09 * 1.5 = 0.135 capped at 0.12
-        assert!(restless.margins().0.unwrap() < 2.0, "not separable");
+        // What the verify step found necessary raises a floor, never lowers
+        // one, and never past the cap.
+        let verified = GestureCal { nod_floor_min: Some(0.11), shake_floor_min: Some(0.05), ..g.clone() };
+        assert_eq!(verified.floors(0.06, 0.06), (0.11, 0.06));
+        let capped = GestureCal { nod_floor_min: Some(0.30), shake_floor_min: Some(0.30), ..g.clone() };
+        assert_eq!(capped.floors(0.06, 0.06), (GestureCal::NOD_FLOOR_MAX, GestureCal::SHAKE_FLOOR_MAX));
         // A record from before these rounds existed still reads, and one from
         // the short-lived numbers-only format reads but raises nothing.
         let old: GestureCal = serde_json::from_str(r#"{"nod":[0.2],"shake":[0.3]}"#).unwrap();

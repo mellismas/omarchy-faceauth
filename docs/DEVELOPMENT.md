@@ -1364,3 +1364,17 @@ nothing else, each shake round as shakes and nothing else, each everyday
 round as nothing. The CLI prints the table and either "Calibration holds"
 or which rounds to redo and how. The replay is checked in a unit test
 against the recorded corpus (a nod, a shake, a read and a lean round).
+
+**Floors from the replay, not from sizes, 2026-09-22 late.** Two live runs
+with the redo-capable calibrator showed the amplitude rule failing in the
+verify step it was paired with: a talk round with a natural head bob of
+0.07 raised the nod floor to 0.108, a talk round's 0.20 of sideways drift
+(the corpus's "still" recordings drift 0.20 sideways too) raised the shake
+floor to 0.12, and at those floors one nod round and one shake round no
+longer read ("nod 0n/0s!", "shake 0n/0s!"). The size statistic is a noisy
+integrated signal; the detector is the judge. The verify step now starts
+from the gesture-derived floors and raises a floor by 0.01 only while an
+everyday round replays as that gesture, up to the caps, and stores the
+result as `nod_floor_min` / `shake_floor_min`; sizes are kept for the
+margins report only. The CLI's redo loop (Enter redoes the NOT OK rounds
+and withdraws what they stored; `a` accepts) came in the same change.

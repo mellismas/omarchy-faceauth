@@ -97,6 +97,8 @@ struct Request {
     calibrate_start: bool,
     #[serde(default)]
     calibrate_verify: bool,
+    #[serde(default)]
+    calibrate_replace: bool,
     /// From the polkit agent: what the request it is about to serve is.
     #[serde(default)]
     context_action: Option<String>,
@@ -352,7 +354,7 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
         let gesture = match gesture.as_str() { "shake" => "shake", "read" => "read", "glance" => "glance", "talk" => "talk", "lean" => "lean", "aside" => "aside", _ => "nod" };
         log::info!("calibration ({}) for {} (uid {})", gesture, req.user, cred.uid());
         let outcome = match take() {
-            Some(mut a) => a.calibrate(&req.user, gesture, req.seconds.unwrap_or(8.0).clamp(4.0, 20.0), req.calibrate_start),
+            Some(mut a) => a.calibrate(&req.user, gesture, req.seconds.unwrap_or(8.0).clamp(4.0, 20.0), req.calibrate_start, req.calibrate_replace),
             None => Outcome::Error { message: "busy".into() },
         };
         return reply(&mut stream, &outcome);
@@ -1057,8 +1059,8 @@ pub fn consent_answer(socket: &Path, user: &str, password: Option<&str>, dismiss
 }
 
 /// Root: one calibration round for "nod" or "shake".
-pub fn calibrate(socket: &Path, user: &str, gesture: &str, seconds: f32, start: bool) -> Result<Outcome> {
-    send(socket, serde_json::json!({ "user": user, "calibrate": gesture, "seconds": seconds, "calibrate_start": start }), Some(Duration::from_secs(90)))
+pub fn calibrate(socket: &Path, user: &str, gesture: &str, seconds: f32, start: bool, replace: bool) -> Result<Outcome> {
+    send(socket, serde_json::json!({ "user": user, "calibrate": gesture, "seconds": seconds, "calibrate_start": start, "calibrate_replace": replace }), Some(Duration::from_secs(90)))
 }
 
 /// Replay the session's rounds at the floors they produced.

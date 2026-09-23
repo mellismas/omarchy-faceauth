@@ -122,6 +122,15 @@ pub const MAX_BUDGET: f32 = 3600.0;
 /// representable.
 pub const NO_DEADLINE: f32 = 1.0e7;
 
+/// One round of a calibration session, as the daemon keeps it.
+#[derive(Clone)]
+pub struct CalRound {
+    pub kind: String,
+    pub frames: Vec<crate::consent::CalFrame>,
+    /// The gesture amplitude this round added to the store, if it did.
+    pub sample: Option<f32>,
+}
+
 /// One calibration round replayed at the derived floors.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RoundCheck {
@@ -176,9 +185,11 @@ pub struct Authenticator {
     /// tick while one runs (the camera lock is held for the whole window), so
     /// it treats the flow as the user being there rather than as time unseen.
     pub last_consent: std::collections::HashMap<String, Instant>,
-    /// The rounds of the calibration session in progress, per user: kind and
-    /// frames, kept until the session is verified or a new one starts.
-    pub cal_rounds: std::collections::HashMap<String, Vec<(String, Vec<crate::consent::CalFrame>)>>,
+    /// The rounds of the calibration session in progress, per user: kind,
+    /// frames, and the gesture sample the round stored (if any), kept until
+    /// a new session starts so failed rounds can be redone and their
+    /// samples withdrawn.
+    pub cal_rounds: std::collections::HashMap<String, Vec<CalRound>>,
     /// When a consent request locked the session (the user left mid-request);
     /// the presence watch adopts it instead of locking again.
     pub session_locked_at: Option<Instant>,
@@ -567,7 +578,6 @@ impl Authenticator {
                 }
             }
         }
-        drop(dialog_cell);
         Round::Done(self.consent_finish(s, gesture, outcome))
     }
 
@@ -577,24 +587,59 @@ impl Authenticator {
     /// Replay every round of the user's calibration session at the floors
     /// they produced, as the consent loop would read them.
     pub fn calibrate_verify(&mut self, user: &str) -> Outcome {
-        let u = match self.store.load(user) {
+        let mut u = match self.store.load(user) {
             Ok(Some(t)) => t,
             Ok(None) => return Outcome::NotEnrolled,
             Err(e) => return Outcome::Error { message: e.to_string() },
         };
-        let floors = u.gesture.floors(crate::consent::NodDetector::MIN_DOWN, crate::consent::ShakeDetector::MIN_TURN);
         let needed = self.cfg.consent_nods;
-        let rounds = self.cal_rounds.remove(user).unwrap_or_default();
+        let rounds = self.cal_rounds.get(user).cloned().unwrap_or_default();
+        // The floors this person's everyday rounds demand: start from the
+        // gesture-derived ones and raise a floor, a step at a time and no
+        // further than the cap, while any everyday round still reads as
+        // that gesture. Sizes do not decide this; the detectors do.
+        let (dn, ds) = (crate::consent::NodDetector::MIN_DOWN, crate::consent::ShakeDetector::MIN_TURN);
+        let (mut nf, mut sf) = u.gesture.base_floors(dn, ds);
+        let everyday: Vec<&CalRound> = rounds.iter().filter(|r| !matches!(r.kind.as_str(), "nod" | "shake")).collect();
+        for _ in 0..40 {
+            let (mut nods, mut shakes) = (0usize, 0usize);
+            for r in &everyday {
+                let (n, s) = crate::consent::replay_round(&r.frames, (nf, sf));
+                nods += n;
+                shakes += s;
+            }
+            let mut moved = false;
+            if nods > 0 && nf < crate::store::GestureCal::NOD_FLOOR_MAX {
+                nf = (nf + 0.01).min(crate::store::GestureCal::NOD_FLOOR_MAX);
+                moved = true;
+            }
+            if shakes > 0 && sf < crate::store::GestureCal::SHAKE_FLOOR_MAX {
+                sf = (sf + 0.01).min(crate::store::GestureCal::SHAKE_FLOOR_MAX);
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+        }
+        if !everyday.is_empty() {
+            let (bn, bs) = u.gesture.base_floors(dn, ds);
+            u.gesture.nod_floor_min = if nf > bn { Some(nf) } else { None };
+            u.gesture.shake_floor_min = if sf > bs { Some(sf) } else { None };
+            if let Err(e) = self.store.save(&u) {
+                return Outcome::Error { message: e.to_string() };
+            }
+        }
+        let floors = u.gesture.floors(dn, ds);
         let checks: Vec<RoundCheck> = rounds
             .iter()
-            .map(|(kind, frames)| {
-                let (nods, shakes) = crate::consent::replay_round(frames, floors);
-                let ok = match kind.as_str() {
+            .map(|r| {
+                let (nods, shakes) = crate::consent::replay_round(&r.frames, floors);
+                let ok = match r.kind.as_str() {
                     "nod" => nods >= needed && shakes == 0,
                     "shake" => shakes >= needed && nods == 0,
                     _ => nods == 0 && shakes == 0,
                 };
-                RoundCheck { kind: kind.clone(), nods, shakes, ok }
+                RoundCheck { kind: r.kind.clone(), nods, shakes, ok }
             })
             .collect();
         let all_ok = !checks.is_empty() && checks.iter().all(|c| c.ok);
@@ -602,7 +647,7 @@ impl Authenticator {
         Outcome::Verified { rounds: checks, all_ok, nod_floor: floors.0, shake_floor: floors.1 }
     }
 
-    pub fn calibrate(&mut self, user: &str, gesture: &str, seconds: f32, start: bool) -> Outcome {
+    pub fn calibrate(&mut self, user: &str, gesture: &str, seconds: f32, start: bool, replace: bool) -> Outcome {
         if start {
             self.cal_rounds.remove(user);
         }
@@ -611,6 +656,31 @@ impl Authenticator {
             Ok(None) => return Outcome::NotEnrolled,
             Err(e) => return Outcome::Error { message: e.to_string() },
         };
+        if replace {
+            // Redoing a kind: this session's earlier rounds of it go, and so
+            // does what they stored, so the floors come from the good ones.
+            let mut changed = false;
+            if let Some(rounds) = self.cal_rounds.get_mut(user) {
+                let mut kept = Vec::new();
+                for r in rounds.drain(..) {
+                    if r.kind != gesture {
+                        kept.push(r);
+                        continue;
+                    }
+                    match (r.kind.as_str(), r.sample) {
+                        ("nod", Some(v)) => { if let Some(i) = u.gesture.nod.iter().rposition(|x| *x == v) { u.gesture.nod.remove(i); changed = true; } }
+                        ("shake", Some(v)) => { if let Some(i) = u.gesture.shake.iter().rposition(|x| *x == v) { u.gesture.shake.remove(i); changed = true; } }
+                        (k, _) => { if let Some(i) = u.gesture.everyday.iter().rposition(|e| e.kind == k) { u.gesture.everyday.remove(i); changed = true; } }
+                    }
+                }
+                *rounds = kept;
+            }
+            if changed {
+                if let Err(e) = self.store.save(&u) {
+                    return Outcome::Error { message: e.to_string() };
+                }
+            }
+        }
         let view = u.clone();
         let cfg = self.cfg.clone();
         let (ask, prompt) = calibration_text(gesture);
@@ -632,7 +702,6 @@ impl Authenticator {
             Ok(false)
         };
         let scan = self.run_with_answers(&view, Some(&mut hook), cfg.consent_scan_seconds, None);
-        drop(dialog_cell);
         dialog.hide();
         let Some(m) = measured.borrow_mut().take() else {
             return match scan {
@@ -642,7 +711,7 @@ impl Authenticator {
             };
         };
         let (dy, dx) = (m.dy, m.dx);
-        self.cal_rounds.entry(user.to_string()).or_default().push((gesture.to_string(), m.frames));
+        let frames = m.frames;
         let (amplitude, sideways, stored) = match gesture {
             "shake" => {
                 // Below the default floor nothing would ever count: the
@@ -672,6 +741,8 @@ impl Authenticator {
                 return Outcome::Error { message: e.to_string() };
             }
         }
+        let sample = if stored && matches!(gesture, "nod" | "shake") { Some(amplitude) } else { None };
+        self.cal_rounds.entry(user.to_string()).or_default().push(CalRound { kind: gesture.to_string(), frames, sample });
         let (nf, sf) = u.gesture.floors(crate::consent::NodDetector::MIN_DOWN, crate::consent::ShakeDetector::MIN_TURN);
         let (nm, sm) = u.gesture.margins();
         log::info!("calibration for {}: {} moved {:.3} (sideways {:.3}, stored: {}); floors now nod {:.3} shake {:.3}", user, gesture, amplitude, sideways, stored, nf, sf);
