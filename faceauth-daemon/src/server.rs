@@ -230,6 +230,13 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
         Ok(r) => r,
         Err(_) => return reply(&mut stream, &Outcome::Error { message: "bad request".into() }),
     };
+    // Root is never a face: sudo, polkit and the lock screen authenticate
+    // the person at the keyboard, and root is only the privilege that writes
+    // the store. Nothing enrols, matches, probes or calibrates uid 0.
+    if user_uid(&req.user) == Some(0) {
+        log::warn!("uid {} asked about root: refused, root is never authenticated by face", cred.uid());
+        return reply(&mut stream, &Outcome::Error { message: "root is never authenticated by face".into() });
+    }
     let allowed = cred.uid() == 0 || user_uid(&req.user).map(|u| u == cred.uid()).unwrap_or(false);
     if !allowed {
         log::warn!("uid {} asked about {}: refused", cred.uid(), req.user);
@@ -675,6 +682,17 @@ fn session_id_from_cgroup(cgroup: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod root_tests {
+    use super::user_uid;
+
+    #[test]
+    fn root_resolves_to_uid_zero_so_the_gate_can_refuse_it() {
+        assert_eq!(user_uid("root"), Some(0));
+        assert_eq!(user_uid("no-such-user-faceauth-test"), None);
+    }
 }
 
 #[cfg(test)]

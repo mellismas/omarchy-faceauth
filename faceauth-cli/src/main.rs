@@ -34,7 +34,7 @@ fn main() -> Result<()> {
         ["enroll", rest @ ..] if !rest.contains(&"--store") => {
             // Production path: the daemon owns the camera and the store.
             let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
-            let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
+            let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
             let label = opt(rest, "--label").unwrap_or("enrol");
             let seconds: f32 = opt(rest, "--seconds").unwrap_or("12").parse()?;
             let count: usize = opt(rest, "--count").unwrap_or("10").parse()?;
@@ -53,7 +53,7 @@ fn main() -> Result<()> {
         ["enroll", rest @ ..] => enroll(rest),
         ["templates", "delete", rest @ ..] => {
             let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
-            let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
+            let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
             let o = faceauth_daemon::server::delete_templates(&socket, &user)?;
             println!("{}", serde_json::to_string(&o)?);
             Ok(())
@@ -62,7 +62,7 @@ fn main() -> Result<()> {
         ["doctor", rest @ ..] => doctor(rest),
         ["probe", rest @ ..] => {
             let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
-            let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
+            let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
             let o = faceauth_daemon::server::probe(&socket, &user, Duration::from_secs(5))?;
             println!("{}", serde_json::to_string(&o)?);
             Ok(())
@@ -70,15 +70,19 @@ fn main() -> Result<()> {
         ["presence", mode @ ("on" | "off"), rest @ ..] => {
             // Root: rewrite the [presence] keys in the config and restart the service.
             let cfg_path = opt(rest, "--config").unwrap_or("/etc/faceauth/config.toml").to_string();
-            let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("SUDO_USER").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "user".into()));
-            let away: f32 = opt(rest, "--away-seconds").unwrap_or("10").parse()?;
+            let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
+            let away: f32 = opt(rest, "--away-seconds").unwrap_or("20").parse()?;
             let text = std::fs::read_to_string(&cfg_path).unwrap_or_default();
             let mut doc: toml::Table = toml::from_str(&text).unwrap_or_default();
             let mut presence = doc.get("presence").and_then(|v| v.as_table()).cloned().unwrap_or_default();
             presence.insert("enabled".into(), toml::Value::Boolean(*mode == "on"));
             presence.insert("user".into(), toml::Value::String(user.clone()));
             presence.insert("away_seconds".into(), toml::Value::Float(away as f64));
-            presence.insert("lock_command".into(), toml::Value::Array(vec![toml::Value::String("/usr/bin/faceauth-lock-session".into()), toml::Value::String(user.clone())]));
+            // An existing lock command is the administrator's (a dev tree's
+            // path rides in its third argument); only a missing one is set.
+            if !presence.contains_key("lock_command") {
+                presence.insert("lock_command".into(), toml::Value::Array(vec![toml::Value::String("/usr/bin/faceauth-lock-session".into()), toml::Value::String(user.clone())]));
+            }
             doc.insert("presence".into(), toml::Value::Table(presence));
             std::fs::write(&cfg_path, toml::to_string_pretty(&doc)?).with_context(|| format!("write {} (run as root)", cfg_path))?;
             let st = std::process::Command::new("systemctl").args(["restart", "faceauth.service"]).status();
@@ -89,7 +93,7 @@ fn main() -> Result<()> {
             // Root: two nods and two shakes, each a recorded round, stored with
             // the templates; the person's floors derive from them.
             let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
-            let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
+            let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
             let rounds: usize = opt(rest, "--rounds").unwrap_or("2").parse()?;
             println!("Calibrating gestures for {}: the window will ask for {} nods and {} shakes, one round at a time.", user, rounds, rounds);
             let mut last = None;
@@ -113,14 +117,14 @@ fn main() -> Result<()> {
         ["consent-context", rest @ ..] => {
             // From the polkit agent: the action and message polkitd gave it.
             let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
-            let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
+            let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
             let o = faceauth_daemon::server::consent_context(&socket, &user, opt(rest, "--action").unwrap_or(""), opt(rest, "--message").unwrap_or(""), opt(rest, "--cookie").unwrap_or(""))?;
             println!("{}", serde_json::to_string(&o)?);
             Ok(())
         }
         ["consent-answer", rest @ ..] => {
             let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
-            let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
+            let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
             // The token came with the window's payload; without it the daemon
             // treats the answer as nobody's. It arrives on stdin, first line,
             // never on the command line (argv is readable and journaled).
@@ -152,7 +156,7 @@ fn main() -> Result<()> {
         }
         ["auth", rest @ ..] => {
             let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
-            let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
+            let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
             let t = Instant::now();
             let o = if rest.contains(&"--consent") {
                 faceauth_daemon::server::ask_consent(&socket, &user)?
@@ -652,6 +656,13 @@ fn capture_burst(p: &mut faceauth_engine::Pipeline, seconds: u64, want: usize, m
     Ok(out)
 }
 
+/// The person a command is about when `--user` is not given: under sudo
+/// that is the person who ran sudo, not root (`sudo faceauth calibrate`
+/// from the menu tunes their gestures, not root's).
+fn target_user() -> String {
+    std::env::var("SUDO_USER").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "user".into())
+}
+
 fn opt<'a>(rest: &'a [&str], key: &str) -> Option<&'a str> {
     rest.iter().position(|a| *a == key).and_then(|i| rest.get(i + 1).copied())
 }
@@ -660,7 +671,7 @@ fn enroll(rest: &[&str]) -> Result<()> {
     use faceauth_daemon::store::{now_secs, Store, Template, UserTemplates};
     let dir = models_dir(rest);
     let store = Store::open(opt(rest, "--store").ok_or_else(|| anyhow!("--store DIR"))?)?;
-    let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
+    let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
     let label = opt(rest, "--label").unwrap_or("enrol").to_string();
     let seconds: u64 = opt(rest, "--seconds").unwrap_or("12").parse()?;
     let count: usize = opt(rest, "--count").unwrap_or("10").parse()?;
@@ -701,7 +712,7 @@ fn verify(rest: &[&str]) -> Result<()> {
     use faceauth_daemon::store::Store;
     let dir = models_dir(rest);
     let store = Store::open(opt(rest, "--store").ok_or_else(|| anyhow!("--store DIR"))?)?;
-    let user = opt(rest, "--user").map(String::from).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
+    let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
     let seconds: u64 = opt(rest, "--seconds").unwrap_or("5").parse()?;
     let u = store.load(&user)?.ok_or_else(|| anyhow!("no templates for {}", user))?;
     let mut p = faceauth_engine::Pipeline::load(&dir)?;
@@ -1016,7 +1027,7 @@ struct Check {
 /// Stable check identifiers are public API; add, never rename.
 fn doctor(rest: &[&str]) -> Result<()> {
     let json = rest.contains(&"--json");
-    let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
+    let user = target_user();
     let mut checks: Vec<Check> = Vec::new();
     let mut push = |id: &'static str, status: &'static str, detail: String| checks.push(Check { id, status, detail });
 

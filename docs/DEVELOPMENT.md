@@ -1304,3 +1304,20 @@ a live process without one). The cgroup session id was already checked
 against logind. H3's per-session marker is not built: the only thing that
 can draw a lookalike overlay is a process running as the user, which can
 also read whatever the daemon hands the window.
+
+**Packaged on the reference machine; the menu's Face submenu, 2026-09-22
+late.** Setup > Security > Face now holds Enroll, Add Look, Tune Gestures,
+a Walk-Away Lock submenu (off, 20, 30, 60 s) and Status, all gated on the
+package being present like the fingerprint entries. That gate exposed the
+dev box: the binaries were hand-installed, so `omarchy-pkg-present` said no
+and Enroll tried to install a package that is not in any repo yet. The
+standalone repo was brought level with the pack (`git format-patch
+--relative` and `git am` under the public identity, eleven commits, tree
+identical to the pack's `src/` plus LICENSE), the package was built from it
+with makepkg (check() ran the suite) and installed with pacman over the
+hand-installed files; the live config was restored afterwards. The first
+menu run of Tune Gestures then calibrated root: under sudo the CLI's default
+user was `$USER`. Every command that names a person now defaults to
+`SUDO_USER` first. `presence on` also keeps an existing lock command instead
+of rewriting it (the dev tree's path rides in its third argument and had
+been dropped).
