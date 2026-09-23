@@ -88,6 +88,14 @@ pub struct UserTemplates {
 pub struct GestureCal {
     pub nod: Vec<f32>,
     pub shake: Vec<f32>,
+    /// Largest vertical excursion in each everyday-movement round (reading,
+    /// a glance at the keyboard, talking): what a nod must stand clear of.
+    #[serde(default)]
+    pub still_nod: Vec<f32>,
+    /// Largest horizontal excursion in the same rounds: what a shake must
+    /// stand clear of.
+    #[serde(default)]
+    pub still_shake: Vec<f32>,
 }
 
 impl GestureCal {
@@ -100,6 +108,18 @@ impl GestureCal {
         Some(s[s.len() / 2])
     }
 
+    /// The floor an everyday movement of this size demands: half again as
+    /// much, so the movement itself never reaches it. Capped so a nervous
+    /// reader still has a floor their nod can clear; past the cap the margin
+    /// says so.
+    pub const STILL_MARGIN: f32 = 1.5;
+    pub const NOD_FLOOR_MAX: f32 = 0.15;
+    pub const SHAKE_FLOOR_MAX: f32 = 0.12;
+
+    fn largest(v: &[f32]) -> Option<f32> {
+        v.iter().copied().fold(None, |m, x| Some(m.map_or(x, |m: f32| m.max(x))))
+    }
+
     /// (nod floor, shake floor) for this person, given the defaults.
     pub fn floors(&self, default_nod: f32, default_shake: f32) -> (f32, f32) {
         // 0.4 of the peak-to-peak, capped: the detector sees single legs, which
@@ -108,9 +128,30 @@ impl GestureCal {
         // Capped at 0.09: on the reference user's recording, both nods count
         // at every floor up to 0.09 and one drops out at 0.10 (its first
         // departure from rest is the small leg).
-        let nod = Self::typical(&self.nod).map(|a| (a * 0.4).clamp(default_nod, 0.09)).unwrap_or(default_nod);
-        let shake = Self::typical(&self.shake).map(|a| (a * 0.5).clamp(0.03, default_shake)).unwrap_or(default_shake);
+        let mut nod = Self::typical(&self.nod).map(|a| (a * 0.4).clamp(default_nod, 0.09)).unwrap_or(default_nod);
+        let mut shake = Self::typical(&self.shake).map(|a| (a * 0.5).clamp(0.03, default_shake)).unwrap_or(default_shake);
+        // Everyday movement pushes a floor up, never down: whatever this
+        // person does while reading or talking must stay under it.
+        if let Some(still) = Self::largest(&self.still_nod) {
+            nod = nod.max((still * Self::STILL_MARGIN).min(Self::NOD_FLOOR_MAX));
+        }
+        if let Some(still) = Self::largest(&self.still_shake) {
+            shake = shake.max((still * Self::STILL_MARGIN).min(Self::SHAKE_FLOOR_MAX));
+        }
         (nod, shake)
+    }
+
+    /// How many times larger this person's typical gesture is than their
+    /// largest everyday movement on the same axis, per axis; None until both
+    /// have been recorded. Under 2.0 the two are not cleanly separable and
+    /// the setup says so.
+    pub fn margins(&self) -> (Option<f32>, Option<f32>) {
+        let m = |g: &[f32], s: &[f32]| match (Self::typical(g), Self::largest(s)) {
+            (Some(g), Some(s)) if s > 0.0 => Some(g / s),
+            (Some(_), Some(_)) => Some(f32::INFINITY),
+            _ => None,
+        };
+        (m(&self.nod, &self.still_nod), m(&self.shake, &self.still_shake))
     }
 
     pub fn is_calibrated(&self) -> bool {
@@ -588,17 +629,39 @@ mod tests {
     }
 
     #[test]
+    fn everyday_movement_raises_a_floor_and_sets_the_margin() {
+        // Reading bobs 0.05 vertically: 1.5x is 0.075, above the 0.06 default.
+        let g = GestureCal { nod: vec![0.26, 0.30], shake: vec![0.33, 0.36], still_nod: vec![0.02, 0.05], still_shake: vec![0.03], ..Default::default() };
+        let (n, s) = g.floors(0.06, 0.06);
+        assert!((n - 0.09).abs() < 1e-6, "{}", n); // 0.28 * 0.4 = 0.112 capped 0.09; 0.075 from reading is below that
+        assert!((s - 0.06).abs() < 1e-6, "{}", s);
+        let (mn, ms) = g.margins();
+        // "typical" is the upper median: 0.30 of [0.26, 0.30], 0.36 of [0.33, 0.36].
+        assert!((mn.unwrap() - 0.30 / 0.05).abs() < 1e-3, "{:?}", mn);
+        assert!((ms.unwrap() - 0.36 / 0.03).abs() < 1e-3, "{:?}", ms);
+        // A restless reader: 0.10 vertical while reading pushes the nod floor to 0.15 (the cap).
+        let restless = GestureCal { nod: vec![0.20], shake: vec![0.30], still_nod: vec![0.10, 0.12], still_shake: vec![0.09], ..Default::default() };
+        let (n, s) = restless.floors(0.06, 0.06);
+        assert!((n - 0.15).abs() < 1e-6, "{}", n); // 0.12 * 1.5 = 0.18 capped at 0.15
+        assert!((s - 0.12).abs() < 1e-6, "{}", s); // 0.09 * 1.5 = 0.135 capped at 0.12
+        assert!(restless.margins().0.unwrap() < 2.0, "not separable");
+        // A record from before these rounds existed still reads.
+        let old: GestureCal = serde_json::from_str(r#"{"nod":[0.2],"shake":[0.3]}"#).unwrap();
+        assert!(old.still_nod.is_empty() && old.margins() == (None, None));
+    }
+
+    #[test]
     fn calibration_floors_only_tighten_the_nod_and_loosen_the_shake() {
         let none = GestureCal::default();
         assert_eq!(none.floors(0.06, 0.06), (0.06, 0.06));
         assert!(!none.is_calibrated());
         // A big nodder: floor rises to half the typical swing, capped.
-        let big = GestureCal { nod: vec![0.30, 0.26, 0.40], shake: vec![0.20, 0.24] };
+        let big = GestureCal { nod: vec![0.30, 0.26, 0.40], shake: vec![0.20, 0.24], ..Default::default() };
         let (n, s) = big.floors(0.06, 0.06);
         assert!((n - 0.09).abs() < 1e-6, "{}", n); // 0.30 * 0.4 = 0.12, capped at 0.09
         assert!((s - 0.06).abs() < 1e-6, "{}", s); // 0.22 * 0.5 = 0.11 > default: stays at default
         // A light nodder: never below the default.
-        let light = GestureCal { nod: vec![0.08, 0.09], shake: vec![0.08, 0.07] };
+        let light = GestureCal { nod: vec![0.08, 0.09], shake: vec![0.08, 0.07], ..Default::default() };
         let (n, s) = light.floors(0.06, 0.06);
         assert!((n - 0.06).abs() < 1e-6, "{}", n);
         assert!((s - 0.04).abs() < 1e-6, "{}", s); // 0.08 * 0.5, above the 0.03 minimum

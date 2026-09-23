@@ -66,7 +66,23 @@ pub enum Outcome {
     /// A polkit context was noted for the request the agent is serving.
     Noted,
     /// A calibration round's measurement.
-    Calibrated { gesture: String, amplitude: f32, stored: bool, nod_floor: f32, shake_floor: f32 },
+    Calibrated {
+        gesture: String,
+        /// The movement on the axis this round is about (vertical for a nod
+        /// and for the everyday rounds, horizontal for a shake).
+        amplitude: f32,
+        /// The movement on the other axis.
+        #[serde(default)]
+        sideways: f32,
+        stored: bool,
+        nod_floor: f32,
+        shake_floor: f32,
+        /// Typical gesture over largest everyday movement, per axis, once both exist.
+        #[serde(default)]
+        nod_margin: Option<f32>,
+        #[serde(default)]
+        shake_margin: Option<f32>,
+    },
     /// Too many failed attempts for this user recently; try again later.
     Cooldown { seconds: u64 },
     /// The consent request ended without an answer that could count: no
@@ -549,7 +565,8 @@ impl Authenticator {
         };
         let view = u.clone();
         let cfg = self.cfg.clone();
-        let caller = crate::consent::CallerInfo { command: format!("Calibration: {} twice, naturally", if gesture == "shake" { "shake your head" } else { "nod" }), via: "calibration".into(), ..Default::default() };
+        let (ask, prompt) = calibration_text(gesture);
+        let caller = crate::consent::CallerInfo { command: format!("Calibration: {}", ask), verified: true, who: "faceauth calibrate, recording motion only".into(), via: "calibration".into(), ..Default::default() };
         let mut dialog = match crate::consent::Dialog::new(&cfg, user) {
             Ok(d) => d,
             Err(e) => return Outcome::Error { message: e.to_string() },
@@ -559,7 +576,7 @@ impl Authenticator {
         }
         let dialog_cell = std::cell::RefCell::new(&mut dialog);
         let measured: std::cell::Cell<Option<(f32, f32)>> = std::cell::Cell::new(None);
-        let msg = if gesture == "shake" { "Recognised. Shake your head twice, the way you would to say no." } else { "Recognised. Nod twice, the way you would to say yes." };
+        let msg = prompt;
         let mut hook = |cap: &mut IrCapture, pipeline: &mut Pipeline, _matched: &faceauth_engine::Face| -> Result<bool> {
             let _ = dialog_cell.borrow_mut().show("nod", msg, &caller, seconds);
             let m = crate::consent::measure_motion(cap, pipeline, &cfg, user, gesture, seconds)?;
@@ -576,19 +593,37 @@ impl Authenticator {
                 Err(e) => Outcome::Error { message: e.to_string() },
             };
         };
-        let (amplitude, floor_default) = if gesture == "shake" { (dx, crate::consent::ShakeDetector::MIN_TURN) } else { (dy, crate::consent::NodDetector::MIN_DOWN) };
-        // Below the default floor nothing would ever count: the sample is
-        // reported but not stored, so a missed attempt cannot lower a floor.
-        let stored = amplitude >= floor_default;
+        let (amplitude, sideways, stored) = match gesture {
+            "shake" => {
+                // Below the default floor nothing would ever count: the
+                // sample is reported but not stored, so a missed attempt
+                // cannot lower a floor.
+                let stored = dx >= crate::consent::ShakeDetector::MIN_TURN;
+                if stored { u.gesture.shake.push(dx) }
+                (dx, dy, stored)
+            }
+            "nod" => {
+                let stored = dy >= crate::consent::NodDetector::MIN_DOWN;
+                if stored { u.gesture.nod.push(dy) }
+                (dy, dx, stored)
+            }
+            // An everyday movement: both axes are kept, however small, since
+            // what matters is how far under the floors it stays.
+            _ => {
+                u.gesture.still_nod.push(dy);
+                u.gesture.still_shake.push(dx);
+                (dy, dx, true)
+            }
+        };
         if stored {
-            if gesture == "shake" { u.gesture.shake.push(amplitude) } else { u.gesture.nod.push(amplitude) }
             if let Err(e) = self.store.save(&u) {
                 return Outcome::Error { message: e.to_string() };
             }
         }
         let (nf, sf) = u.gesture.floors(crate::consent::NodDetector::MIN_DOWN, crate::consent::ShakeDetector::MIN_TURN);
-        log::info!("calibration for {}: {} moved {:.3} (stored: {}); floors now nod {:.3} shake {:.3}", user, gesture, amplitude, stored, nf, sf);
-        Outcome::Calibrated { gesture: gesture.to_string(), amplitude, stored, nod_floor: nf, shake_floor: sf }
+        let (nm, sm) = u.gesture.margins();
+        log::info!("calibration for {}: {} moved {:.3} (sideways {:.3}, stored: {}); floors now nod {:.3} shake {:.3}", user, gesture, amplitude, sideways, stored, nf, sf);
+        Outcome::Calibrated { gesture: gesture.to_string(), amplitude, sideways, stored, nod_floor: nf, shake_floor: sf, nod_margin: nm, shake_margin: sm }
     }
 
     /// Turn a gesture and a face outcome into the verdict, show it, notify.
@@ -1050,6 +1085,23 @@ pub fn confirm(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, templ
     log::info!("confirm: {} in {:.2}s ({} pairs, {} no signal, {} matched)", match &verdict { Confirm::Live => "live".to_string(), Confirm::NoSignal => "no signal".to_string(), Confirm::Refused(w) => format!("refused: {}", w) }, t0.elapsed().as_secs_f32(), pairs, nosignal, passed);
     Ok(verdict)
 }
+
+/// What the window asks for in a calibration round, and the prompt once
+/// the face has matched. The everyday rounds record what a person does when
+/// they are not gesturing, so their floors stand clear of it.
+pub fn calibration_text(gesture: &str) -> (&'static str, &'static str) {
+    match gesture {
+        "shake" => ("shake your head twice, naturally", "Recognised. Shake your head twice, the way you would to say no."),
+        "read" => ("read the screen for a few seconds", "Recognised. Just read this window for a few seconds, the way you normally read."),
+        "glance" => ("look down at the keyboard and back, twice", "Recognised. Look down at your keyboard and back up at the screen, twice."),
+        "talk" => ("say a sentence or two", "Recognised. Say a sentence or two, as if to someone beside you."),
+        _ => ("nod twice, naturally", "Recognised. Nod twice, the way you would to say yes."),
+    }
+}
+
+/// The rounds `faceauth calibrate` runs: the two gestures, then the
+/// everyday movements they must stand clear of.
+pub const CALIBRATION_ROUNDS: [(&str, usize, f32); 5] = [("nod", 2, 8.0), ("shake", 2, 8.0), ("read", 1, 10.0), ("glance", 1, 8.0), ("talk", 1, 8.0)];
 
 fn elapsed_of(o: &Outcome) -> u64 {
     match o {

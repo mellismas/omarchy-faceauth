@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth auth [--user NAME] [--socket PATH] [--consent]   (asks a running faceauthd; --consent = window + nod)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there?)\n  faceauth enroll [--user NAME] [--label TEXT] [--seconds N] [--count N]   (through the daemon)\n  faceauth enroll --store DIR ...                   (direct camera access, development)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] [--dismiss]   (from the consent window; stdin: token line, then password line)\n  faceauth consent-context --action ID --message TEXT [--cookie C]   (from the polkit agent, as a request starts)\n  faceauth calibrate [--user NAME] [--rounds N]   (root; two nods and two shakes, stored with the templates)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence                                (current state)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
+        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth auth [--user NAME] [--socket PATH] [--consent]   (asks a running faceauthd; --consent = window + nod)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there?)\n  faceauth enroll [--user NAME] [--label TEXT] [--seconds N] [--count N]   (through the daemon)\n  faceauth enroll --store DIR ...                   (direct camera access, development)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] [--dismiss]   (from the consent window; stdin: token line, then password line)\n  faceauth consent-context --action ID --message TEXT [--cookie C]   (from the polkit agent, as a request starts)\n  faceauth calibrate [--user NAME] [--gestures-only]   (root; two nods, two shakes and three everyday movements, stored with the templates)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence                                (current state)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
     );
     std::process::exit(2)
 }
@@ -90,27 +90,53 @@ fn main() -> Result<()> {
             Ok(())
         }
         ["calibrate", rest @ ..] => {
-            // Root: two nods and two shakes, each a recorded round, stored with
-            // the templates; the person's floors derive from them.
+            // Root: two nods, two shakes and three everyday movements, each a
+            // recorded round stored with the templates; the person's floors
+            // derive from them, and the margins say whether the two are apart.
             let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
             let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
-            let rounds: usize = opt(rest, "--rounds").unwrap_or("2").parse()?;
-            println!("Calibrating gestures for {}: the window will ask for {} nods and {} shakes, one round at a time.", user, rounds, rounds);
+            let gestures_only = rest.contains(&"--gestures-only");
+            println!("Calibrating for {}.\n", user);
+            println!("Why: a nod approves root access and a head shake refuses it, so the daemon needs to");
+            println!("know how you move. It records two nods and two shakes to learn the size of yours, and");
+            println!("then three ordinary movements (reading, a glance at the keyboard, talking) to learn what");
+            println!("must never count. That is how an everyday movement cannot approve or refuse something");
+            println!("on your behalf. Each round is a recording of head motion for a few seconds, never an");
+            println!("image, stored root-only with your templates. The window will ask for each round.\n");
             let mut last = None;
-            for gesture in ["nod", "shake"] {
+            for (gesture, rounds, seconds) in faceauth_daemon::auth::CALIBRATION_ROUNDS {
+                if gestures_only && !matches!(gesture, "nod" | "shake") {
+                    continue;
+                }
                 for i in 1..=rounds {
-                    let o = faceauth_daemon::server::calibrate(&socket, &user, gesture, 8.0)?;
+                    let o = faceauth_daemon::server::calibrate(&socket, &user, gesture, seconds)?;
                     match &o {
-                        faceauth_daemon::auth::Outcome::Calibrated { amplitude, stored, nod_floor, shake_floor, .. } => {
-                            println!("  {} {}/{}: moved {:.2} of a face width{}", gesture, i, rounds, amplitude, if *stored { "" } else { " (too small to count; not stored)" });
-                            last = Some((*nod_floor, *shake_floor));
+                        faceauth_daemon::auth::Outcome::Calibrated { amplitude, sideways, stored, nod_floor, shake_floor, nod_margin, shake_margin, .. } => {
+                            let what = match gesture { "nod" => "nod", "shake" => "shake", "read" => "reading", "glance" => "glance at the keyboard", _ => "talking" };
+                            if matches!(gesture, "nod" | "shake") {
+                                println!("  {} {}/{}: moved {:.2} of a face width{}", what, i, rounds, amplitude, if *stored { "" } else { " (too small to count; not stored)" });
+                            } else {
+                                println!("  {}: moved up to {:.2} vertically, {:.2} sideways", what, amplitude, sideways);
+                            }
+                            last = Some((*nod_floor, *shake_floor, *nod_margin, *shake_margin));
                         }
                         other => println!("  {} {}/{}: {}", gesture, i, rounds, serde_json::to_string(other)?),
                     }
                 }
             }
-            if let Some((n, s)) = last {
-                println!("Floors for {}: nod {:.3}, shake {:.3} (defaults {:.3} / {:.3}).", user, n, s, faceauth_daemon::consent::NodDetector::MIN_DOWN, faceauth_daemon::consent::ShakeDetector::MIN_TURN);
+            if let Some((n, s, nm, sm)) = last {
+                println!("\nFloors for {}: nod {:.3}, shake {:.3} (defaults {:.3} / {:.3}).", user, n, s, faceauth_daemon::consent::NodDetector::MIN_DOWN, faceauth_daemon::consent::ShakeDetector::MIN_TURN);
+                for (name, m) in [("nod", nm), ("shake", sm)] {
+                    if let Some(m) = m {
+                        if m >= 2.0 {
+                            println!("Your {} is {:.1} times your largest everyday movement on that axis: clearly apart.", name, m);
+                        } else {
+                            println!("WARNING: your {} is only {:.1} times your largest everyday movement on that axis.", name, m);
+                            println!("  The floor has been raised to keep that movement from counting, so a {} now has to be", name);
+                            println!("  deliberate. If it stops being recognised, run this again with a bigger {} or a calmer read.", name);
+                        }
+                    }
+                }
             }
             Ok(())
         }

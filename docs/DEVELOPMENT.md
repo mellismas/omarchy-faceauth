@@ -1321,3 +1321,19 @@ user was `$USER`. Every command that names a person now defaults to
 `SUDO_USER` first. `presence on` also keeps an existing lock command instead
 of rewriting it (the dev tree's path rides in its third argument and had
 been dropped).
+
+**Everyday movement calibrated, 2026-09-22 late.** Mike's point: positive
+calibration confirms rather than adjusts for a big mover (both floors were
+pinned at their caps by his rounds), and the negatives came from one corpus,
+so a person who reads with a bigger bob than the reference user would sit
+closer to their nod floor unseen. `faceauth calibrate` now runs three
+everyday rounds after the gestures (read the screen for ten seconds, look
+down at the keyboard and back twice, say a sentence or two); the largest
+excursion on each axis is stored as `still_nod` and `still_shake`, and the
+floor on that axis is raised to 1.5 times it, capped at 0.15 for the nod
+and 0.12 for the shake. The margins (typical gesture over largest everyday
+movement) are reported, and under 2.0 the CLI says the two are not cleanly
+apart and what to do. The CLI opens with the plain explanation of why the
+rounds are recorded (Mike's earlier ask: no accidental approvals or
+refusals of something harmful; motion, never images; root-only). Records
+from before these fields read unchanged.

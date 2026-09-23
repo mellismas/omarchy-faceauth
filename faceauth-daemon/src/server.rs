@@ -338,7 +338,7 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>) -> Result<()> {
         }
     }
     if let Some(gesture) = &req.calibrate {
-        let gesture = if gesture == "shake" { "shake" } else { "nod" };
+        let gesture = match gesture.as_str() { "shake" => "shake", "read" => "read", "glance" => "glance", "talk" => "talk", _ => "nod" };
         log::info!("calibration ({}) for {} (uid {})", gesture, req.user, cred.uid());
         let outcome = match take() {
             Some(mut a) => a.calibrate(&req.user, gesture, req.seconds.unwrap_or(8.0).clamp(4.0, 20.0)),
