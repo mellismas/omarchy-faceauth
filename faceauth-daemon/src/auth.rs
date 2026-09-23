@@ -377,16 +377,6 @@ impl Authenticator {
             Ok(d) => d,
             Err(e) => return Err(Outcome::Error { message: e.to_string() }),
         };
-        // The cooldown counts the lock screen's failures and this lane's
-        // together: the lane that grants root gets no more tries than the one
-        // that opens the session.
-        if let Some(hold) = self.hold_for(user) {
-            log::warn!("consent for {} refused: {} recent failures, {}s of hold left", user, COOLDOWN_FAILURES, hold.as_secs());
-            if open_window {
-                dialog.show_final("denied", &format!("Too many failed attempts. Try again in {} seconds, or use your password.", hold.as_secs().max(1)), &caller);
-            }
-            return Err(Outcome::Cooldown { seconds: hold.as_secs().max(1) });
-        }
         if open_window {
             if let Err(e) = dialog.show("scanning", "Look at the camera.", &caller, 0.0) {
                 log::warn!("consent: no window for {}: {}", user, e);
@@ -431,6 +421,21 @@ impl Authenticator {
                 outcome = Outcome::ConsentDenied { reason: "no answer".into(), elapsed_ms: started.elapsed().as_millis() as u64 };
                 gesture = Some(Gesture::Timeout);
                 break;
+            }
+            // A hold (the cooldown counts the lock screen's failures and this
+            // lane's together) pauses the face checks, not the request: the
+            // window stays up with its password box, and when the hold is
+            // over the scan resumes on its own.
+            if let Some(hold) = self.hold_for(&user) {
+                // An answer already waiting (typed during the hold) goes to
+                // the scan start, which takes it before touching the camera.
+                let answered = answers.lock().map(|m| m.contains_key(&user)).unwrap_or(false);
+                if !answered {
+                    log::warn!("consent for {}: {} recent failures; face checks paused for {}s", user, COOLDOWN_FAILURES, hold.as_secs());
+                    let _ = dialog_cell.borrow_mut().show("password", &format!("Too many failed face checks. They pause for {} seconds; type your password, or wait.", hold.as_secs().max(1)), caller_ref, 0.0);
+                    self.wait_for_hold(&user, hold, &answers);
+                    continue;
+                }
             }
             let templates_ref = &s.templates;
             let mut hook = |cap: &mut IrCapture, pipeline: &mut Pipeline, matched: &faceauth_engine::Face| -> Result<bool> {
@@ -482,11 +487,8 @@ impl Authenticator {
                 // enrolled face. A failure, charged like a refused scan.
                 (Some(Gesture::ConfirmFailed(why)), _) => {
                     log::warn!("consent: the confirm after the nods refused ({})", why);
-                    let hold = self.charge(&user);
-                    outcome = match hold {
-                        Some(h) => Outcome::Cooldown { seconds: h.as_secs().max(1) },
-                        None => refusal(&s.caller, format!("confirm: {}", why), started.elapsed().as_millis() as u64),
-                    };
+                    let _ = self.charge(&user);
+                    outcome = refusal(&s.caller, format!("confirm: {}", why), started.elapsed().as_millis() as u64);
                     gesture = g;
                     break;
                 }
@@ -502,13 +504,8 @@ impl Authenticator {
                     continue;
                 }
                 (None, Outcome::NoMatch { .. }) | (None, Outcome::NoFace { .. }) => {
-                    if matches!(o, Outcome::NoMatch { .. }) {
-                        if let Some(hold) = self.charge(&user) {
-                            log::warn!("consent for {}: too many failed scans; {}s of hold", user, hold.as_secs());
-                            outcome = Outcome::Cooldown { seconds: hold.as_secs().max(1) };
-                            gesture = None;
-                            break;
-                        }
+                    if matches!(o, Outcome::NoMatch { .. }) && self.charge(&user).is_some() {
+                        continue; // the loop top shows the hold
                     }
                     let _ = dialog_cell.borrow_mut().show("scanning", "Face not recognised. Look at the camera, or type your password.", caller_ref, 0.0);
                     if let Some(r) = self.wait_for_attention(&user, &answers, lost_after) {
@@ -521,11 +518,8 @@ impl Authenticator {
                 // approved by it), and the log keeps the refusal.
                 (None, Outcome::Denied { reason, .. }) if reason != "password" => {
                     log::info!("consent: scan refused ({}); the window keeps waiting", reason);
-                    if let Some(hold) = self.charge(&user) {
-                        log::warn!("consent for {}: too many refused scans; {}s of hold", user, hold.as_secs());
-                        outcome = Outcome::Cooldown { seconds: hold.as_secs().max(1) };
-                        gesture = None;
-                        break;
+                    if self.charge(&user).is_some() {
+                        continue; // the loop top shows the hold
                     }
                     let _ = dialog_cell.borrow_mut().show("scanning", "Not accepted. Look straight at the camera, or type your password.", caller_ref, 0.0);
                     if let Some(r) = self.wait_for_attention(&user, &answers, lost_after) {
@@ -603,6 +597,18 @@ impl Authenticator {
     /// presence watch's, until a face is turned to the camera (then the next
     /// round scans it), the window answers (the next round takes the answer),
     /// or nobody has been there for the presence away time (the user left).
+    /// Sit out a hold without the camera: until it is over, or the window
+    /// answers (a password or a dismissal, which the next scan start takes).
+    fn wait_for_hold(&mut self, user: &str, hold: Duration, answers: &Answers) {
+        let until = Instant::now() + hold;
+        while Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(200));
+            if answers.lock().map(|m| m.contains_key(user)).unwrap_or(false) {
+                return;
+            }
+        }
+    }
+
     fn wait_for_attention(&mut self, user: &str, answers: &Answers, lost_after: Option<Duration>) -> Option<Round> {
         let look = crate::presence::PresenceConfig { user: user.to_string(), ..Default::default() };
         let mut unseen_since = Instant::now();

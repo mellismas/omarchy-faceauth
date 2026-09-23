@@ -837,12 +837,27 @@ fn consent_rounds<'a>(take: &dyn Fn() -> Option<std::sync::MutexGuard<'a, Authen
     // window is not summoned at all: hiding a pending window would make it
     // answer with a dismissal.
     let mut already_locked = crate::consent::session_locked(user);
-    let mut session = match take() {
-        Some(mut a) => match a.consent_begin(user, caller, budget, !already_locked) {
-            Ok(s) => s,
-            Err(o) => return o,
-        },
-        None => return Outcome::Error { message: "busy".into() },
+    // The lock screen may hold the camera as the request starts (it locked
+    // a moment ago and is scanning): wait for it rather than answer "busy",
+    // which the module would turn into the caller's password prompt.
+    let begin_by = Instant::now() + Duration::from_secs(20);
+    let mut session = loop {
+        match take() {
+            Some(mut a) => match a.consent_begin(user, caller, budget, !already_locked) {
+                Ok(s) => break s,
+                Err(o) => return o,
+            },
+            None => {
+                if gone() {
+                    return Outcome::ConsentDenied { reason: "requester gone".into(), elapsed_ms: 0 };
+                }
+                if Instant::now() > begin_by {
+                    return Outcome::Error { message: "busy".into() };
+                }
+                std::thread::sleep(Duration::from_millis(300));
+                already_locked = crate::consent::session_locked(user);
+            }
+        }
     };
     if already_locked {
         log::info!("consent: request from pid {} arrived while the session is locked; parked until the unlock", session.caller.pid);

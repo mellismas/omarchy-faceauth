@@ -1204,14 +1204,75 @@ and the dialog stays hidden through the instant before the cancel lands;
 sudo keeps its terminal prompt on a shake. The cooldown held after five
 reflectance refusals of the print, and fell to polkit's password dialog by
 design (a hold is the lane being unavailable, not a no). The hand-held
-print waggle never reached the confirm: the print's box swung about two
-face widths and its width changed by half, so every leg was thrown out by
-the size ceiling and the width tolerance, and the sideways drift read as a
-shake (recorded, `traces/print/`). A nod-scale print waggle, which is the
-confirm's case, is not recorded yet. The re-arm cycle after an unanswered
+print waggle never reached the confirm: the box jumped between the paper
+and the user's own face showing around its edge (width 85 to 160 px, centre
+leaps of 200 px), so every leg was thrown out by the size ceiling and the
+width tolerance, and the sideways drift read as a shake (recorded,
+`traces/print/`). It is not a clean print-only recording. A print alone at
+nod scale, which is the confirm's case, is not recorded yet. A hand waved
+across the still face produced no nod (the face was lost and the gesture
+paused). A curved print brought in after the user's face had matched
+produced no nod either, over four runs trying to get one. The shakes
+counted in those runs were the user's own head moving in and out of view
+past the paper's edge, which reads as a shake; Mike's call is that this is
+right, since an interference pattern refusing rather than accepting is the
+direction it should fail. The curved
+print was then presented at the scan itself, before the user's face: refused
+five times out of five by the reflectance cue (readings 1.22 to 1.95 against
+the 0.80 ceiling), then the cooldown hold, which falls to polkit's password
+dialog by design. The user's face was behind the paper for ten seconds, so
+the presence watch locked the session, and the lock screen's face lane then
+spun during the hold: about forty attempts in thirty seconds in bursts of
+ten, each answered "cooldown" in twenty milliseconds and restarted twenty
+milliseconds later, by a path other than the 1.5 s retry timer (not yet
+identified). The lock plugin now refuses to start a scan within a second of
+the last start and lets the retry timer space it; that change belongs with
+the lock-screen PR. The re-arm cycle after an unanswered
 nod window was exercised live later the same night: 90 s in view with no
 nod, the attention wait, a turn to the camera after four looks, a rescan,
 two nods, the confirm, approval. Found on the way: the locality check
 listed a logind session the daemon's own `systemd-run --machine` call had
 just opened and closed, and a lookup that failed on it made sudo's retry
 "unverifiable"; a vanished session is now skipped.
+
+**A hold keeps the window; a request waits for the camera, 2026-09-22 late.**
+Mike's intent for the cooldown in the consent lane: "use your password"
+means the box on the card. A hold now pauses the face checks with the window
+up in its password state ("Too many failed face checks. They pause for N
+seconds; type your password, or wait."), and the scan resumes on its own
+when the hold is over; verified live with the print (five refusals, 29 s
+pause, rescan, nod). At the lock screen a hold is still a refusal. A run
+before that ended in polkit's password dialog for a different reason: the
+presence watch had locked the session on the print (a face that is not the
+user, for ten seconds: the right call), the lock screen held the camera,
+and the consent request answered "busy" at its start, which the module
+turns into the caller's prompt. The start of a request now waits up to 20 s
+for the camera, re-reading the lock state meanwhile, the way the round loop
+already did mid-request. Reproduced on purpose afterwards (screen locked
+from a shell, request fired 1.2 s later while the lock's scan held the
+camera): the request waited five seconds, parked as "arrived while the
+session is locked", resumed on the face unlock, and took the nod; no busy,
+no password dialog. The walk-away lock during a request was
+reproduced three times in one run and parked and resumed each time.
+
+**A hand on the face is not a walk-away, 2026-09-22 late.** Reading with a
+hand over part of the face locked the session: the detector lost the face
+entirely, and no face for the away time is absence. Mike's rule: the person
+was there, the same shape is there, only the face is hidden. The watch
+keeps the frame and box of the last full sighting; when no face clears the
+threshold it compares the region under that box (shoulders and torso, three
+box widths wide, two box heights down; `motion::below`) with the reference
+by zero-mean normalised cross-correlation (`motion::similarity`, sampled
+every fourth pixel), and a match at or above `SAME_SHAPE` (0.75) holds the
+away clock, for up to `PARTIAL_GRACE_S` (120 s) after the last full
+sighting. The rule runs whenever the user's face is not seen, hidden or
+detected but failing identity (a hand over half of it does that, and the
+first live run went `Present -> Stranger` on the hand and locked from the
+stranger clock once the face was fully covered). A stranger's torso is
+another shape and does not hold. Measured live the same night: a hand over
+part of the face 1.00, a sheet over it 0.95, the face fully covered 0.79,
+all held with no lock through forty seconds of failed identity checks; the
+chair empty -0.34, locked at ten seconds and unlocked by face. The threshold
+was set at 0.75 first and moved to 0.60 on those numbers, leaving room on
+the covered side and a wide gap to empty. The value is logged once per
+episode either way.

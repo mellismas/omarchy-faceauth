@@ -8,12 +8,15 @@
 //!
 //! State: `Present` (enrolled user seen recently), `Away` (no face for
 //! `away_seconds`, session locked once on the transition), `Stranger` (a face
-//! that is not the enrolled user; treated as away for locking). The state is
-//! published to `<runtime>/presence.json` for the shell.
+//! that is not the enrolled user; it does not lock, and does not count as
+//! the user either). A face the detector only half sees (a hand over the
+//! chin while reading) is not absence: while one is in view, the away clock
+//! is held for up to `PARTIAL_GRACE_S` after the last full sighting. The
+//! state is published to `<runtime>/presence.json` for the shell.
 
 use crate::auth::Authenticator;
 use anyhow::Result;
-use faceauth_engine::pose;
+use faceauth_engine::{pose, Grey};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -84,6 +87,10 @@ pub struct Published {
 pub fn run(auth: Arc<Mutex<Authenticator>>, cfg: PresenceConfig) {
     let mut last_seen: Option<Instant> = None;
     let mut state = State::Unknown;
+    let mut last_full: Option<Instant> = None;
+    let mut partial_logged = false;
+    // The frame and face box of the last full sighting.
+    let mut reference: Option<(Grey, [f32; 4])> = None;
     let mut locked_by_presence = false;
     let mut tick: u32 = 0;
     let mut identity_ok = true; // until two consecutive identity checks say otherwise
@@ -172,6 +179,34 @@ pub fn run(auth: Arc<Mutex<Authenticator>>, cfg: PresenceConfig) {
         let seen = obs.face && identity_ok && (!cfg.require_attention || obs.attentive);
         if seen {
             last_seen = Some(now);
+            last_full = Some(now);
+            partial_logged = false;
+            if let (Some(f), Some(b)) = (obs.frame.as_ref(), obs.bbox) {
+                reference = Some((f.clone(), b));
+            }
+        } else if partial_holds(now, last_full) {
+            // The user's face is not seen: hidden, or detected but failing
+            // identity (a hand over half of it does that too). Is the person
+            // still in the chair? The shape under the last face box says: a
+            // hand or a sheet over the face leaves it, standing up replaces
+            // it with the wall, and another person's torso is another shape.
+            let sim = match (reference.as_ref(), obs.frame.as_ref()) {
+                (Some(r), Some(f)) => same_shape(r, f),
+                _ => 0.0,
+            };
+            if sim >= SAME_SHAPE {
+                last_seen = Some(now);
+                if !partial_logged {
+                    log::info!("presence: the user's face is not seen but the same shape is in the chair ({:.2}); the clock is held", sim);
+                    partial_logged = true;
+                }
+            } else if !partial_logged {
+                // Logged once per episode so the threshold can be set from
+                // what real hands and sheets score. A scene similarity, not
+                // a match score.
+                log::info!("presence: the user's face is not seen and the shape under the last box differs ({:.2} < {}); the clock runs", sim, SAME_SHAPE);
+                partial_logged = true;
+            }
         }
         let away_for = last_seen.map(|t| now.duration_since(t).as_secs_f32());
         let next = if seen {
@@ -233,6 +268,10 @@ pub fn run(auth: Arc<Mutex<Authenticator>>, cfg: PresenceConfig) {
 pub(crate) struct Observation {
     pub(crate) face: bool,
     pub(crate) attentive: bool,
+    /// The frame this look decided on, and the face box when one was found,
+    /// so the watch can keep a reference and compare the next look to it.
+    pub(crate) frame: Option<Grey>,
+    pub(crate) bbox: Option<[f32; 4]>,
     /// Some(true/false) when an identity check ran.
     pub(crate) identity: Option<bool>,
 }
@@ -276,12 +315,12 @@ pub(crate) fn observe(a: &mut Authenticator, cfg: &PresenceConfig, identify: boo
     }
     let Some(img) = img else {
         cap.stop()?;
-        return Ok(Observation { face: false, attentive: false, identity: None });
+        return Ok(Observation { face: false, attentive: false, identity: None, frame: None, bbox: None });
     };
     let faces = a.pipeline.detector.detect(&img, a.cfg.min_detection)?;
     let Some(face) = faces.into_iter().max_by(|x, y| x.score.total_cmp(&y.score)) else {
         cap.stop()?;
-        return Ok(Observation { face: false, attentive: false, identity: None });
+        return Ok(Observation { face: false, attentive: false, identity: None, frame: Some(img), bbox: None });
     };
     // A face was in view at this exposure: the next look starts from it.
     a.last_exposure = Some(cap.exposure);
@@ -313,5 +352,45 @@ pub(crate) fn observe(a: &mut Authenticator, cfg: &PresenceConfig, identify: boo
     };
     cap.stop()?;
     log::debug!("presence tick: face {:.2} yaw {:.2} pitch {:.2} roll {:.0} attentive {} identity {:?}", face.score, p.yaw, p.pitch, p.roll.to_degrees(), attentive, identity);
-    Ok(Observation { face: true, attentive, identity })
+    let bbox = face.bbox;
+    Ok(Observation { face: true, attentive, identity, frame: Some(img), bbox: Some(bbox) })
+}
+
+/// How long a partly hidden face holds off the away clock, measured from
+/// the last full sighting of the user. Long enough to read with a hand on
+/// the chin; short enough that a coat on the chair does not keep the
+/// machine open all evening.
+pub const PARTIAL_GRACE_S: f32 = 120.0;
+
+/// How alike the region under the last face box must look, against the
+/// frame of the last full sighting, for "still there, face hidden".
+/// Measured 2026-09-22: a hand over part of the face 1.00, a sheet over it
+/// 0.95, the face fully covered 0.79, the chair empty -0.34.
+pub const SAME_SHAPE: f32 = 0.60;
+
+/// Is the person still in the chair? No face cleared the threshold, but the
+/// shoulders and torso under where the face was look as they did at the
+/// last full sighting. A hand over the face leaves them alone; standing up
+/// replaces them with the wall.
+pub fn same_shape(reference: &(Grey, [f32; 4]), frame: &Grey) -> f32 {
+    let r = faceauth_engine::motion::below(reference.1, frame.width, frame.height);
+    faceauth_engine::motion::similarity(&reference.0, frame, r)
+}
+
+/// Does a hidden-face sighting at `now` hold off the away clock?
+pub fn partial_holds(now: Instant, last_full: Option<Instant>) -> bool {
+    last_full.map(|t| now.duration_since(t).as_secs_f32() < PARTIAL_GRACE_S).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod partial_tests {
+    use super::*;
+
+    #[test]
+    fn a_partial_face_holds_the_clock_only_after_a_full_sighting_and_only_for_the_grace() {
+        let now = Instant::now();
+        assert!(!partial_holds(now, None), "never seen in full: a weak blob is not the user");
+        assert!(partial_holds(now, Some(now - Duration::from_secs(30))));
+        assert!(!partial_holds(now, Some(now - Duration::from_secs_f32(PARTIAL_GRACE_S + 1.0))));
+    }
 }

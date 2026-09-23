@@ -49,7 +49,13 @@ on its own: the PAM stacks are written only by `omarchy setup security face`.
   above the default, the shake's only ever falls below it.
 - **Walk-away lock** (opt-in, `sudo faceauth presence on`): one short look
   every two seconds (five on battery); lock when the camera has not seen the
-  enrolled user for the away time.
+  enrolled user for the away time. A hidden face is not absence on its own:
+  when no face clears the threshold, the shoulders and torso under where the
+  face was are compared with the last full sighting, and while that shape
+  is still in the chair (a hand over the chin while reading) the clock is
+  held, for up to two minutes after the last full sighting. Standing up
+  replaces the shape with the wall. A face that is not the enrolled user
+  neither counts as present nor locks.
 - **Every failure falls back to the password**, from a covered camera to a
   stopped service: the module returns `PAM_IGNORE` for everything but a
   match and one other thing. On a polkit consent line the answer no (a head
@@ -107,7 +113,9 @@ on its own: the PAM stacks are written only by `omarchy setup security face`.
   non-match, a liveness refusal, a wrong password behind a match), then a
   thirty-second hold. Once a hold has been served every further failure
   starts the next at once, twice as long, up to eight minutes, until a
-  match or ten quiet minutes.
+  match or ten quiet minutes. At the lock screen a hold is a refusal; in
+  the consent window it pauses the face checks with the window still up,
+  so the password box is there and the scan resumes when the hold is over.
 - **Not defended**: a look-alike, a 3D mask, malware already running as you
   with your password, a video rendered on a display the IR camera can see
   (not measured; not claimed), and anything a setuid-root binary you can run
