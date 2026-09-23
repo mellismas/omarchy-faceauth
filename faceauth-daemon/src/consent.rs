@@ -13,7 +13,7 @@
 use crate::capture::IrCapture;
 use crate::config::Config;
 use std::sync::{Arc, Mutex};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use faceauth_engine::{pose, Grey, Pipeline};
 use serde::Serialize;
 use std::path::Path;
@@ -144,6 +144,87 @@ pub const ACK_WAIT: Duration = Duration::from_secs(3);
 /// After the window acknowledges, how long before a nod leg counts: a nod
 /// already in motion when the card appeared was not a nod at this card.
 pub const ACK_DWELL: Duration = Duration::from_millis(1500);
+
+/// Per user, a passwordless-sudo spell the window asked for with the live
+/// request's token, waiting on that request's approval.
+static PASSWORDLESS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> = std::sync::LazyLock::new(Default::default);
+
+/// The longest passwordless spell the card may ask for.
+pub const PASSWORDLESS_MAX_MINUTES: u32 = 24 * 60;
+
+/// The window asks that this user's live request, when approved, also turn
+/// passwordless sudo on for `minutes`. Nothing is written now: the answer
+/// waits on the approval (a nod and its confirm, or the password), and a
+/// refusal drops it.
+pub fn arm_passwordless(user: &str, minutes: u32) -> bool {
+    if minutes == 0 || minutes > PASSWORDLESS_MAX_MINUTES {
+        return false;
+    }
+    if let Ok(mut p) = PASSWORDLESS.lock() {
+        p.insert(user.to_string(), minutes);
+    }
+    true
+}
+
+/// The spell armed for this user, if any, and it is forgotten either way.
+pub fn take_passwordless(user: &str) -> Option<u32> {
+    PASSWORDLESS.lock().ok().and_then(|mut p| p.remove(user))
+}
+
+/// The sudoers.d file and the expiry timer unit Omarchy's own
+/// `omarchy-sudo-passwordless` command uses, so its toggle-off, its
+/// re-arm and its reboot cleanup all apply to a spell started here.
+pub fn passwordless_file(dir: &Path, user: &str) -> std::path::PathBuf {
+    dir.join(format!("99-omarchy-nopasswd-{}", user))
+}
+
+pub fn passwordless_timer_unit(user: &str) -> String {
+    format!("omarchy-nopasswd-expire-{}", user)
+}
+
+/// Turn passwordless sudo on for `user` for `minutes`: the NOPASSWD rule
+/// as a root-only sudoers.d file, and a transient timer that deletes it.
+/// `arm` runs the timer command (systemd-run, as root) first: a timer with
+/// no rule to delete is nothing, a rule with no timer would never end.
+/// Only then is the rule written, so the spell never outlives its timer.
+pub fn enable_passwordless(dir: &Path, user: &str, minutes: u32, arm: &dyn Fn(&[String]) -> Result<()>) -> Result<std::path::PathBuf> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if user.is_empty() || !user.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+        bail!("user name {:?} cannot be written into a sudoers rule", user);
+    }
+    let file = passwordless_file(dir, user);
+    let unit = passwordless_timer_unit(user);
+    let args: Vec<String> = vec!["--on-active".into(), format!("{}m", minutes), "--timer-property=AccuracySec=1s".into(), format!("--unit={}", unit), "--collect".into(), "/usr/bin/rm".into(), "-f".into(), "--".into(), file.display().to_string()];
+    arm(&args).context("arm the passwordless expiry timer; no rule was written")?;
+    let tmp = dir.join(format!(".99-omarchy-nopasswd-{}.tmp", user));
+    {
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o440).open(&tmp).with_context(|| format!("write {}", tmp.display()))?;
+        writeln!(f, "{} ALL=(ALL) NOPASSWD: ALL", user)?;
+    }
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o440))?;
+    std::fs::rename(&tmp, &file).with_context(|| format!("place {}", file.display()))?;
+    Ok(file)
+}
+
+/// Is this request Omarchy's own passwordless-sudo command? Its toggle
+/// would fight a spell started from its own card (it removes the rule and
+/// stops the timer as it finishes), so the button does not apply to it.
+pub fn is_passwordless_command(caller: &CallerInfo) -> bool {
+    caller.command.split_whitespace().any(|w| w == "omarchy-sudo-passwordless" || w.ends_with("/omarchy-sudo-passwordless"))
+}
+
+/// `systemd-run` as root, for the expiry timer. An earlier timer of the
+/// same name (a spell being extended) is stopped first.
+pub fn run_passwordless_timer(user: &str, args: &[String]) -> Result<()> {
+    let unit = format!("{}.timer", passwordless_timer_unit(user));
+    let _ = std::process::Command::new("/usr/bin/systemctl").args(["stop", &unit]).env_clear().env("PATH", "/usr/bin:/bin").output();
+    let out = std::process::Command::new("/usr/bin/timeout").args(["-k", "2", "10", "/usr/bin/systemd-run"]).args(args).env_clear().env("PATH", "/usr/bin:/bin").output().context("run systemd-run")?;
+    if !out.status.success() {
+        bail!("systemd-run {}: {}", out.status, String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
 
 /// The window says it has drawn the request `token` names. True when that
 /// is this user's live request.
@@ -1109,7 +1190,7 @@ impl NodDetector {
     /// watch's attentive yaw): the mean yaw over the nod's span must be
     /// within this. A head held turned toward another screen nods the same
     /// way on the pitch axis, but it is not nodding at the card.
-    pub const YAW_FACING: f32 = 0.25;
+    pub const YAW_FACING: f32 = 0.40;
 
     pub fn new() -> Self {
         Self::with_floor(Self::MIN_DOWN)
@@ -2536,5 +2617,52 @@ mod facing_gate_tests {
             }
         }
         assert!(bad.is_empty(), "{:?}", bad);
+    }
+}
+
+#[cfg(test)]
+mod passwordless_tests {
+    use super::*;
+
+    #[test]
+    fn a_spell_is_armed_only_in_range_and_taken_once() {
+        let user = "faceauth-passwordless-test-user";
+        assert!(!arm_passwordless(user, 0));
+        assert!(!arm_passwordless(user, PASSWORDLESS_MAX_MINUTES + 1));
+        assert_eq!(take_passwordless(user), None);
+        assert!(arm_passwordless(user, 15));
+        assert_eq!(take_passwordless(user), Some(15));
+        assert_eq!(take_passwordless(user), None, "taken once; a refusal or an approval clears it");
+    }
+
+    /// The rule Omarchy's own command writes, root-only, and the timer it
+    /// arms; a timer that cannot be armed takes the rule with it.
+    #[test]
+    fn the_rule_is_written_root_only_with_its_expiry_timer() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("faceauth-sudoers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let seen = std::sync::Mutex::new(Vec::<String>::new());
+        let arm = |args: &[String]| { seen.lock().unwrap().extend(args.iter().cloned()); Ok(()) };
+        let file = enable_passwordless(&dir, "mellis", 20, &arm).unwrap();
+        assert_eq!(file, dir.join("99-omarchy-nopasswd-mellis"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "mellis ALL=(ALL) NOPASSWD: ALL\n");
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o440);
+        let args = seen.lock().unwrap().join(" ");
+        assert!(args.contains("--on-active 20m") && args.contains("--unit=omarchy-nopasswd-expire-mellis") && args.ends_with(&format!("/usr/bin/rm -f -- {}", file.display())), "{}", args);
+        // A user name that could break out of the rule is refused.
+        assert!(enable_passwordless(&dir, "evil ALL=(ALL)", 5, &arm).is_err());
+        // No timer, no rule: the timer is armed before the rule is written.
+        let fail = |_: &[String]| Err(anyhow!("no systemd"));
+        assert!(enable_passwordless(&dir, "bob", 5, &fail).is_err());
+        assert!(!dir.join("99-omarchy-nopasswd-bob").exists());
+        let mut c = CallerInfo { command: "sudo omarchy-sudo-passwordless".into(), ..Default::default() };
+        assert!(is_passwordless_command(&c));
+        c.command = "sudo /usr/bin/omarchy-sudo-passwordless 30".into();
+        assert!(is_passwordless_command(&c));
+        c.command = "sudo pacman -Syu".into();
+        assert!(!is_passwordless_command(&c));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

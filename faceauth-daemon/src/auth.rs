@@ -44,6 +44,9 @@ pub enum Outcome {
     Error { message: String },
     /// Answer to a presence probe: one short look, detector only.
     Probe { face: bool, attentive: bool, face_px: f32, elapsed_ms: u64 },
+    /// Root only: every frame of a pose sweep scored against the user's
+    /// templates, with the head pose it was taken at.
+    Sweep { frames: Vec<SweepFrame>, templates: usize, elapsed_ms: u64 },
     /// Answer to a ping: the daemon is up and its models are loaded.
     Pong {
         version: String,
@@ -108,9 +111,25 @@ impl Outcome {
         match self {
             Outcome::Match { frames, elapsed_ms, .. } => Outcome::Match { score: None, frames, elapsed_ms },
             Outcome::NoMatch { frames, elapsed_ms, .. } => Outcome::NoMatch { score: None, frames, elapsed_ms },
+            Outcome::Sweep { templates, elapsed_ms, .. } => Outcome::Sweep { frames: Vec::new(), templates, elapsed_ms },
             o => o,
         }
     }
+}
+
+/// One frame of a pose sweep: when, the best cosine against the templates
+/// and which one, and the head pose it was taken at (see `pose::Pose`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SweepFrame {
+    pub t: f32,
+    pub score: f32,
+    pub template: usize,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub nose_pitch: f32,
+    /// Sideways tilt, degrees.
+    pub roll: f32,
+    pub face_px: f32,
 }
 
 /// The longest a caller with a limit of its own (the CLI) may ask a consent
@@ -272,6 +291,48 @@ impl Authenticator {
 
     /// One cheap look for the lock screen while its panel is blank: is anyone
     /// there? About half a second of camera, detection only, no identity.
+    /// A pose sweep: score every frame for `seconds` against the user's
+    /// templates and record the head pose with it, so the curve of how the
+    /// match falls off with yaw and pitch can be measured, and measured
+    /// again after enrolment changes. Root only (the server enforces it):
+    /// it returns scores.
+    pub fn sweep(&mut self, user: &str, seconds: f32) -> Outcome {
+        let t0 = Instant::now();
+        let templates = match self.store.load(user) {
+            Ok(Some(t)) => t,
+            Ok(None) => return Outcome::NotEnrolled,
+            Err(e) => return Outcome::Error { message: e.to_string() },
+        };
+        let r = (|| -> Result<Outcome> {
+            let mut cap = IrCapture::open(&self.cfg)?;
+            if let Some(i) = &cap.illuminator {
+                i.set(true)?;
+            }
+            let device = cap.identity.clone();
+            let deadline = Duration::from_secs_f32(seconds.clamp(3.0, 60.0));
+            let mut frames = Vec::new();
+            while t0.elapsed() < deadline {
+                let Some(img) = cap.next(Duration::from_secs(2))? else { continue };
+                if cap.frames % 2 != 0 {
+                    continue;
+                }
+                let faces = self.pipeline.analyse(&img, self.cfg.min_detection, 1)?;
+                let Some(face) = faces.first() else { continue };
+                cap.meter_on(face);
+                let Some(e) = &face.embedding else { continue };
+                let p = faceauth_engine::pose::pose(&face.landmarks);
+                let (score, template) = templates.best_match_on(e, &device).unwrap_or((-1.0, usize::MAX));
+                frames.push(SweepFrame { t: t0.elapsed().as_secs_f32(), score, template, yaw: p.yaw, pitch: p.pitch, nose_pitch: p.nose_pitch, roll: p.roll.to_degrees(), face_px: face.bbox[2] });
+            }
+            cap.stop()?;
+            Ok(Outcome::Sweep { frames, templates: templates.usable_on(&device), elapsed_ms: t0.elapsed().as_millis() as u64 })
+        })();
+        match r {
+            Ok(o) => o,
+            Err(e) => Outcome::Error { message: e.to_string() },
+        }
+    }
+
     pub fn probe(&mut self) -> Outcome {
         let t0 = Instant::now();
         let r = (|| -> Result<Outcome> {
@@ -320,15 +381,20 @@ impl Authenticator {
     /// Enrol: capture `count` embeddings over `seconds`, spaced across the
     /// window so they cover different poses, LEDs on, exposure metered on the
     /// face. Stored under `label` beside any existing templates.
-    pub fn enroll(&mut self, user: &str, label: &str, seconds: f32, count: usize) -> Outcome {
-        match self.run_enroll(user, label, seconds, count) {
+    pub fn enroll(&mut self, user: &str, label: &str, seconds: f32, count: usize, pose: Option<&str>) -> Outcome {
+        match self.run_enroll(user, label, seconds, count, pose) {
             Ok(o) => o,
             Err(e) => Outcome::Error { message: e.to_string() },
         }
     }
 
-    fn run_enroll(&mut self, user: &str, label: &str, seconds: f32, count: usize) -> Result<Outcome> {
+    fn run_enroll(&mut self, user: &str, label: &str, seconds: f32, count: usize, pose: Option<&str>) -> Result<Outcome> {
         use crate::store::{now_secs, Template, UserTemplates};
+        if let Some(p) = pose {
+            if !POSES.contains(&p) {
+                return Ok(Outcome::Error { message: format!("unknown pose {:?}; one of {}", p, POSES.join(", ")) });
+            }
+        }
         // Enrolment is the recovery path for a blob this machine can no longer
         // open (a cleared TPM, a firmware reset): set it aside and start fresh.
         let existing = match self.store.load(user) {
@@ -353,9 +419,15 @@ impl Authenticator {
         if let Some(i) = &cap.illuminator {
             i.set(true)?;
         }
-        let mut samples: Vec<(Vec<f32>, f32, f32)> = Vec::new();
+        let mut samples: Vec<(Vec<f32>, f32, f32, faceauth_engine::pose::Pose)> = Vec::new();
         let mut last = Instant::now() - spacing;
         let mut seen = 0usize;
+        let mut off_pose = 0usize;
+        // This person's level, from the centre look already enrolled, so
+        // up and down are measured against it rather than a fixed number.
+        let level = level_of(&u);
+        let (mut lo_seen, mut hi_seen) = (f32::MAX, f32::MIN);
+        let (mut yaw_lo, mut yaw_hi) = (f32::MAX, f32::MIN);
         while t0.elapsed() < deadline && samples.len() < count {
             let Some(img) = cap.next(Duration::from_secs(2))? else { continue };
             if cap.frames % 3 != 0 {
@@ -369,15 +441,40 @@ impl Authenticator {
             if seen <= 3 || last.elapsed() < spacing {
                 continue;
             }
+            let p = faceauth_engine::pose::pose(&face.landmarks);
+            // A guided round keeps only frames in the pose it asked for.
+            if let Some(want) = pose {
+                lo_seen = lo_seen.min(p.nose_pitch);
+                hi_seen = hi_seen.max(p.nose_pitch);
+                yaw_lo = yaw_lo.min(p.yaw);
+                yaw_hi = yaw_hi.max(p.yaw);
+                if !pose_bin_accepts_at(want, &p, level) {
+                    off_pose += 1;
+                    continue;
+                }
+            }
             last = Instant::now();
             if let Some(e) = &face.embedding {
-                samples.push((e.clone(), face.score, face.bbox[2]));
+                samples.push((e.clone(), face.score, face.bbox[2], p));
             }
         }
         let device = cap.identity.clone();
         cap.stop()?;
         if samples.len() < 3 {
-            return Ok(Outcome::Error { message: format!("only {} usable frames; face the camera at normal distance and try again", samples.len()) });
+            let hint = match pose {
+                Some(p) if off_pose > 0 => {
+                    let want = match p {
+                        "up" => format!("up needs a pitch reading of {:.2} or less", level - UP_BELOW_LEVEL),
+                        "down" => format!("down needs {:.2} or more", level + DOWN_ABOVE_LEVEL),
+                        "left" => "left needs a turn reading of -0.18 or less".to_string(),
+                        "right" => "right needs a turn reading of 0.18 or more".to_string(),
+                        _ => format!("centre needs a turn within 0.12 and a pitch within 0.06 of {:.2}", level),
+                    };
+                    format!("only {} frames in the {} pose; the {} frames read pitch {:.2} to {:.2} and turn {:+.2} to {:+.2}, and {}. {}", samples.len(), p, off_pose, lo_seen, hi_seen, yaw_lo, yaw_hi, want, POSE_HINTS[POSES.iter().position(|q| *q == p).unwrap_or(0)])
+                }
+                _ => format!("only {} usable frames; face the camera at normal distance and try again", samples.len()),
+            };
+            return Ok(Outcome::Error { message: hint });
         }
         let now = now_secs();
         let added = samples.len();
@@ -392,8 +489,14 @@ impl Authenticator {
             }
             log::info!("enrolment for {}: {} earlier template(s) bound to {}", user, legacy, device);
         }
-        for (e, q, w) in samples {
-            u.templates.push(Template { embedding: e, quality: q, face_width: w, created: now, label: label.to_string(), device: Some(device.clone()) });
+        for (e, q, w, p) in samples {
+            u.templates.push(Template { embedding: e, quality: q, face_width: w, created: now, label: label.to_string(), device: Some(device.clone()), yaw: Some(p.yaw), nose_pitch: Some(p.nose_pitch) });
+        }
+        // Over the cap, the surplus copies of looks already held go, not
+        // the new look: coverage is what an identity is for.
+        let pruned = u.prune_to(crate::store::MAX_TEMPLATES);
+        if pruned > 0 {
+            log::info!("enrolment for {}: {} near-duplicate template(s) dropped to stay within {}", user, pruned, crate::store::MAX_TEMPLATES);
         }
         let (lo, mean, _) = u.self_consistency().unwrap_or((1.0, 1.0, 1.0));
         let path = self.store.save(&u)?;
@@ -844,6 +947,10 @@ impl Authenticator {
         };
         let outcome = if password_ok { Outcome::Match { score: Some(1.0), frames: 0, elapsed_ms: s.started.elapsed().as_millis() as u64 } } else { outcome };
         self.last_consent.insert(user.to_string(), Instant::now());
+        if !matches!(outcome, Outcome::Match { .. }) {
+            // Whatever the card asked for rides on an approval only.
+            let _ = crate::consent::take_passwordless(user);
+        }
         match &outcome {
             Outcome::Match { frames, .. } => {
                 self.last_match.insert(user.to_string(), Instant::now());
@@ -855,10 +962,31 @@ impl Authenticator {
                 s.dialog.show_final("approved", "Allowed.", caller);
                 notify(&self.cfg, user, &format!("Root access granted by {}", how), &format!("{}\n{}", caller.command, caller.parents));
                 log::info!("consent granted ({}) for {}: {} [{}]", how, user, caller.command, caller.parents);
+                // The card's passwordless button: the same approval turns
+                // passwordless sudo on for the minutes asked, the way
+                // Omarchy's own command would, with no further request.
+                if let Some(minutes) = crate::consent::take_passwordless(user) {
+                    if crate::consent::is_passwordless_command(caller) {
+                        log::info!("passwordless sudo for {} not armed from the passwordless command's own request", user);
+                        notify(&self.cfg, user, "Passwordless sudo: use the command's own answer", "The button does not apply to omarchy-sudo-passwordless itself.");
+                    } else {
+                    match crate::consent::enable_passwordless(std::path::Path::new("/etc/sudoers.d"), user, minutes, &|args| crate::consent::run_passwordless_timer(user, args)) {
+                        Ok(_) => {
+                            log::warn!("passwordless sudo on for {} for {} min, by the card's button and this approval", user, minutes);
+                            notify(&self.cfg, user, &format!("Passwordless sudo on for {} minutes", minutes), "Any process running as you can use sudo without asking until then. Setup > Security > Passwordless Sudo turns it off early.");
+                        }
+                        Err(e) => {
+                            log::warn!("passwordless sudo for {} not enabled: {:#}", user, e);
+                            notify(&self.cfg, user, "Passwordless sudo not enabled", &format!("{:#}", e));
+                        }
+                    }
+                    }
+                }
             }
             Outcome::Refused { reason, .. } | Outcome::ConsentDenied { reason, .. } if reason == "shaken" || reason == "dismissed" => {
                 // The user closed the window, or shook their head at it: the
                 // answer is no, and the window goes away without a verdict on it.
+                let _ = crate::consent::take_passwordless(user);
                 s.dialog.hide();
                 let how = if reason == "shaken" { "Refused by head shake" } else { "Refused: dismissed" };
                 notify(&self.cfg, user, how, &format!("{}\n{}", caller.command, caller.parents));
@@ -1180,7 +1308,7 @@ pub fn confirm(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, templ
     let device = cap.identity.clone();
     let mut prev: Option<(Grey, f64)> = None;
     let mut tracked = followed;
-    let (mut passed, mut nosignal, mut pairs) = (0usize, 0usize, 0usize);
+    let (mut passed, mut failed, mut nosignal, mut pairs) = (0usize, 0usize, 0usize, 0usize);
     let verdict = loop {
         if t0.elapsed().as_secs_f32() > CONFIRM_SECONDS {
             break if pairs == 0 || nosignal == pairs { Confirm::NoSignal } else { Confirm::Refused("no match within the confirm window".into()) };
@@ -1224,12 +1352,20 @@ pub fn confirm(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, templ
                     break Confirm::Live;
                 }
             }
-            Some(_) => break Confirm::Refused("the face that nodded does not match".into()),
+            // One pair under the threshold is a frame caught mid-movement
+            // as often as a stranger; the refusal, like the pass, takes two.
+            Some((score, _)) => {
+                failed += 1;
+                log::debug!("confirm: pair {} under the threshold ({:.3})", pairs, score);
+                if failed >= 2 {
+                    break Confirm::Refused("the face that nodded does not match".into());
+                }
+            }
             None => break Confirm::Refused("no template for this camera".into()),
         }
     };
     cap.illuminator.as_ref().unwrap().set(true)?;
-    log::info!("confirm: {} in {:.2}s ({} pairs, {} no signal, {} matched)", match &verdict { Confirm::Live => "live".to_string(), Confirm::NoSignal => "no signal".to_string(), Confirm::Refused(w) => format!("refused: {}", w) }, t0.elapsed().as_secs_f32(), pairs, nosignal, passed);
+    log::info!("confirm: {} in {:.2}s ({} pairs, {} no signal, {} matched, {} under)", match &verdict { Confirm::Live => "live".to_string(), Confirm::NoSignal => "no signal".to_string(), Confirm::Refused(w) => format!("refused: {}", w) }, t0.elapsed().as_secs_f32(), pairs, nosignal, passed, failed);
     Ok(verdict)
 }
 
@@ -1319,5 +1455,83 @@ mod strikes_tests {
         }
         s.charge(t(70));
         assert_eq!(s.hold(t(70)), None, "four of the five are over a minute old");
+    }
+}
+
+/// The looks a guided enrolment asks for, in order, and what to tell the
+/// person for each. Yaw is the nose offset in inter-eye distances (about
+/// 0.35 for a 30 degree turn); nose_pitch is the nose's drop below the eye
+/// line in the same units (about 0.5 level, more looking down).
+pub const POSES: [&str; 5] = ["centre", "left", "right", "up", "down"];
+pub const POSE_HINTS: [&str; 5] = [
+    "look straight at the camera",
+    "turn your head to the left, about a quarter turn, and hold it",
+    "turn your head to the right, about a quarter turn, and hold it",
+    "tilt your chin up a little, not much, and hold it",
+    "tilt your head down a little, as if reading the keyboard, and hold it",
+];
+
+/// The nose_pitch a person reads at level: the mean over their centre
+/// templates, else over any template that recorded one, else the sweep's
+/// typical 0.53 (2026-09-23; a lid camera looks up at the face, so the
+/// chin-up moves this measure only a little).
+pub const LEVEL_DEFAULT: f32 = 0.53;
+/// How far below the level reading counts as chin-up, and above as chin-down.
+pub const UP_BELOW_LEVEL: f32 = 0.02;
+pub const DOWN_ABOVE_LEVEL: f32 = 0.08;
+
+pub fn level_of(u: &UserTemplates) -> f32 {
+    let centre: Vec<f32> = u.templates.iter().filter(|t| t.label.ends_with("-centre")).filter_map(|t| t.nose_pitch).collect();
+    let any: Vec<f32> = u.templates.iter().filter_map(|t| t.nose_pitch).collect();
+    let pick = if !centre.is_empty() { centre } else { any };
+    if pick.is_empty() { LEVEL_DEFAULT } else { pick.iter().sum::<f32>() / pick.len() as f32 }
+}
+
+/// Is this frame in the pose a guided round asked for, with up and down
+/// measured against this person's own level? Turn bands are from the
+/// pose sweep of 2026-09-23: a quarter turn reads 0.25 to 0.40 on yaw.
+pub fn pose_bin_accepts_at(name: &str, p: &faceauth_engine::pose::Pose, level: f32) -> bool {
+    match name {
+        "centre" => p.yaw.abs() <= 0.12 && (p.nose_pitch - level).abs() <= 0.06,
+        "left" => p.yaw <= -0.18 && p.yaw >= -0.60,
+        "right" => p.yaw >= 0.18 && p.yaw <= 0.60,
+        "up" => p.nose_pitch <= level - UP_BELOW_LEVEL && p.yaw.abs() <= 0.20,
+        "down" => p.nose_pitch >= level + DOWN_ABOVE_LEVEL && p.yaw.abs() <= 0.20,
+        _ => false,
+    }
+}
+
+/// The bands at the default level.
+pub fn pose_bin_accepts(name: &str, p: &faceauth_engine::pose::Pose) -> bool {
+    pose_bin_accepts_at(name, p, LEVEL_DEFAULT)
+}
+
+#[cfg(test)]
+mod pose_bin_tests {
+    use super::*;
+    use faceauth_engine::pose::Pose;
+
+    fn at(yaw: f32, nose_pitch: f32) -> Pose {
+        Pose { yaw, pitch: 0.5, roll: 0.0, nose_pitch, inter_eye: 40.0 }
+    }
+
+    #[test]
+    fn each_pose_takes_its_own_frames_and_no_others() {
+        let frontal = at(0.0, LEVEL_DEFAULT);
+        assert!(pose_bin_accepts("centre", &frontal));
+        for p in ["left", "right", "up", "down"] {
+            assert!(!pose_bin_accepts(p, &frontal), "{} must not take a frontal frame", p);
+        }
+        assert!(pose_bin_accepts("left", &at(-0.3, 0.5)) && !pose_bin_accepts("right", &at(-0.3, 0.5)));
+        assert!(pose_bin_accepts("right", &at(0.3, 0.5)) && !pose_bin_accepts("centre", &at(0.3, 0.5)));
+        assert!(pose_bin_accepts("up", &at(0.05, 0.50)) && !pose_bin_accepts("centre", &at(0.05, 0.44)), "a comfortable chin-up reads a couple of hundredths under level");
+        assert!(pose_bin_accepts("down", &at(0.05, 0.7)) && !pose_bin_accepts("centre", &at(0.05, 0.7)));
+        assert!(pose_bin_accepts("centre", &at(0.05, 0.55)) && !pose_bin_accepts("up", &at(0.05, 0.55)) && !pose_bin_accepts("down", &at(0.05, 0.55)), "level is level");
+        // Relative to a person who reads higher at level, the same bands move with them.
+        assert!(pose_bin_accepts_at("up", &at(0.0, 0.57), 0.60) && !pose_bin_accepts_at("up", &at(0.0, 0.59), 0.60));
+        assert!(pose_bin_accepts_at("down", &at(0.0, 0.69), 0.60) && !pose_bin_accepts_at("down", &at(0.0, 0.66), 0.60));
+        assert!(!pose_bin_accepts("left", &at(-0.9, 0.5)), "a profile is past what the aligner can use");
+        assert!(!pose_bin_accepts("sideways", &frontal));
+        assert_eq!(POSES.len(), POSE_HINTS.len());
     }
 }

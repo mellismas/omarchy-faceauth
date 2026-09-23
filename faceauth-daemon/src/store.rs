@@ -61,6 +61,13 @@ pub struct Template {
     /// only matches on that camera. None on templates from before binding.
     #[serde(default)]
     pub device: Option<String>,
+    /// The head pose the frame was taken at (`pose::Pose` yaw and
+    /// nose_pitch), so an identity can be seen to cover the range of looks
+    /// a person uses. None on templates from before pose was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yaw: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nose_pitch: Option<f32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -239,6 +246,27 @@ impl UserTemplates {
     }
 
     /// Pairwise similarity statistics of the stored templates: (min, mean, max).
+    /// Trim the set to `max` templates by dropping, one at a time, the
+    /// template most similar to another (the surplus copy of a look the set
+    /// already has), so what remains covers the widest range of looks. The
+    /// number removed is returned.
+    pub fn prune_to(&mut self, max: usize) -> usize {
+        let mut removed = 0;
+        while self.templates.len() > max.max(1) {
+            let n = self.templates.len();
+            let mut worst = (0usize, -1.0f32);
+            for i in 0..n {
+                let nearest = (0..n).filter(|&j| j != i).map(|j| faceauth_engine::cosine(&self.templates[i].embedding, &self.templates[j].embedding)).fold(-1.0, f32::max);
+                if nearest > worst.1 {
+                    worst = (i, nearest);
+                }
+            }
+            self.templates.remove(worst.0);
+            removed += 1;
+        }
+        removed
+    }
+
     pub fn self_consistency(&self) -> Option<(f32, f32, f32)> {
         let n = self.templates.len();
         if n < 2 {
@@ -286,7 +314,7 @@ impl Sealing {
         if !Path::new(TIMEOUT).exists() {
             return Sealing::Plain(format!("{} not installed", TIMEOUT));
         }
-        match seal("faceauth-probe", b"probe").and_then(|blob| unseal("faceauth-probe", &blob)) {
+        match seal(Path::new(SYSTEMD_CREDS), "faceauth-probe", b"probe").and_then(|blob| unseal(Path::new(SYSTEMD_CREDS), "faceauth-probe", &blob)) {
             Ok((back, _)) if back == b"probe" => Sealing::Tpm,
             Ok(_) => Sealing::Plain("TPM probe round trip returned different bytes".into()),
             Err(e) => Sealing::Plain(format!("TPM probe failed: {}", e)),
@@ -301,12 +329,12 @@ impl Sealing {
     }
 }
 
-fn creds(args: &[&str], stdin_bytes: &[u8]) -> Result<Vec<u8>> {
+fn creds(bin: &Path, args: &[&str], stdin_bytes: &[u8]) -> Result<Vec<u8>> {
     // `-k 5`: a TPM call that ignores SIGTERM is killed five seconds later,
     // so the daemon never hangs on the credential service.
     let mut child = Command::new(TIMEOUT)
         .args(["-k", "5", "30"])
-        .arg(SYSTEMD_CREDS)
+        .arg(bin)
         .args(args)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -332,16 +360,16 @@ fn creds(args: &[&str], stdin_bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Seal `plain` to the TPM under credential name `name`, scoped to root; the blob is text.
-fn seal(name: &str, plain: &[u8]) -> Result<Vec<u8>> {
-    creds(&["encrypt", "--with-key=host+tpm2", "--tpm2-pcrs=", "--uid=0", &format!("--name={}", name), "-", "-"], plain)
+fn seal(bin: &Path, name: &str, plain: &[u8]) -> Result<Vec<u8>> {
+    creds(bin, &["encrypt", "--with-key=host+tpm2", "--tpm2-pcrs=", "--uid=0", &format!("--name={}", name), "-", "-"], plain)
 }
 
 /// Unseal a blob. Returns the bytes and whether the blob was of the older,
 /// system-scoped kind (which the caller should re-seal).
-fn unseal(name: &str, blob: &[u8]) -> Result<(Vec<u8>, bool)> {
-    match creds(&["decrypt", "--uid=0", &format!("--name={}", name), "-", "-"], blob) {
+fn unseal(bin: &Path, name: &str, blob: &[u8]) -> Result<(Vec<u8>, bool)> {
+    match creds(bin, &["decrypt", "--uid=0", &format!("--name={}", name), "-", "-"], blob) {
         Ok(b) => Ok((b, false)),
-        Err(e) if e.to_string().contains("scoped to the system") => Ok((creds(&["decrypt", &format!("--name={}", name), "-", "-"], blob)?, true)),
+        Err(e) if e.to_string().contains("scoped to the system") => Ok((creds(bin, &["decrypt", &format!("--name={}", name), "-", "-"], blob)?, true)),
         Err(e) => Err(e),
     }
 }
@@ -369,6 +397,10 @@ pub struct Store {
     sealing: Mutex<Sealing>,
     /// How to re-probe sealing (tests inject one that stays plain).
     probe: fn() -> Sealing,
+    /// The credential tool. Tests point it at /bin/false: an unseal from a
+    /// user's test run makes PID 1 ask polkit, which puts a real consent
+    /// window on the desktop.
+    creds_bin: PathBuf,
     /// Unsealing costs about a second of TPM time; templates are cached per
     /// user against the file they came from, so an attempt pays it only when
     /// the file changed.
@@ -388,7 +420,15 @@ impl Store {
     pub fn open_with_probe(dir: impl AsRef<Path>, sealing: Sealing, probe: fn() -> Sealing) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        Ok(Store { dir, sealing: Mutex::new(sealing), probe, cache: Mutex::new(HashMap::new()) })
+        Ok(Store { dir, sealing: Mutex::new(sealing), probe, creds_bin: PathBuf::from(SYSTEMD_CREDS), cache: Mutex::new(HashMap::new()) })
+    }
+
+    /// A store whose credential tool always fails: for tests that must
+    /// never reach the credential service.
+    #[cfg(test)]
+    fn without_creds(mut self) -> Self {
+        self.creds_bin = PathBuf::from("/bin/false");
+        self
     }
 
     pub fn sealing(&self) -> Sealing {
@@ -449,7 +489,7 @@ impl Store {
                 }
             }
             let blob = std::fs::read(&sealed).with_context(|| format!("read {}", sealed.display()))?;
-            let (text, old_kind) = unseal(&cred_name(user), &blob).with_context(|| format!("unseal {}", sealed.display()))?;
+            let (text, old_kind) = unseal(&self.creds_bin, &cred_name(user), &blob).with_context(|| format!("unseal {}", sealed.display()))?;
             let t = Self::parse(&String::from_utf8_lossy(&text), &sealed, user)?;
             if let Some(t) = &t {
                 if old_kind && self.sealing() == Sealing::Tpm {
@@ -511,7 +551,7 @@ impl Store {
         }
         let json = serde_json::to_string(t)?;
         let (target, bytes, remove) = match &sealing {
-            Sealing::Tpm => (sealed_path, seal(&cred_name(&t.user), json.as_bytes())?, Some(plain_path)),
+            Sealing::Tpm => (sealed_path, seal(&self.creds_bin, &cred_name(&t.user), json.as_bytes())?, Some(plain_path)),
             Sealing::Plain(_) => (plain_path, json.into_bytes(), None),
         };
         // A unique staging name per write: two saves for one user cannot
@@ -611,7 +651,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn tmpl(e: Vec<f32>, created: u64, device: Option<&str>) -> Template {
-        Template { embedding: e, quality: 0.9, face_width: 80.0, created, label: "enrol".into(), device: device.map(String::from) }
+        Template { embedding: e, quality: 0.9, face_width: 80.0, created, label: "enrol".into(), device: device.map(String::from), yaw: None, nose_pitch: None }
     }
 
     fn temp(name: &str) -> PathBuf {
@@ -723,6 +763,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Pruning drops the copies of a look the set already has and keeps
+    /// the different ones.
+    #[test]
+    fn pruning_keeps_the_different_looks() {
+        let mut u = UserTemplates::new("alice", "glintr100");
+        let mk = |v: Vec<f32>| { let n = v.iter().map(|x| x * x).sum::<f32>().sqrt(); tmpl(v.iter().map(|x| x / n).collect(), 1, None) };
+        u.templates.push(mk(vec![1.0, 0.0, 0.0]));
+        u.templates.push(mk(vec![1.0, 0.05, 0.0]));
+        u.templates.push(mk(vec![1.0, -0.05, 0.0]));
+        u.templates.push(mk(vec![0.0, 1.0, 0.0]));
+        u.templates.push(mk(vec![0.0, 0.0, 1.0]));
+        assert_eq!(u.prune_to(3), 2);
+        let kept: Vec<usize> = u.templates.iter().map(|t| t.embedding.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0).collect();
+        assert_eq!(kept, vec![0, 1, 2], "one of each direction survives; the near copies go");
+        assert_eq!(u.prune_to(10), 0);
+    }
+
     #[test]
     fn too_many_templates_is_a_named_error() {
         let dir = temp("cap");
@@ -744,7 +801,7 @@ mod tests {
         let dir = temp("sticky");
         // The re-probe must stay plain here: on a machine where PID 1 unseals
         // for any user, Sealing::detect() succeeds even in a user's test run.
-        let store = Store::open_with_probe(&dir, Sealing::Plain("probe failed in this test".into()), || Sealing::Plain("still failing".into())).unwrap();
+        let store = Store::open_with_probe(&dir, Sealing::Plain("probe failed in this test".into()), || Sealing::Plain("still failing".into())).unwrap().without_creds();
         let sealed = store.sealed_path_for("alice").unwrap();
         std::fs::write(&sealed, b"not a real blob").unwrap();
         let mut u = UserTemplates::new("alice", "glintr100");

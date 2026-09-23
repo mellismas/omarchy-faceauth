@@ -54,7 +54,7 @@ DeviceAllow=char-video4linux rw
 DeviceAllow=char-media rw
 # The TPM resource manager, for sealing templates through systemd-creds.
 DeviceAllow=/dev/tpmrm0 rw
-ReadWritePaths=/var/lib/faceauth /run/faceauth
+ReadWritePaths=/var/lib/faceauth /run/faceauth /etc/sudoers.d
 UMask=0077
 # Unsealed templates live in memory; a core dump would write them to disk.
 LimitCORE=0

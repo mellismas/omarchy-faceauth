@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth auth [--user NAME] [--socket PATH] [--consent]   (asks a running faceauthd; --consent = window + nod)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there?)\n  faceauth enroll [--user NAME] [--label TEXT] [--seconds N] [--count N]   (through the daemon)\n  faceauth enroll --store DIR ...                   (direct camera access, development)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] [--dismiss|--ack]   (from the consent window; stdin: token line, then password line)\n  faceauth consent-context --action ID --message TEXT [--cookie C]   (from the polkit agent, as a request starts)\n  faceauth calibrate [--user NAME] [--gestures-only]   (root; two nods, two shakes and five everyday movements, stored with the templates)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence                                (current state)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
+        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth auth [--user NAME] [--socket PATH] [--consent]   (asks a running faceauthd; --consent = window + nod)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there?)
+  faceauth sweep [--user NAME] [--seconds N] [--log FILE] [--threshold T]   (root; scores per frame while you turn your head, binned by yaw and pitch)\n  faceauth enroll [--user NAME] [--label TEXT] [--seconds N] [--count N] [--guided [--poses up,down]]   (through the daemon; --guided asks for five looks: centre, left, right, up, down)\n  faceauth enroll --store DIR ...                   (direct camera access, development)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] [--dismiss|--ack|--passwordless MIN]   (from the consent window; stdin: token line, then password line)\n  faceauth consent-context --action ID --message TEXT [--cookie C]   (from the polkit agent, as a request starts)\n  faceauth calibrate [--user NAME] [--gestures-only]   (root; two nods, two shakes and five everyday movements, stored with the templates)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence                                (current state)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
     );
     std::process::exit(2)
 }
@@ -36,10 +37,14 @@ fn main() -> Result<()> {
             let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
             let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
             let label = opt(rest, "--label").unwrap_or("enrol");
+            if rest.contains(&"--guided") {
+                let only: Vec<String> = opt(rest, "--poses").map(|p| p.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default();
+                return enroll_guided(&socket, &user, label, &only);
+            }
             let seconds: f32 = opt(rest, "--seconds").unwrap_or("12").parse()?;
             let count: usize = opt(rest, "--count").unwrap_or("10").parse()?;
             println!("Enrolling {}: look at the camera and move your head a little over the next {} s.", user, seconds as u32);
-            let o = faceauth_daemon::server::enroll(&socket, &user, label, seconds, count)?;
+            let o = faceauth_daemon::server::enroll(&socket, &user, label, seconds, count, None)?;
             match &o {
                 faceauth_daemon::auth::Outcome::Enrolled { added, total, consistency_min, consistency_mean, path } => {
                     println!("Saved {} templates ({} new) to {}", total, added, path);
@@ -60,6 +65,108 @@ fn main() -> Result<()> {
         }
         ["models", "fetch", rest @ ..] => models_fetch(rest),
         ["doctor", rest @ ..] => doctor(rest),
+        ["sweep", rest @ ..] => {
+            // Root: how the match falls off with head pose, against the
+            // templates as they are. The user turns slowly left, right, up
+            // and down; every frame is scored and binned by yaw.
+            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
+            let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
+            let seconds: f32 = opt(rest, "--seconds").unwrap_or("20").parse()?;
+            let threshold: f32 = opt(rest, "--threshold").unwrap_or("0.70").parse()?;
+            println!("Pose sweep for {}: {} s. Follow the cues; move slowly and keep your eyes on the screen.", user, seconds as u32);
+            // Cues on a timer while the daemon records: five equal phases.
+            let cues = ["Face the camera", "Turn LEFT, about a quarter turn, and hold", "Turn RIGHT, about a quarter turn, and hold", "Chin UP a little, and hold", "Chin DOWN, as if reading the keyboard", "Tilt your head LEFT, ear toward shoulder", "Tilt your head RIGHT, ear toward shoulder"];
+            let phase = seconds / cues.len() as f32;
+            std::thread::spawn(move || {
+                for c in cues {
+                    println!("\n>>> {}", c);
+                    std::thread::sleep(Duration::from_secs_f32(phase));
+                }
+                println!("\n>>> Done.");
+            });
+            let o = faceauth_daemon::server::sweep(&socket, &user, seconds)?;
+            let faceauth_daemon::auth::Outcome::Sweep { frames, templates, elapsed_ms } = &o else {
+                println!("{}", serde_json::to_string(&o)?);
+                return Ok(());
+            };
+            if let Some(path) = opt(rest, "--log") {
+                use std::io::Write as _;
+                let mut f = std::fs::OpenOptions::new().append(true).create(true).open(path)?;
+                let stamp = faceauth_daemon::store::now_secs();
+                for fr in frames {
+                    writeln!(f, "{},{:.2},{:.3},{},{:.3},{:.3},{:.3},{:.0},{:.0}", stamp, fr.t, fr.score, fr.template, fr.yaw, fr.pitch, fr.nose_pitch, fr.face_px, fr.roll)?;
+                }
+                println!("{} frames appended to {}", frames.len(), path);
+            }
+            println!("{} frames in {:.1} s against {} templates; threshold {:.2}", frames.len(), *elapsed_ms as f32 / 1000.0, templates, threshold);
+            let mut bins: std::collections::BTreeMap<i32, Vec<f32>> = Default::default();
+            for fr in frames {
+                bins.entry((fr.yaw * 10.0).round() as i32).or_default().push(fr.score);
+            }
+            println!("{:>6} {:>6} {:>6} {:>6} {:>6} {:>5}", "yaw", "frames", "min", "mean", "max", "pass");
+            for (b, v) in &bins {
+                let n = v.len() as f32;
+                let mean = v.iter().sum::<f32>() / n;
+                let min = v.iter().cloned().fold(1.0, f32::min);
+                let max = v.iter().cloned().fold(-1.0, f32::max);
+                let pass = v.iter().filter(|s| **s >= threshold).count() as f32 / n * 100.0;
+                println!("{:>6.1} {:>6} {:>6.3} {:>6.3} {:>6.3} {:>4.0}%", *b as f32 / 10.0, v.len(), min, mean, max, pass);
+            }
+            let mut pbins: std::collections::BTreeMap<i32, Vec<f32>> = Default::default();
+            for fr in frames {
+                pbins.entry((fr.nose_pitch * 10.0).round() as i32).or_default().push(fr.score);
+            }
+            println!("{:>6} {:>6} {:>6} {:>6} {:>5}", "npitch", "frames", "min", "mean", "pass");
+            for (b, v) in &pbins {
+                let n = v.len() as f32;
+                let mean = v.iter().sum::<f32>() / n;
+                let min = v.iter().cloned().fold(1.0, f32::min);
+                let pass = v.iter().filter(|s| **s >= threshold).count() as f32 / n * 100.0;
+                println!("{:>6.1} {:>6} {:>6.3} {:>6.3} {:>4.0}%", *b as f32 / 10.0, v.len(), min, mean, pass);
+            }
+            let mut rbins: std::collections::BTreeMap<i32, Vec<f32>> = Default::default();
+            for fr in frames {
+                rbins.entry((fr.roll / 10.0).round() as i32 * 10).or_default().push(fr.score);
+            }
+            println!("{:>6} {:>6} {:>6} {:>6} {:>5}", "roll", "frames", "min", "mean", "pass");
+            for (b, v) in &rbins {
+                let n = v.len() as f32;
+                let mean = v.iter().sum::<f32>() / n;
+                let min = v.iter().cloned().fold(1.0, f32::min);
+                let pass = v.iter().filter(|s| **s >= threshold).count() as f32 / n * 100.0;
+                println!("{:>6} {:>6} {:>6.3} {:>6.3} {:>4.0}%", b, v.len(), min, mean, pass);
+            }
+            Ok(())
+        }
+        ["pose", rest @ ..] => {
+            // Root: a live readout of the pose measures, a few seconds at a
+            // time, so a person can see what a turn or a tilt reads.
+            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
+            let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
+            let rounds: usize = opt(rest, "--rounds").unwrap_or("8").parse()?;
+            let seconds: f32 = opt(rest, "--seconds").unwrap_or("3").parse()?;
+            println!("Pose readout for {}: {} rounds of {} s. Turn is yaw (negative left), pitch is nose_pitch (higher is chin down). Move and watch.", user, rounds, seconds);
+            println!("{:>5} {:>7} {:>7} {:>7} {:>7} {:>7} {:>6}", "round", "frames", "turn", "turn+-", "pitch", "pitch+-", "score");
+            for r in 1..=rounds {
+                let o = faceauth_daemon::server::sweep(&socket, &user, seconds)?;
+                let faceauth_daemon::auth::Outcome::Sweep { frames, .. } = &o else {
+                    println!("{}", serde_json::to_string(&o)?);
+                    continue;
+                };
+                if frames.is_empty() {
+                    println!("{:>5} {:>7}", r, "no face");
+                    continue;
+                }
+                let n = frames.len() as f32;
+                let mean = |f: &dyn Fn(&faceauth_daemon::auth::SweepFrame) -> f32| frames.iter().map(f).sum::<f32>() / n;
+                let (yaw, pitch, score) = (mean(&|f| f.yaw), mean(&|f| f.nose_pitch), mean(&|f| f.score));
+                let spread = |f: &dyn Fn(&faceauth_daemon::auth::SweepFrame) -> f32| { let v: Vec<f32> = frames.iter().map(f).collect(); (v.iter().cloned().fold(f32::MAX, f32::min), v.iter().cloned().fold(f32::MIN, f32::max)) };
+                let (ylo, yhi) = spread(&|f| f.yaw);
+                let (plo, phi) = spread(&|f| f.nose_pitch);
+                println!("{:>5} {:>7} {:>+7.2} {:>7} {:>7.2} {:>7} {:>6.2}", r, frames.len(), yaw, format!("{:+.2}..{:+.2}", ylo, yhi), pitch, format!("{:.2}..{:.2}", plo, phi), score);
+            }
+            Ok(())
+        }
         ["probe", rest @ ..] => {
             let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
             let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
@@ -224,6 +331,8 @@ fn main() -> Result<()> {
             let token = if token.is_empty() { None } else { Some(token.as_str()) };
             let o = if rest.contains(&"--ack") {
                 faceauth_daemon::server::consent_ack(&socket, &user, token)?
+            } else if let Some(m) = opt(rest, "--passwordless") {
+                faceauth_daemon::server::consent_passwordless(&socket, &user, m.parse().context("--passwordless takes minutes")?, token)?
             } else if rest.contains(&"--dismiss") {
                 faceauth_daemon::server::consent_answer(&socket, &user, None, true, token)?
             } else {
@@ -781,7 +890,7 @@ fn enroll(rest: &[&str]) -> Result<()> {
     let now = now_secs();
     for s in &samples {
         // Development path (direct camera): unbound templates, usable on any camera.
-        u.templates.push(Template { embedding: s.embedding.clone(), quality: s.score, face_width: s.face_width, created: now, label: label.clone(), device: None });
+        u.templates.push(Template { embedding: s.embedding.clone(), quality: s.score, face_width: s.face_width, created: now, label: label.clone(), device: None, yaw: None, nose_pitch: None });
     }
     let (lo, mean, hi) = u.self_consistency().unwrap_or((1.0, 1.0, 1.0));
     let path = store.save(&u)?;
@@ -798,6 +907,52 @@ fn at_rest_note(path: &str) -> String {
     } else {
         "Note: templates are plaintext at rest (root 0600): the daemon could not seal them (its log says why).".into()
     }
+}
+
+/// Five short rounds, one per look, so the identity covers the range of
+/// poses a person uses at the machine rather than one frontal view. Each
+/// round keeps only frames in its pose; a round that reads nothing in its
+/// pose is offered again.
+fn enroll_guided(socket: &std::path::Path, user: &str, label: &str, only: &[String]) -> Result<()> {
+    use faceauth_daemon::auth::{Outcome, POSES, POSE_HINTS};
+    println!("Enrolling {} in {}. Each takes about five seconds; the camera reads only frames in the look it asked for.", user, if only.is_empty() { "five looks".to_string() } else { format!("these looks: {}", only.join(", ")) });
+    let mut total = 0usize;
+    for (pose, hint) in POSES.iter().zip(POSE_HINTS.iter()) {
+        if !only.is_empty() && !only.iter().any(|o| o == pose) {
+            continue;
+        }
+        loop {
+            println!("\n{}: {}. Starting in 2 s.", pose.to_uppercase(), hint);
+            std::thread::sleep(Duration::from_secs(2));
+            println!("Hold it.");
+            let round_label = format!("{}-{}", label, pose);
+            let o = faceauth_daemon::server::enroll(socket, user, &round_label, 6.0, 4, Some(pose))?;
+            match &o {
+                Outcome::Enrolled { added, total: t, .. } => {
+                    println!("{} frames kept for {}.", added, pose);
+                    total = *t;
+                    break;
+                }
+                Outcome::Error { message } => {
+                    println!("Not read: {}", message);
+                    print!("Press Enter to try {} again, or s to skip it: ", pose);
+                    use std::io::Write as _;
+                    std::io::stdout().flush()?;
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    if line.trim().eq_ignore_ascii_case("s") {
+                        break;
+                    }
+                }
+                other => {
+                    println!("{}", serde_json::to_string(other)?);
+                    return Err(anyhow!("enrolment stopped"));
+                }
+            }
+        }
+    }
+    println!("\nSaved: {} templates in all.", total);
+    Ok(())
 }
 
 fn verify(rest: &[&str]) -> Result<()> {
