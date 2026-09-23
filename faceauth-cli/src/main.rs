@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth auth [--user NAME] [--socket PATH] [--consent]   (asks a running faceauthd; --consent = window + nod)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there?)\n  faceauth enroll [--user NAME] [--label TEXT] [--seconds N] [--count N]   (through the daemon)\n  faceauth enroll --store DIR ...                   (direct camera access, development)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] [--dismiss]   (from the consent window; stdin: token line, then password line)\n  faceauth consent-context --action ID --message TEXT [--cookie C]   (from the polkit agent, as a request starts)\n  faceauth calibrate [--user NAME] [--gestures-only]   (root; two nods, two shakes and three everyday movements, stored with the templates)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence                                (current state)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
+        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth auth [--user NAME] [--socket PATH] [--consent]   (asks a running faceauthd; --consent = window + nod)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there?)\n  faceauth enroll [--user NAME] [--label TEXT] [--seconds N] [--count N]   (through the daemon)\n  faceauth enroll --store DIR ...                   (direct camera access, development)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] [--dismiss]   (from the consent window; stdin: token line, then password line)\n  faceauth consent-context --action ID --message TEXT [--cookie C]   (from the polkit agent, as a request starts)\n  faceauth calibrate [--user NAME] [--gestures-only]   (root; two nods, two shakes and five everyday movements, stored with the templates)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence                                (current state)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
     );
     std::process::exit(2)
 }
@@ -99,7 +99,8 @@ fn main() -> Result<()> {
             println!("Calibrating for {}.\n", user);
             println!("Why: a nod approves root access and a head shake refuses it, so the daemon needs to");
             println!("know how you move. It records two nods and two shakes to learn the size of yours, and");
-            println!("then three ordinary movements (reading, a glance at the keyboard, talking) to learn what");
+            println!("then five ordinary movements (reading, a glance at the keyboard, talking, leaning in, a");
+            println!("look to the side) to learn what");
             println!("must never count. That is how an everyday movement cannot approve or refuse something");
             println!("on your behalf. Each round is a recording of head motion for a few seconds, never an");
             println!("image, stored root-only with your templates. The window will ask for each round.\n");
@@ -112,7 +113,7 @@ fn main() -> Result<()> {
                     let o = faceauth_daemon::server::calibrate(&socket, &user, gesture, seconds)?;
                     match &o {
                         faceauth_daemon::auth::Outcome::Calibrated { amplitude, sideways, stored, nod_floor, shake_floor, nod_margin, shake_margin, .. } => {
-                            let what = match gesture { "nod" => "nod", "shake" => "shake", "read" => "reading", "glance" => "glance at the keyboard", _ => "talking" };
+                            let what = match gesture { "nod" => "nod", "shake" => "shake", "read" => "reading", "glance" => "glance at the keyboard", "talk" => "talking", "lean" => "leaning in", _ => "look to the side" };
                             if matches!(gesture, "nod" | "shake") {
                                 println!("  {} {}/{}: moved {:.2} of a face width{}", what, i, rounds, amplitude, if *stored { "" } else { " (too small to count; not stored)" });
                             } else {

@@ -1126,7 +1126,7 @@ pub fn measure_motion(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config
     // Recorded only when `gesture_trace` is on, like a consent round: the
     // floors are what calibration keeps; a per-frame recording is a tuning
     // aid, plaintext under the root-only gestures directory, not a template.
-    let label: &'static str = match gesture { "shake" => "cal-shake", "read" => "cal-read", "glance" => "cal-glance", "talk" => "cal-talk", _ => "cal-nod" };
+    let label: &'static str = match gesture { "shake" => "cal-shake", "read" => "cal-read", "glance" => "cal-glance", "talk" => "cal-talk", "lean" => "cal-lean", "aside" => "cal-aside", _ => "cal-nod" };
     let saver = TraceSaver { cfg, user: user.to_string(), trace: Default::default(), label: std::cell::Cell::new(label) };
     let trace = &saver.trace;
     let mut prev: Option<(Grey, [f32; 4])> = None;

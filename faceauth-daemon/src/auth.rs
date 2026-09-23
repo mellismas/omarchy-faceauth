@@ -1095,13 +1095,15 @@ pub fn calibration_text(gesture: &str) -> (&'static str, &'static str) {
         "read" => ("read the screen for a few seconds", "Recognised. Just read this window for a few seconds, the way you normally read."),
         "glance" => ("look down at the keyboard and back, twice", "Recognised. Look down at your keyboard and back up at the screen, twice."),
         "talk" => ("say a sentence or two", "Recognised. Say a sentence or two, as if to someone beside you."),
+        "lean" => ("lean in toward the screen and back, twice", "Recognised. Lean in toward the screen and sit back, twice."),
+        "aside" => ("look over at something beside the screen and back, twice", "Recognised. Look over at something beside the screen and back, twice."),
         _ => ("nod twice, naturally", "Recognised. Nod twice, the way you would to say yes."),
     }
 }
 
 /// The rounds `faceauth calibrate` runs: the two gestures, then the
 /// everyday movements they must stand clear of.
-pub const CALIBRATION_ROUNDS: [(&str, usize, f32); 5] = [("nod", 2, 8.0), ("shake", 2, 8.0), ("read", 1, 10.0), ("glance", 1, 8.0), ("talk", 1, 8.0)];
+pub const CALIBRATION_ROUNDS: [(&str, usize, f32); 7] = [("nod", 2, 8.0), ("shake", 2, 8.0), ("read", 1, 10.0), ("glance", 1, 8.0), ("talk", 1, 8.0), ("lean", 1, 8.0), ("aside", 1, 8.0)];
 
 fn elapsed_of(o: &Outcome) -> u64 {
     match o {

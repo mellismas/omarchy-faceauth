@@ -1326,9 +1326,11 @@ been dropped).
 calibration confirms rather than adjusts for a big mover (both floors were
 pinned at their caps by his rounds), and the negatives came from one corpus,
 so a person who reads with a bigger bob than the reference user would sit
-closer to their nod floor unseen. `faceauth calibrate` now runs three
+closer to their nod floor unseen. `faceauth calibrate` now runs five
 everyday rounds after the gestures (read the screen for ten seconds, look
-down at the keyboard and back twice, say a sentence or two); the largest
+down at the keyboard and back twice, say a sentence or two, lean in toward
+the screen and back twice, look over at something beside the screen and
+back twice; the last two on Mike's ask); the largest
 excursion on each axis is stored as `still_nod` and `still_shake`, and the
 floor on that axis is raised to 1.5 times it, capped at 0.15 for the nod
 and 0.12 for the shake. The margins (typical gesture over largest everyday
