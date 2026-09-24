@@ -1526,6 +1526,7 @@ mod arg_tests {
                 face: false,
                 attentive: false,
                 face_px: 0.0,
+                scannable: false,
                 elapsed_ms: 1
             }),
             0

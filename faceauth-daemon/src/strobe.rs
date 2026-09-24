@@ -79,7 +79,7 @@ impl<'a> StrobeGate<'a> {
 
     /// A fresh mask for the next pair (C11). One mask per attempt lets a
     /// replayed stream that happens to be in phase pass every pair of the
-    /// attempt; drawn again after each scored pair, the matches an attempt
+    /// attempt; drawn again after each matched pair, the matches an attempt
     /// needs come under different masks, and a looping recording is in
     /// phase for both about one time in seventy instead of one in nine.
     /// The settle starts over, so a redraw costs the eight frames the next

@@ -121,7 +121,7 @@ One claim per bullet, each with where the code keeps it.
   confirm (`liveness::FlashResponse`, `auth::confirm`).
 - **Replay.** Each attempt draws a random strobe mask from 68 patterns in
   nine distinguishable classes, scores only frames that follow it, and
-  draws a fresh mask after every scored pair, so the two matches an
+  draws a fresh mask after every matching pair, so the two matches an
   attempt needs come under different masks: a recording that ignores the
   strobe control passes about one attempt in seventy; a device that reads
   the control and replays a face in step is not caught

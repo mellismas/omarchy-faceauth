@@ -52,6 +52,9 @@ pub enum Outcome {
         face: bool,
         attentive: bool,
         face_px: f32,
+        /// Near enough for an attempt to judge (`scannable`); the lock
+        /// screen wakes the panel only for such a face.
+        scannable: bool,
         elapsed_ms: u64,
     },
     /// Root only, development builds only: every frame of a pose sweep
@@ -393,6 +396,10 @@ impl Authenticator {
                 face: o.face,
                 attentive: o.attentive,
                 face_px: o.bbox.map(|b| b[2]).unwrap_or(0.0),
+                scannable: match (o.bbox, o.frame.as_ref()) {
+                    (Some(b), Some(f)) => scannable(b[2], f.width, f.height),
+                    _ => false,
+                },
                 elapsed_ms: t0.elapsed().as_millis() as u64,
             },
             Err(e) => Outcome::Error {
@@ -1524,8 +1531,6 @@ impl Authenticator {
                 }
                 Gated::Pass(face) => {
                     n_faces += 1;
-                    // The next scored pair comes under a fresh mask (C11).
-                    gate.redraw()?;
                     face
                 }
             };
@@ -1576,6 +1581,14 @@ impl Authenticator {
             );
             if matches >= self.cfg.required_matches {
                 break Some(face);
+            }
+            // The next match must come under a fresh mask (C11). Only a
+            // match earns the redraw: redrawing after every scored pair
+            // spent eight frames on each miss and halved the pairs an
+            // attempt could score, and the matches are what a replay has
+            // to land under two masks.
+            if score >= self.cfg.accept_threshold {
+                gate.redraw()?;
             }
         };
         let n_frames = n_frames + gate.frames();
@@ -1654,6 +1667,21 @@ pub(crate) enum Gated {
     Pass(faceauth_engine::Face),
 }
 
+/// The narrowest face, as a fraction of the frame's shorter side, that an
+/// attempt scores (60 px on a 480 px side). Enrolment's right distance
+/// starts at 0.14 (`enrol::SIZE_RIGHT`); sitting back from the reference
+/// machine measured 45 px, where the strobe cannot be read and the crop
+/// does not match. A face under this is treated as no face: never scored,
+/// so never a match and never charged against the five-a-minute rule, and
+/// the lock screen's probe does not wake the panel for it.
+pub const SCAN_MIN_FACE_FRAC: f32 = 0.125;
+
+/// Is a face `face_w` pixels wide, in a `w` by `h` frame, near enough to
+/// judge?
+pub fn scannable(face_w: f32, w: usize, h: usize) -> bool {
+    face_w >= SCAN_MIN_FACE_FRAC * w.min(h) as f32
+}
+
 /// Detect the face in a pair's lit frame (the best one, or, with `follow`,
 /// only a detection that continues that box), put the pair through the
 /// gate at it, and embed it only when the gate passed.
@@ -1678,6 +1706,10 @@ pub(crate) fn gated_face(
             log::debug!("confirm: the scored face is not the followed box");
             return Ok(Gated::NoFace);
         }
+    }
+    if !scannable(face.bbox[2], pair.lit.width, pair.lit.height) {
+        log::debug!("gate: face {:.0} px wide, too far to judge", face.bbox[2]);
+        return Ok(Gated::NoFace);
     }
     match gate.judge(pair, &face)? {
         Gate::Pass(fr) => {
@@ -2177,8 +2209,6 @@ pub fn confirm(
             }
             Gated::Pass(face) => {
                 pairs += 1;
-                // The next scored pair comes under a fresh mask (C11).
-                gate.redraw()?;
                 face
             }
         };
@@ -2191,6 +2221,8 @@ pub fn confirm(
                 if passed >= 2 {
                     break Confirm::Live;
                 }
+                // The second match comes under a fresh mask (C11).
+                gate.redraw()?;
             }
             // One pair under the threshold is a frame caught mid-movement
             // as often as a stranger; the refusal, like the pass, takes two.
@@ -2407,6 +2439,24 @@ mod confirm_tests {
         assert!(matches!(confirm_at_timeout(1), Confirm::NoSignal));
         assert!(matches!(confirm_at_timeout(2), Confirm::Refused(_)));
         assert!(matches!(confirm_at_timeout(5), Confirm::Refused(_)));
+    }
+}
+
+#[cfg(test)]
+mod scannable_tests {
+    use super::*;
+
+    /// On the reference camera's 640x480 frames: ordinary sitting (78 to
+    /// 96 px) is judged, sitting back (45 px, measured) is not; the rule
+    /// follows the frame's shorter side.
+    #[test]
+    fn a_face_too_far_to_judge_is_not_scanned() {
+        assert!(scannable(78.0, 640, 480));
+        assert!(scannable(60.0, 640, 480));
+        assert!(!scannable(45.0, 640, 480));
+        assert!(!scannable(59.0, 640, 480));
+        assert!(scannable(120.0, 1280, 960));
+        assert!(!scannable(100.0, 1280, 960));
     }
 }
 
