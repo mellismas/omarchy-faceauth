@@ -120,10 +120,12 @@ One claim per bullet, each with where the code keeps it.
   A print held up and waggled passes the detector and fails the strobed
   confirm (`liveness::FlashResponse`, `auth::confirm`).
 - **Replay.** Each attempt draws a random strobe mask from 68 patterns in
-  nine distinguishable classes and scores only frames that follow it, so a
-  recording that ignores the strobe control fails about eight attempts in
-  nine; a device that reads the control and replays a face in step is not
-  caught (`liveness::StrobePhase`).
+  nine distinguishable classes, scores only frames that follow it, and
+  draws a fresh mask after every scored pair, so the two matches an
+  attempt needs come under different masks: a recording that ignores the
+  strobe control passes about one attempt in seventy; a device that reads
+  the control and replays a face in step is not caught
+  (`liveness::StrobePhase`).
 - **Walk-away lock** (opt-in, `sudo faceauth presence on`): one short look
   every five seconds (ten on battery). In the default mode any face turned
   to the screen holds the lock off, whoever it belongs to (a laptop handed

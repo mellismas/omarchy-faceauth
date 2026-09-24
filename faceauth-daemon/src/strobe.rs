@@ -77,6 +77,31 @@ impl<'a> StrobeGate<'a> {
         })
     }
 
+    /// A fresh mask for the next pair (C11). One mask per attempt lets a
+    /// replayed stream that happens to be in phase pass every pair of the
+    /// attempt; drawn again after each scored pair, the matches an attempt
+    /// needs come under different masks, and a looping recording is in
+    /// phase for both about one time in seventy instead of one in nine.
+    /// The settle starts over, so a redraw costs the eight frames the next
+    /// pair waits for. Ungated, nothing happens.
+    pub fn redraw(&mut self) -> Result<()> {
+        let Some(phase) = self.phase.as_mut() else {
+            return Ok(());
+        };
+        let pattern = phase.redraw();
+        if let Some(i) = &self.cap.illuminator {
+            i.set_pattern(pattern)?;
+        }
+        self.prev = None;
+        self.started = Instant::now();
+        Ok(())
+    }
+
+    /// Masks drawn so far, counting the first; 0 when ungated.
+    pub fn draws(&self) -> usize {
+        self.phase.as_ref().map(|p| p.draws()).unwrap_or(0)
+    }
+
     /// Is the strobe running?
     pub fn strobed(&self) -> bool {
         self.phase.is_some()

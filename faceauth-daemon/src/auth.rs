@@ -1528,6 +1528,8 @@ impl Authenticator {
                 }
                 Gated::Pass(face) => {
                     n_faces += 1;
+                    // The next scored pair comes under a fresh mask (C11).
+                    gate.redraw()?;
                     face
                 }
             };
@@ -2179,6 +2181,8 @@ pub fn confirm(
             }
             Gated::Pass(face) => {
                 pairs += 1;
+                // The next scored pair comes under a fresh mask (C11).
+                gate.redraw()?;
                 face
             }
         };
@@ -2260,9 +2264,22 @@ pub fn nod_frames_match(
     Ok(r)
 }
 
-/// The rule behind `nod_frames_match`, on embeddings: every kept frame must
-/// score at or above `threshold` against a template usable on `device`, and
-/// there must be at least one.
+/// How far under the accept threshold a nod frame may score and still count
+/// as the user's own face pitched mid-nod. The frames are kept at the ends
+/// of the nod legs, chin down or chin up, which is where the embedder is
+/// weakest on an enrolled face; another person's face scores far below
+/// this against the user's templates, since different identities sit
+/// around 0.1 to 0.3 on this model, and the live confirm just before the
+/// nods matched at the full threshold. Set by reasoning, not measured on
+/// a corpus; the refusal log carries the scores so it can be.
+pub const NOD_FRAME_SLACK: f32 = 0.20;
+
+/// The rule behind `nod_frames_match`, on embeddings: there must be at
+/// least one kept frame, every frame must score within `NOD_FRAME_SLACK`
+/// of `threshold` against a template usable on `device`, and at least half
+/// of them must reach `threshold` itself. One pitched frame under the line
+/// is the user mid-nod; a frame far under it, or most of them under it,
+/// is someone else nodding.
 pub fn check_nod_embeddings(
     embeddings: &[Vec<f32>],
     templates: &UserTemplates,
@@ -2272,18 +2289,30 @@ pub fn check_nod_embeddings(
     if embeddings.is_empty() {
         return Err("no frames were kept from the nods".into());
     }
+    let floor = threshold - NOD_FRAME_SLACK;
+    let mut scores = Vec::with_capacity(embeddings.len());
     for (i, e) in embeddings.iter().enumerate() {
         match templates.best_match_on(e, device) {
-            Some((score, _)) if score >= threshold => {}
-            Some(_) => {
+            Some((score, _)) if score >= floor => scores.push(score),
+            Some((score, _)) => {
+                log::debug!("confirm: nod frame {} scored {:.3}", i + 1, score);
                 return Err(format!(
                     "nod frame {} of {} is not the enrolled face",
                     i + 1,
                     embeddings.len()
-                ))
+                ));
             }
             None => return Err("no template for this camera".into()),
         }
+    }
+    let passed = scores.iter().filter(|s| **s >= threshold).count();
+    if passed * 2 < scores.len() {
+        log::debug!("confirm: nod frame scores {:?}", scores);
+        return Err(format!(
+            "only {} of {} nod frames are the enrolled face",
+            passed,
+            scores.len()
+        ));
     }
     Ok(())
 }
@@ -2425,6 +2454,36 @@ mod nod_frame_tests {
             check_nod_embeddings(&[], &u, "ipu3:x", 0.70).is_err(),
             "no frames is not a pass"
         );
+        // The user's own face pitched mid-nod: one frame under the
+        // threshold but within the slack passes beside frames that reach
+        // it; most frames under it do not, and one far under it never does.
+        let pitched = vec![0.6, 0.8];
+        assert_eq!(
+            check_nod_embeddings(
+                &[me.clone(), pitched.clone(), me.clone()],
+                &u,
+                "ipu3:x",
+                0.70
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check_nod_embeddings(&[me.clone(), pitched.clone()], &u, "ipu3:x", 0.70),
+            Ok(()),
+            "half at the threshold is enough"
+        );
+        let e = check_nod_embeddings(
+            &[me.clone(), pitched.clone(), pitched.clone()],
+            &u,
+            "ipu3:x",
+            0.70,
+        )
+        .unwrap_err();
+        assert!(e.contains("only 1 of 3"), "{}", e);
+        let far = vec![0.4, 0.917];
+        let e =
+            check_nod_embeddings(&[me.clone(), far, me.clone()], &u, "ipu3:x", 0.70).unwrap_err();
+        assert!(e.contains("nod frame 2 of 3"), "{}", e);
         assert!(check_nod_embeddings(&[me], &u, "uvc:other", 0.70)
             .unwrap_err()
             .contains("no template"));

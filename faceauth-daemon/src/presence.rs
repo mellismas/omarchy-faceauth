@@ -391,8 +391,12 @@ impl Watch {
         // the chin or a look down at a phone fits no attentive pose and
         // embeds as nobody), so the hold runs for any look that holds
         // nothing, in both modes: the secure mode's first-miss lock is for
-        // a chair whose shape has changed, not for the user's own hand.
-        let held_by_shape = if !seen && partial_holds(now, self.last_full) {
+        // a chair whose shape has changed, not for the user's own hand. A
+        // face turned to the screen that fails its check is not hidden, it
+        // is someone else looking at the session, and the shape under it
+        // holds nothing.
+        let hidden = !obs.face || !obs.attentive;
+        let held_by_shape = if !seen && hidden && partial_holds(now, self.last_full) {
             let sim = match (self.reference.as_ref(), obs.frame.as_ref()) {
                 (Some(r), Some(f)) => same_shape(r, f),
                 _ => 0.0,
@@ -438,7 +442,8 @@ impl Watch {
                     self.reference = Some((f.clone(), b));
                 }
             }
-        } else if self.state == State::Present || self.state == State::Stranger {
+        } else if !held_by_shape && (self.state == State::Present || self.state == State::Stranger)
+        {
             log::info!("presence: nobody holds the clock this look (face {}, identity {:?}, frame {}, last full sighting {})", obs.face, obs.identity, obs.frame.is_some(), self.last_full.map(|t| format!("{:.0}s ago", now.duration_since(t).as_secs_f32())).unwrap_or_else(|| "never".into()));
         }
         let away_for = self.last_seen.map(|t| now.duration_since(t).as_secs_f32());
@@ -1300,6 +1305,40 @@ mod watch_tests {
             first_lock(&mut w, t0, &looks, PresenceMode::Secure),
             Some(4),
             "secure: the first failed check on a changed chair locks at once"
+        );
+    }
+
+    /// A face turned to the screen that fails its check is a stranger
+    /// looking at the session, not a hidden user, whatever the shape under
+    /// it: the secure mode locks on the first such check and the default
+    /// mode runs its clock once the two strikes are in.
+    #[test]
+    fn an_attentive_face_that_fails_its_check_gets_no_shape_hold() {
+        let mut frame = Grey::new(120, 120);
+        frame
+            .data
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, v)| *v = (i % 251) as u8);
+        let seen = Observation {
+            face: true,
+            attentive: true,
+            frame: Some(frame.clone()),
+            bbox: Some([20.0, 10.0, 40.0, 40.0]),
+            identity: Some(true),
+        };
+        let stranger = Observation {
+            identity: Some(false),
+            ..seen.clone()
+        };
+        let mut looks = vec![seen];
+        looks.extend((0..8).map(|_| stranger.clone()));
+        let t0 = Instant::now();
+        let mut w = Watch::new(cfg());
+        assert_eq!(
+            first_lock(&mut w, t0, &looks, PresenceMode::Secure),
+            Some(2),
+            "secure: the first failed check on a face looking at the screen locks"
         );
     }
 
