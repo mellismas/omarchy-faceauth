@@ -1,5 +1,5 @@
 //! Exposure, white-balance and tone calibration, as measured and signed off on
-//! the reference machine (see `kernel/CALIBRATION.md` in the pack).
+//! the reference machine (Surface Book 2, ov7251 IR and ov5693 RGB sensors).
 //!
 //! Everything here works on linear 10-bit samples. Nothing here touches a
 //! device: the loops compute the next setting and the caller applies it.
@@ -78,7 +78,8 @@ pub fn meter(px: &[u16], width: usize, black: u16, win: Window) -> Metering {
 ///
 /// - square-root approach so the loop under-shoots rather than oscillates
 /// - a clipped share above 5% never brightens; above 15% it darkens
-/// - rate limited to 0.8..1.25 per step (a step every 0.5 s)
+/// - rate limited to 0.8..1.25 per step, at the caller's step interval
+///   (`AutoExposure` steps every 400 ms)
 /// - a 6% deadband so a face leaning in or out does not make it chase
 pub fn ae_factor(m: Metering, target: f64) -> f64 {
     if m.mean <= 0.0 {
@@ -114,11 +115,71 @@ impl Smoother {
         self.acc = Some(a);
         a
     }
-    pub fn reset(&mut self) {
-        self.acc = None;
+}
+
+/// The exposure loop as one object: meter, smooth, step, at most once per
+/// `STEP` interval. It computes the next setting and the caller writes it
+/// to the sensor, so the loop is unit-tested without hardware and lives in
+/// one place for every capture path.
+#[derive(Clone, Debug)]
+pub struct AutoExposure {
+    smoother: Smoother,
+    /// The setting in force, as the caller last applied it.
+    pub exposure: Exposure,
+    /// What the meter saw at the last step, smoothed.
+    pub metering: Metering,
+    pub limits: ExposureLimits,
+    last_step: Option<std::time::Instant>,
+}
+
+impl AutoExposure {
+    /// Between steps. Measured on the reference machine: a face settles
+    /// in about 1.2 s at this rate without overshoot.
+    pub const STEP: std::time::Duration = std::time::Duration::from_millis(400);
+
+    pub fn new(start: Exposure, limits: ExposureLimits) -> Self {
+        AutoExposure {
+            smoother: Smoother::default(),
+            exposure: start,
+            metering: Metering::default(),
+            limits,
+            // The first step comes one interval after the stream starts, so
+            // the loop reads a frame the sensor has settled on at the seed.
+            last_step: Some(std::time::Instant::now()),
+        }
     }
-    pub fn value(&self) -> Option<f64> {
-        self.acc
+
+    /// Meter `win` of a 10-bit frame and, when a step interval has passed
+    /// and the reading calls for it, return the setting to apply next.
+    /// The caller records it back through `exposure` once applied. A frame
+    /// inside the interval is not metered at all.
+    pub fn observe(&mut self, px: &[u16], width: usize, win: Window) -> Option<Exposure> {
+        let now = std::time::Instant::now();
+        if self
+            .last_step
+            .map(|t| now.duration_since(t) < Self::STEP)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        self.last_step = Some(now);
+        let mut m = meter(px, width, 0, win);
+        // A window that is nearly all white reads a mean near 1.0 with a
+        // clip share that can still be small; treat it as clipped so the
+        // loop backs off rather than holds.
+        if m.mean > 0.95 {
+            m.clip = m.clip.max(0.2);
+        }
+        self.metering = Metering {
+            mean: self.smoother.push(m.mean),
+            clip: m.clip,
+        };
+        let f = ae_factor(self.metering, AE_TARGET);
+        if f == 1.0 {
+            return None;
+        }
+        let next = self.exposure.step(f, &self.limits);
+        (next != self.exposure).then_some(next)
     }
 }
 
@@ -168,13 +229,16 @@ impl Exposure {
     }
 }
 
-/// The IR loop's limits on the reference sensor (ov7251 at 30 fps).
+/// The IR loop's limits on the reference sensor (ov7251 at 30 fps); the
+/// live loops read theirs from the sensor's controls.
+#[cfg(test)]
 pub const IR_LIMITS: ExposureLimits = ExposureLimits {
     exposure: (1, 1704),
     gain: Some((16, 1023)),
     dgain_max: 4.0,
 };
 /// The RGB loop's limits on the reference sensor (ov5693 at 1296x972).
+#[cfg(test)]
 pub const RGB_LIMITS: ExposureLimits = ExposureLimits {
     exposure: (1, 1030),
     gain: None,
@@ -183,6 +247,7 @@ pub const RGB_LIMITS: ExposureLimits = ExposureLimits {
 /// Metering target for both loops.
 pub const AE_TARGET: f64 = 0.30;
 
+#[cfg(feature = "dev-tools")]
 /// Grey-world white balance on Bayer-reduced RGB: gains that bring the R and B
 /// means to the G mean, using mid-tone blocks only (0.08..0.85 of range) so
 /// highlights and the black floor do not vote. Smoothed with alpha 0.15.
@@ -192,12 +257,14 @@ pub struct WhiteBalance {
     pub wb: f64,
 }
 
+#[cfg(feature = "dev-tools")]
 impl Default for WhiteBalance {
     fn default() -> Self {
         WhiteBalance { wr: 1.0, wb: 1.0 }
     }
 }
 
+#[cfg(feature = "dev-tools")]
 impl WhiteBalance {
     /// `rgb` is the reduced frame; `range` is `1023 - black`.
     pub fn update(&mut self, rgb: &[[f32; 3]], range: f64) -> &Self {
@@ -226,6 +293,7 @@ impl WhiteBalance {
     }
 }
 
+#[cfg(feature = "dev-tools")]
 /// Percentile of a 10-bit frame, subsampled by `step`, never returning 0 for
 /// the black point so divisions stay safe.
 pub fn percentile(px: &[u16], step: usize, p: f64) -> u16 {
@@ -246,6 +314,7 @@ pub fn percentile(px: &[u16], step: usize, p: f64) -> u16 {
     1023
 }
 
+#[cfg(feature = "dev-tools")]
 /// The signed-off fixed look for the two displays (used by the viewer and by
 /// the enrolment preview). The matcher's input is normalised separately.
 #[derive(Clone, Copy, Debug)]
@@ -254,12 +323,14 @@ pub struct IrLook {
     pub brightness: f64,
     pub contrast: f64,
 }
+#[cfg(feature = "dev-tools")]
 pub const IR_LOOK: IrLook = IrLook {
     dgain: 1.0,
     brightness: 0.25,
     contrast: 2.05,
 };
 
+#[cfg(feature = "dev-tools")]
 #[derive(Clone, Copy, Debug)]
 pub struct RgbLook {
     pub r_gain: f64,
@@ -270,6 +341,7 @@ pub struct RgbLook {
     pub contrast: f64,
     pub gamma: f64,
 }
+#[cfg(feature = "dev-tools")]
 pub const RGB_LOOK: RgbLook = RgbLook {
     r_gain: 1.3,
     g_gain: 1.3,
@@ -280,6 +352,7 @@ pub const RGB_LOOK: RgbLook = RgbLook {
     gamma: 2.2,
 };
 
+#[cfg(feature = "dev-tools")]
 /// IR frame to 8-bit grey with black/white stretch and the fixed look.
 pub fn ir_to_grey8(px: &[u16], black: u16, white: u16, look: IrLook, out: &mut [u8]) {
     let span = (white.max(black + 1) - black) as f64;
@@ -296,6 +369,7 @@ pub fn ir_to_grey8(px: &[u16], black: u16, white: u16, look: IrLook, out: &mut [
     }
 }
 
+#[cfg(feature = "dev-tools")]
 /// Bayer-reduced RGB to 8-bit sRGB-ish with white balance, the fixed look and gamma.
 pub fn rgb_to_rgb8(
     rgb: &[[f32; 3]],
@@ -486,6 +560,86 @@ mod tests {
         assert_eq!(rgb.dgain, 1.25, "RGB has no analogue gain");
     }
 
+    /// A loop whose caller never multiplies the frame by the digital gain
+    /// must cap it at 1.0: with the cap at 4.0, a dark spell at maximum
+    /// exposure and gain climbs a gain that changes nothing on the sensor,
+    /// and the first darkening steps afterwards only unwind it (seven
+    /// steps, 2.8 s at the 400 ms interval, with the frames still
+    /// saturated). With the cap at 1.0 the first darkening step moves the
+    /// analogue gain at once.
+    #[test]
+    fn a_digital_gain_the_caller_never_applies_is_capped_at_one() {
+        let phantom = IR_LIMITS;
+        let mut e = Exposure {
+            exposure: 1704,
+            gain: 1023,
+            dgain: 1.0,
+        };
+        for _ in 0..7 {
+            e = e.step(1.25, &phantom);
+        }
+        assert!(e.dgain > 3.9, "{:?}", e);
+        let mut wasted = 0;
+        while e.dgain > 1.0 {
+            e = e.step(0.8, &phantom);
+            wasted += 1;
+        }
+        assert_eq!(
+            (e.exposure, e.gain),
+            (1704, 1023),
+            "nothing on the sensor moved"
+        );
+        assert_eq!(wasted, 7);
+
+        let capped = ExposureLimits {
+            dgain_max: 1.0,
+            ..IR_LIMITS
+        };
+        let mut e = Exposure {
+            exposure: 1704,
+            gain: 1023,
+            dgain: 1.0,
+        };
+        for _ in 0..7 {
+            e = e.step(1.25, &capped);
+        }
+        assert_eq!(e.dgain, 1.0);
+        let down = e.step(0.8, &capped);
+        assert!(
+            down.gain < 1023,
+            "the first darkening step moves the sensor: {:?}",
+            down
+        );
+    }
+
+    /// The stepper meters at most once per interval and hands back a new
+    /// setting only when the reading calls for one.
+    #[test]
+    fn the_stepper_meters_once_per_interval() {
+        let lim = ExposureLimits {
+            dgain_max: 1.0,
+            ..IR_LIMITS
+        };
+        let start = Exposure {
+            exposure: 500,
+            gain: 16,
+            dgain: 1.0,
+        };
+        let mut ae = AutoExposure::new(start, lim);
+        ae.last_step = None;
+        let (w, h) = (100usize, 100usize);
+        let dark = vec![50u16; w * h];
+        let win = Window::centre(w, h);
+        let next = ae.observe(&dark, w, win).expect("a dark frame brightens");
+        assert!(next.exposure > 500, "{:?}", next);
+        ae.exposure = next;
+        assert!(
+            ae.observe(&dark, w, win).is_none(),
+            "a second frame inside the interval is not metered"
+        );
+        assert!(ae.metering.mean < AE_TARGET);
+    }
+
     #[test]
     fn meter_reads_mean_and_clip() {
         let (w, h) = (100usize, 100usize);
@@ -512,6 +666,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "dev-tools")]
     #[test]
     fn percentile_never_zero() {
         assert_eq!(percentile(&[0u16; 100], 1, 0.005), 1);

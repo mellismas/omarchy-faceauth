@@ -98,6 +98,7 @@ pub fn unpack_y16(
     true
 }
 
+#[cfg(feature = "dev-tools")]
 /// Bayer 2x2 block reduction: each block becomes one linear (R, G, B) triple on
 /// the 10-bit scale after black subtraction, with the two greens averaged.
 /// `order` names the top-left pixel of a block: `B` for BGGR, `R` for RGGB,
@@ -110,6 +111,7 @@ pub enum BayerOrder {
     Gbrg,
 }
 
+#[cfg(feature = "dev-tools")]
 /// The last raw row pair of the IPU3 RGB frame is not image data; `rows_out`
 /// callers pass `height / 2 - 1` for it.
 pub fn bayer_reduce(
@@ -207,6 +209,7 @@ mod tests {
 
     /// Dimensions whose product overflows are refused, not wrapped into a
     /// size check that passes (F14).
+    #[cfg(feature = "dev-tools")]
     #[test]
     fn absurd_dimensions_are_refused_not_wrapped() {
         let mut dst = vec![0u16; 16];
@@ -235,6 +238,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "dev-tools")]
     #[test]
     fn bayer_bggr_picks_the_right_sites() {
         // One 2x2 block: B=100 G=200 / G=300 R=400, black 10.

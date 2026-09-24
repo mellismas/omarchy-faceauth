@@ -13,6 +13,9 @@ path = "src/lib.rs"
 name = "faceauthd"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow.workspace = true
 env_logger.workspace = true

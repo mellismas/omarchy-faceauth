@@ -9,7 +9,7 @@
 //! uid's user, or anything if it is root. Attempts are serialised; a second
 //! request while one runs waits its turn (the camera is one resource).
 
-use crate::auth::{Authenticator, Outcome};
+use crate::auth::{consent_denied, Authenticator, Outcome, Refusal};
 use anyhow::{bail, Context, Result};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use serde::Deserialize;
@@ -18,131 +18,138 @@ use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 /// Longest request line accepted, before any authorisation.
 const MAX_REQUEST: u64 = 4096;
 /// Connections handled at once; the rest are refused immediately.
 const MAX_CONNECTIONS: usize = 8;
+/// How often the idle thread looks, and how long the recognition model may sit
+/// unused before it is released.
+const MODEL_IDLE_TICK: Duration = Duration::from_secs(60);
+const MODEL_IDLE_RELEASE: Duration = Duration::from_secs(600);
 /// How long a request waits for the camera before answering "busy".
 const BUSY_WAIT: Duration = Duration::from_millis(1500);
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
-/// The consent answer slot and the pending set, cloned from the authenticator
-/// at start so answer requests never need the camera lock.
-static ANSWERS: std::sync::LazyLock<crate::consent::Answers> =
-    std::sync::LazyLock::new(Default::default);
-/// The uid whose consent request holds the window, if any. A request of
-/// the same user waits its turn (the user answers what is on screen, then
-/// gets the next); a request of another user is refused at once and falls
-/// to its password, so one user's parked request never holds another's
-/// sudo open (B1).
-static CONSENT_TURN: Mutex<Option<u32>> = Mutex::new(None);
-/// Consent requests live or waiting, per uid. Requests queue and take the
-/// window in turn, and a user running many things at once (twenty agent
-/// sessions each calling sudo from its own terminal) may well have a
-/// dozen waiting; the bound is against a runaway same-uid loop holding
-/// threads open, not a limit anyone is meant to reach.
-static CONSENT_COUNT: Mutex<Vec<(u32, usize)>> = Mutex::new(Vec::new());
-const CONSENT_PER_UID: usize = 32;
+/// Who has templates, kept beside the socket ACL: set at start and again
+/// after every enrolment and deletion, the same moments the ACL changes.
+/// The bar widget's presence poll reads it instead of the store, so a poll
+/// never waits on the authenticator while an enrolment walk-through or a
+/// consent request holds it. Parked polls each kept a connection slot for
+/// as long as the session ran, and after eight the window's own Continue,
+/// Redo and Cancel were answered "busy" (C5).
+static ENROLLED: RwLock<Vec<String>> = RwLock::new(Vec::new());
+/// After the user says no (a shake, a dismissal, a confirm that refused)
+/// the no stands for a while, per user, whoever asks: sudo retries a failed
+/// authentication three times from the same process, polkit asks again
+/// through a fresh helper, and a program can run either again at once. A
+/// request in that time is refused without a window, so a refusal cannot
+/// be worn down by asking until a tired nod gets through (A5).
+static REFUSALS: Mutex<Vec<(u32, Backoff)>> = Mutex::new(Vec::new());
 
-/// The turn, released when the request ends however it ends.
-struct Turn;
+/// The first refusal stands this long; each refusal that follows within
+/// `BACKOFF_QUIET` of the last doubles it, up to `BACKOFF_MAX_DOUBLINGS`.
+const BACKOFF: Duration = Duration::from_secs(60);
+const BACKOFF_MAX_DOUBLINGS: u32 = 3;
+const BACKOFF_QUIET: Duration = Duration::from_secs(600);
 
-impl Drop for Turn {
-    fn drop(&mut self) {
-        if let Ok(mut t) = CONSENT_TURN.lock() {
-            *t = None;
+/// One user's standing refusal.
+#[derive(Clone, Copy, Debug, Default)]
+struct Backoff {
+    until: Option<Instant>,
+    /// When the last no was said.
+    last: Option<Instant>,
+    /// Doublings earned by repeated refusals.
+    level: u32,
+    /// The user has been told once for this spell.
+    notified: bool,
+}
+
+impl Backoff {
+    /// The user said no now: how long requests are refused for.
+    fn refuse(&mut self, now: Instant) -> Duration {
+        let repeat = self
+            .last
+            .is_some_and(|l| now.duration_since(l) < BACKOFF_QUIET);
+        self.level = if repeat {
+            (self.level + 1).min(BACKOFF_MAX_DOUBLINGS)
+        } else {
+            0
+        };
+        let length = BACKOFF * 2u32.pow(self.level);
+        self.until = Some(now + length);
+        self.last = Some(now);
+        self.notified = false;
+        length
+    }
+
+    /// How much longer the refusal stands, if it does.
+    fn standing(&self, now: Instant) -> Option<Duration> {
+        self.until
+            .filter(|u| *u > now)
+            .map(|u| u.saturating_duration_since(now))
+    }
+}
+
+/// The refusal standing for this uid now, and whether this is the first
+/// request refused by it (the one that gets a notice).
+fn refusal_standing(uid: u32, now: Instant) -> Option<(Duration, bool)> {
+    let mut r = REFUSALS.lock().ok()?;
+    r.retain(|(_, b)| {
+        b.until.is_some_and(|u| u > now)
+            || b.last
+                .is_some_and(|l| now.duration_since(l) < BACKOFF_QUIET)
+    });
+    let (_, b) = r.iter_mut().find(|(u, _)| *u == uid)?;
+    let left = b.standing(now)?;
+    let first = !std::mem::replace(&mut b.notified, true);
+    Some((left, first))
+}
+
+/// The user said no to a request of this uid's: start or lengthen the
+/// standing refusal.
+fn refused(uid: u32, now: Instant) -> Duration {
+    let Ok(mut r) = REFUSALS.lock() else {
+        return Duration::ZERO;
+    };
+    if let Some((_, b)) = r.iter_mut().find(|(u, _)| *u == uid) {
+        return b.refuse(now);
+    }
+    let mut b = Backoff::default();
+    let d = b.refuse(now);
+    r.push((uid, b));
+    d
+}
+
+/// Was this the user saying no? A shake, a dismissal or a refused confirm;
+/// not a timeout, a wrong password or a request that fell through.
+fn is_explicit_no(o: &Outcome) -> bool {
+    match o {
+        Outcome::Refused { reason, .. } | Outcome::ConsentDenied { reason, .. } => {
+            Refusal::parse(reason).is_some_and(|r| r.is_explicit_no())
         }
+        _ => false,
     }
 }
-
-/// What a request finds when it asks for the turn.
-#[derive(Debug, PartialEq)]
-enum TurnCall {
-    /// Taken; the caller now holds it.
-    Taken,
-    /// Held by the same user: wait and ask again.
-    Wait,
-    /// Held by another user: refuse, do not wait.
-    OtherUser(u32),
-}
-
-/// Ask for the turn on behalf of `uid`.
-fn ask_turn(turn: &Mutex<Option<u32>>, uid: u32) -> TurnCall {
-    let mut t = turn.lock().unwrap_or_else(|p| p.into_inner());
-    match *t {
-        None => {
-            *t = Some(uid);
-            TurnCall::Taken
-        }
-        Some(h) if h == uid => TurnCall::Wait,
-        Some(h) => TurnCall::OtherUser(h),
-    }
-}
-
-/// A place among the user's consent requests, given back when the request ends.
-struct ConsentPlace(u32);
-
-impl Drop for ConsentPlace {
-    fn drop(&mut self) {
-        if let Ok(mut c) = CONSENT_COUNT.lock() {
-            if let Some(e) = c.iter_mut().find(|(u, _)| *u == self.0) {
-                e.1 = e.1.saturating_sub(1);
-            }
-            c.retain(|(_, n)| *n > 0);
-        }
-    }
-}
-
-/// Take a place among `uid`'s consent requests, or None when the user
-/// already has `CONSENT_PER_UID` live or waiting.
-fn take_consent_place(count: &Mutex<Vec<(u32, usize)>>, uid: u32) -> Option<ConsentPlace> {
-    let mut c = count.lock().unwrap_or_else(|p| p.into_inner());
-    let n = c
-        .iter()
-        .find(|(u, _)| *u == uid)
-        .map(|(_, n)| *n)
-        .unwrap_or(0);
-    if n >= CONSENT_PER_UID {
-        return None;
-    }
-    match c.iter_mut().find(|(u, _)| *u == uid) {
-        Some(e) => e.1 += 1,
-        None => c.push((uid, 1)),
-    }
-    Some(ConsentPlace(uid))
-}
-/// Requesters (pid, start time) the user refused, and when. sudo retries a
-/// failed authentication (three tries by default), each a new request from
-/// the same process: the refusal stands for those retries without a window.
-static REFUSED: Mutex<Vec<((i32, u64), Instant)>> = Mutex::new(Vec::new());
-const REFUSAL_STANDS: Duration = Duration::from_secs(30);
-/// Polkit asks again after a failure, through a fresh helper, until the
-/// agent cancels the request (which it does on a face refusal, a moment
-/// later). A refusal for a user's polkit request stands for this long, so
-/// the helper that arrives in that moment is refused without a window.
-static POLKIT_REFUSED: Mutex<Vec<(u32, Instant)>> = Mutex::new(Vec::new());
-const POLKIT_REFUSAL_STANDS: Duration = Duration::from_secs(5);
-/// The daemon's config, for notices sent while the authenticator is busy
-/// with another request (its mutex is held for a whole consent round).
+/// The daemon's config, for the presence query answered while the
+/// authenticator is busy with another request (its mutex is held for a
+/// whole consent round).
 static CFG: std::sync::OnceLock<crate::config::Config> = std::sync::OnceLock::new();
-static PENDING: std::sync::LazyLock<Arc<Mutex<std::collections::HashSet<String>>>> =
-    std::sync::LazyLock::new(Default::default);
 
-/// Wire the authenticator's answer slot and pending set to the server's statics.
-pub fn attach(auth: &mut Authenticator) {
-    auth.answers = Arc::clone(&ANSWERS);
-    auth.pending = Arc::clone(&PENDING);
-}
-
+/// A request line. Unknown fields are refused rather than dropped: a
+/// misspelt answer field would otherwise read as a plain look (A3).
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Request {
     user: String,
     /// true: a presence probe (one short look, detector only) instead of an attempt.
     #[serde(default)]
     probe: bool,
-    /// Root only: a pose sweep of this many seconds, scored per frame.
+    /// Root only, development builds only: a pose sweep of this many
+    /// seconds, scored per frame. The package has no such field, so the
+    /// request is refused as unknown there (H2).
+    #[cfg(feature = "dev-tools")]
     #[serde(default)]
     sweep_seconds: Option<f32>,
     /// true: is the daemon up, with models loaded and this user enrolled?
@@ -175,10 +182,6 @@ struct Request {
     /// An elevation: open the consent window, require the nod.
     #[serde(default)]
     consent: bool,
-    /// Seconds the caller will wait for the consent verdict; the window stays
-    /// up for the whole of it minus a margin, and never longer.
-    #[serde(default)]
-    budget: Option<f32>,
     /// From the consent window: the typed password for the pending request.
     #[serde(default)]
     consent_password: Option<String>,
@@ -188,6 +191,10 @@ struct Request {
     /// From the consent window: it has drawn the request the token names.
     #[serde(default)]
     consent_ack: bool,
+    /// From the consent window: the user pressed "Ready to nod" after a nod
+    /// window passed unanswered, so the nods may be armed again.
+    #[serde(default)]
+    consent_rearm: bool,
     /// From the consent window: with the approval of this request, turn
     /// passwordless sudo on for this many minutes.
     #[serde(default)]
@@ -195,21 +202,16 @@ struct Request {
     /// From the consent window: the token the daemon put in its payload.
     #[serde(default)]
     consent_token: Option<String>,
-    /// Root only: a calibration round for "nod" or "shake".
-    #[serde(default)]
-    calibrate: Option<String>,
-    #[serde(default)]
-    calibrate_start: bool,
-    #[serde(default)]
-    calibrate_verify: bool,
-    #[serde(default)]
-    calibrate_replace: bool,
     /// From the polkit agent: what the request it is about to serve is.
     #[serde(default)]
     context_action: Option<String>,
     #[serde(default)]
     context_message: Option<String>,
+    /// Sent by the agent and read by nothing: the cookie names polkit's
+    /// own session, which the daemon has no use for. Accepted so the
+    /// agent's line is not refused as unknown.
     #[serde(default)]
+    #[allow(dead_code)]
     context_cookie: Option<String>,
     /// From the polkit agent: polkitd's caller and subject pids, when its
     /// Quickshell exposes the request's details.
@@ -223,22 +225,33 @@ struct Request {
     presence_mode: Option<String>,
 }
 
-/// Who may connect: root, and the enrolled users, by ACL on the socket
-/// (mode 0660 plus a read-write entry per enrolled uid). Any other account
-/// is refused by the kernel before a byte is read. No group, so no re-login
-/// at setup: enrolment itself grants access, deletion revokes it.
+/// The setfacl spec for the socket: root through the owner and group
+/// entries, one read-write entry per listed uid, nothing for anyone else.
+/// Pure, so the tests can check who a given list admits.
+fn acl_spec(uids: &[u32]) -> String {
+    let mut spec = String::from("u::rw,g::rw,o::-");
+    for uid in uids {
+        spec.push_str(&format!(",u:{}:rw", uid));
+    }
+    spec
+}
+
+/// Who may connect: root, the enrolled users, and the user whose enrolment
+/// walk-through is running, by ACL on the socket (mode 0660 plus a
+/// read-write entry per uid). Any other account is refused by the kernel
+/// before a byte is read. No group, so no re-login at setup: the
+/// walk-through grants its own user for its duration (the window and its
+/// control calls run as that user, who has no template yet), a finished
+/// enrolment keeps the grant, and the refresh after any other outcome or
+/// a deletion revokes it.
 pub fn apply_socket_acl(socket: &Path, users: &[String]) {
     use std::os::unix::fs::PermissionsExt;
     if let Err(e) = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o660)) {
         log::warn!("socket mode: {}", e);
         return;
     }
-    let mut spec = String::from("u::rw,g::rw,o::-");
-    for u in users {
-        if let Some(uid) = user_uid(u) {
-            spec.push_str(&format!(",u:{}:rw", uid));
-        }
-    }
+    let uids: Vec<u32> = users.iter().filter_map(|u| user_uid(u)).collect();
+    let spec = acl_spec(&uids);
     match std::process::Command::new("/usr/bin/setfacl")
         .arg("--set")
         .arg(&spec)
@@ -248,7 +261,7 @@ pub fn apply_socket_acl(socket: &Path, users: &[String]) {
         .output()
     {
         Ok(o) if o.status.success() => log::info!(
-            "socket open to root and {} enrolled user(s): {}",
+            "socket open to root and {} user(s): {}",
             users.len(),
             users.join(" ")
         ),
@@ -263,7 +276,25 @@ pub fn apply_socket_acl(socket: &Path, users: &[String]) {
 
 fn refresh_socket_acl(auth: &Mutex<Authenticator>) {
     if let Ok(a) = auth.lock() {
-        apply_socket_acl(&a.cfg.socket, &a.store.enrolled_users());
+        let users = a.store.enrolled_users();
+        apply_socket_acl(Path::new(crate::config::SOCKET), &users);
+        set_enrolled(users);
+    }
+}
+
+fn set_enrolled(users: Vec<String>) {
+    match ENROLLED.write() {
+        Ok(mut e) => *e = users,
+        Err(p) => *p.into_inner() = users,
+    }
+}
+
+/// Is `user` enrolled, by the list kept at the last enrolment or deletion?
+/// No lock but the list's own, so it answers at once during a walk-through.
+fn is_enrolled(user: &str) -> bool {
+    match ENROLLED.read() {
+        Ok(e) => e.iter().any(|u| u == user),
+        Err(p) => p.into_inner().iter().any(|u| u == user),
     }
 }
 
@@ -281,9 +312,32 @@ pub fn serve(auth: Arc<Mutex<Authenticator>>, socket: &Path) -> Result<()> {
             .map(|a| a.store.enrolled_users())
             .unwrap_or_default();
         apply_socket_acl(socket, &users);
+        set_enrolled(users);
     }
     if let Ok(a) = auth.lock() {
         let _ = CFG.set(a.cfg.clone());
+    }
+    // The recognition model is the daemon's one large allocation, about
+    // 250 MB resident. After ten minutes without an embed it is dropped and
+    // the pages handed back; the next attempt reloads it in under half a
+    // second. The presence watch keeps it warm by using it, so a watched
+    // user never pays the reload, and try_lock keeps this off any request's
+    // critical path.
+    {
+        let auth = Arc::clone(&auth);
+        std::thread::Builder::new()
+            .name("model-idle".into())
+            .spawn(move || loop {
+                std::thread::sleep(MODEL_IDLE_TICK);
+                if let Ok(mut a) = auth.try_lock() {
+                    if a.pipeline.embedder.is_loaded()
+                        && a.pipeline.embedder.idle_for() > MODEL_IDLE_RELEASE
+                    {
+                        a.pipeline.embedder.release();
+                    }
+                }
+            })
+            .context("spawn the model idle thread")?;
     }
     log::info!("listening on {}", socket.display());
     for conn in listener.incoming() {
@@ -544,8 +598,6 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> R
         let ctx = crate::consent::PolkitContext {
             action: clip(action),
             message: clip(req.context_message.as_deref().unwrap_or("")),
-            cookie: clip(req.context_cookie.as_deref().unwrap_or("")),
-            uid: cred.uid(),
             agent: peer,
             caller_pid: req.context_caller_pid,
             subject_pid: req.context_subject_pid,
@@ -570,33 +622,20 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> R
         return reply(&mut stream, &Outcome::Noted);
     }
     // Answers to a pending consent request must not wait for the camera lock:
-    // the consent flow holds it. They go through the shared answer slot.
+    // the consent flow holds it. They go into the live record, whose own
+    // lock is held for microseconds.
     if req.consent_password.is_some()
         || req.consent_dismiss
         || req.consent_ack
+        || req.consent_rearm
         || req.consent_passwordless.is_some()
     {
-        // No lock: read the shared handles through a short-lived try_lock on
-        // the authenticator is impossible while consent runs, so they live in
-        // the server's own copies (see `serve`).
-        let (answers, pending) = (&ANSWERS, &PENDING);
-        // The acknowledgement arrives during the first show, before the
-        // request is marked pending; its token is the whole check.
-        let is_pending = pending
-            .lock()
-            .map(|p| p.contains(&req.user))
-            .unwrap_or(false);
-        if !is_pending && !req.consent_ack {
-            return reply(
-                &mut stream,
-                &Outcome::Error {
-                    message: "no pending request".into(),
-                },
-            );
-        }
+        let consent = &crate::consent::CONSENT;
         // Only the window the daemon summoned holds the token; a process
         // that merely reaches the socket cannot cancel or answer a request.
-        if !crate::consent::Dialog::token_matches(&req.user, req.consent_token.as_deref()) {
+        // The token is the whole check: it exists exactly while a request
+        // of this user's is live and has a window.
+        if !consent.token_matches(&req.user, req.consent_token.as_deref()) {
             log::warn!(
                 "consent answer for {} from uid {} pid {} without the request's token: refused",
                 req.user,
@@ -611,7 +650,7 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> R
             );
         }
         if req.consent_ack {
-            crate::consent::ack(&req.user, req.consent_token.as_deref());
+            consent.ack(&req.user, req.consent_token.as_deref());
             log::info!(
                 "consent window for {} (uid {}, pid {}) acknowledged the request",
                 req.user,
@@ -621,36 +660,55 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> R
             return reply(&mut stream, &Outcome::Noted);
         }
         if let Some(minutes) = req.consent_passwordless {
-            let armed = crate::consent::arm_passwordless(&req.user, minutes);
-            log::info!(
-                "consent window for {} (uid {}): passwordless sudo for {} min {}",
-                req.user,
-                cred.uid(),
+            // The rider record decides: the token must be the card's own
+            // request, the lane sudo, and the enrolled face in the nod
+            // window now. The card greys its button on the same signal, so
+            // a program driving the socket gets no more than the button.
+            let armed = consent.arm_passwordless(
+                &req.user,
+                req.consent_token.as_deref().unwrap_or(""),
                 minutes,
-                if armed {
-                    "armed on this request's approval"
-                } else {
-                    "refused (out of range)"
-                }
             );
-            let o = if armed {
-                Outcome::Noted
-            } else {
-                Outcome::Error {
-                    message: "minutes out of range".into(),
-                }
+            match &armed {
+                Ok(()) => log::info!(
+                    "consent window for {} (uid {}): passwordless sudo for {} min armed on this request's approval",
+                    req.user,
+                    cred.uid(),
+                    minutes
+                ),
+                Err(why) => log::warn!(
+                    "consent window for {} (uid {}, pid {}): passwordless sudo for {} min refused: {}",
+                    req.user,
+                    cred.uid(),
+                    cred.pid(),
+                    minutes,
+                    why
+                ),
+            }
+            let o = match armed {
+                Ok(()) => Outcome::Noted,
+                Err(why) => Outcome::Error {
+                    message: why.into(),
+                },
             };
             return reply(&mut stream, &o);
         }
         let answer = if req.consent_dismiss {
             crate::consent::Answer::Dismiss
+        } else if req.consent_rearm {
+            crate::consent::Answer::Rearm
         } else {
             crate::consent::Answer::Password(crate::consent::Secret::new(
                 req.consent_password.take().unwrap_or_default(),
             ))
         };
-        if let Ok(mut m) = answers.lock() {
-            m.insert(req.user.clone(), answer);
+        if let Err(why) = consent.answer(&req.user, req.consent_token.as_deref(), answer) {
+            return reply(
+                &mut stream,
+                &Outcome::Error {
+                    message: why.into(),
+                },
+            );
         }
         log::info!(
             "consent answer for {} from uid {}: {}",
@@ -658,63 +716,20 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> R
             cred.uid(),
             if req.consent_dismiss {
                 "dismiss"
+            } else if req.consent_rearm {
+                "ready to nod"
             } else {
                 "password"
             }
         );
-        return reply(
-            &mut stream,
-            &Outcome::Pong {
-                version: env!("CARGO_PKG_VERSION").into(),
-                model: String::new(),
-                templates: 0,
-                sealed: false,
-                unbound: 0,
-                floors: None,
-            },
-        );
+        return reply(&mut stream, &Outcome::Noted);
     }
     // The watched user reads ("query") or switches the presence watch's
     // mode for this run of the daemon: local (the gate above), and only
     // that user, for their own watch. It does not persist; the config sets
     // the mode at every start. Both forms answer with the state.
     if let Some(mode) = &req.presence_mode {
-        let watched = CFG.get().map(|c| c.presence.clone()).unwrap_or_default();
-        // "Watching" is what the bar widget and the key binding show up for,
-        // so it also needs the user enrolled: a watch configured for a user
-        // with no templates never locks for them and offers nothing to switch.
-        let enrolled = auth
-            .lock()
-            .map(|a| a.store.enrolled_users().iter().any(|u| u == &req.user))
-            .unwrap_or(false);
-        let outcome = match presence_mode_change(cred.uid(), &req.user, &watched, mode) {
-            Ok(Some(m)) if !enrolled => {
-                let _ = m;
-                Outcome::Error {
-                    message: format!("{} is not enrolled", req.user),
-                }
-            }
-            Ok(Some(m)) => {
-                crate::presence::set_presence_mode(m);
-                log::info!(
-                    "presence: mode set to {} by uid {} pid {}",
-                    m.name(),
-                    cred.uid(),
-                    cred.pid()
-                );
-                presence_state(&watched, &req.user, enrolled)
-            }
-            Ok(None) => presence_state(&watched, &req.user, enrolled),
-            Err(why) => {
-                log::warn!(
-                    "presence mode request from uid {} for {} refused: {}",
-                    cred.uid(),
-                    req.user,
-                    why
-                );
-                Outcome::Error { message: why }
-            }
-        };
+        let outcome = presence_query(cred.uid(), cred.pid(), &req.user, mode);
         return reply(&mut stream, &outcome);
     }
     if req.ping {
@@ -730,12 +745,7 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> R
     // ask (the setup command runs them under sudo, behind the password), so no
     // unprivileged process, and nothing reaching a locked session over ssh,
     // can enrol a new face or erase the enrolled one.
-    if (req.enroll.is_some()
-        || req.delete_templates
-        || req.calibrate.is_some()
-        || req.calibrate_verify)
-        && cred.uid() != 0
-    {
+    if (req.enroll.is_some() || req.delete_templates) && cred.uid() != 0 {
         log::warn!(
             "uid {} asked to change templates for {}: refused",
             cred.uid(),
@@ -747,45 +757,6 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> R
                 message: "not permitted: enrolment and deletion require root".into(),
             },
         );
-    }
-    if req.calibrate_verify {
-        let outcome = match take() {
-            Some(mut a) => a.calibrate_verify(&req.user),
-            None => Outcome::Error {
-                message: "busy".into(),
-            },
-        };
-        return reply(&mut stream, &outcome);
-    }
-    if let Some(gesture) = &req.calibrate {
-        let gesture = match gesture.as_str() {
-            "shake" => "shake",
-            "read" => "read",
-            "glance" => "glance",
-            "talk" => "talk",
-            "lean" => "lean",
-            "aside" => "aside",
-            _ => "nod",
-        };
-        log::info!(
-            "calibration ({}) for {} (uid {})",
-            gesture,
-            req.user,
-            cred.uid()
-        );
-        let outcome = match take() {
-            Some(mut a) => a.calibrate(
-                &req.user,
-                gesture,
-                req.seconds.unwrap_or(8.0).clamp(4.0, 20.0),
-                req.calibrate_start,
-                req.calibrate_replace,
-            ),
-            None => Outcome::Error {
-                message: "busy".into(),
-            },
-        };
-        return reply(&mut stream, &outcome);
     }
     if let Some(start) = &req.enrol_session {
         if cred.uid() != 0 {
@@ -804,15 +775,29 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> R
         );
         // The session holds the camera for as long as the person takes.
         let outcome = match take() {
-            Some(mut a) => crate::enrol::run(&mut a, &req.user, start),
+            Some(mut a) => {
+                // The window and its control calls run as the session user,
+                // who on a first enrolment has no template and so no ACL
+                // entry. Grant before the summon inside run, because the
+                // window connects once and never retries. The grant is made
+                // from the guard's own fields: refresh_socket_acl would lock
+                // the authenticator this thread already holds.
+                let mut users = a.store.enrolled_users();
+                if !users.contains(&req.user) {
+                    users.push(req.user.clone());
+                }
+                apply_socket_acl(Path::new(crate::config::SOCKET), &users);
+                crate::enrol::run(&mut a, &req.user, start)
+            }
             None => Outcome::Error {
                 message: "busy".into(),
             },
         };
         log::info!("enrolment walk-through for {}: {:?}", req.user, outcome);
-        if matches!(outcome, Outcome::Enrolled { .. }) {
-            refresh_socket_acl(auth);
-        }
+        // Every outcome: back to the template-only list, which keeps the
+        // user after a finished enrolment and drops the session grant after
+        // a failed or cancelled one. The guard was dropped with the match.
+        refresh_socket_acl(auth);
         return reply(&mut stream, &outcome);
     }
     if req.enrol_watch || req.enrol_control.is_some() {
@@ -839,12 +824,12 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> R
         }
         // The stream: lines until the session ends. The writer drops this
         // connection when a write fails, so a closed window costs nothing.
+        // The stream: lines until the session ends. The connection goes
+        // to the session's writer and this thread returns at once (H11):
+        // the writer drops the connection when a write fails, so a closed
+        // window costs nothing, and no thread sleeps for the session.
         stream.set_read_timeout(None)?;
-        crate::enrol::add_watcher(stream.try_clone()?);
-        slot.release();
-        while crate::enrol::is_active() {
-            std::thread::sleep(Duration::from_millis(250));
-        }
+        crate::enrol::add_watcher(stream);
         return Ok(());
     }
     if let Some(label) = &req.enroll {
@@ -904,15 +889,6 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> R
         log::debug!("probe for {}: {:?}", req.user, outcome);
         return reply(&mut stream, &outcome);
     }
-    #[cfg(not(feature = "dev-tools"))]
-    if req.sweep_seconds.is_some() {
-        return reply(
-            &mut stream,
-            &Outcome::Error {
-                message: "not built with dev-tools".into(),
-            },
-        );
-    }
     #[cfg(feature = "dev-tools")]
     if let Some(seconds) = req.sweep_seconds {
         // Scores per frame: root only, like every other reply that carries them.
@@ -958,44 +934,52 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> R
         // or nod at it, and the request would re-arm forever (B2).
         if !active_graphical_session(&LiveProcs, uid) {
             log::info!("consent for {}: no active graphical session to ask in; falls through to the password", req.user);
-            return reply(
-                &mut stream,
-                &Outcome::ConsentDenied {
-                    reason: "no active graphical session to ask in".into(),
-                    elapsed_ms: 0,
-                },
-            );
+            return reply(&mut stream, &consent_denied(Refusal::NoSession, 0));
         }
-        let Some(_place) = take_consent_place(&CONSENT_COUNT, uid) else {
-            log::info!("consent for {}: {} requests already live or waiting; this one falls through to the password", req.user, CONSENT_PER_UID);
-            return reply(
-                &mut stream,
-                &Outcome::ConsentDenied {
-                    reason: "too many requests waiting".into(),
-                    elapsed_ms: 0,
-                },
-            );
+        // One consent request at a time, and the rest of the same user's
+        // wait their turn in arrival order rather than falling to the
+        // password: a request has no deadline, so the queue only ever
+        // drains by the user answering (or requesters going away). The
+        // place is taken before the slot is released, so the bound on a
+        // user's requests is what a runaway loop meets, not the slots.
+        let consent = &crate::consent::CONSENT;
+        let place = match consent.join(uid) {
+            Ok(p) => p,
+            Err(crate::consent::NoTurn::OtherUser(h)) => {
+                log::info!("consent for {}: uid {}'s request holds the window; this one falls through to the password", req.user, h);
+                return reply(&mut stream, &consent_denied(Refusal::OtherUser, 0));
+            }
+            Err(_) => {
+                log::info!("consent for {}: {} requests already live or waiting; this one falls through to the password", req.user, crate::consent::CONSENT_PER_UID);
+                return reply(&mut stream, &consent_denied(Refusal::TooMany, 0));
+            }
         };
         slot.release();
-        let key = (cred.pid(), crate::consent::starttime_of(cred.pid()));
-        if let Ok(mut r) = REFUSED.lock() {
-            r.retain(|(_, at)| at.elapsed() < REFUSAL_STANDS);
-            if r.iter().any(|(k, _)| *k == key) {
-                log::info!(
-                    "consent: pid {} was refused moments ago; the refusal stands",
-                    cred.pid()
-                );
-                return reply(
-                    &mut stream,
-                    &Outcome::Refused {
-                        reason: "refused already".into(),
-                        elapsed_ms: 0,
-                    },
+        let caller = crate::consent::CallerInfo::from_pid(cred.pid(), uid, agent);
+        if let Some((left, first)) = refusal_standing(uid, Instant::now()) {
+            log::info!(
+                "consent for {}: refused a moment ago; the refusal stands for {}s more, no window for pid {}",
+                req.user,
+                left.as_secs(),
+                cred.pid()
+            );
+            if first {
+                crate::consent::notify(
+                    &req.user,
+                    "Refused a moment ago",
+                    &format!(
+                        "Requests are refused without asking for {} more seconds.\n{}\n{}",
+                        left.as_secs().max(1),
+                        caller.command,
+                        caller.parents
+                    ),
                 );
             }
+            // The same answer the no itself gave: sudo falls to its
+            // password, polkit's agent cancels.
+            let o = crate::auth::refused(&caller, Refusal::RefusedRecently, 0);
+            return reply(&mut stream, &o);
         }
-        let caller = crate::consent::CallerInfo::from_pid(cred.pid(), uid, agent);
-        let via_polkit = caller.via == "polkit";
         // polkitd named the requesting process: it has to be local too, not
         // only the agent that is serving it. A pkexec from an SSH shell
         // served by a text agent is refused at the agent; one that reached
@@ -1020,152 +1004,77 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> R
                 }
             }
         }
-        if via_polkit {
-            if let Ok(mut r) = POLKIT_REFUSED.lock() {
-                r.retain(|(_, at)| at.elapsed() < POLKIT_REFUSAL_STANDS);
-                if r.iter().any(|(u, _)| *u == uid) {
-                    log::info!("consent: polkit asked again for uid {} right after a refusal; the refusal stands", uid);
-                    return reply(
-                        &mut stream,
-                        &Outcome::Refused {
-                            reason: "refused already".into(),
-                            elapsed_ms: 0,
-                        },
-                    );
-                }
-            }
-        }
         // The requester may not wait for an answer (sudo interrupted, the
-        // polkit helper gone): a hang-up on its socket ends the request and
-        // takes the window down with it.
-        let probe = stream.try_clone()?;
-        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let live = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        {
-            // A watcher blocks on the request socket; a hang-up drops a
-            // "gone" answer into the slot every wait loop polls, so the
-            // window comes down within a frame wherever the request is.
-            // Only the request on screen owns the slot: a waiting request's
-            // hang-up ends that request through its flag alone (B3).
-            let (flag, active, live, user) = (
-                Arc::clone(&flag),
-                Arc::clone(&active),
-                Arc::clone(&live),
-                req.user.clone(),
+        // polkit helper gone): a dup of its socket goes into the live
+        // record, and every wait loop polls it for the hang-up, so the
+        // request ends and its window comes down within a frame wherever
+        // it is. No thread blocks on it.
+        let requester = std::os::fd::OwnedFd::from(stream.try_clone()?);
+        // The window shows one request at a time; the one waiting is
+        // announced so it is not a silent hang. The turn is held for the
+        // whole request, parked spells included, so a later request never
+        // opens its window over an earlier one.
+        let on_wait = || {
+            log::info!(
+                "consent: request from pid {} waits its turn behind another",
+                cred.pid()
             );
-            let watcher = std::thread::Builder::new()
-                .name("hang-up".into())
-                .spawn(move || {
-                    if watch_hangup(&probe, &active) {
-                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                        if live.load(std::sync::atomic::Ordering::SeqCst) {
-                            if let Ok(mut m) = ANSWERS.lock() {
-                                m.insert(user, crate::consent::Answer::Gone);
-                            }
-                        }
-                    }
-                });
-            if let Err(e) = watcher {
-                log::warn!("consent: cannot watch the request socket: {}", e);
-                return reply(
-                    &mut stream,
-                    &Outcome::Error {
-                        message: "cannot watch the request".into(),
-                    },
+            crate::consent::notify(
+                &req.user,
+                "Another request is waiting",
+                &format!(
+                    "{}\n{}\nIt gets the window after the one on screen is answered.",
+                    caller.command, caller.parents
+                ),
+            );
+        };
+        let _turn = match consent.take_turn(place, &req.user, Some(requester), &on_wait) {
+            Ok(t) => t,
+            Err(crate::consent::NoTurn::Gone) => {
+                return reply(&mut stream, &consent_denied(Refusal::Gone, 0));
+            }
+            Err(e) => {
+                log::info!(
+                    "consent for {}: lost its place while waiting ({:?}); falls through to the password",
+                    req.user,
+                    e
                 );
-            }
-        }
-        let gone = || flag.load(std::sync::atomic::Ordering::SeqCst);
-        // Ends the watcher once the request is over: the socket's read side
-        // is shut, so the peek returns at once instead of at the next timeout
-        // (B5).
-        let stop_watching = |active: &Arc<std::sync::atomic::AtomicBool>| {
-            active.store(false, std::sync::atomic::Ordering::SeqCst);
-            let _ = stream.shutdown(std::net::Shutdown::Read);
-        };
-        // One consent request at a time, and the rest wait their turn rather
-        // than falling to the password: a request has no deadline, so the
-        // queue only ever drains by the user answering (or requesters going
-        // away). The turn is held for the whole request, parked spells
-        // included, so a later request never opens its window over an
-        // earlier one.
-        let _turn = {
-            let mut waited = false;
-            loop {
-                match ask_turn(&CONSENT_TURN, uid) {
-                    TurnCall::Taken => break Turn,
-                    TurnCall::OtherUser(h) => {
-                        log::info!("consent for {}: uid {}'s request holds the window; this one falls through to the password", req.user, h);
-                        stop_watching(&active);
-                        return reply(
-                            &mut stream,
-                            &Outcome::ConsentDenied {
-                                reason: "another user's request is on screen".into(),
-                                elapsed_ms: 0,
-                            },
-                        );
-                    }
-                    TurnCall::Wait => {
-                        if gone() {
-                            stop_watching(&active);
-                            return reply(
-                                &mut stream,
-                                &Outcome::ConsentDenied {
-                                    reason: "requester gone".into(),
-                                    elapsed_ms: 0,
-                                },
-                            );
-                        }
-                        if !waited {
-                            waited = true;
-                            log::info!(
-                                "consent: request from pid {} waits its turn behind another",
-                                cred.pid()
-                            );
-                            // The window shows one request at a time; the one
-                            // waiting is announced so it is not a silent hang.
-                            if let Some(cfg) = CFG.get() {
-                                crate::consent::notify(cfg, &req.user, "Another request is waiting", &format!("{}\n{}\nIt gets the window after the one on screen is answered.", caller.command, caller.parents));
-                            }
-                        }
-                        std::thread::sleep(Duration::from_millis(300));
-                    }
-                }
+                return reply(&mut stream, &consent_denied(Refusal::OtherUser, 0));
             }
         };
-        live.store(true, std::sync::atomic::Ordering::SeqCst);
-        let outcome = consent_rounds(
-            &take,
-            &req.user,
-            caller,
-            req.budget.filter(|b| b.is_finite()),
-            &gone,
-        );
-        stop_watching(&active);
-        if matches!(outcome, Outcome::Refused { .. }) {
-            if let Ok(mut r) = REFUSED.lock() {
-                r.push((key, Instant::now()));
-            }
-            if via_polkit {
-                if let Ok(mut r) = POLKIT_REFUSED.lock() {
-                    r.push((uid, Instant::now()));
-                }
-            }
-        }
-        // A hang-up noticed after the verdict must not haunt the next request.
-        if let Ok(mut m) = ANSWERS.lock() {
-            if matches!(m.get(&req.user), Some(crate::consent::Answer::Gone)) {
-                m.remove(&req.user);
-            }
+        let outcome = consent_rounds(&take, &req.user, caller);
+        if is_explicit_no(&outcome) {
+            let d = refused(uid, Instant::now());
+            log::info!(
+                "consent for {}: the refusal stands for {}s",
+                req.user,
+                d.as_secs()
+            );
         }
         outcome
     } else {
-        match take() {
-            Some(mut a) => a.authenticate(&req.user),
-            None => Outcome::Error {
-                message: "busy".into(),
+        // Elevation is never passive: sudo and polkit run their PAM stacks
+        // as root, and a face line on them without `consent` (a typo, a
+        // pasted lock-screen example) must not turn a look into root. The
+        // lock screen, the only plain-look caller, runs as the user (A3).
+        match admit_plain_look(cred.uid()) {
+            Ok(()) => match take() {
+                Some(mut a) => a.authenticate(&req.user),
+                None => Outcome::Error {
+                    message: "busy".into(),
+                },
             },
+            Err(why) => {
+                log::warn!(
+                    "plain look for {} from pid {} (uid 0) refused: {}",
+                    req.user,
+                    cred.pid(),
+                    why
+                );
+                Outcome::Error {
+                    message: why.into(),
+                }
+            }
         }
     };
     // Scores go to root peers only, and not to the journal (readable by
@@ -1178,6 +1087,17 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> R
         outcome.redacted()
     };
     reply(&mut stream, &outcome)
+}
+
+/// May this peer ask for a plain look (a match with no window and no
+/// nod)? Only a caller running as the user: a root peer is an elevation
+/// stack, and an elevation needs consent.
+fn admit_plain_look(peer_uid: u32) -> std::result::Result<(), &'static str> {
+    if peer_uid == 0 {
+        Err("a root caller needs consent")
+    } else {
+        Ok(())
+    }
 }
 
 /// Whether every lid the firmware reports is closed, read the way
@@ -1237,16 +1157,64 @@ fn presence_mode_change(
     Ok(Some(m))
 }
 
-/// The state a presence mode request answers with: the mode in force and
-/// whether the daemon's watch is on for `user`.
+/// Answer a presence mode request (a read, or a switch) from `peer_uid`.
+/// Everything it needs is in the statics: the config, the mode in force and
+/// the enrolled list. It takes no authenticator on purpose, so the bar
+/// widget's poll is answered in microseconds however long the camera is
+/// held, and its connection slot is back at once (C5).
+fn presence_query(peer_uid: u32, peer_pid: i32, user: &str, mode: &str) -> Outcome {
+    let watched = CFG.get().map(|c| c.presence.clone()).unwrap_or_default();
+    // "Watching" is what the bar widget and the key binding show up for,
+    // so it also needs the user enrolled: a watch configured for a user
+    // with no templates never locks for them and offers nothing to switch.
+    let enrolled = is_enrolled(user);
+    match presence_mode_change(peer_uid, user, &watched, mode) {
+        Ok(Some(_)) if !enrolled => Outcome::Error {
+            message: format!("{} is not enrolled", user),
+        },
+        Ok(Some(m)) => {
+            crate::presence::set_presence_mode(m);
+            log::info!(
+                "presence: mode set to {} by uid {} pid {}",
+                m.name(),
+                peer_uid,
+                peer_pid
+            );
+            presence_state(&watched, user, enrolled)
+        }
+        Ok(None) => presence_state(&watched, user, enrolled),
+        Err(why) => {
+            log::warn!(
+                "presence mode request from uid {} for {} refused: {}",
+                peer_uid,
+                user,
+                why
+            );
+            Outcome::Error { message: why }
+        }
+    }
+}
+
+/// The state a presence mode request answers with: the mode in force,
+/// whether the daemon's watch is on for `user`, and if it is, what the
+/// watch last decided. The decision goes only with `watching`, so it
+/// reaches root and the watched user and nobody else (H16).
 fn presence_state(
     watched: &crate::presence::PresenceConfig,
     user: &str,
     enrolled: bool,
 ) -> Outcome {
+    let watching = watched.enabled && watched.user == user && enrolled;
+    let last = if watching {
+        crate::presence::snapshot()
+    } else {
+        None
+    };
     Outcome::PresenceMode {
         mode: crate::presence::presence_mode().name().into(),
-        watching: watched.enabled && watched.user == user && enrolled,
+        watching,
+        state: last.map(|s| s.state),
+        away_for: last.and_then(|s| s.away_for),
     }
 }
 
@@ -1341,35 +1309,6 @@ fn active_graphical_session(v: &dyn ProcView, uid: u32) -> bool {
     false
 }
 
-/// Block on the request socket until it hangs up or the request ends.
-/// True when a hang-up was seen while the request was still active.
-fn watch_hangup(probe: &UnixStream, active: &std::sync::atomic::AtomicBool) -> bool {
-    use nix::sys::socket::{recv, MsgFlags};
-    use std::os::fd::AsRawFd;
-    let mut b = [0u8; 1];
-    loop {
-        if !active.load(std::sync::atomic::Ordering::SeqCst) {
-            return false;
-        }
-        match recv(probe.as_raw_fd(), &mut b, MsgFlags::MSG_PEEK) {
-            Ok(0) => break,
-            // A signal (the daemon reaps the window's helper processes)
-            // interrupts the wait; it is not a hang-up.
-            Err(nix::errno::Errno::EINTR) => continue,
-            // The request socket carries the handler's five-second read
-            // timeout, which the clone shares: an idle period is not a
-            // hang-up either, and it is when the request's end is noticed.
-            Err(nix::errno::Errno::EAGAIN) => continue,
-            Err(e) => {
-                log::warn!("consent: request socket: {}", e);
-                break;
-            }
-            Ok(_) => std::thread::sleep(Duration::from_millis(200)), // unexpected extra bytes; not our concern
-        }
-    }
-    active.load(std::sync::atomic::Ordering::SeqCst)
-}
-
 struct LiveProcs;
 
 /// A pidfd for a live process, or None when it is gone.
@@ -1390,15 +1329,10 @@ impl ProcView for LiveProcs {
         crate::consent::comm_of(pid)
     }
     fn real_uid(&self, pid: i32) -> Option<u32> {
-        let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
-        status
-            .lines()
-            .find_map(|l| l.strip_prefix("Uid:"))
-            .and_then(|v| v.split_whitespace().next())
-            .and_then(|s| s.parse().ok())
+        crate::consent::real_uid_of(pid)
     }
     fn cgroup(&self, pid: i32) -> Option<String> {
-        std::fs::read_to_string(format!("/proc/{}/cgroup", pid)).ok()
+        crate::consent::read_proc(pid, "cgroup")
     }
     fn pidfd_id(&self, pid: i32) -> Option<u64> {
         nix::sys::stat::fstat(&pidfd_open(pid)?)
@@ -1697,6 +1631,182 @@ mod root_tests {
 }
 
 #[cfg(test)]
+mod socket_acl_tests {
+    use super::acl_spec;
+
+    /// The list a walk-through applies is the template-only list plus the
+    /// session user, so a first-time user can connect the window and press
+    /// Continue; the list applied afterwards is built from the templates
+    /// alone, so a failed session leaves that user with no entry.
+    #[test]
+    fn a_session_admits_its_user_and_the_template_list_after_a_failure_does_not() {
+        let enrolled = [1000u32, 1001];
+        let session_uid = 1002u32;
+        let mut session = enrolled.to_vec();
+        session.push(session_uid);
+        let spec = acl_spec(&session);
+        assert!(spec.contains(",u:1002:rw"), "session spec: {}", spec);
+        assert!(spec.contains(",u:1000:rw") && spec.contains(",u:1001:rw"));
+        let after_failure = acl_spec(&enrolled);
+        assert!(
+            !after_failure.contains("1002"),
+            "after failure: {}",
+            after_failure
+        );
+        assert!(after_failure.contains(",u:1000:rw") && after_failure.contains(",u:1001:rw"));
+    }
+
+    /// Root keeps access through the owner and group entries; nobody else
+    /// gets in on an empty list.
+    #[test]
+    fn an_empty_list_is_root_only() {
+        assert_eq!(acl_spec(&[]), "u::rw,g::rw,o::-");
+    }
+}
+
+#[cfg(test)]
+mod plain_look_tests {
+    use super::*;
+
+    /// A3: a plain look is admitted from a caller running as the user (the
+    /// lock screen) and refused from root (an elevation stack whose face
+    /// line lacks `consent`).
+    #[test]
+    fn a_root_peer_gets_no_plain_look() {
+        assert_eq!(admit_plain_look(0), Err("a root caller needs consent"));
+        assert_eq!(admit_plain_look(1000), Ok(()));
+    }
+
+    /// A3: a misspelt field does not degrade a request to a plain look;
+    /// the line is refused.
+    #[test]
+    fn a_request_with_an_unknown_field_is_refused() {
+        assert!(serde_json::from_str::<Request>(r#"{"user":"alice","consent":true}"#).is_ok());
+        assert!(serde_json::from_str::<Request>(r#"{"user":"alice","consnet":true}"#).is_err());
+        assert!(serde_json::from_str::<Request>(
+            r#"{"user":"alice","consent_dismis":true,"consent_token":"t"}"#
+        )
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+
+    /// A5: after the user says no, requests are refused without a window
+    /// for a minute, whoever asks; repeats double it, up to a bound, and a
+    /// quiet spell forgets the doubling.
+    #[test]
+    fn a_refusal_stands_for_a_minute_and_repeats_double_it() {
+        let base = Instant::now();
+        let t = |secs: u64| base + Duration::from_secs(secs);
+        let mut b = Backoff::default();
+        assert_eq!(b.standing(t(0)), None);
+        assert_eq!(b.refuse(t(0)), Duration::from_secs(60));
+        assert_eq!(
+            b.standing(t(10)),
+            Some(Duration::from_secs(50)),
+            "a second requester, another pid, gets no window"
+        );
+        assert_eq!(b.standing(t(61)), None);
+        assert_eq!(b.refuse(t(70)), Duration::from_secs(120));
+        assert_eq!(b.refuse(t(200)), Duration::from_secs(240));
+        assert_eq!(b.refuse(t(500)), Duration::from_secs(480));
+        assert_eq!(
+            b.refuse(t(1000)),
+            Duration::from_secs(480),
+            "the doubling is capped"
+        );
+        assert_eq!(
+            b.refuse(t(1000 + 601)),
+            Duration::from_secs(60),
+            "ten quiet minutes forget the escalation"
+        );
+    }
+
+    /// The per-uid table: one notice per spell, and only the user's own
+    /// explicit no starts one.
+    #[test]
+    fn the_table_notifies_once_per_spell_and_reads_only_an_explicit_no() {
+        let uid = 4_000_000_001u32;
+        let now = Instant::now();
+        assert!(refusal_standing(uid, now).is_none());
+        refused(uid, now);
+        assert_eq!(
+            refusal_standing(uid, now).map(|(_, first)| first),
+            Some(true)
+        );
+        assert_eq!(
+            refusal_standing(uid, now).map(|(_, first)| first),
+            Some(false)
+        );
+        assert!(
+            refusal_standing(uid + 1, now).is_none(),
+            "another user is not refused"
+        );
+        assert!(refusal_standing(uid, now + Duration::from_secs(61)).is_none());
+        for (o, no) in [
+            (
+                Outcome::ConsentDenied {
+                    reason: "shaken".into(),
+                    elapsed_ms: 0,
+                },
+                true,
+            ),
+            (
+                Outcome::Refused {
+                    reason: "dismissed".into(),
+                    elapsed_ms: 0,
+                },
+                true,
+            ),
+            (
+                Outcome::ConsentDenied {
+                    reason: "confirm: not live".into(),
+                    elapsed_ms: 0,
+                },
+                true,
+            ),
+            (
+                Outcome::ConsentDenied {
+                    reason: "no answer".into(),
+                    elapsed_ms: 0,
+                },
+                false,
+            ),
+            (
+                Outcome::ConsentDenied {
+                    reason: "wrong password".into(),
+                    elapsed_ms: 0,
+                },
+                false,
+            ),
+            (
+                Outcome::ConsentDenied {
+                    reason: "refused a moment ago".into(),
+                    elapsed_ms: 0,
+                },
+                false,
+            ),
+            (
+                Outcome::Match {
+                    score: None,
+                    frames: 1,
+                    elapsed_ms: 0,
+                },
+                false,
+            ),
+        ] {
+            assert_eq!(is_explicit_no(&o), no, "{:?}", o);
+        }
+        if let Ok(mut r) = REFUSALS.lock() {
+            r.retain(|(u, _)| *u != uid);
+        }
+    }
+}
+
+#[cfg(test)]
 mod request_read_tests {
     use super::*;
     use std::os::unix::net::UnixStream;
@@ -1953,6 +2063,32 @@ mod locality_tests {
                 ..
             }
         ));
+        // The watch's decision rides on the answer only with `watching`,
+        // so another user asking about themselves never learns whether
+        // the owner is at the desk (H16).
+        assert!(matches!(
+            presence_state(&watched, "someone-else", true),
+            Outcome::PresenceMode {
+                state: None,
+                away_for: None,
+                ..
+            }
+        ));
+        let before_a_tick = presence_state(&watched, &me, true);
+        assert!(matches!(
+            before_a_tick,
+            Outcome::PresenceMode {
+                watching: true,
+                state: None,
+                ..
+            }
+        ));
+        let json = serde_json::to_string(&before_a_tick).unwrap();
+        assert!(
+            !json.contains("state"),
+            "no decision yet, no field: {}",
+            json
+        );
     }
 
     /// A process table the check reads instead of /proc and logind.
@@ -2216,17 +2352,17 @@ mod locality_tests {
 /// Drive a consent request through as many camera rounds as it needs. When
 /// the user leaves mid-request the session is locked and the request parks
 /// without the camera (so the lock screen can use it), until the user is back
-/// (a face match on the lock screen), a password or a dismissal arrives from
-/// the window, or the caller's budget runs out.
+/// (a face match on the lock screen), the session unlocks by other means,
+/// or a password or a dismissal arrives from the window.
 fn consent_rounds<'a>(
     take: &dyn Fn() -> Option<std::sync::MutexGuard<'a, Authenticator>>,
     user: &str,
     caller: crate::consent::CallerInfo,
-    budget: Option<f32>,
-    gone: &dyn Fn() -> bool,
 ) -> Outcome {
     use crate::auth::Round;
-    use crate::consent::{Answer, Gesture};
+    use crate::consent::{Answer, Gesture, CONSENT};
+    use crate::presence::SESSION_LOCK;
+    let gone = || CONSENT.requester_gone(user);
     // A request that arrives while the session is locked waits, unseen and
     // without the camera (the lock screen owns it), until the unlock. The
     // window is not summoned at all: hiding a pending window would make it
@@ -2238,16 +2374,13 @@ fn consent_rounds<'a>(
     let begin_by = Instant::now() + Duration::from_secs(20);
     let mut session = loop {
         match take() {
-            Some(mut a) => match a.consent_begin(user, caller, budget, !already_locked) {
+            Some(mut a) => match a.consent_begin(user, caller, !already_locked) {
                 Ok(s) => break s,
                 Err(o) => return o,
             },
             None => {
                 if gone() {
-                    return Outcome::ConsentDenied {
-                        reason: "requester gone".into(),
-                        elapsed_ms: 0,
-                    };
+                    return consent_denied(Refusal::Gone, 0);
                 }
                 if Instant::now() > begin_by {
                     return Outcome::Error {
@@ -2268,10 +2401,7 @@ fn consent_rounds<'a>(
                 "consent: the requester went away after {:.0}s; window closed",
                 session.started.elapsed().as_secs_f32()
             );
-            return Outcome::ConsentDenied {
-                reason: "requester gone".into(),
-                elapsed_ms: session.started.elapsed().as_millis() as u64,
-            };
+            return consent_denied(Refusal::Gone, session.started.elapsed().as_millis() as u64);
         }
         if !already_locked {
             let round = match take() {
@@ -2279,105 +2409,66 @@ fn consent_rounds<'a>(
                 None => {
                     // The camera is taken (the lock screen, most likely): wait
                     // a little and try again rather than giving up.
-                    if session.started.elapsed().as_secs_f32() > session.total {
-                        return Outcome::ConsentDenied {
-                            reason: "no answer".into(),
-                            elapsed_ms: session.started.elapsed().as_millis() as u64,
-                        };
-                    }
                     std::thread::sleep(Duration::from_millis(500));
                     continue;
                 }
             };
-            let Round::FaceLost = round else {
-                let Round::Done(o) = round else {
-                    unreachable!()
-                };
-                return o;
-            };
+            match round {
+                Round::Done(o) => return o,
+                Round::FaceLost => {}
+                // Locked by other means under the card: adopt the lock and
+                // park, without locking again or announcing a lock (D2).
+                Round::SessionLocked => already_locked = true,
+            }
         }
-        // Lock the session (unless it already is), then park.
-        let lock_time = Instant::now();
-        let (lock_cmd, lock_user) = {
-            let cfg = &session.dialog.cfg.presence;
-            (cfg.lock_command.clone(), cfg.user.clone())
-        };
-        if already_locked {
-            // Somebody else locked it; adopt the lock so the presence watch
-            // does not lock again and the resume logic below applies.
-            if let Some(mut a) = take() {
-                a.session_locked_at = Some(lock_time);
-            }
-            session.locked_at = Some(lock_time);
-        } else if session.locked_at.is_none() && !lock_cmd.is_empty() {
-            // Hand the lock to the presence watch first so it does not lock too.
-            if let Some(mut a) = take() {
-                a.session_locked_at = Some(lock_time);
-            }
-            let args: Vec<String> = lock_cmd
-                .iter()
-                .skip(1)
-                .map(|a| {
-                    if a.is_empty() {
-                        lock_user.clone()
-                    } else {
-                        a.clone()
-                    }
-                })
-                .collect();
-            match std::process::Command::new(&lock_cmd[0])
-                .args(&args)
-                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-                .output()
-            {
-                Ok(o) if o.status.success() => {
+        // Lock the session, or take over a lock made by other means, then
+        // park. One lock for the daemon: the presence watch sees the same
+        // record and waits for the same unlock, so it never locks twice.
+        let lock_time = if already_locked {
+            SESSION_LOCK.adopt(Instant::now())
+        } else {
+            let omarchy_path = crate::consent::omarchy_path();
+            match SESSION_LOCK.lock(&session.dialog.cfg.presence.user, &omarchy_path) {
+                Ok(t) => {
                     log::info!("consent: user left with a request pending; session locked");
-                    session.locked_at = Some(lock_time);
+                    t
                 }
-                Ok(o) => log::warn!(
-                    "consent: lock command exited {}: {}",
-                    o.status,
-                    String::from_utf8_lossy(&o.stderr).trim()
-                ),
-                Err(e) => log::warn!("consent: lock command: {}", e),
+                Err(e) => {
+                    log::warn!("consent: lock command: {}", e);
+                    Instant::now()
+                }
             }
-        }
+        };
         if !already_locked {
-            let _ = session.dialog.show("locked", "Locked while you were away. Unlock, then look at the camera or type your password.", &session.caller, session.total);
+            let _ = session.dialog.show("locked", "Locked while you were away. Unlock, then look at the camera or type your password.", &session.caller);
         }
         already_locked = false;
         // Park: no camera. Wake on a face match newer than the lock, on the
-        // session unlocking by any means, on an answer from the window, or
-        // when the budget is out.
-        let mut last_lock_check = Instant::now();
+        // session unlocking by any means, or on an answer from the window.
+        let mut last_beat = Instant::now();
         loop {
-            if session.started.elapsed().as_secs_f32() > session.total - 2.0 {
-                let ms = session.started.elapsed().as_millis() as u64;
-                return match take() {
-                    Some(mut a) => a.consent_finish(
-                        &mut session,
-                        Some(Gesture::Timeout),
-                        Outcome::NoFace { elapsed_ms: ms },
-                    ),
-                    None => Outcome::ConsentDenied {
-                        reason: "no answer".into(),
-                        elapsed_ms: ms,
-                    },
-                };
+            // The card, if one is up behind the lock, is re-sent now and
+            // then so its own safety net does not hide it (D1).
+            if last_beat.elapsed() >= crate::consent::HEARTBEAT {
+                last_beat = Instant::now();
+                session.dialog.heartbeat(&session.caller);
             }
-            let answer = ANSWERS.lock().ok().and_then(|mut m| m.remove(user));
-            if let Some(ans) = answer {
+            if let Some(ans) = CONSENT.poll(user) {
+                // Nothing to arm behind a lock; the unlock re-arms.
+                if matches!(ans, Answer::Rearm) {
+                    continue;
+                }
                 if matches!(ans, crate::consent::Answer::Gone) {
                     log::info!("consent: the requester went away while the session was locked; window closed");
-                    return Outcome::ConsentDenied {
-                        reason: "requester gone".into(),
-                        elapsed_ms: session.started.elapsed().as_millis() as u64,
-                    };
+                    return consent_denied(
+                        Refusal::Gone,
+                        session.started.elapsed().as_millis() as u64,
+                    );
                 }
                 let g = match ans {
                     Answer::Password(pw) => Gesture::Password(pw),
                     Answer::Dismiss => Gesture::Dismissed,
-                    Answer::Gone => Gesture::Gone,
+                    Answer::Gone | Answer::Rearm => Gesture::Gone,
                 };
                 let ms = session.started.elapsed().as_millis() as u64;
                 loop {
@@ -2390,40 +2481,29 @@ fn consent_rounds<'a>(
                     }
                 }
             }
-            let mut back = match take() {
-                Some(a) => a
-                    .last_match
-                    .get(user)
-                    .map(|m| *m > lock_time)
-                    .unwrap_or(false),
+            let matched = match take() {
+                Some(a) => a.last_match.get(user).is_some_and(|m| *m > lock_time),
                 None => false,
             };
-            if !back && last_lock_check.elapsed() > Duration::from_secs(2) {
-                last_lock_check = Instant::now();
-                back = !crate::consent::session_locked(user);
-            }
-            if back {
-                log::info!("consent: user back after the lock; the request resumes");
-                if let Some(mut a) = take() {
-                    a.session_locked_at = None;
-                }
-                session.locked_at = None;
+            let how =
+                SESSION_LOCK.resumed(Instant::now(), matched, Duration::from_secs(2), &|| {
+                    crate::consent::session_locked(user)
+                });
+            if let Some(how) = how {
+                log::info!(
+                    "consent: user back after the lock ({}); the request resumes",
+                    how
+                );
+                // The unlock is the user back at the card: the request's
+                // away clock starts over, or the next round would end
+                // with the user gone before its first look (E2).
+                session.user_seen_at.set(Instant::now());
                 let _ = session.dialog.show(
                     "scanning",
                     "Welcome back. Look at the camera.",
                     &session.caller,
-                    session.total,
                 );
                 break;
-            }
-            if gone() {
-                log::info!(
-                    "consent: the requester went away while the session was locked; window closed"
-                );
-                return Outcome::ConsentDenied {
-                    reason: "requester gone".into(),
-                    elapsed_ms: session.started.elapsed().as_millis() as u64,
-                };
             }
             std::thread::sleep(Duration::from_millis(300));
         }
@@ -2482,6 +2562,15 @@ pub fn consent_ack(socket: &Path, user: &str, token: Option<&str>) -> Result<Out
 
 /// From the consent window: with this request's approval, passwordless
 /// sudo for `minutes`.
+/// From the window: the user pressed "Ready to nod".
+pub fn consent_rearm(socket: &Path, user: &str, token: Option<&str>) -> Result<Outcome> {
+    send(
+        socket,
+        serde_json::json!({ "user": user, "consent_rearm": true, "consent_token": token }),
+        None,
+    )
+}
+
 pub fn consent_passwordless(
     socket: &Path,
     user: &str,
@@ -2511,46 +2600,6 @@ pub fn consent_answer(
         }
     };
     send(socket, body, Some(Duration::from_secs(3)))
-}
-
-/// Root: one calibration round for "nod" or "shake".
-pub fn calibrate(
-    socket: &Path,
-    user: &str,
-    gesture: &str,
-    seconds: f32,
-    start: bool,
-    replace: bool,
-) -> Result<Outcome> {
-    send(
-        socket,
-        serde_json::json!({ "user": user, "calibrate": gesture, "seconds": seconds, "calibrate_start": start, "calibrate_replace": replace }),
-        Some(Duration::from_secs(90)),
-    )
-}
-
-/// Replay the session's rounds at the floors they produced.
-pub fn calibrate_verify(socket: &Path, user: &str) -> Result<Outcome> {
-    send(
-        socket,
-        serde_json::json!({ "user": user, "calibrate_verify": true }),
-        Some(Duration::from_secs(30)),
-    )
-}
-
-/// From the polkit agent: what the request it is about to serve is.
-pub fn consent_context(
-    socket: &Path,
-    user: &str,
-    action: &str,
-    message: &str,
-    cookie: &str,
-) -> Result<Outcome> {
-    send(
-        socket,
-        serde_json::json!({ "user": user, "context_action": action, "context_message": message, "context_cookie": cookie }),
-        Some(Duration::from_secs(3)),
-    )
 }
 
 /// A consent request: the reply comes when the user answers the window, or
@@ -2663,89 +2712,144 @@ mod queue_tests {
         assert_eq!(ACTIVE.load(Ordering::SeqCst), before);
     }
 
-    /// Another user's parked request refuses at once instead of holding
-    /// this user's sudo open (B1); the same user's waits its turn.
+    /// The bar widget's presence poll is answered while the authenticator
+    /// is held for the length of an enrolment walk-through (C5). The query
+    /// takes no authenticator at all (its signature is the guarantee); this
+    /// holds a lock for the walk-through's whole run on the calling thread
+    /// and expects the reply, with the enrolled list read from the static,
+    /// well inside the busy wait a locked request would have spent.
     #[test]
-    fn a_request_never_queues_behind_another_users() {
-        let turn: Mutex<Option<u32>> = Mutex::new(None);
-        assert_eq!(ask_turn(&turn, 1000), TurnCall::Taken);
-        assert_eq!(ask_turn(&turn, 1001), TurnCall::OtherUser(1000));
-        assert_eq!(ask_turn(&turn, 1000), TurnCall::Wait);
-        *turn.lock().unwrap() = None;
-        assert_eq!(ask_turn(&turn, 1001), TurnCall::Taken);
+    fn a_presence_query_answers_while_the_authenticator_is_held() {
+        let user = "c5-poll-user";
+        set_enrolled(vec![user.to_string()]);
+        let walk_through: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        let held = walk_through.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let poll = std::thread::spawn(move || {
+            let started = Instant::now();
+            let outcome = presence_query(1000, 1, user, "query");
+            tx.send((outcome, started.elapsed())).unwrap();
+        });
+        let (outcome, took) = rx
+            .recv_timeout(BUSY_WAIT)
+            .expect("the poll was answered while the walk-through held its lock");
+        assert!(
+            matches!(outcome, Outcome::PresenceMode { .. }),
+            "a state reply, not busy: {:?}",
+            outcome
+        );
+        assert!(
+            took < BUSY_WAIT / 2,
+            "answered at once, not after a wait: {:?}",
+            took
+        );
+        // The list is what the poll reads: a deleted user stops "watching"
+        // without the store being asked.
+        assert!(is_enrolled(user));
+        set_enrolled(Vec::new());
+        assert!(!is_enrolled(user));
+        drop(held);
+        poll.join().unwrap();
     }
 
-    /// Consent requests per user are bounded, live or waiting, well above
-    /// anything a person or a fleet of agent sessions reaches; the place
-    /// comes back when a request ends (B4).
+    /// Three same-uid requests take the window in arrival order; another
+    /// user's is refused while one is live (B1); a request past the bound
+    /// waits nowhere (B4); a requester that hangs up while waiting never
+    /// gets the window (H9, H11).
     #[test]
-    fn consent_requests_are_bounded_per_user() {
-        let count: Mutex<Vec<(u32, usize)>> = Mutex::new(Vec::new());
-        let places: Vec<ConsentPlace> = (0..CONSENT_PER_UID)
+    fn same_user_requests_take_the_window_in_arrival_order() {
+        use crate::consent::{ConsentState, NoTurn};
+        let st: &'static ConsentState = Box::leak(Box::new(ConsentState::new()));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let first = st.join(1000).unwrap();
+        let held = st.take_turn(first, "alice", None, &|| {}).unwrap();
+        assert_eq!(st.join(1001).unwrap_err(), NoTurn::OtherUser(1000));
+        // Three more of alice's, joined a moment apart, each on its own
+        // thread as the daemon runs them.
+        let mut threads = Vec::new();
+        for n in 1..=3u32 {
+            let place = st.join(1000).unwrap();
+            let order = Arc::clone(&order);
+            threads.push(std::thread::spawn(move || {
+                let turn = st.take_turn(place, "alice", None, &|| {}).unwrap();
+                order.lock().unwrap().push(n);
+                std::thread::sleep(Duration::from_millis(50));
+                drop(turn);
+            }));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            st.join(1001).unwrap_err(),
+            NoTurn::OtherUser(1000),
+            "refused while alice's is live"
+        );
+        drop(held);
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), vec![1, 2, 3]);
+        assert!(st.live_user().is_none(), "the last turn freed the window");
+        let _b = st
+            .join(1001)
+            .expect("free for another user once alice is done");
+        // The bound: one past it waits nowhere; a freed place is a place taken.
+        let st2: &'static ConsentState = Box::leak(Box::new(ConsentState::new()));
+        let places: Vec<_> = (0..crate::consent::CONSENT_PER_UID)
             .map(|i| {
-                take_consent_place(&count, 1000).unwrap_or_else(|| panic!("place {} refused", i))
+                st2.join(1000)
+                    .unwrap_or_else(|e| panic!("place {}: {:?}", i, e))
             })
             .collect();
         const {
             assert!(
-                CONSENT_PER_UID >= 20,
+                crate::consent::CONSENT_PER_UID >= 20,
                 "twenty agent sessions calling sudo at once must all queue"
             )
         };
-        assert!(
-            take_consent_place(&count, 1000).is_none(),
-            "one past the bound waits nowhere"
-        );
-        let _c = take_consent_place(&count, 1001).expect("another user is not affected");
-        // The drop goes to the daemon's static, not this test's map, so the
-        // count is corrected by hand here; what is tested is the rule.
-        count
-            .lock()
-            .unwrap()
-            .iter_mut()
-            .find(|(u, _)| *u == 1000)
-            .unwrap()
-            .1 -= 1;
-        assert!(
-            take_consent_place(&count, 1000).is_some(),
-            "a place freed is a place taken"
-        );
+        assert_eq!(st2.join(1000).unwrap_err(), NoTurn::TooMany);
         drop(places);
+        let _p = st2.join(1000).expect("a place freed is a place taken");
+        // A requester that hangs up while waiting is Gone, not served.
+        let st3: &'static ConsentState = Box::leak(Box::new(ConsentState::new()));
+        let live = st3.test_live(1000, "alice");
+        let (a, b) = UnixStream::pair().unwrap();
+        let place = st3.join(1000).unwrap();
+        let waiter = std::thread::spawn(move || {
+            st3.take_turn(place, "alice", Some(b.into()), &|| {})
+                .map(|_| ())
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        drop(a);
+        assert_eq!(waiter.join().unwrap().unwrap_err(), NoTurn::Gone);
+        drop(live);
     }
 
-    /// The watcher ends within one read timeout of the request ending,
-    /// and reports no hang-up for a request that is already over (B5).
+    /// The hang-up is read off the request socket itself: dropping the
+    /// requester's end reads as gone at the next poll, a peer that is alive
+    /// and silent does not, and a live record with no requester never
+    /// reads as gone (H11).
     #[test]
-    fn the_hangup_watcher_stops_with_its_request() {
+    fn a_dropped_requester_reads_as_gone_and_a_silent_one_does_not() {
+        use crate::consent::{peer_gone, Answer, ConsentState};
         let (a, b) = UnixStream::pair().unwrap();
-        b.set_read_timeout(Some(Duration::from_millis(100)))
-            .unwrap();
-        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let probe = b.try_clone().unwrap();
-        let act = Arc::clone(&active);
-        let t = std::thread::spawn(move || watch_hangup(&probe, &act));
-        std::thread::sleep(Duration::from_millis(250));
-        assert!(
-            !t.is_finished(),
-            "the watcher waits while the request is active"
-        );
-        active.store(false, std::sync::atomic::Ordering::SeqCst);
-        b.shutdown(std::net::Shutdown::Read).unwrap();
-        let start = Instant::now();
-        assert!(
-            !t.join().unwrap(),
-            "a hang-up after the request ended is not one"
-        );
-        assert!(start.elapsed() < Duration::from_millis(500));
-        // A real hang-up while active is reported.
-        let (a2, b2) = UnixStream::pair().unwrap();
-        b2.set_read_timeout(Some(Duration::from_millis(100)))
-            .unwrap();
-        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let act = Arc::clone(&active);
-        let t = std::thread::spawn(move || watch_hangup(&b2, &act));
-        drop(a2);
-        assert!(t.join().unwrap());
+        let b: std::os::fd::OwnedFd = b.into();
+        assert!(!peer_gone(&b), "alive and silent");
         drop(a);
+        assert!(peer_gone(&b), "hung up");
+        let st: &'static ConsentState = Box::leak(Box::new(ConsentState::new()));
+        let place = st.join(1000).unwrap();
+        let (a, b) = UnixStream::pair().unwrap();
+        let _turn = st
+            .take_turn(place, "alice", Some(b.into()), &|| {})
+            .unwrap();
+        assert!(!st.requester_gone("alice"));
+        assert!(st.poll("alice").is_none());
+        drop(a);
+        assert!(st.requester_gone("alice"));
+        assert!(matches!(st.poll("alice"), Some(Answer::Gone)));
+        assert!(
+            st.answered("alice"),
+            "a hang-up counts as an answer waiting"
+        );
     }
 }

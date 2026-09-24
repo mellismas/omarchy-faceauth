@@ -5,9 +5,13 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow.workspace = true
-faceauth-camera = { version = "0.1.0", path = "../faceauth-camera" }
+libc.workspace = true
 log.workspace = true
-ndarray = "0.17.2"
-ort = { version = "2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray"] }
+# A release candidate because no 2.0 release exists yet; the load-dynamic
+# feature is what lets the engine bind Arch's libonnxruntime.so at run time.
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["load-dynamic"] }

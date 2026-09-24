@@ -9,9 +9,7 @@
 //! with the host secret in the mix (`host+tpm2`, `/var/lib/systemd/
 //! credential.secret`, root-only): PID 1 then refuses to unseal or mint one
 //! for any caller that is not root. So a copy of the file is useless off
-//! this machine, and on it only root can open it or forge one. (System-scoped
-//! credentials, the first cut, were unsealed by PID 1 for any local user; a
-//! blob of that kind is still read, and re-sealed root-only on first load.)
+//! this machine, and on it only root can open it or forge one.
 //! There is no recovery key anywhere on disk, by design: templates that
 //! cannot be unsealed are re-enrolled (enrolment sets an unreadable blob
 //! aside and starts fresh). Without a working TPM the file is `<user>.json`,
@@ -26,7 +24,10 @@
 //! entries and matched by the best score, which is how variants merge into one
 //! identity without averaging away what makes each distinct. Each template
 //! records the camera it was enrolled on and only matches on that camera: a
-//! camera swapped in for the enrolled one gets nothing to match against.
+//! camera swapped in for the enrolled one gets nothing to match against. A
+//! template with no camera recorded (`device` empty, which only the
+//! development store path writes) matches on any camera, and `doctor`
+//! reports such a set.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -42,7 +43,8 @@ const SYSTEMD_CREDS: &str = "/usr/bin/systemd-creds";
 const TIMEOUT: &str = "/usr/bin/timeout";
 /// Templates per user. A sealed credential is capped at 1 MiB by systemd
 /// (about 90 templates as compact JSON); the cap keeps every store the same
-/// size, sealed or not, and four looks of ten is plenty.
+/// size, sealed or not. One walk-through writes up to 34, so the cap holds
+/// a full walk-through with a few older looks, and Add Look prunes to it.
 pub const MAX_TEMPLATES: usize = 40;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -62,8 +64,9 @@ pub struct Template {
     #[serde(default)]
     pub device: Option<String>,
     /// The head pose the frame was taken at (`pose::Pose` yaw and
-    /// nose_pitch), so an identity can be seen to cover the range of looks
-    /// a person uses. None on templates from before pose was recorded.
+    /// nose_pitch), recorded with the template for a later look at which
+    /// poses a set covers; nothing reads them yet. None on templates from
+    /// before pose was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yaw: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -81,48 +84,39 @@ pub struct UserTemplates {
     /// Which recognition model produced these; a model change invalidates them.
     pub model: String,
     pub templates: Vec<Template>,
-    /// This person's gesture sizes, measured at enrolment.
+    /// This person's gesture rounds, recorded in the enrolment walk-through.
     #[serde(default)]
     pub gesture: GestureCal,
 }
 
-/// How far this person's face moves, in face widths, when they nod and
-/// when they shake, from calibration rounds (each a recorded double
-/// gesture). The floors derive from these: the nod's only ever rises above
-/// the default (a lower floor is where false approvals live), the shake's
-/// only ever falls below it (a false refusal costs a password prompt).
+/// What the enrolment walk-through recorded of this person's gestures, in
+/// degrees from the face mesh. The consent window's floors derive from
+/// where each gesture round stops reading (`floors_deg`); the swings are
+/// kept for the record. A record written before round-4 C3 also carries
+/// the image-motion fields of the removed fallback detectors (`nod`,
+/// `shake`, `everyday`, `nod_floor_min`, `shake_floor_min`, `still_nod`,
+/// `still_shake`): it parses, sets no floor from them, and drops them on
+/// the next save.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct GestureCal {
-    pub nod: Vec<f32>,
-    pub shake: Vec<f32>,
-    /// Everyday-movement rounds: what the person does when not gesturing,
-    /// each with its largest vertical and horizontal excursion.
-    #[serde(default)]
-    pub everyday: Vec<EverydayRound>,
-    /// Floors the verify step found necessary so that this person's
-    /// everyday rounds read as nothing when replayed through the detectors;
-    /// a floor never sits below its own. None until a session has been
-    /// verified.
-    #[serde(default)]
-    pub nod_floor_min: Option<f32>,
-    #[serde(default)]
-    pub shake_floor_min: Option<f32>,
-    /// The same rounds on the face mesh, in degrees: each nod's largest
-    /// pitch swing, each shake's largest yaw swing, and every everyday
-    /// round's swing on both axes. The mesh detectors take their floors
-    /// from these; the fields above stay for the image-motion detectors.
+    /// Each nod round's largest pitch swing and each shake round's
+    /// largest yaw swing, and every everyday round's swing on both axes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nod_deg: Vec<f32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shake_deg: Vec<f32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub everyday_deg: Vec<EverydayDeg>,
-    /// From a short-lived earlier format that kept only the numbers; ignored
-    /// once `everyday` has rounds, and dropped on the next save.
+    /// Where each recorded gesture round stops reading: the highest floor,
+    /// degrees, at which the walk-through's replay of that round through
+    /// the mesh detector still counted it as its gesture. The floors
+    /// derive from these, not from the swings above: the detector's first
+    /// leg runs from rest, about half the peak-to-peak swing, so a fraction
+    /// of the swing said nothing about where the round stops reading.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub still_nod: Vec<f32>,
+    pub nod_reads_to_deg: Vec<f32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub still_shake: Vec<f32>,
+    pub shake_reads_to_deg: Vec<f32>,
 }
 
 /// An everyday round on the mesh: its largest 1.5 s swing in yaw and in
@@ -134,125 +128,41 @@ pub struct EverydayDeg {
     pub dpitch: f32,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct EverydayRound {
-    pub kind: String,
-    pub dy: f32,
-    pub dx: f32,
-}
-
-/// The everyday rounds whose size is worth reporting against the gestures:
-/// the small, jittery ones. A glance at the keyboard, a lean-in and a look
-/// aside are as big as a gesture and are refused by the detector's shape
-/// rules (one leg, a hold at the bottom or the side), not by size. No
-/// round's size raises a floor by itself: the verify step replays every
-/// round through the detectors, and raises a floor only when an everyday
-/// round reads as a gesture, only as far as it takes.
-pub const FLOOR_KINDS: [&str; 2] = ["read", "talk"];
-
 impl GestureCal {
-    fn typical(v: &[f32]) -> Option<f32> {
-        if v.is_empty() {
-            return None;
-        }
-        let mut s = v.to_vec();
-        s.sort_by(|a, b| a.total_cmp(b));
-        Some(s[s.len() / 2])
-    }
+    /// The margin under where a person's own gestures stop reading: the
+    /// reference user's shake-1 stops at 21 degrees and a lighter shake at
+    /// the card is more exposed than the one made for the walk-through.
+    pub const MESH_FLOOR_MARGIN: f32 = 0.85;
+    /// Caps on a derived mesh floor. The reference rounds (`traces/v2`)
+    /// stop reading at 15 degrees for both nods and at 21 for the lighter
+    /// shake; a person whose rounds all read far higher still gets a floor
+    /// no ordinary gesture would miss.
+    pub const NOD_DEG_MAX: f32 = 16.0;
+    pub const SHAKE_DEG_MAX: f32 = 24.0;
 
-    /// How far the verify step may raise a floor to keep everyday movement
-    /// from reading as a gesture. Past this the person's own gestures would
-    /// go with it, and the check says so instead.
-    pub const NOD_FLOOR_MAX: f32 = 0.15;
-    pub const SHAKE_FLOOR_MAX: f32 = 0.12;
-
-    fn largest(v: &[f32]) -> Option<f32> {
-        v.iter()
-            .copied()
-            .fold(None, |m, x| Some(m.map_or(x, |m: f32| m.max(x))))
-    }
-
-    /// (nod floor, shake floor) for this person, given the defaults.
-    pub fn floors(&self, default_nod: f32, default_shake: f32) -> (f32, f32) {
-        // 0.4 of the peak-to-peak, capped: the detector sees single legs, which
-        // run 0.14 to 0.21 on a 0.26 nod (recorded), and the floor must sit
-        // clearly under the smallest of them.
-        // Capped at 0.09: on the reference user's recording, both nods count
-        // at every floor up to 0.09 and one drops out at 0.10 (its first
-        // departure from rest is the small leg).
-        let mut nod = Self::typical(&self.nod)
-            .map(|a| (a * 0.4).clamp(default_nod, 0.09))
-            .unwrap_or(default_nod);
-        let mut shake = Self::typical(&self.shake)
-            .map(|a| (a * 0.5).clamp(0.03, default_shake))
-            .unwrap_or(default_shake);
-        // Everyday movement pushes a floor up, never down: what the verify
-        // step found necessary for this person's own rounds to read as nothing.
-        if let Some(m) = self.nod_floor_min {
-            nod = nod.max(m.min(Self::NOD_FLOOR_MAX));
-        }
-        if let Some(m) = self.shake_floor_min {
-            shake = shake.max(m.min(Self::SHAKE_FLOOR_MAX));
-        }
-        (nod, shake)
-    }
-
-    /// The mesh detectors' floors, degrees: 0.4 of this person's typical
-    /// gesture swing, never under the detector's own minimum nor over a
-    /// cap that would lose a light gesture (recorded 2026-09-24: nods 26
-    /// to 35 degrees peak to peak with legs from 12; shakes 49 to 57 with
-    /// legs from 33).
+    /// The mesh detectors' floors, degrees, derived by replay: the highest
+    /// floor at which every one of this person's recorded gesture rounds
+    /// still reads, times `MESH_FLOOR_MARGIN`, never under the detector's
+    /// own minimum nor over the cap. Nothing recorded means the defaults.
     pub fn floors_deg(&self, default_nod: f32, default_shake: f32) -> (f32, f32) {
-        let nod = Self::typical(&self.nod_deg)
-            .map(|a| (a * 0.4).clamp(default_nod, 16.0))
-            .unwrap_or(default_nod);
-        let shake = Self::typical(&self.shake_deg)
-            .map(|a| (a * 0.4).clamp(default_shake, 24.0))
-            .unwrap_or(default_shake);
-        (nod, shake)
-    }
-
-    /// The floors with no everyday adjustment: the starting point the
-    /// verify step raises from.
-    pub fn base_floors(&self, default_nod: f32, default_shake: f32) -> (f32, f32) {
-        let nod = Self::typical(&self.nod)
-            .map(|a| (a * 0.4).clamp(default_nod, 0.09))
-            .unwrap_or(default_nod);
-        let shake = Self::typical(&self.shake)
-            .map(|a| (a * 0.5).clamp(0.03, default_shake))
-            .unwrap_or(default_shake);
-        (nod, shake)
-    }
-
-    /// The largest vertical and horizontal excursion among the jittery
-    /// everyday rounds (`FLOOR_KINDS`), the ones a floor stands clear of.
-    fn jitter(&self) -> (Option<f32>, Option<f32>) {
-        let rounds: Vec<&EverydayRound> = self
-            .everyday
-            .iter()
-            .filter(|r| FLOOR_KINDS.contains(&r.kind.as_str()))
-            .collect();
-        let ys: Vec<f32> = rounds.iter().map(|r| r.dy).collect();
-        let xs: Vec<f32> = rounds.iter().map(|r| r.dx).collect();
-        (Self::largest(&ys), Self::largest(&xs))
-    }
-
-    /// How many times larger this person's typical gesture is than their
-    /// largest everyday movement on the same axis, per axis; None until both
-    /// have been recorded. Under 2.0 the two are not cleanly separable and
-    /// the setup says so.
-    pub fn margins(&self) -> (Option<f32>, Option<f32>) {
-        let (sy, sx) = self.jitter();
-        let m = |g: &[f32], s: Option<f32>| match (Self::typical(g), s) {
-            (Some(g), Some(s)) if s > 0.0 => Some(g / s),
-            (Some(_), Some(_)) => Some(f32::INFINITY),
-            _ => None,
+        let derive = |reads_to: &[f32], default: f32, cap: f32| {
+            reads_to
+                .iter()
+                .copied()
+                .fold(None, |m, x| Some(m.map_or(x, |m: f32| m.min(x))))
+                .map(|r| (r * Self::MESH_FLOOR_MARGIN).clamp(default, cap))
+                .unwrap_or(default)
         };
-        (m(&self.nod, sy), m(&self.shake, sx))
+        (
+            derive(&self.nod_reads_to_deg, default_nod, Self::NOD_DEG_MAX),
+            derive(&self.shake_reads_to_deg, default_shake, Self::SHAKE_DEG_MAX),
+        )
     }
 
+    /// The walk-through recorded at least one nod round and one shake
+    /// round that read on the mesh: the person has floors of their own.
     pub fn is_calibrated(&self) -> bool {
-        !self.nod.is_empty() && !self.shake.is_empty()
+        !self.nod_reads_to_deg.is_empty() && !self.shake_reads_to_deg.is_empty()
     }
 }
 
@@ -307,36 +217,70 @@ impl UserTemplates {
         v
     }
 
-    /// Pairwise similarity statistics of the stored templates: (min, mean, max).
-    /// Trim the set to `max` templates by dropping, one at a time, the
+    /// A template whose mean similarity to the rest of the set is under
+    /// this is not a look of the same person: the reference set agrees at
+    /// 0.90 pairwise, an impostor's frame scores 0.37 to 0.56 against it,
+    /// and a garbage crop lower still.
+    pub const OUTLIER_MEAN: f32 = 0.5;
+    /// A template from a frame the detector scored under this is a poor
+    /// crop (the daemon's own floor for a face is 0.6).
+    pub const QUALITY_FLOOR: f32 = 0.6;
+
+    /// Trim the set to `max` templates, one at a time, and return how many
+    /// went. The order matters: a set pruned by nearest neighbour alone
+    /// keeps whatever is least like the rest, so an impostor's frame or a
+    /// garbage crop is the last thing to go and the person's own looks go
+    /// first. So each round drops, in this order, a template inconsistent
+    /// with the set (mean similarity to the others under `OUTLIER_MEAN`),
+    /// then one of poor quality (under `QUALITY_FLOOR`), and only then the
     /// template most similar to another (the surplus copy of a look the set
-    /// already has), so what remains covers the widest range of looks. The
-    /// number removed is returned.
+    /// already has), so what remains covers the widest range of looks.
     pub fn prune_to(&mut self, max: usize) -> usize {
         let mut removed = 0;
         while self.templates.len() > max.max(1) {
             let n = self.templates.len();
-            let mut worst = (0usize, -1.0f32);
-            for i in 0..n {
-                let nearest = (0..n)
-                    .filter(|&j| j != i)
-                    .map(|j| {
-                        faceauth_engine::cosine(
-                            &self.templates[i].embedding,
-                            &self.templates[j].embedding,
-                        )
+            let sim = |i: usize, j: usize| {
+                faceauth_engine::cosine(&self.templates[i].embedding, &self.templates[j].embedding)
+            };
+            let mean_to_rest = |i: usize| {
+                (0..n).filter(|&j| j != i).map(|j| sim(i, j)).sum::<f32>() / (n - 1) as f32
+            };
+            let outlier = (0..n)
+                .map(|i| (i, mean_to_rest(i)))
+                .filter(|&(_, m)| m < Self::OUTLIER_MEAN)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i);
+            let poor = || {
+                (0..n)
+                    .map(|i| (i, self.templates[i].quality))
+                    .filter(|&(_, q)| {
+                        !q.partial_cmp(&Self::QUALITY_FLOOR)
+                            .is_some_and(|o| o.is_ge())
                     })
-                    .fold(-1.0, f32::max);
-                if nearest > worst.1 {
-                    worst = (i, nearest);
-                }
-            }
-            self.templates.remove(worst.0);
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(i, _)| i)
+            };
+            let duplicate = || {
+                (0..n)
+                    .map(|i| {
+                        let nearest = (0..n)
+                            .filter(|&j| j != i)
+                            .map(|j| sim(i, j))
+                            .fold(-1.0, f32::max);
+                        (i, nearest)
+                    })
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            };
+            let victim = outlier.or_else(poor).unwrap_or_else(duplicate);
+            self.templates.remove(victim);
             removed += 1;
         }
         removed
     }
 
+    /// Pairwise similarity statistics of the stored templates: (min, mean, max).
     pub fn self_consistency(&self) -> Option<(f32, f32, f32)> {
         let n = self.templates.len();
         if n < 2 {
@@ -390,7 +334,7 @@ impl Sealing {
         match seal(Path::new(SYSTEMD_CREDS), "faceauth-probe", b"probe")
             .and_then(|blob| unseal(Path::new(SYSTEMD_CREDS), "faceauth-probe", &blob))
         {
-            Ok((back, _)) if back == b"probe" => Sealing::Tpm,
+            Ok(back) if back == b"probe" => Sealing::Tpm,
             Ok(_) => Sealing::Plain("TPM probe round trip returned different bytes".into()),
             Err(e) => Sealing::Plain(format!("TPM probe failed: {}", e)),
         }
@@ -534,25 +478,14 @@ fn seal(bin: &Path, name: &str, plain: &[u8]) -> Result<Vec<u8>> {
     )
 }
 
-/// Unseal a blob. Returns the bytes and whether the blob was of the older,
-/// system-scoped kind (which the caller should re-seal).
-fn unseal(bin: &Path, name: &str, blob: &[u8]) -> Result<(Vec<u8>, bool)> {
-    match creds(
+/// Unseal a blob sealed by `seal`: root-scoped and name-bound, nothing else
+/// is accepted.
+fn unseal(bin: &Path, name: &str, blob: &[u8]) -> Result<Vec<u8>> {
+    creds(
         bin,
         &["decrypt", "--uid=0", &format!("--name={}", name), "-", "-"],
         blob,
-    ) {
-        Ok(b) => Ok((b, false)),
-        Err(e) if e.to_string().contains("scoped to the system") => Ok((
-            creds(
-                bin,
-                &["decrypt", &format!("--name={}", name), "-", "-"],
-                blob,
-            )?,
-            true,
-        )),
-        Err(e) => Err(e),
-    }
+    )
 }
 
 fn cred_name(user: &str) -> String {
@@ -741,21 +674,10 @@ impl Store {
             }
             let blob =
                 std::fs::read(&sealed).with_context(|| format!("read {}", sealed.display()))?;
-            let (text, old_kind) = unseal(&self.creds_bin, &cred_name(user), &blob)
+            let text = unseal(&self.creds_bin, &cred_name(user), &blob)
                 .with_context(|| format!("unseal {}", sealed.display()))?;
             let t = self.parse(&String::from_utf8_lossy(&text), &sealed, user)?;
             if let Some(t) = &t {
-                if old_kind && self.sealing() == Sealing::Tpm {
-                    // A system-scoped blob from the first cut: any local user
-                    // could have asked PID 1 to open it. Re-seal root-only now.
-                    match self.save(t) {
-                        Ok(p) => log::info!("{}: re-sealed root-only", p.display()),
-                        Err(e) => {
-                            log::warn!("{}: could not re-seal root-only: {}", sealed.display(), e)
-                        }
-                    }
-                    return Ok(Some(t.clone()));
-                }
                 if let Ok(mut c) = self.cache.lock() {
                     c.insert(user.to_string(), (fp, t.clone()));
                 }
@@ -782,10 +704,14 @@ impl Store {
         Ok(t)
     }
 
-    /// Write atomically (temp file, fsync, rename) with mode 0600: sealed when
-    /// this machine can, plaintext otherwise. Sealing removes the plaintext
-    /// form; a plaintext write never removes a sealed file, and is refused
-    /// outright when one exists (sticky sealing).
+    /// Write atomically (temp file, fsync, rename, directory fsync) with
+    /// mode 0600: sealed when this machine can, plaintext otherwise. Sealing
+    /// removes the plaintext form; a plaintext write never removes a sealed
+    /// file, and is refused outright when one exists (sticky sealing). A
+    /// staging file another process of this daemon left behind (a crash
+    /// between create and rename) is removed first. A non-finite number is
+    /// refused: JSON has no spelling for it, serde writes `null`, and the
+    /// whole set would then fail to parse.
     pub fn save(&self, t: &UserTemplates) -> Result<PathBuf> {
         use std::os::unix::fs::OpenOptionsExt;
         if t.templates.len() > MAX_TEMPLATES {
@@ -796,6 +722,14 @@ impl Store {
                 MAX_TEMPLATES
             );
         }
+        if let Some(what) = non_finite_field(t) {
+            bail!(
+                "templates for {}: {} is not a finite number; refusing to write an unreadable set",
+                t.user,
+                what
+            );
+        }
+        self.remove_stale_temps(&t.user, Some(std::process::id()))?;
         let sealed_path = self.sealed_path_for(&t.user)?;
         let plain_path = self.path_for(&t.user)?;
         let mut sealing = self.sealing();
@@ -858,6 +792,11 @@ impl Store {
                     .with_context(|| format!("remove {}", other.display()))?;
             }
         }
+        // The rename and the unlink are directory entries; without a sync
+        // of the directory a power cut can leave either name, or both.
+        std::fs::File::open(&self.dir)
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("sync {}", self.dir.display()))?;
         if let Ok(mut c) = self.cache.lock() {
             match fingerprint(&target) {
                 Ok(fp) => {
@@ -869,6 +808,26 @@ impl Store {
             }
         }
         Ok(target)
+    }
+
+    /// Remove `<user>.tmp-<pid>-<n>` staging files, which a crash between
+    /// create and rename leaves behind; those of `keep_pid` (a save in
+    /// progress by this process) stay.
+    fn remove_stale_temps(&self, user: &str, keep_pid: Option<u32>) -> Result<()> {
+        Self::check_user(user)?;
+        let prefix = format!("{}.tmp-", user);
+        let keep = keep_pid.map(|p| format!("{}.tmp-{}-", user, p));
+        for e in std::fs::read_dir(&self.dir).into_iter().flatten().flatten() {
+            let name = e.file_name();
+            let Some(n) = name.to_str() else { continue };
+            if !n.starts_with(&prefix) || keep.as_deref().is_some_and(|k| n.starts_with(k)) {
+                continue;
+            }
+            std::fs::remove_file(e.path())
+                .with_context(|| format!("remove stale {}", e.path().display()))?;
+            log::warn!("{}: stale staging file removed", e.path().display());
+        }
+        Ok(())
     }
 
     /// Enrolment's recovery from a blob this machine can no longer open (a
@@ -919,6 +878,26 @@ impl Store {
         Ok(())
     }
 
+    /// The one way an enrolment opens a user's set, terminal or
+    /// walk-through: the store must be allowed to replace what it holds
+    /// (`check_can_replace`), and a set it cannot read goes aside only on
+    /// the credential tool's own verdict. A TPM that is busy, unreachable
+    /// or slow keeps the good set, and the enrolment fails instead of
+    /// starting over with nothing (F2, on both paths).
+    pub fn open_for_enrolment(&self, user: &str) -> Result<Option<UserTemplates>> {
+        self.check_can_replace(user)?;
+        match self.load(user) {
+            Ok(t) => Ok(t),
+            Err(e) => match self.set_aside_if_unreadable(user, &e)? {
+                Some(aside) => {
+                    log::warn!("enrolment for {}: existing templates unreadable ({}); set aside as {} and starting fresh", user, e, aside.display());
+                    Ok(None)
+                }
+                None => Err(e),
+            },
+        }
+    }
+
     /// Users with templates on disk (sealed or plain): the accounts allowed
     /// to talk to the daemon's socket.
     pub fn enrolled_users(&self) -> Vec<String> {
@@ -941,12 +920,29 @@ impl Store {
         v
     }
 
+    /// The directory a user's gesture recordings go in (dev-tools builds
+    /// only): a directory per user, so a delete takes exactly that user's
+    /// files and never a neighbour's whose name shares a prefix.
+    pub fn gestures_dir_for(&self, user: &str) -> Result<PathBuf> {
+        Self::check_user(user)?;
+        Ok(self.dir.join("gestures").join(user))
+    }
+
+    /// The directory a user's walk-through frame recordings go in
+    /// (dev-tools builds only, raw IR frames): per user, like the gestures.
+    pub fn record_dir_for(&self, user: &str) -> Result<PathBuf> {
+        Self::check_user(user)?;
+        Ok(self.dir.join("record").join(user))
+    }
+
     /// Remove everything the store holds about a user: the templates, sealed
-    /// or plain, any set-aside blob (`<user>.cred.unreadable-*`), the gesture
-    /// recordings (`gestures/<secs>-<user>-*.txt`) and the walk-through's
-    /// frame recordings (`record/<user>/`). True when templates were there.
+    /// or plain, any set-aside blob (`<user>.cred.unreadable-*`), any
+    /// staging file a crash left, the gesture recordings (`gestures/<user>/`)
+    /// and the walk-through's frame recordings (`record/<user>/`). True when
+    /// templates were there.
     pub fn delete(&self, user: &str) -> Result<bool> {
         Self::check_user(user)?;
+        self.remove_stale_temps(user, None)?;
         let mut any = false;
         for p in [self.sealed_path_for(user)?, self.path_for(user)?] {
             if p.exists() {
@@ -963,41 +959,45 @@ impl Store {
                     .with_context(|| format!("remove {}", e.path().display()))?;
             }
         }
-        for e in std::fs::read_dir(self.dir.join("gestures"))
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            let name = e.file_name();
-            let Some(n) = name.to_str() else { continue };
-            // `<unix seconds>-<user>-<how it ended>.txt`, the user matched
-            // as a whole component so "al" does not take "alice"'s files.
-            let is_users = n
-                .strip_suffix(".txt")
-                .and_then(|stem| stem.split_once('-'))
-                .map(|(secs, rest)| {
-                    secs.chars().all(|c| c.is_ascii_digit())
-                        && rest
-                            .strip_prefix(user)
-                            .map(|r| r.starts_with('-'))
-                            .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            if is_users {
-                std::fs::remove_file(e.path())
-                    .with_context(|| format!("remove {}", e.path().display()))?;
+        for dir in [self.gestures_dir_for(user)?, self.record_dir_for(user)?] {
+            if dir.is_dir() {
+                std::fs::remove_dir_all(&dir)
+                    .with_context(|| format!("remove {}", dir.display()))?;
             }
-        }
-        let record = self.dir.join("record").join(user);
-        if record.is_dir() {
-            std::fs::remove_dir_all(&record)
-                .with_context(|| format!("remove {}", record.display()))?;
         }
         if let Ok(mut c) = self.cache.lock() {
             c.remove(user);
         }
         Ok(any)
     }
+}
+
+/// The first non-finite number in a set, named, or None when every float
+/// in it can be written as JSON.
+fn non_finite_field(t: &UserTemplates) -> Option<String> {
+    for (i, tp) in t.templates.iter().enumerate() {
+        if tp.embedding.iter().any(|v| !v.is_finite()) {
+            return Some(format!("template {} embedding", i));
+        }
+        if !tp.quality.is_finite() || !tp.face_width.is_finite() {
+            return Some(format!("template {} quality or face_width", i));
+        }
+        if tp.yaw.is_some_and(|v| !v.is_finite()) || tp.nose_pitch.is_some_and(|v| !v.is_finite()) {
+            return Some(format!("template {} pose", i));
+        }
+    }
+    let g = &t.gesture;
+    let floats = g
+        .nod_deg
+        .iter()
+        .chain(&g.shake_deg)
+        .chain(&g.nod_reads_to_deg)
+        .chain(&g.shake_reads_to_deg)
+        .chain(g.everyday_deg.iter().flat_map(|e| [&e.dyaw, &e.dpitch]));
+    if floats.into_iter().any(|v| !v.is_finite()) {
+        return Some("gesture calibration".into());
+    }
+    None
 }
 
 pub fn current_uid(user: &str) -> Option<u32> {
@@ -1102,152 +1102,189 @@ mod tests {
         assert!(only_bound.best_match_on(&[1.0, 0.0], "uvc:y").is_none());
     }
 
+    /// A record from before round-4 C3 carries the image-motion fields of
+    /// the fallback detectors: it still loads, sets no floor from them,
+    /// and sheds them on the next save. Only the walk-through's replay
+    /// results make a person calibrated, and they survive the store.
     #[test]
-    fn everyday_rounds_set_margins_and_only_the_verify_step_raises_a_floor() {
-        let ev = |kind: &str, dy: f32, dx: f32| EverydayRound {
-            kind: kind.into(),
-            dy,
-            dx,
-        };
-        // Sizes alone never move a floor: a talk round with a natural bob of
-        // 0.07 (recorded live) would have pushed the nod floor past the 0.09
-        // where a real nod drops out.
-        let g = GestureCal {
-            nod: vec![0.26, 0.30],
-            shake: vec![0.33, 0.36],
-            everyday: vec![
-                ev("read", 0.02, 0.03),
-                ev("talk", 0.07, 0.02),
-                ev("lean", 0.27, 0.08),
-                ev("aside", 0.10, 0.50),
-            ],
-            ..Default::default()
-        };
-        assert_eq!(g.floors(0.06, 0.06), (0.09, 0.06));
-        let (mn, ms) = g.margins();
-        // "typical" is the upper median: 0.30 of [0.26, 0.30], 0.36 of [0.33, 0.36].
-        assert!((mn.unwrap() - 0.30 / 0.07).abs() < 1e-3, "{:?}", mn);
-        assert!((ms.unwrap() - 0.36 / 0.03).abs() < 1e-3, "{:?}", ms);
-        // What the verify step found necessary raises a floor, never lowers
-        // one, and never past the cap.
-        let verified = GestureCal {
-            nod_floor_min: Some(0.11),
-            shake_floor_min: Some(0.05),
-            ..g.clone()
-        };
-        assert_eq!(verified.floors(0.06, 0.06), (0.11, 0.06));
-        let capped = GestureCal {
-            nod_floor_min: Some(0.30),
-            shake_floor_min: Some(0.30),
-            ..g.clone()
-        };
-        assert_eq!(
-            capped.floors(0.06, 0.06),
-            (GestureCal::NOD_FLOOR_MAX, GestureCal::SHAKE_FLOOR_MAX)
-        );
-        // A record from before these rounds existed still reads, and one from
-        // the short-lived numbers-only format reads but raises nothing.
-        let old: GestureCal = serde_json::from_str(r#"{"nod":[0.2],"shake":[0.3]}"#).unwrap();
-        assert!(old.everyday.is_empty() && old.margins() == (None, None));
-        let numbers: GestureCal = serde_json::from_str(
-            r#"{"nod":[0.26],"shake":[0.22],"still_nod":[0.27],"still_shake":[0.5]}"#,
+    fn a_record_with_the_image_motion_fields_still_loads_and_sets_no_floor() {
+        let old: GestureCal = serde_json::from_str(
+            r#"{"nod":[0.26,0.30],"shake":[0.33],"everyday":[{"kind":"read","dy":0.02,"dx":0.03}],"nod_floor_min":0.11,"shake_floor_min":0.05,"still_nod":[0.27],"still_shake":[0.5]}"#,
         )
         .unwrap();
-        assert_eq!(numbers.floors(0.06, 0.06), (0.09, 0.06));
-    }
-
-    #[test]
-    fn calibration_floors_only_tighten_the_nod_and_loosen_the_shake() {
-        let none = GestureCal::default();
-        assert_eq!(none.floors(0.06, 0.06), (0.06, 0.06));
-        assert!(!none.is_calibrated());
-        // A big nodder: floor rises to half the typical swing, capped.
-        let big = GestureCal {
-            nod: vec![0.30, 0.26, 0.40],
-            shake: vec![0.20, 0.24],
+        assert_eq!(old, GestureCal::default());
+        assert!(!old.is_calibrated());
+        assert_eq!(old.floors_deg(8.0, 15.0), (8.0, 15.0));
+        let saved = serde_json::to_string(&old).unwrap();
+        assert!(
+            !saved.contains("nod_floor_min") && !saved.contains("still_nod"),
+            "{}",
+            saved
+        );
+        let cal = GestureCal {
+            nod_deg: vec![34.7],
+            shake_deg: vec![49.2],
+            nod_reads_to_deg: vec![14.0],
+            shake_reads_to_deg: vec![20.0],
             ..Default::default()
         };
-        let (n, s) = big.floors(0.06, 0.06);
-        assert!((n - 0.09).abs() < 1e-6, "{}", n); // 0.30 * 0.4 = 0.12, capped at 0.09
-        assert!((s - 0.06).abs() < 1e-6, "{}", s); // 0.22 * 0.5 = 0.11 > default: stays at default
-                                                   // A light nodder: never below the default.
-        let light = GestureCal {
-            nod: vec![0.08, 0.09],
-            shake: vec![0.08, 0.07],
-            ..Default::default()
-        };
-        let (n, s) = light.floors(0.06, 0.06);
-        assert!((n - 0.06).abs() < 1e-6, "{}", n);
-        assert!((s - 0.04).abs() < 1e-6, "{}", s); // 0.08 * 0.5, above the 0.03 minimum
-                                                   // Stored with the templates and read back.
+        assert!(cal.is_calibrated());
         let dir = temp("cal");
         let store = Store::open_with(&dir, Sealing::Plain("test".into())).unwrap();
         let mut u = UserTemplates::new("alice", "glintr100");
         u.uid = None;
         u.templates.push(tmpl(vec![1.0, 0.0], 1, None));
-        u.gesture = light.clone();
+        u.gesture = cal.clone();
         store.save(&u).unwrap();
-        assert_eq!(store.load("alice").unwrap().unwrap().gesture, light);
+        assert_eq!(store.load("alice").unwrap().unwrap().gesture, cal);
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    fn unit(v: Vec<f32>) -> Vec<f32> {
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter().map(|x| x / n).collect()
+    }
+
     /// Pruning drops the copies of a look the set already has and keeps
-    /// the different ones.
+    /// the different ones. The looks here agree at 0.8 (a person with and
+    /// without glasses, a turned head), as real looks of one face do.
     #[test]
     fn pruning_keeps_the_different_looks() {
         let mut u = UserTemplates::new("alice", "glintr100");
-        let mk = |v: Vec<f32>| {
-            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            tmpl(v.iter().map(|x| x / n).collect(), 1, None)
+        let mk = |v: Vec<f32>, label: &str| Template {
+            label: label.into(),
+            ..tmpl(unit(v), 1, None)
         };
-        u.templates.push(mk(vec![1.0, 0.0, 0.0]));
-        u.templates.push(mk(vec![1.0, 0.05, 0.0]));
-        u.templates.push(mk(vec![1.0, -0.05, 0.0]));
-        u.templates.push(mk(vec![0.0, 1.0, 0.0]));
-        u.templates.push(mk(vec![0.0, 0.0, 1.0]));
+        u.templates.push(mk(vec![1.0, 0.0, 0.0], "a"));
+        u.templates.push(mk(vec![1.0, 0.05, 0.0], "a-copy"));
+        u.templates.push(mk(vec![1.0, -0.05, 0.0], "a-copy"));
+        u.templates.push(mk(vec![0.8, 0.6, 0.0], "b"));
+        u.templates.push(mk(vec![0.8, 0.0, 0.6], "c"));
         assert_eq!(u.prune_to(3), 2);
-        let kept: Vec<usize> = u
-            .templates
-            .iter()
-            .map(|t| {
-                t.embedding
-                    .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.total_cmp(b.1))
-                    .unwrap()
-                    .0
-            })
-            .collect();
+        let mut kept: Vec<&str> = u.templates.iter().map(|t| t.label.as_str()).collect();
+        kept.sort();
         assert_eq!(
             kept,
-            vec![0, 1, 2],
-            "one of each direction survives; the near copies go"
+            vec!["a", "b", "c"],
+            "one of each look survives; the near copies go"
         );
         assert_eq!(u.prune_to(10), 0);
     }
 
+    /// An impostor's frame and a garbage crop have no close neighbour, so a
+    /// nearest-neighbour prune kept them and dropped the person's own looks.
+    /// They go first now: the outlier, then the poor crop, then duplicates.
     #[test]
-    fn mesh_floors_come_from_the_recorded_swings() {
+    fn pruning_drops_the_impostor_and_the_junk_before_the_person() {
+        let mut u = UserTemplates::new("alice", "glintr100");
+        let genuine = |v: Vec<f32>, label: &str| Template {
+            label: label.into(),
+            ..tmpl(unit(v), 1, None)
+        };
+        u.templates
+            .push(genuine(vec![1.0, 0.0, 0.0, 0.0], "look-1"));
+        u.templates
+            .push(genuine(vec![1.0, 0.1, 0.0, 0.0], "look-1b"));
+        u.templates
+            .push(genuine(vec![0.9, 0.4, 0.0, 0.0], "look-2"));
+        u.templates
+            .push(genuine(vec![0.9, 0.0, 0.4, 0.0], "look-3"));
+        u.templates.push(Template {
+            label: "impostor".into(),
+            ..tmpl(unit(vec![0.0, 0.0, 0.0, 1.0]), 1, None)
+        });
+        u.templates.push(Template {
+            label: "junk".into(),
+            quality: 0.31,
+            ..tmpl(unit(vec![0.95, 0.3, 0.0, 0.0]), 1, None)
+        });
+        assert_eq!(u.prune_to(5), 1);
+        assert!(
+            u.templates.iter().all(|t| t.label != "impostor"),
+            "the outlier goes first"
+        );
+        assert_eq!(u.prune_to(4), 1);
+        assert!(
+            u.templates.iter().all(|t| t.label != "junk"),
+            "then the poor crop"
+        );
+        assert_eq!(u.prune_to(3), 1);
+        let mut kept: Vec<&str> = u.templates.iter().map(|t| t.label.as_str()).collect();
+        kept.sort();
+        assert_eq!(kept, vec!["look-1", "look-2", "look-3"], "then a near copy");
+    }
+
+    /// A staging file a crash left behind is removed by the next save and
+    /// by delete; a non-finite number is refused rather than written as
+    /// `null`.
+    #[test]
+    fn stale_staging_files_are_removed_and_non_finite_values_refused() {
+        let dir = temp("stale");
+        let store = Store::open_with(&dir, Sealing::Plain("test".into())).unwrap();
+        std::fs::write(dir.join("alice.tmp-1-0"), b"half").unwrap();
+        std::fs::write(dir.join("alice.tmp-2-7"), b"half").unwrap();
+        std::fs::write(dir.join("alicia.tmp-3-0"), b"hers").unwrap();
+        let mut u = UserTemplates::new("alice", "glintr100");
+        u.uid = None;
+        u.templates.push(tmpl(vec![1.0, 0.0], 1, Some("cam")));
+        store.save(&u).unwrap();
+        assert!(!dir.join("alice.tmp-1-0").exists() && !dir.join("alice.tmp-2-7").exists());
+        assert!(
+            dir.join("alicia.tmp-3-0").exists(),
+            "a neighbour's file is not touched"
+        );
+        std::fs::write(dir.join("alice.tmp-9-0"), b"half").unwrap();
+        assert!(store.delete("alice").unwrap());
+        assert!(!dir.join("alice.tmp-9-0").exists());
+        let mut bad = UserTemplates::new("alice", "glintr100");
+        bad.uid = None;
+        bad.templates
+            .push(tmpl(vec![f32::NAN, 0.0], 1, Some("cam")));
+        let e = store.save(&bad).unwrap_err().to_string();
+        assert!(e.contains("not a finite number"), "{}", e);
+        assert!(!dir.join("alice.json").exists());
+        let mut bad = UserTemplates::new("alice", "glintr100");
+        bad.uid = None;
+        bad.templates.push(tmpl(vec![1.0, 0.0], 1, Some("cam")));
+        bad.gesture.nod_reads_to_deg = vec![f32::INFINITY];
+        assert!(store.save(&bad).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The mesh floors sit a margin under the lowest point at which any of
+    /// the person's recorded rounds stops reading, never under the
+    /// detector's minimum nor over the cap; the swings play no part.
+    #[test]
+    fn mesh_floors_sit_under_where_the_recorded_rounds_stop_reading() {
         let mut g = GestureCal::default();
         assert_eq!(
             g.floors_deg(8.0, 15.0),
             (8.0, 15.0),
             "nothing recorded: the defaults"
         );
+        // The reference user's swings alone (the old input) change nothing.
         g.nod_deg = vec![34.7, 25.7];
         g.shake_deg = vec![49.2, 56.8];
+        assert_eq!(g.floors_deg(8.0, 15.0), (8.0, 15.0));
+        // The reference rounds: both nods read up to 14 degrees, the shakes
+        // to 20 and past 26 (2026-09-24 replay).
+        g.nod_reads_to_deg = vec![14.0, 14.0];
+        g.shake_reads_to_deg = vec![26.0, 20.0];
         let (n, s) = g.floors_deg(8.0, 15.0);
         assert!(
-            (n - 13.88).abs() < 0.1 && (s - 22.72).abs() < 0.1,
-            "0.4 of the upper median: {} {}",
+            (n - 11.9).abs() < 0.01 && (s - 17.0).abs() < 0.01,
+            "0.85 of the lowest drop-out: {} {}",
             n,
             s
         );
-        g.nod_deg = vec![80.0];
-        g.shake_deg = vec![120.0];
+        // A round that reads only at the minimum keeps the floor there.
+        g.nod_reads_to_deg = vec![14.0, 8.0];
+        assert_eq!(g.floors_deg(8.0, 15.0).0, 8.0);
+        g.nod_reads_to_deg = vec![80.0];
+        g.shake_reads_to_deg = vec![120.0];
         assert_eq!(
             g.floors_deg(8.0, 15.0),
-            (16.0, 24.0),
+            (GestureCal::NOD_DEG_MAX, GestureCal::SHAKE_DEG_MAX),
             "capped so a light gesture still counts"
         );
     }
@@ -1441,9 +1478,85 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir2);
     }
 
+    /// A credential tool that answers with this script's exit code and
+    /// stderr, for driving `open_for_enrolment` through a real unseal.
+    fn fake_creds(dir: &Path, name: &str, code: i32, stderr: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(
+            &p,
+            format!("#!/bin/sh\necho '{}' >&2\nexit {}\n", stderr, code),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    /// The walk-through and the terminal enrolment open the set the same
+    /// way: a TPM that timed out keeps the sealed blob and fails the
+    /// enrolment; only the tool's verdict on the blob sets it aside (F2,
+    /// round-4 C8).
+    #[test]
+    fn enrolment_keeps_a_sealed_set_the_tpm_could_not_open_in_time() {
+        let dir = temp("openenrol");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = Store::open_with_probe(&dir, Sealing::Tpm, || Sealing::Tpm).unwrap();
+        let sealed = store.sealed_path_for("alice").unwrap();
+        std::fs::write(&sealed, b"a good sealed blob").unwrap();
+
+        store.creds_bin = fake_creds(&dir, "creds-timeout.sh", 124, "");
+        let e = store.open_for_enrolment("alice").unwrap_err();
+        assert!(!is_definitive(&e), "{:#}", e);
+        assert!(sealed.exists(), "a timeout keeps the blob");
+
+        store.creds_bin = fake_creds(
+            &dir,
+            "creds-busy.sh",
+            1,
+            "Failed to connect to TPM: Connection refused",
+        );
+        assert!(store.open_for_enrolment("alice").is_err());
+        assert!(sealed.exists(), "an unreachable TPM keeps the blob");
+
+        store.creds_bin = fake_creds(
+            &dir,
+            "creds-bad.sh",
+            1,
+            "Failed to decrypt credential: Bad message",
+        );
+        assert!(
+            store.open_for_enrolment("alice").unwrap().is_none(),
+            "the tool's verdict starts a fresh set"
+        );
+        assert!(!sealed.exists(), "and sets the old one aside");
+        assert!(std::fs::read_dir(&dir).unwrap().flatten().any(|e| e
+            .file_name()
+            .to_string_lossy()
+            .starts_with("alice.cred.unreadable-")));
+
+        // A store that cannot seal refuses before it touches the blob.
+        let dir2 = temp("openenrol-plain");
+        let _ = std::fs::remove_dir_all(&dir2);
+        let plain = Store::open_with_probe(
+            &dir2,
+            Sealing::Plain("TPM probe failed: timeout".into()),
+            || Sealing::Plain("still failing".into()),
+        )
+        .unwrap()
+        .without_creds();
+        let sealed2 = plain.sealed_path_for("alice").unwrap();
+        std::fs::write(&sealed2, b"blob").unwrap();
+        let e = plain.open_for_enrolment("alice").unwrap_err().to_string();
+        assert!(e.contains("enrolment refused"), "{}", e);
+        assert!(sealed2.exists());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir2);
+    }
+
     /// Deleting a user takes the set-aside blobs, the gesture recordings
     /// and the walk-through recordings with the templates, and nobody
-    /// else's (F5).
+    /// else's: not a neighbour whose name extends theirs ("alice") nor one
+    /// that adds a hyphen ("al-x") (F5, round-4 F4).
     #[test]
     fn delete_removes_every_trace_of_the_user_and_only_theirs() {
         let dir = temp("deleteall");
@@ -1457,26 +1570,36 @@ mod tests {
         store.save(&u).unwrap();
         std::fs::write(dir.join("al.cred.unreadable-1700000000"), b"x").unwrap();
         std::fs::write(dir.join("alice.cred.unreadable-1700000000"), b"x").unwrap();
-        std::fs::create_dir_all(dir.join("gestures")).unwrap();
-        std::fs::write(dir.join("gestures/1700000001-al-nodded.txt"), b"x").unwrap();
-        std::fs::write(dir.join("gestures/1700000002-alice-nodded.txt"), b"x").unwrap();
-        std::fs::write(dir.join("gestures/1700000003-al-with-dash-al-x.txt"), b"x").unwrap();
-        std::fs::create_dir_all(dir.join("record/al")).unwrap();
-        std::fs::write(dir.join("record/al/frame.pgm"), b"x").unwrap();
-        std::fs::create_dir_all(dir.join("record/alice")).unwrap();
+        for user in ["al", "alice", "al-x"] {
+            let g = store.gestures_dir_for(user).unwrap();
+            std::fs::create_dir_all(&g).unwrap();
+            std::fs::write(g.join("1700000001-nodded.txt"), b"x").unwrap();
+            std::fs::write(g.join("1700000002-v2-nod-1.txt"), b"x").unwrap();
+            let r = store.record_dir_for(user).unwrap();
+            std::fs::create_dir_all(&r).unwrap();
+            std::fs::write(r.join("012.40_yaw-0.120_pitch0.610.pgm"), b"P5\n").unwrap();
+        }
         assert!(store.delete("al").unwrap());
         let left: Vec<String> = walk(&dir);
         assert_eq!(
             left,
             vec![
                 "alice.cred.unreadable-1700000000",
-                "gestures/1700000002-alice-nodded.txt",
-                "record/alice"
+                "gestures/al-x/1700000001-nodded.txt",
+                "gestures/al-x/1700000002-v2-nod-1.txt",
+                "gestures/alice/1700000001-nodded.txt",
+                "gestures/alice/1700000002-v2-nod-1.txt",
+                "record/al-x/012.40_yaw-0.120_pitch0.610.pgm",
+                "record/alice/012.40_yaw-0.120_pitch0.610.pgm",
             ],
             "{:?}",
             left
         );
         assert!(!store.delete("al").unwrap(), "nothing left to delete");
+        assert!(
+            store.gestures_dir_for("../x").is_err() && store.record_dir_for("a/b").is_err(),
+            "a recording directory is never outside the store"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

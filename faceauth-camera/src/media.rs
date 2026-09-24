@@ -55,6 +55,10 @@ pub struct MediaDevice {
     path: PathBuf,
 }
 
+/// Spare link and pad descriptors handed to `MEDIA_IOC_ENUM_LINKS` beyond
+/// the count an earlier enumeration reported (see `links`).
+const LINK_HEADROOM: usize = 16;
+
 impl MediaDevice {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -90,7 +94,8 @@ impl MediaDevice {
     }
 
     pub fn info(&self) -> Result<(String, String, String)> {
-        let mut i: media_device_info = unsafe { std::mem::zeroed() };
+        let mut i = media_device_info::zeroed();
+        // SAFETY: the `sys` rule; the kernel fills a struct we own.
         unsafe { media_ioc_device_info(self.file.as_raw_fd(), &mut i) }
             .context("MEDIA_IOC_DEVICE_INFO")?;
         Ok((cstr(&i.driver), cstr(&i.model), cstr(&i.bus_info)))
@@ -100,8 +105,9 @@ impl MediaDevice {
         let mut out = Vec::new();
         let mut id = MEDIA_ENT_ID_FLAG_NEXT;
         loop {
-            let mut d: media_entity_desc = unsafe { std::mem::zeroed() };
+            let mut d = media_entity_desc::zeroed();
             d.id = id;
+            // SAFETY: the `sys` rule; EINVAL past the last entity ends the walk.
             match unsafe { media_ioc_enum_entities(self.file.as_raw_fd(), &mut d) } {
                 Ok(_) => {}
                 Err(nix::errno::Errno::EINVAL) => break,
@@ -121,23 +127,33 @@ impl MediaDevice {
         Ok(out)
     }
 
-    pub fn entity_by_name(&self, name: &str) -> Result<Option<Entity>> {
-        Ok(self.entities()?.into_iter().find(|e| e.name == name))
-    }
-
     /// Links leaving this entity. The kernel reports outgoing links only, so a
     /// sink's inputs are found by enumerating its sources.
+    ///
+    /// `MEDIA_IOC_ENUM_LINKS` carries no buffer length: the kernel writes one
+    /// descriptor per link the entity has at the time of the call, and the
+    /// counts here come from an earlier `ENUM_ENTITIES`. A link created in
+    /// between (a lens driver binding while the daemon probes) would be
+    /// written past a buffer sized to the old count, so both buffers carry
+    /// headroom and the entries the kernel did not fill are dropped: an
+    /// entity id is never 0.
     pub fn links(&self, entity: &Entity) -> Result<Vec<Link>> {
-        let mut pads = vec![media_pad_desc::default(); entity.pads as usize];
-        let mut links = vec![media_link_desc::default(); entity.links as usize];
-        let mut e: media_links_enum = unsafe { std::mem::zeroed() };
-        e.entity = entity.id;
-        e.pads = pads.as_mut_ptr();
-        e.links = links.as_mut_ptr();
+        let mut pads = vec![media_pad_desc::default(); entity.pads as usize + LINK_HEADROOM];
+        let mut links = vec![media_link_desc::default(); entity.links as usize + LINK_HEADROOM];
+        let mut e = media_links_enum {
+            entity: entity.id,
+            _pad: 0,
+            pads: pads.as_mut_ptr(),
+            links: links.as_mut_ptr(),
+            reserved: [0; 4],
+        };
+        // SAFETY: the `sys` rule; `pads` and `links` outlive the call and
+        // hold more descriptors than the entity had when it was enumerated.
         unsafe { media_ioc_enum_links(self.file.as_raw_fd(), &mut e) }
             .with_context(|| format!("MEDIA_IOC_ENUM_LINKS {}", entity.name))?;
         Ok(links
             .iter()
+            .filter(|l| l.source.entity != 0 || l.sink.entity != 0)
             .map(|l| Link {
                 source_entity: l.source.entity,
                 source_pad: l.source.index,
@@ -155,6 +171,7 @@ impl MediaDevice {
         d.sink.entity = link.sink_entity;
         d.sink.index = link.sink_pad;
         d.flags = if enable { MEDIA_LNK_FL_ENABLED } else { 0 };
+        // SAFETY: the `sys` rule.
         match unsafe { media_ioc_setup_link(self.file.as_raw_fd(), &mut d) } {
             Ok(_) => Ok(()),
             Err(e) => bail!(

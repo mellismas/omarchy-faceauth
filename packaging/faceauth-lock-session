@@ -1,11 +1,12 @@
 #!/bin/bash
 # Lock a user's Omarchy session from the faceauth daemon (root).
-#   faceauth-lock-session <user> [omarchy-path]
+#   faceauth-lock-session <user> <omarchy-path>
 # The lock command runs inside the user's own systemd manager, with that
 # session's environment, so the daemon never switches uid itself: the service
 # sandbox drops CAP_SETUID, and runuser/su would open a PAM session whose
-# modules fail under it. OMARCHY_PATH must name the tree the running shell was
-# launched from (the packaged one unless the desktop is dev-linked).
+# modules fail under it. The Omarchy tree is the daemon's to resolve (its
+# config, then /etc/omarchy.conf, then the package), so it is passed in and
+# never parsed here a second time.
 #
 # A presence lock keeps the panel lit for ten minutes rather than the usual
 # few seconds: the owner may be a few feet away and wants to see the screen
@@ -19,27 +20,7 @@
 set -uo pipefail
 
 user=${1:?user}
-
-# The Omarchy tree. Never fatal: a missing /etc/omarchy.conf (no package or
-# installer creates it) means the packaged tree, and omarchy-dev-link writes
-# the export form, which a bare `OMARCHY_PATH=` match would miss.
-omarchy_path_from_conf() {
-  local conf=${1:-/etc/omarchy.conf} line v
-  [[ -r $conf ]] || return 0
-  while IFS= read -r line; do
-    line=${line#"${line%%[![:space:]]*}"}
-    line=${line#export }
-    line=${line#"${line%%[![:space:]]*}"}
-    [[ $line == OMARCHY_PATH=* ]] || continue
-    v=${line#OMARCHY_PATH=}
-    v=${v%%[[:space:]]*}
-    v=${v#\"}; v=${v%\"}; v=${v#\'}; v=${v%\'}
-    [[ $v == /* ]] && { printf '%s\n' "$v"; return 0; }
-  done < "$conf"
-  return 0
-}
-omarchy_path=${2:-$(omarchy_path_from_conf "${FACEAUTH_OMARCHY_CONF:-/etc/omarchy.conf}")}
-omarchy_path=${omarchy_path:-/usr/share/omarchy}
+omarchy_path=${2:?omarchy-path}
 
 run_as_user() {
   /usr/bin/timeout 15 /usr/bin/systemd-run --machine="$user@.host" --user --wait --collect --quiet \

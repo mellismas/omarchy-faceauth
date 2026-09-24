@@ -2,25 +2,34 @@
 //! prove the capture crate on hardware; enrol, test, doctor follow.
 
 use anyhow::{anyhow, bail, Context, Result};
-use faceauth_camera::calib::{self, Exposure, Smoother, Window, AE_TARGET};
 use faceauth_camera::ipu3::SensorKind;
-use faceauth_camera::unpack::{bayer_reduce, BayerOrder};
-use faceauth_camera::{Camera, Frame, Illuminator};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "dev-tools")]
+mod dev;
+
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth auth [--user NAME] [--socket PATH] [--consent]   (asks a running faceauthd; --consent = window + nod)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there?)
-  faceauth sweep [--user NAME] [--seconds N] [--log FILE] [--threshold T]   (dev-tools builds; root; scores per frame while you turn your head)
-  faceauth pose [--user NAME] [--rounds N] [--seconds N]   (dev-tools builds; root; a live pose readout)\n  faceauth enroll [--user NAME] [--label TEXT] [--guided [--start distance]]   (root; the walk-through window: distance, path, holds, verify)
-  faceauth enroll [--user NAME] [--label TEXT] [--terminal [--poses up,down]]   (root; the five looks from the terminal, no window)
-  faceauth enroll [--user NAME] [--label TEXT] [--seconds N] [--count N]   (root; one look, as the camera sees it)
-  faceauth enrol-control continue|redo|cancel [--user NAME]   (from the enrolment window)\n  faceauth enroll --store DIR ...                   (direct camera access, development)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] [--dismiss|--ack|--passwordless MIN]   (from the consent window; stdin: token line, then password line)\n  faceauth consent-context --action ID --message TEXT [--cookie C]   (from the polkit agent, as a request starts)\n  faceauth calibrate [--user NAME] [--gestures-only]   (root; two nods, two shakes and five everyday movements, stored with the templates)
-  faceauth calibrate [--user NAME] --guided              (root; the same rounds in the walk-through window)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence mode [default|secure] [--user NAME]   (as the watched user; reads or switches the watch's mode until the next restart; prints {{\"presence\":{{\"mode\":..,\"watching\":..}}}})\n  faceauth presence                                (current state)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only] [--exposure LINES]\n"
+        "usage:\n  faceauth cam probe\n  faceauth cam graph\n  faceauth auth [--user NAME] [--socket PATH] [--consent]   (asks a running faceauthd; --consent = window + nod)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there?)
+  faceauth enroll [--user NAME] [--label TEXT] [--start distance]   (root; the walk-through window, the same one Setup > Security > Face opens; --guided is accepted)
+  faceauth enroll [--user NAME] [--label TEXT] --terminal [--poses up,down]   (root; the five looks from the terminal, no window)
+  faceauth enroll [--user NAME] [--label TEXT] --look [--seconds N] [--count N]   (root; one look, as the camera sees it, no walk-through)
+  faceauth enrol-control continue|redo|cancel [--user NAME]   (from the enrolment window)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]   (development: the omarchy-faceauth-models package ships the files)\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] [--dismiss|--ack|--rearm|--passwordless MIN]   (from the consent window; stdin: token line, then password line)\n  faceauth calibrate [--user NAME] --guided              (root; the gesture and everyday rounds in the walk-through window, stored with the templates)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence mode [default|secure] [--user NAME]   (as the watched user; reads or switches the watch's mode until the next restart; prints {{\"presence\":{{\"mode\":..,\"watching\":..}}}})\n  faceauth presence [--user NAME]                  (the watch's mode and, for the watched user, its state){}",
+        dev_usage()
     );
     std::process::exit(2)
+}
+
+/// The development tools' usage lines, in a build that has them.
+#[cfg(feature = "dev-tools")]
+fn dev_usage() -> &'static str {
+    dev::USAGE
+}
+
+#[cfg(not(feature = "dev-tools"))]
+fn dev_usage() -> &'static str {
+    ""
 }
 
 fn main() -> Result<()> {
@@ -28,83 +37,21 @@ fn main() -> Result<()> {
         .format_timestamp_millis()
         .init();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    // The bring-up and tuning tools exist only in a development build:
+    // the package ships none of them (H2).
+    #[cfg(feature = "dev-tools")]
+    if let Some(r) = dev::dispatch(&argv) {
+        return r;
+    }
+    match argv.as_slice() {
         ["cam", "probe"] => cam_probe(),
         ["cam", "graph"] => cam_graph(),
-        ["cam", "test", rest @ ..] => cam_test(rest),
-        ["engine", "inspect", model] => {
-            faceauth_engine::runtime::init()?;
-            print!("{}", faceauth_engine::runtime::describe(model)?);
-            Ok(())
-        }
-        ["engine", "test", rest @ ..] => engine_test(rest),
-        ["engine", "mesh", rest @ ..] => {
-            // The dense landmarks and the head pose from them, on a still
-            // frame: detect, mesh, pose, and the five-point pose beside it.
-            let dir = models_dir(rest);
-            let img = faceauth_engine::Grey::read_pgm(
-                rest.iter()
-                    .find(|a| a.ends_with(".pgm"))
-                    .ok_or_else(|| anyhow!("IMAGE.pgm"))?,
-            )?;
-            let mut p = faceauth_engine::Pipeline::load(&dir)?;
-            let Some(mesh) = p.mesh.as_mut() else {
-                bail!(
-                    "no {} in {}",
-                    faceauth_engine::mesh::FACE_MESH_FILE,
-                    dir.display()
-                )
-            };
-            let faces = p.detector.detect(&img, 0.5)?;
-            let Some(face) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else {
-                println!("no face");
-                return Ok(());
-            };
-            let five = faceauth_engine::pose::pose(&face.landmarks);
-            let t = Instant::now();
-            let m = mesh.for_face(&img, face)?;
-            let took = t.elapsed();
-            println!("face {:.0}px det {:.2}; five-point yaw {:+.3} nose_pitch {:.3} mouth_drop {:.3} roll {:+.1}", face.bbox[2], face.score, five.yaw, five.nose_pitch, five.mouth_drop, five.roll.to_degrees());
-            match m {
-                Some(m) => {
-                    let hp = faceauth_engine::mesh::head_pose(&m);
-                    println!(
-                        "mesh score {:.3} in {:.1} ms: yaw {:+.1} pitch {:+.1} roll {:+.1} deg",
-                        m.score,
-                        took.as_secs_f32() * 1000.0,
-                        hp.yaw,
-                        hp.pitch,
-                        hp.roll
-                    );
-                    for (name, i) in [
-                        ("forehead", faceauth_engine::mesh::FOREHEAD),
-                        ("chin", faceauth_engine::mesh::CHIN),
-                        ("nose", faceauth_engine::mesh::NOSE_TIP),
-                        ("r-eye", faceauth_engine::mesh::RIGHT_EYE_OUTER),
-                        ("l-eye", faceauth_engine::mesh::LEFT_EYE_OUTER),
-                        ("r-cheek", faceauth_engine::mesh::RIGHT_CHEEK),
-                        ("l-cheek", faceauth_engine::mesh::LEFT_CHEEK),
-                    ] {
-                        let q = m.points[i];
-                        println!("  {:8} ({:.0}, {:.0}, z {:+.0})", name, q[0], q[1], q[2]);
-                    }
-                }
-                None => println!("mesh: no face in the crop"),
-            }
-            Ok(())
-        }
-        ["engine", "live", rest @ ..] => engine_live(rest),
-        ["enroll", rest @ ..] if !rest.contains(&"--store") => {
+        ["enroll", rest @ ..] => {
             // Production path: the daemon owns the camera and the store.
-            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
-            let user = opt(rest, "--user")
-                .map(String::from)
-                .unwrap_or_else(target_user);
+            let socket =
+                PathBuf::from(opt(rest, "--socket").unwrap_or(faceauth_daemon::config::SOCKET));
+            let user = user_arg(rest)?;
             let label = opt(rest, "--label").unwrap_or("enrol");
             if rest.contains(&"--terminal") {
                 let only: Vec<String> = opt(rest, "--poses")
@@ -112,9 +59,11 @@ fn main() -> Result<()> {
                     .unwrap_or_default();
                 return enroll_guided(&socket, &user, label, &only);
             }
-            if rest.contains(&"--guided") {
-                // The walk-through: the daemon opens the window, the person
-                // follows it, and the outcome comes back here.
+            if !rest.contains(&"--look") {
+                // The walk-through, and the default: the daemon opens the
+                // window Setup > Security > Face uses, the person follows
+                // it, and the outcome comes back here. `--guided` still
+                // names it for scripts written when it was not the default.
                 let start_at = opt(rest, "--start");
                 println!(
                     "Enrolling {}: follow the window on your screen. This terminal waits for it.",
@@ -172,251 +121,43 @@ fn main() -> Result<()> {
                 other => bail!("enrolment failed: {}", serde_json::to_string(other)?),
             }
         }
-        ["enroll", rest @ ..] => enroll(rest),
         ["templates", "delete", rest @ ..] => {
-            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
-            let user = opt(rest, "--user")
-                .map(String::from)
-                .unwrap_or_else(target_user);
+            only_flags(rest, &["--socket", "--user"])?;
+            let socket =
+                PathBuf::from(opt(rest, "--socket").unwrap_or(faceauth_daemon::config::SOCKET));
+            let user = user_arg(rest)?;
             let o = faceauth_daemon::server::delete_templates(&socket, &user)?;
-            println!("{}", serde_json::to_string(&o)?);
-            Ok(())
+            finish(&o)
         }
         ["models", "fetch", rest @ ..] => models_fetch(rest),
         ["doctor", rest @ ..] => doctor(rest),
-        #[cfg(feature = "dev-tools")]
-        ["sweep", rest @ ..] => {
-            // Root: how the match falls off with head pose, against the
-            // templates as they are. The user turns slowly left, right, up
-            // and down; every frame is scored and binned by yaw.
-            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
-            let user = opt(rest, "--user")
-                .map(String::from)
-                .unwrap_or_else(target_user);
-            let seconds: f32 = opt(rest, "--seconds").unwrap_or("20").parse()?;
-            let threshold: f32 = opt(rest, "--threshold").unwrap_or("0.70").parse()?;
-            println!("Pose sweep for {}: {} s. Follow the cues; move slowly and keep your eyes on the screen.", user, seconds as u32);
-            // Cues on a timer while the daemon records: five equal phases.
-            let cues = [
-                "Face the camera",
-                "Turn LEFT, about a quarter turn, and hold",
-                "Turn RIGHT, about a quarter turn, and hold",
-                "Chin UP a little, and hold",
-                "Chin DOWN, as if reading the keyboard",
-                "Tilt your head LEFT, ear toward shoulder",
-                "Tilt your head RIGHT, ear toward shoulder",
-            ];
-            let phase = seconds / cues.len() as f32;
-            std::thread::spawn(move || {
-                for c in cues {
-                    println!("\n>>> {}", c);
-                    std::thread::sleep(Duration::from_secs_f32(phase));
-                }
-                println!("\n>>> Done.");
-            });
-            let o = faceauth_daemon::server::sweep(&socket, &user, seconds)?;
-            let faceauth_daemon::auth::Outcome::Sweep {
-                frames,
-                templates,
-                elapsed_ms,
-            } = &o
-            else {
-                println!("{}", serde_json::to_string(&o)?);
-                return Ok(());
-            };
-            if let Some(path) = opt(rest, "--log") {
-                use std::io::Write as _;
-                let mut f = std::fs::OpenOptions::new()
-                    .append(true)
-                    .create(true)
-                    .open(path)?;
-                let stamp = faceauth_daemon::store::now_secs();
-                for fr in frames {
-                    writeln!(
-                        f,
-                        "{},{:.2},{:.3},{},{:.3},{:.3},{:.3},{:.0},{:.0}",
-                        stamp,
-                        fr.t,
-                        fr.score,
-                        fr.template,
-                        fr.yaw,
-                        fr.pitch,
-                        fr.nose_pitch,
-                        fr.face_px,
-                        fr.roll
-                    )?;
-                }
-                println!("{} frames appended to {}", frames.len(), path);
-            }
-            println!(
-                "{} frames in {:.1} s against {} templates; threshold {:.2}",
-                frames.len(),
-                *elapsed_ms as f32 / 1000.0,
-                templates,
-                threshold
-            );
-            let mut bins: std::collections::BTreeMap<i32, Vec<f32>> = Default::default();
-            for fr in frames {
-                bins.entry((fr.yaw * 10.0).round() as i32)
-                    .or_default()
-                    .push(fr.score);
-            }
-            println!(
-                "{:>6} {:>6} {:>6} {:>6} {:>6} {:>5}",
-                "yaw", "frames", "min", "mean", "max", "pass"
-            );
-            for (b, v) in &bins {
-                let n = v.len() as f32;
-                let mean = v.iter().sum::<f32>() / n;
-                let min = v.iter().cloned().fold(1.0, f32::min);
-                let max = v.iter().cloned().fold(-1.0, f32::max);
-                let pass = v.iter().filter(|s| **s >= threshold).count() as f32 / n * 100.0;
-                println!(
-                    "{:>6.1} {:>6} {:>6.3} {:>6.3} {:>6.3} {:>4.0}%",
-                    *b as f32 / 10.0,
-                    v.len(),
-                    min,
-                    mean,
-                    max,
-                    pass
-                );
-            }
-            let mut pbins: std::collections::BTreeMap<i32, Vec<f32>> = Default::default();
-            for fr in frames {
-                pbins
-                    .entry((fr.nose_pitch * 10.0).round() as i32)
-                    .or_default()
-                    .push(fr.score);
-            }
-            println!(
-                "{:>6} {:>6} {:>6} {:>6} {:>5}",
-                "npitch", "frames", "min", "mean", "pass"
-            );
-            for (b, v) in &pbins {
-                let n = v.len() as f32;
-                let mean = v.iter().sum::<f32>() / n;
-                let min = v.iter().cloned().fold(1.0, f32::min);
-                let pass = v.iter().filter(|s| **s >= threshold).count() as f32 / n * 100.0;
-                println!(
-                    "{:>6.1} {:>6} {:>6.3} {:>6.3} {:>4.0}%",
-                    *b as f32 / 10.0,
-                    v.len(),
-                    min,
-                    mean,
-                    pass
-                );
-            }
-            let mut rbins: std::collections::BTreeMap<i32, Vec<f32>> = Default::default();
-            for fr in frames {
-                rbins
-                    .entry((fr.roll / 10.0).round() as i32 * 10)
-                    .or_default()
-                    .push(fr.score);
-            }
-            println!(
-                "{:>6} {:>6} {:>6} {:>6} {:>5}",
-                "roll", "frames", "min", "mean", "pass"
-            );
-            for (b, v) in &rbins {
-                let n = v.len() as f32;
-                let mean = v.iter().sum::<f32>() / n;
-                let min = v.iter().cloned().fold(1.0, f32::min);
-                let pass = v.iter().filter(|s| **s >= threshold).count() as f32 / n * 100.0;
-                println!(
-                    "{:>6} {:>6} {:>6.3} {:>6.3} {:>4.0}%",
-                    b,
-                    v.len(),
-                    min,
-                    mean,
-                    pass
-                );
-            }
-            Ok(())
-        }
-        #[cfg(feature = "dev-tools")]
-        ["pose", rest @ ..] => {
-            // Root: a live readout of the pose measures, a few seconds at a
-            // time, so a person can see what a turn or a tilt reads.
-            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
-            let user = opt(rest, "--user")
-                .map(String::from)
-                .unwrap_or_else(target_user);
-            let rounds: usize = opt(rest, "--rounds").unwrap_or("8").parse()?;
-            let seconds: f32 = opt(rest, "--seconds").unwrap_or("3").parse()?;
-            println!("Pose readout for {}: {} rounds of {} s. Turn is yaw (negative left), pitch is nose_pitch (higher is chin down). Move and watch.", user, rounds, seconds);
-            println!(
-                "{:>5} {:>7} {:>7} {:>7} {:>7} {:>7} {:>6}",
-                "round", "frames", "turn", "turn+-", "pitch", "pitch+-", "score"
-            );
-            for r in 1..=rounds {
-                let o = faceauth_daemon::server::sweep(&socket, &user, seconds)?;
-                let faceauth_daemon::auth::Outcome::Sweep { frames, .. } = &o else {
-                    println!("{}", serde_json::to_string(&o)?);
-                    continue;
-                };
-                if frames.is_empty() {
-                    println!("{:>5} {:>7}", r, "no face");
-                    continue;
-                }
-                let n = frames.len() as f32;
-                let mean = |f: &dyn Fn(&faceauth_daemon::auth::SweepFrame) -> f32| {
-                    frames.iter().map(f).sum::<f32>() / n
-                };
-                let (yaw, pitch, score) = (
-                    mean(&|f| f.yaw),
-                    mean(&|f| f.nose_pitch),
-                    mean(&|f| f.score),
-                );
-                let spread = |f: &dyn Fn(&faceauth_daemon::auth::SweepFrame) -> f32| {
-                    let v: Vec<f32> = frames.iter().map(f).collect();
-                    (
-                        v.iter().cloned().fold(f32::MAX, f32::min),
-                        v.iter().cloned().fold(f32::MIN, f32::max),
-                    )
-                };
-                let (ylo, yhi) = spread(&|f| f.yaw);
-                let (plo, phi) = spread(&|f| f.nose_pitch);
-                println!(
-                    "{:>5} {:>7} {:>+7.2} {:>7} {:>7.2} {:>7} {:>6.2}",
-                    r,
-                    frames.len(),
-                    yaw,
-                    format!("{:+.2}..{:+.2}", ylo, yhi),
-                    pitch,
-                    format!("{:.2}..{:.2}", plo, phi),
-                    score
-                );
-            }
-            Ok(())
-        }
         ["enrol-control", word, rest @ ..] => {
             // From the enrolment window: continue, redo or cancel.
-            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
-            let user = opt(rest, "--user")
-                .map(String::from)
-                .unwrap_or_else(target_user);
+            only_flags(rest, &["--socket", "--user"])?;
+            let socket =
+                PathBuf::from(opt(rest, "--socket").unwrap_or(faceauth_daemon::config::SOCKET));
+            let user = user_arg(rest)?;
             let o = faceauth_daemon::server::enrol_control(&socket, &user, word)?;
-            println!("{}", serde_json::to_string(&o)?);
-            Ok(())
+            finish(&o)
         }
         ["probe", rest @ ..] => {
-            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
-            let user = opt(rest, "--user")
-                .map(String::from)
-                .unwrap_or_else(target_user);
+            only_flags(rest, &["--socket", "--user"])?;
+            let socket =
+                PathBuf::from(opt(rest, "--socket").unwrap_or(faceauth_daemon::config::SOCKET));
+            let user = user_arg(rest)?;
             let o = faceauth_daemon::server::probe(&socket, &user, Duration::from_secs(5))?;
-            println!("{}", serde_json::to_string(&o)?);
-            Ok(())
+            finish(&o)
         }
         ["presence", mode @ ("on" | "off"), rest @ ..] => {
-            // Root: rewrite the [presence] keys in the config and restart the service.
+            // Root: edit the [presence] keys in the config and restart the service.
             let cfg_path = opt(rest, "--config")
                 .unwrap_or("/etc/faceauth/config.toml")
                 .to_string();
-            let user = opt(rest, "--user")
-                .map(String::from)
-                .unwrap_or_else(target_user);
-            let away: f32 = opt(rest, "--away-seconds").unwrap_or("20").parse()?;
+            let user = user_arg(rest)?;
+            let away_arg = opt(rest, "--away-seconds").unwrap_or("20");
+            let away: f32 = away_arg
+                .parse()
+                .with_context(|| format!("--away-seconds {}: not a number", away_arg))?;
             // A config that does not parse is not replaced by one that only
             // holds [presence]: the administrator's other keys would go with
             // it. A missing file starts empty (F4).
@@ -425,52 +166,36 @@ fn main() -> Result<()> {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
                 Err(e) => return Err(e).with_context(|| format!("read {}", cfg_path)),
             };
-            let mut doc: toml::Table = toml::from_str(&text).with_context(|| {
-                format!(
-                    "{} does not parse; fix it before changing the presence watch",
-                    cfg_path
-                )
-            })?;
-            let mut presence = doc
-                .get("presence")
-                .and_then(|v| v.as_table())
-                .cloned()
-                .unwrap_or_default();
-            presence.insert("enabled".into(), toml::Value::Boolean(*mode == "on"));
-            presence.insert("user".into(), toml::Value::String(user.clone()));
-            presence.insert("away_seconds".into(), toml::Value::Float(away as f64));
-            // An existing lock command is the administrator's (a dev tree's
-            // path rides in its third argument); only a missing one is set.
-            if !presence.contains_key("lock_command") {
-                presence.insert(
-                    "lock_command".into(),
-                    toml::Value::Array(vec![
-                        toml::Value::String("/usr/bin/faceauth-lock-session".into()),
-                        toml::Value::String(user.clone()),
-                    ]),
+            let edited = presence_edit(&text, &cfg_path, *mode == "on", &user, away)?;
+            write_config_atomically(&cfg_path, &edited)
+                .with_context(|| format!("write {} (run as root)", cfg_path))?;
+            let st = std::process::Command::new("/usr/bin/systemctl")
+                .args(["restart", "faceauth.service"])
+                .status()
+                .context("run /usr/bin/systemctl")?;
+            if !st.success() {
+                bail!(
+                    "presence watch {} written to {}, but the service did not restart ({}); see `systemctl status faceauth.service`",
+                    mode,
+                    cfg_path,
+                    st
                 );
             }
-            doc.insert("presence".into(), toml::Value::Table(presence));
-            write_config_atomically(&cfg_path, &toml::to_string_pretty(&doc)?)
-                .with_context(|| format!("write {} (run as root)", cfg_path))?;
-            let st = std::process::Command::new("systemctl")
-                .args(["restart", "faceauth.service"])
-                .status();
-            println!(
-                "presence watch {} for {} (away after {} s); service restart: {}",
-                mode,
-                user,
-                away,
-                st.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string())
-            );
+            if *mode == "on" {
+                println!(
+                    "presence watch on for {} (away after {} s); service restarted",
+                    user, away
+                );
+            } else {
+                println!("presence watch off; service restarted");
+            }
             Ok(())
         }
         ["calibrate", rest @ ..] if rest.contains(&"--guided") => {
             // Root: the gesture and everyday rounds in the walk-through window.
-            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
-            let user = opt(rest, "--user")
-                .map(String::from)
-                .unwrap_or_else(target_user);
+            let socket =
+                PathBuf::from(opt(rest, "--socket").unwrap_or(faceauth_daemon::config::SOCKET));
+            let user = user_arg(rest)?;
             println!("Tuning gestures for {}: follow the window on your screen. This terminal waits for it.", user);
             let o = faceauth_daemon::server::enrol_session(&socket, &user, "tune", Some("bridge"))?;
             match &o {
@@ -484,251 +209,36 @@ fn main() -> Result<()> {
                 other => Err(anyhow!("tuning failed: {}", serde_json::to_string(other)?)),
             }
         }
-        ["calibrate", rest @ ..] => {
-            // Root: two nods, two shakes and three everyday movements, each a
-            // recorded round stored with the templates; the person's floors
-            // derive from them, and the margins say whether the two are apart.
-            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
-            let user = opt(rest, "--user")
-                .map(String::from)
-                .unwrap_or_else(target_user);
-            let gestures_only = rest.contains(&"--gestures-only");
-            println!("Calibrating for {}.\n", user);
-            println!("Why: a nod approves root access and a head shake refuses it, so the daemon needs to");
-            println!("know how you move. It records two nods and two shakes to learn the size of yours, and");
-            println!("then five ordinary movements (reading, a glance at the keyboard, talking to the screen, leaning in, a");
-            println!("look to the side) to learn what");
-            println!("must never count. That is how an everyday movement cannot approve or refuse something");
-            println!("on your behalf. Each round is a recording of head motion for a few seconds, never an");
-            println!("image, stored root-only with your templates. The window will ask for each round.\n");
-            let round_name = |kind: &str| match kind {
-                "nod" => "nod",
-                "shake" => "shake",
-                "read" => "reading",
-                "glance" => "glance at the keyboard",
-                "talk" => "talking",
-                "lean" => "leaning in",
-                _ => "look to the side",
-            };
-            // Run the rounds of `kinds`, then check every round of the session.
-            // A kind being redone replaces this session's earlier rounds of it.
-            let run =
-                |kinds: &[&str],
-                 first_ever: bool,
-                 replace: bool|
-                 -> Result<Option<(Vec<faceauth_daemon::auth::RoundCheck>, bool)>> {
-                    let mut last = None;
-                    let mut first = first_ever;
-                    for (gesture, rounds, seconds) in faceauth_daemon::auth::CALIBRATION_ROUNDS {
-                        if !kinds.contains(&gesture) {
-                            continue;
-                        }
-                        for i in 1..=rounds {
-                            // Replacing: the first round of a redone kind withdraws the earlier ones.
-                            let o = faceauth_daemon::server::calibrate(
-                                &socket,
-                                &user,
-                                gesture,
-                                seconds,
-                                first,
-                                replace && i == 1,
-                            )?;
-                            first = false;
-                            match &o {
-                                faceauth_daemon::auth::Outcome::Calibrated {
-                                    amplitude,
-                                    sideways,
-                                    stored,
-                                    nod_floor,
-                                    shake_floor,
-                                    nod_margin,
-                                    shake_margin,
-                                    ..
-                                } => {
-                                    let what = round_name(gesture);
-                                    if matches!(gesture, "nod" | "shake") {
-                                        println!(
-                                            "  {} {}/{}: moved {:.2} of a face width{}",
-                                            what,
-                                            i,
-                                            rounds,
-                                            amplitude,
-                                            if *stored {
-                                                ""
-                                            } else {
-                                                " (too small to count; not stored)"
-                                            }
-                                        );
-                                    } else if faceauth_daemon::store::FLOOR_KINDS.contains(&gesture)
-                                    {
-                                        println!("  {}: moved up to {:.2} vertically, {:.2} sideways (the floors stand clear of this)", what, amplitude, sideways);
-                                    } else {
-                                        println!("  {}: moved up to {:.2} vertically, {:.2} sideways (a big single move; refused by its shape, not its size)", what, amplitude, sideways);
-                                    }
-                                    last = Some((
-                                        *nod_floor,
-                                        *shake_floor,
-                                        *nod_margin,
-                                        *shake_margin,
-                                    ));
-                                }
-                                other => println!(
-                                    "  {} {}/{}: {}",
-                                    gesture,
-                                    i,
-                                    rounds,
-                                    serde_json::to_string(other)?
-                                ),
-                            }
-                        }
-                    }
-                    if let Some((n, s, nm, sm)) = last {
-                        println!(
-                            "\nFloors for {}: nod {:.3}, shake {:.3} (defaults {:.3} / {:.3}).",
-                            user,
-                            n,
-                            s,
-                            faceauth_daemon::consent::NodDetector::MIN_DOWN,
-                            faceauth_daemon::consent::ShakeDetector::MIN_TURN
-                        );
-                        for (name, m) in [("nod", nm), ("shake", sm)] {
-                            if let Some(m) = m {
-                                if m >= 2.0 {
-                                    println!("Your {} is {:.1} times your largest everyday movement on that axis: clearly apart.", name, m);
-                                } else {
-                                    println!("WARNING: your {} is only {:.1} times your largest everyday movement on that axis.", name, m);
-                                    println!("  The floor has been raised to keep that movement from counting, so a {} now has to be", name);
-                                    println!("  deliberate. If it stops being recognised, run this again with a bigger {} or a calmer read.", name);
-                                }
-                            }
-                        }
-                    }
-                    // The proof: every round replayed through the real detectors at
-                    // these floors, the way a request would read it.
-                    println!("\nChecking every round against those floors...");
-                    match faceauth_daemon::server::calibrate_verify(&socket, &user)? {
-                        faceauth_daemon::auth::Outcome::Verified {
-                            rounds,
-                            all_ok,
-                            nod_floor,
-                            shake_floor,
-                        } => {
-                            println!(
-                                "  floors after the everyday rounds: nod {:.3}, shake {:.3}",
-                                nod_floor, shake_floor
-                            );
-                            for r in &rounds {
-                                let read = match (r.nods, r.shakes) {
-                                    (0, 0) => "nothing".to_string(),
-                                    (n, 0) => format!("{} nod(s)", n),
-                                    (0, s) => format!("{} shake(s)", s),
-                                    (n, s) => format!("{} nod(s) and {} shake(s)", n, s),
-                                };
-                                println!(
-                                    "  {:<24} read as {:<24} {}",
-                                    round_name(&r.kind),
-                                    read,
-                                    if r.ok { "ok" } else { "NOT OK" }
-                                );
-                            }
-                            Ok(Some((rounds, all_ok)))
-                        }
-                        other => {
-                            println!("  could not check: {}", serde_json::to_string(&other)?);
-                            Ok(None)
-                        }
-                    }
-                };
-            let all_kinds: Vec<&str> = faceauth_daemon::auth::CALIBRATION_ROUNDS
-                .iter()
-                .map(|r| r.0)
-                .filter(|k| !gestures_only || matches!(*k, "nod" | "shake"))
-                .collect();
-            let mut result = run(&all_kinds, true, false)?;
-            let mut passes = 0;
-            while let Some((rounds, all_ok)) = &result {
-                if *all_ok {
-                    println!("\nEvery gesture round reads as its gesture and no everyday round reads as one. Calibration holds.");
-                    break;
-                }
-                let mut redo: Vec<&str> = Vec::new();
-                for r in rounds.iter().filter(|r| !r.ok) {
-                    let k: &str = match r.kind.as_str() {
-                        "nod" => "nod",
-                        "shake" => "shake",
-                        "read" => "read",
-                        "glance" => "glance",
-                        "talk" => "talk",
-                        "lean" => "lean",
-                        _ => "aside",
-                    };
-                    if !redo.contains(&k) {
-                        redo.push(k);
-                    }
-                }
-                println!(
-                    "\nSome rounds do not read the way they should at these floors: {}.",
-                    redo.iter()
-                        .map(|k| round_name(k))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                println!("A gesture that was not read wants to be a little clearer; an everyday movement that read as a");
-                println!("gesture wants to be as ordinary as you would really do it.");
-                passes += 1;
-                if passes > 3 {
-                    println!("Three redos already; keeping what there is. Run this again later.");
-                    break;
-                }
-                print!("Redo those rounds now? [Enter = redo, a = accept as is and finish] ");
-                use std::io::Write as _;
-                std::io::stdout().flush()?;
-                let mut answer = String::new();
-                let interactive = std::io::stdin()
-                    .read_line(&mut answer)
-                    .map(|n| n > 0)
-                    .unwrap_or(false);
-                if !interactive || answer.trim().eq_ignore_ascii_case("a") {
-                    println!("Kept as is.");
-                    break;
-                }
-                println!();
-                result = run(&redo, false, true)?;
-            }
-            Ok(())
-        }
-        ["consent-context", rest @ ..] => {
-            // From the polkit agent: the action and message polkitd gave it.
-            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
-            let user = opt(rest, "--user")
-                .map(String::from)
-                .unwrap_or_else(target_user);
-            let o = faceauth_daemon::server::consent_context(
-                &socket,
-                &user,
-                opt(rest, "--action").unwrap_or(""),
-                opt(rest, "--message").unwrap_or(""),
-                opt(rest, "--cookie").unwrap_or(""),
-            )?;
-            println!("{}", serde_json::to_string(&o)?);
-            Ok(())
-        }
         ["consent-answer", rest @ ..] => {
-            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
-            let user = opt(rest, "--user")
-                .map(String::from)
-                .unwrap_or_else(target_user);
+            only_flags(
+                rest,
+                &[
+                    "--socket",
+                    "--user",
+                    "--dismiss",
+                    "--ack",
+                    "--rearm",
+                    "--passwordless",
+                ],
+            )?;
+            let socket =
+                PathBuf::from(opt(rest, "--socket").unwrap_or(faceauth_daemon::config::SOCKET));
+            let user = user_arg(rest)?;
             // The token came with the window's payload; without it the daemon
             // treats the answer as nobody's. It arrives on stdin, first line,
             // never on the command line (argv is readable and journaled).
+            // The token and the password are wiped after the send with the
+            // daemon's own helper; a plain drop leaves the bytes in freed
+            // memory (J26).
             let mut token = String::new();
             std::io::stdin().read_line(&mut token)?;
-            let token = token.trim_end_matches(['\n', '\r']).to_string();
-            let token = if token.is_empty() {
+            token.truncate(token.trim_end_matches(['\n', '\r']).len());
+            let token_ref = if token.is_empty() {
                 None
             } else {
                 Some(token.as_str())
             };
+            let token = token_ref;
             let o = if rest.contains(&"--ack") {
                 faceauth_daemon::server::consent_ack(&socket, &user, token)?
             } else if let Some(m) = opt(rest, "--passwordless") {
@@ -740,10 +250,12 @@ fn main() -> Result<()> {
                 )?
             } else if rest.contains(&"--dismiss") {
                 faceauth_daemon::server::consent_answer(&socket, &user, None, true, token)?
+            } else if rest.contains(&"--rearm") {
+                faceauth_daemon::server::consent_rearm(&socket, &user, token)?
             } else {
                 let mut pw = String::new();
                 std::io::stdin().read_line(&mut pw)?;
-                let pw = pw.trim_end_matches(['\n', '\r']).to_string();
+                pw.truncate(pw.trim_end_matches(['\n', '\r']).len());
                 let r = faceauth_daemon::server::consent_answer(
                     &socket,
                     &user,
@@ -751,21 +263,21 @@ fn main() -> Result<()> {
                     false,
                     token,
                 );
-                drop(pw);
+                faceauth_daemon::consent::wipe_string(&mut pw);
                 r?
             };
-            println!("{}", serde_json::to_string(&o)?);
-            Ok(())
+            let mut token = token.map(String::from).unwrap_or_default();
+            faceauth_daemon::consent::wipe_string(&mut token);
+            finish(&o)
         }
         ["presence", "mode", rest @ ..] => {
             // As the watched user, over the socket: no argument reads the
             // mode, "default" or "secure" switches it until the next restart.
             // One JSON line for the shell's toggle; a refusal is one line on
             // stderr and exit 1.
-            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
-            let user = opt(rest, "--user")
-                .map(String::from)
-                .unwrap_or_else(target_user);
+            let socket =
+                PathBuf::from(opt(rest, "--socket").unwrap_or(faceauth_daemon::config::SOCKET));
+            let user = user_arg(rest)?;
             let mode = rest
                 .first()
                 .filter(|a| !a.starts_with("--"))
@@ -775,7 +287,7 @@ fn main() -> Result<()> {
                 bail!("presence mode: \"default\" or \"secure\" (or nothing, to read it)");
             }
             match faceauth_daemon::server::presence_mode(&socket, &user, mode) {
-                Ok(faceauth_daemon::auth::Outcome::PresenceMode { mode, watching }) => {
+                Ok(faceauth_daemon::auth::Outcome::PresenceMode { mode, watching, .. }) => {
                     println!(
                         "{}",
                         serde_json::json!({ "presence": { "mode": mode, "watching": watching } })
@@ -799,22 +311,22 @@ fn main() -> Result<()> {
                 }
             }
         }
-        ["presence"] => {
-            let f = "/run/faceauth/presence.json";
-            match std::fs::read_to_string(f) {
-                Ok(t) => println!("{}", t.trim()),
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    println!("presence state is root-only ({}); run with sudo", f)
-                }
-                Err(e) => println!("no presence state ({}): {}", f, e),
-            }
-            Ok(())
+        ["presence", rest @ ..] => {
+            // The watch's state, from the daemon: the mode, whether this
+            // user is watched, and if so what the watch last decided.
+            // Root and the watched user get the decision; anyone else
+            // only the mode (H16).
+            only_flags(rest, &["--socket", "--user"])?;
+            let socket =
+                PathBuf::from(opt(rest, "--socket").unwrap_or(faceauth_daemon::config::SOCKET));
+            let user = user_arg(rest)?;
+            let o = faceauth_daemon::server::presence_mode(&socket, &user, "query")?;
+            finish(&o)
         }
         ["auth", rest @ ..] => {
-            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
-            let user = opt(rest, "--user")
-                .map(String::from)
-                .unwrap_or_else(target_user);
+            let socket =
+                PathBuf::from(opt(rest, "--socket").unwrap_or(faceauth_daemon::config::SOCKET));
+            let user = user_arg(rest)?;
             let t = Instant::now();
             let o = if rest.contains(&"--consent") {
                 faceauth_daemon::server::ask_consent(&socket, &user)?
@@ -828,8 +340,6 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
-        ["liveness", "capture", rest @ ..] => liveness_capture(rest),
-        ["verify", rest @ ..] => verify(rest),
         _ => usage(),
     }
 }
@@ -904,14 +414,13 @@ fn cam_probe() -> Result<()> {
                     faceauth_camera::sys::fourcc_str(s.pixelformat)
                 );
                 if s.kind == SensorKind::Infrared {
-                    match Illuminator::open(&s.subdev)? {
-                        Some(i) => println!(
-                            "            illuminator: strobe control present (pattern: {})",
-                            i.has_pattern()
-                        ),
-                        None => {
-                            println!("            illuminator: no strobe control (ambient only)")
-                        }
+                    // A read of the control list, never an `Illuminator`:
+                    // dropping one switches the strobe off under a running
+                    // daemon's gate (J22).
+                    if faceauth_camera::has_strobe(&s.subdev)? {
+                        println!("            illuminator: strobe controls present");
+                    } else {
+                        println!("            illuminator: no strobe control (ambient only)");
                     }
                 }
             }
@@ -920,701 +429,97 @@ fn cam_probe() -> Result<()> {
     Ok(())
 }
 
-struct Loop {
-    /// Metering window in raw frame coordinates; None = centre window.
-    window: Option<Window>,
-    cam: Camera,
-    frame: Frame,
-    frames: u64,
-    smoother: Smoother,
-    exposure: Exposure,
-    metering: calib::Metering,
-    last_step: Instant,
-    /// Hold the exposure where it started instead of metering: for a frame
-    /// meant to look like the gate's own, which freezes exposure too.
-    fixed: bool,
-}
-
-impl Loop {
-    fn new(mut cam: Camera, start: Exposure) -> Result<Self> {
-        cam.set_exposure(start)?;
-        cam.start()?;
-        Ok(Loop {
-            window: None,
-            cam,
-            frame: Frame::new(0, 0),
-            frames: 0,
-            smoother: Smoother::default(),
-            exposure: start,
-            metering: Default::default(),
-            last_step: Instant::now(),
-            fixed: false,
-        })
-    }
-
-    /// Capture one frame; every 0.5 s run an exposure step.
-    fn tick(&mut self, black: u16) -> Result<bool> {
-        if !self.cam.capture(&mut self.frame, Duration::from_secs(2))? {
-            return Ok(false);
-        }
-        self.frames += 1;
-        if !self.fixed && self.last_step.elapsed() >= Duration::from_millis(500) {
-            self.last_step = Instant::now();
-            let w = self
-                .window
-                .unwrap_or_else(|| Window::centre(self.frame.width, self.frame.height))
-                .clamp(self.frame.width, self.frame.height);
-            let mut m = calib::meter(&self.frame.px, self.frame.width, black, w);
-            m.mean *= self.exposure.dgain;
-            if m.mean > 0.95 {
-                m.clip = m.clip.max(0.2);
-            }
-            let smoothed = calib::Metering {
-                mean: self.smoother.push(m.mean),
-                clip: m.clip,
-            };
-            self.metering = smoothed;
-            let f = calib::ae_factor(smoothed, AE_TARGET);
-            if f != 1.0 {
-                let next = self.exposure.step(f, &self.cam.limits);
-                self.cam.set_exposure(next)?;
-                self.exposure = next;
-            }
-        }
-        Ok(true)
-    }
-}
-
-fn cam_test(rest: &[&str]) -> Result<()> {
-    let mut seconds = 10u64;
-    let mut led = "off";
-    let mut snapshot: Option<PathBuf> = None;
-    let mut ir_only = false;
-    let mut exposure: Option<i64> = None;
-    let mut it = rest.iter();
-    while let Some(a) = it.next() {
-        match *a {
-            "--seconds" => seconds = it.next().ok_or_else(|| anyhow!("--seconds N"))?.parse()?,
-            "--exposure" => {
-                exposure = Some(
-                    it.next()
-                        .ok_or_else(|| anyhow!("--exposure LINES"))?
-                        .parse()?,
-                )
-            }
-            "--led" => led = it.next().ok_or_else(|| anyhow!("--led on|off|alt"))?,
-            "--snapshot" => {
-                snapshot = Some(PathBuf::from(
-                    it.next().ok_or_else(|| anyhow!("--snapshot DIR"))?,
-                ))
-            }
-            "--ir-only" => ir_only = true,
-            _ => usage(),
-        }
-    }
-    let g = faceauth_camera::ipu3::probe()?
-        .ok_or_else(|| anyhow!("no IPU3 graph found (UVC path not wired into cam test yet)"))?;
-    let ir = g
-        .ir_sensor()
-        .ok_or_else(|| anyhow!("no front IR sensor on the IPU3 graph"))?;
-    let rgb = g.colour_sensor();
-
-    let (iw, ih) = g.configure(ir, None)?;
-    let ir_cam = Camera::open(&ir.video, &ir.subdev, iw, ih, ir.pixelformat, 6)?;
-    log::info!(
-        "IR  {} {}x{} exposure {:?} gain {:?}",
-        ir.name,
-        iw,
-        ih,
-        ir_cam.limits.exposure,
-        ir_cam.limits.gain
-    );
-    let illum = Illuminator::open(&ir.subdev)?;
-    let mut ir_loop = Loop::new(
-        ir_cam,
-        Exposure {
-            exposure: exposure.unwrap_or(500),
-            gain: 16,
-            dgain: 1.0,
-        },
-    )?;
-    ir_loop.fixed = exposure.is_some();
-
-    let mut rgb_loop = match (rgb, ir_only) {
-        (Some(r), false) => {
-            // The reference RGB sensor overruns its link at its default 2592x972 mode.
-            let (rw, rh) = g.configure(r, Some((1296, 972)))?;
-            let cam = Camera::open(&r.video, &r.subdev, rw, rh, r.pixelformat, 6)?;
-            log::info!(
-                "RGB {} {}x{} exposure {:?}",
-                r.name,
-                rw,
-                rh,
-                cam.limits.exposure
-            );
-            Some(Loop::new(
-                cam,
-                Exposure {
-                    exposure: 1030,
-                    gain: 0,
-                    dgain: 1.0,
-                },
-            )?)
-        }
-        _ => None,
-    };
-
-    match (led, &illum) {
-        ("on", Some(i)) => i.set(true)?,
-        ("alt", Some(i)) => i.set_pattern(0xaa)?,
-        ("off", Some(i)) => i.set(false)?,
-        ("off", None) => {}
-        (_, None) => bail!("--led requested but the IR sensor has no strobe control"),
-        (other, _) => bail!("--led {}: expected on, off or alt", other),
-    }
-
-    let t0 = Instant::now();
-    let mut last_log = Instant::now();
-    let mut wb = calib::WhiteBalance::default();
-    let mut rgb_reduced: Vec<[f32; 3]> = Vec::new();
-    let mut ir_black = 0u16;
-    let mut ir_white = 1023u16;
-    let mut rgb_black = 25u16;
-    while t0.elapsed() < Duration::from_secs(seconds) {
-        if !ir_loop.tick(ir_black)? {
-            log::warn!("IR: no frame in 2 s");
-        }
-        if let Some(r) = rgb_loop.as_mut() {
-            // Poll the RGB node without blocking the IR cadence.
-            if !r.tick(rgb_black)? {
-                log::warn!("RGB: no frame in 2 s");
-            }
-        }
-        if ir_loop.frames % 15 == 0 && ir_loop.frame.width > 0 {
-            ir_black = calib::percentile(&ir_loop.frame.px, 7, 0.005);
-            ir_white = calib::percentile(&ir_loop.frame.px, 7, 0.995);
-        }
-        if let Some(r) = rgb_loop.as_mut() {
-            if r.frames % 15 == 0 && r.frame.width > 0 {
-                rgb_black = calib::percentile(&r.frame.px, 13, 0.005);
-                let n = (r.frame.width / 2) * (r.frame.height / 2);
-                rgb_reduced.resize(n, [0.0; 3]);
-                bayer_reduce(
-                    &r.frame.px,
-                    r.frame.width,
-                    r.frame.height,
-                    BayerOrder::Bggr,
-                    rgb_black,
-                    &mut rgb_reduced,
-                );
-                wb.update(&rgb_reduced, 1023.0 - rgb_black as f64);
-            }
-        }
-        if last_log.elapsed() >= Duration::from_secs(1) {
-            last_log = Instant::now();
-            let el = t0.elapsed().as_secs_f64();
-            let mut line = format!(
-                "t={:5.1}s IR {:4} fr ({:4.1} fps) exp={:4} gain={:3} dg={:.2} blk={} wht={} meter {:.2}/{:.2}",
-                el,
-                ir_loop.frames,
-                ir_loop.frames as f64 / el,
-                ir_loop.exposure.exposure,
-                ir_loop.exposure.gain,
-                ir_loop.exposure.dgain,
-                ir_black,
-                ir_white,
-                ir_loop.metering.mean,
-                ir_loop.metering.clip
-            );
-            if let Some(r) = &rgb_loop {
-                line += &format!(
-                    " | RGB {:4} fr ({:4.1} fps) exp={:4} dg={:.2} blk={} wb={:.2}/{:.2} meter {:.2}/{:.2}",
-                    r.frames,
-                    r.frames as f64 / el,
-                    r.exposure.exposure,
-                    r.exposure.dgain,
-                    rgb_black,
-                    wb.wr,
-                    wb.wb,
-                    r.metering.mean,
-                    r.metering.clip
-                );
-            }
-            if let Some(i) = &illum {
-                line += &format!(" | led={}", i.is_on()? as u8);
-            }
-            println!("{}", line);
-        }
-    }
-
-    if let Some(dir) = snapshot {
-        std::fs::create_dir_all(&dir)?;
-        let f = &ir_loop.frame;
-        let mut grey = vec![0u8; f.width * f.height];
-        calib::ir_to_grey8(&f.px, ir_black, ir_white, calib::IR_LOOK, &mut grey);
-        write_pgm(&dir.join("ir.pgm"), f.width, f.height, &grey)?;
-        if let Some(r) = &rgb_loop {
-            let (w2, h2) = (r.frame.width / 2, r.frame.height / 2 - 1);
-            let n = (r.frame.width / 2) * (r.frame.height / 2);
-            rgb_reduced.resize(n, [0.0; 3]);
-            bayer_reduce(
-                &r.frame.px,
-                r.frame.width,
-                r.frame.height,
-                BayerOrder::Bggr,
-                rgb_black,
-                &mut rgb_reduced,
-            );
-            let mut out = vec![[0u8; 3]; w2 * h2];
-            calib::rgb_to_rgb8(
-                &rgb_reduced[..w2 * h2],
-                rgb_black,
-                1023,
-                wb,
-                r.exposure.dgain,
-                calib::RGB_LOOK,
-                &mut out,
-            );
-            write_ppm(&dir.join("rgb.ppm"), w2, h2, &out)?;
-        }
-        println!("snapshots written to {}", dir.display());
-    }
-    if let Some(i) = &illum {
-        i.set(false)?;
-    }
-    ir_loop.cam.stop()?;
-    if let Some(r) = rgb_loop.as_mut() {
-        r.cam.stop()?;
-    }
-    Ok(())
-}
-
-fn write_pgm(path: &PathBuf, w: usize, h: usize, data: &[u8]) -> Result<()> {
-    let mut f = std::fs::File::create(path).with_context(|| path.display().to_string())?;
-    write!(f, "P5\n{} {}\n255\n", w, h)?;
-    f.write_all(data)?;
-    Ok(())
-}
-
-fn write_ppm(path: &PathBuf, w: usize, h: usize, data: &[[u8; 3]]) -> Result<()> {
-    let mut f = std::fs::File::create(path).with_context(|| path.display().to_string())?;
-    write!(f, "P6\n{} {}\n255\n", w, h)?;
-    for p in data {
-        f.write_all(p)?;
-    }
-    Ok(())
-}
-
-fn models_dir(rest: &[&str]) -> PathBuf {
-    let mut it = rest.iter();
-    while let Some(a) = it.next() {
-        if *a == "--models" {
-            if let Some(d) = it.next() {
-                return PathBuf::from(d);
-            }
-        }
-    }
-    std::env::var("FACEAUTH_MODELS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/usr/share/faceauth/models"))
-}
-
-/// Detect and embed faces in one or two PGM images; with two, print their similarity.
-fn engine_test(rest: &[&str]) -> Result<()> {
-    use faceauth_engine::{Grey, Pipeline};
-    let dir = models_dir(rest);
-    let images: Vec<&str> = rest
-        .iter()
-        .copied()
-        .filter(|a| a.ends_with(".pgm"))
-        .collect();
-    if images.is_empty() {
-        usage();
-    }
-    let t = Instant::now();
-    let mut p = Pipeline::load(&dir)?;
-    println!(
-        "models loaded from {} in {:.0} ms",
-        dir.display(),
-        t.elapsed().as_secs_f64() * 1e3
-    );
-    let mut embeddings = Vec::new();
-    for path in &images {
-        let img = Grey::read_pgm(path)?;
-        let t = Instant::now();
-        let faces = p.analyse(&img, 0.5, 1)?;
-        let ms = t.elapsed().as_secs_f64() * 1e3;
-        println!(
-            "{}: {}x{} {} face(s) in {:.1} ms",
-            path,
-            img.width,
-            img.height,
-            faces.len(),
-            ms
-        );
-        for f in &faces {
-            println!("  score {:.3} bbox [{:.0} {:.0} {:.0} {:.0}] eyes ({:.0},{:.0}) ({:.0},{:.0}) nose ({:.0},{:.0})",
-                f.score, f.bbox[0], f.bbox[1], f.bbox[2], f.bbox[3],
-                f.landmarks[0][0], f.landmarks[0][1], f.landmarks[1][0], f.landmarks[1][1], f.landmarks[2][0], f.landmarks[2][1]);
-        }
-        if let Some(e) = faces.first().and_then(|f| f.embedding.clone()) {
-            embeddings.push(e);
-        }
-    }
-    if embeddings.len() == 2 {
-        println!(
-            "cosine similarity: {:.4}",
-            faceauth_engine::cosine(&embeddings[0], &embeddings[1])
-        );
-    }
-    Ok(())
-}
-
-/// Stream the IR camera, run the pipeline on each frame, report timings and
-/// the similarity of successive embeddings (same person, so it should stay high).
-fn engine_live(rest: &[&str]) -> Result<()> {
-    use faceauth_engine::{Grey, Pipeline};
-    let dir = models_dir(rest);
-    let mut seconds = 10u64;
-    let mut led = "on";
-    let mut save: Option<PathBuf> = None;
-    let mut it = rest.iter();
-    while let Some(a) = it.next() {
-        match *a {
-            "--seconds" => seconds = it.next().ok_or_else(|| anyhow!("--seconds N"))?.parse()?,
-            "--led" => led = it.next().ok_or_else(|| anyhow!("--led on|off"))?,
-            "--save" => {
-                save = Some(PathBuf::from(
-                    it.next().ok_or_else(|| anyhow!("--save DIR"))?,
-                ))
-            }
-            "--models" => {
-                it.next();
-            }
-            _ => usage(),
-        }
-    }
-    let mut p = Pipeline::load(&dir)?;
-    let g = faceauth_camera::ipu3::probe()?.ok_or_else(|| anyhow!("no IPU3 graph"))?;
-    let ir = g.ir_sensor().ok_or_else(|| anyhow!("no IR sensor"))?;
-    let (iw, ih) = g.configure(ir, None)?;
-    let cam = Camera::open(&ir.video, &ir.subdev, iw, ih, ir.pixelformat, 6)?;
-    let illum = Illuminator::open(&ir.subdev)?;
-    let mut lp = Loop::new(
-        cam,
-        Exposure {
-            exposure: 500,
-            gain: 16,
-            dgain: 1.0,
-        },
-    )?;
-    if let Some(i) = &illum {
-        i.set(led == "on")?;
-    }
-    let t0 = Instant::now();
-    let mut black = 0u16;
-    let mut white = 1023u16;
-    let mut last: Option<Vec<f32>> = None;
-    let mut first: Option<Vec<f32>> = None;
-    let mut n = 0usize;
-    let mut sum_ms = 0f64;
-    let mut best_crop: Option<(f32, Grey)> = None;
-    let neutral = calib::IrLook {
-        dgain: 1.0,
-        brightness: 0.0,
-        contrast: 1.0,
-    };
-    while t0.elapsed() < Duration::from_secs(seconds) {
-        if !lp.tick(black)? {
-            continue;
-        }
-        if lp.frames % 15 == 0 {
-            black = calib::percentile(&lp.frame.px, 7, 0.005);
-            white = calib::percentile(&lp.frame.px, 7, 0.995);
-        }
-        if lp.frames % 5 != 0 {
-            continue;
-        }
-        let f = &lp.frame;
-        let mut g8 = Grey::new(f.width, f.height);
-        calib::ir_to_grey8(&f.px, black, white, neutral, &mut g8.data);
-        // Reference IR sensor mounting: transpose plus both flips brings the face upright.
-        let img = g8.oriented(true, true, true);
-        let t = Instant::now();
-        let faces = p.analyse(&img, 0.5, 1)?;
-        let ms = t.elapsed().as_secs_f64() * 1e3;
-        n += 1;
-        sum_ms += ms;
-        let Some(face) = faces.first() else {
-            println!(
-                "t={:4.1}s no face ({:.0} ms) exp={} gain={}",
-                t0.elapsed().as_secs_f64(),
-                ms,
-                lp.exposure.exposure,
-                lp.exposure.gain
-            );
-            continue;
-        };
-        // Meter on the face: map the oriented-frame box back to raw sensor coordinates
-        // (orientation was transpose + both flips: raw x = W-1-oy, raw y = H-1-ox).
-        {
-            let (rw, rh) = (f.width as f32, f.height as f32);
-            let [bx, by, bw, bh] = face.bbox;
-            let (ox0, oy0, ox1, oy1) = (
-                bx.max(0.0),
-                by.max(0.0),
-                (bx + bw).max(0.0),
-                (by + bh).max(0.0),
-            );
-            let x0 = (rw - 1.0 - oy1).max(0.0) as usize;
-            let x1 = (rw - 1.0 - oy0).max(0.0) as usize;
-            let y0 = (rh - 1.0 - ox1).max(0.0) as usize;
-            let y1 = (rh - 1.0 - ox0).max(0.0) as usize;
-            lp.window = Some(Window {
-                x0,
-                y0,
-                x1: x1.max(x0 + 1),
-                y1: y1.max(y0 + 1),
-            });
-        }
-        let e = face.embedding.clone().unwrap();
-        let sim_prev = last.as_ref().map(|l| faceauth_engine::cosine(l, &e));
-        let sim_first = first.as_ref().map(|l| faceauth_engine::cosine(l, &e));
-        println!(
-            "t={:4.1}s face score {:.2} bbox {:.0}x{:.0} at ({:.0},{:.0}) {:.0} ms | vs prev {} vs first {} | exp={} gain={} meter {:.2}",
-            t0.elapsed().as_secs_f64(), face.score, face.bbox[2], face.bbox[3], face.bbox[0], face.bbox[1], ms,
-            sim_prev.map(|s| format!("{:.3}", s)).unwrap_or("-".into()),
-            sim_first.map(|s| format!("{:.3}", s)).unwrap_or("-".into()),
-            lp.exposure.exposure, lp.exposure.gain, lp.metering.mean
-        );
-        if first.is_none() {
-            first = Some(e.clone());
-        }
-        last = Some(e);
-        if best_crop
-            .as_ref()
-            .map(|(s, _)| face.score > *s)
-            .unwrap_or(true)
-        {
-            best_crop = Some((
-                face.score,
-                faceauth_engine::align::align_112(&img, &face.landmarks),
-            ));
-            if let Some(dir) = &save {
-                std::fs::create_dir_all(dir)?;
-                img.write_pgm(dir.join("frame.pgm"))?;
-            }
-        }
-    }
-    if let Some(i) = &illum {
-        i.set(false)?;
-    }
-    if let (Some(dir), Some((s, crop))) = (&save, &best_crop) {
-        crop.write_pgm(dir.join("crop-112.pgm"))?;
-        println!("best crop (score {:.2}) saved to {}", s, dir.display());
-    }
-    if n > 0 {
-        println!(
-            "{} frames analysed, mean {:.1} ms per frame (detect + align + embed)",
-            n,
-            sum_ms / n as f64
-        );
-    }
-    lp.cam.stop()?;
-    Ok(())
-}
-
-/// One embedded face from a capture burst.
-struct Sample {
-    embedding: Vec<f32>,
-    score: f32,
-    face_width: f32,
-}
-
-/// Stream the IR camera with the illuminator on and face-box metering, and
-/// collect up to `want` embeddings of the best-scoring detections within `seconds`.
-/// This is the capture the daemon runs for both enrolment and verification.
-fn capture_burst(
-    p: &mut faceauth_engine::Pipeline,
-    seconds: u64,
-    want: usize,
-    min_score: f32,
-    quiet: bool,
-    spacing_ms: u64,
-) -> Result<Vec<Sample>> {
-    use faceauth_engine::Grey;
-    let g = faceauth_camera::ipu3::probe()?.ok_or_else(|| anyhow!("no IPU3 graph"))?;
-    let ir = g.ir_sensor().ok_or_else(|| anyhow!("no IR sensor"))?;
-    let (iw, ih) = g.configure(ir, None)?;
-    let cam = Camera::open(&ir.video, &ir.subdev, iw, ih, ir.pixelformat, 6)?;
-    let illum = Illuminator::open(&ir.subdev)?;
-    let mut lp = Loop::new(
-        cam,
-        Exposure {
-            exposure: 500,
-            gain: 16,
-            dgain: 1.0,
-        },
-    )?;
-    if let Some(i) = &illum {
-        i.set(true)?;
-    }
-    let t0 = Instant::now();
-    let (mut black, mut white) = (0u16, 1023u16);
-    let neutral = calib::IrLook {
-        dgain: 1.0,
-        brightness: 0.0,
-        contrast: 1.0,
-    };
-    let mut out: Vec<Sample> = Vec::new();
-    let mut seen = 0usize;
-    let mut last_sample = Instant::now();
-    while t0.elapsed() < Duration::from_secs(seconds) && out.len() < want {
-        if !lp.tick(black)? {
-            continue;
-        }
-        if lp.frames % 15 == 0 {
-            black = calib::percentile(&lp.frame.px, 7, 0.005);
-            white = calib::percentile(&lp.frame.px, 7, 0.995);
-        }
-        // Let the exposure settle for the first second, then sample every third frame.
-        if t0.elapsed() < Duration::from_millis(1000) || lp.frames % 3 != 0 {
-            continue;
-        }
-        let f = &lp.frame;
-        let mut g8 = Grey::new(f.width, f.height);
-        calib::ir_to_grey8(&f.px, black, white, neutral, &mut g8.data);
-        let img = g8.oriented(true, true, true);
-        let faces = p.analyse(&img, min_score, 1)?;
-        let Some(face) = faces.first() else { continue };
-        seen += 1;
-        {
-            let (rw, rh) = (f.width as f32, f.height as f32);
-            let [bx, by, bw, bh] = face.bbox;
-            let (ox0, oy0, ox1, oy1) = (
-                bx.max(0.0),
-                by.max(0.0),
-                (bx + bw).max(0.0),
-                (by + bh).max(0.0),
-            );
-            let x0 = (rw - 1.0 - oy1).max(0.0) as usize;
-            let x1 = (rw - 1.0 - oy0).max(0.0) as usize;
-            let y0 = (rh - 1.0 - ox1).max(0.0) as usize;
-            let y1 = (rh - 1.0 - ox0).max(0.0) as usize;
-            lp.window = Some(Window {
-                x0,
-                y0,
-                x1: x1.max(x0 + 1),
-                y1: y1.max(y0 + 1),
-            });
-        }
-        // Skip frames before the face-box metering has had a chance to act, and
-        // space samples out so an enrolment covers different poses.
-        if seen <= 2
-            || (!out.is_empty() && last_sample.elapsed() < Duration::from_millis(spacing_ms))
-        {
-            continue;
-        }
-        last_sample = Instant::now();
-        if !quiet {
-            println!(
-                "  t={:4.1}s sample {} score {:.2} face {:.0}px exp={} gain={}",
-                t0.elapsed().as_secs_f64(),
-                out.len() + 1,
-                face.score,
-                face.bbox[2],
-                lp.exposure.exposure,
-                lp.exposure.gain
-            );
-        }
-        out.push(Sample {
-            embedding: face.embedding.clone().unwrap(),
-            score: face.score,
-            face_width: face.bbox[2],
-        });
-    }
-    if let Some(i) = &illum {
-        i.set(false)?;
-    }
-    lp.cam.stop()?;
-    Ok(out)
-}
-
 /// The person a command is about when `--user` is not given: under sudo
-/// that is the person who ran sudo, not root (`sudo faceauth calibrate`
-/// from the menu tunes their gestures, not root's).
-fn target_user() -> String {
-    std::env::var("SUDO_USER")
-        .or_else(|_| std::env::var("USER"))
-        .unwrap_or_else(|_| "user".into())
+/// the person who ran sudo (`SUDO_UID`, the id, not the name any process
+/// can set in its environment), otherwise the invoking uid. Never a
+/// literal fallback, and never root: root is not authenticated by face,
+/// so a command that resolves to it has to be told whom it is for (J23).
+fn target_user() -> Result<String> {
+    let uid = match std::env::var("SUDO_UID") {
+        Ok(v) => v
+            .parse::<u32>()
+            .with_context(|| format!("SUDO_UID {:?} is not a uid", v))?,
+        Err(_) => nix::unistd::getuid().as_raw(),
+    };
+    if uid == 0 {
+        bail!("this command is about a user, and root is never authenticated by face: run it as the user, under sudo from the user's shell, or with --user NAME");
+    }
+    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(|u| u.name)
+        .ok_or_else(|| anyhow!("no user with uid {}", uid))
+}
+
+/// `--user NAME` when given, else the target user. A `--user` with no
+/// name is an error, not a fall-through to somebody else (J23).
+fn user_arg(rest: &[&str]) -> Result<String> {
+    match opt_value(rest, "--user") {
+        Ok(Some(u)) => Ok(u.to_string()),
+        Ok(None) => target_user(),
+        Err(e) => Err(e),
+    }
+}
+
+/// The value after `key`: `Ok(None)` when the flag is absent, an error
+/// when it is the last argument or is followed by another flag.
+fn opt_value<'a>(rest: &'a [&str], key: &str) -> Result<Option<&'a str>> {
+    let Some(i) = rest.iter().position(|a| *a == key) else {
+        return Ok(None);
+    };
+    match rest.get(i + 1) {
+        Some(v) if !v.starts_with("--") => Ok(Some(v)),
+        _ => bail!("{} needs a value", key),
+    }
 }
 
 fn opt<'a>(rest: &'a [&str], key: &str) -> Option<&'a str> {
-    rest.iter()
-        .position(|a| *a == key)
-        .and_then(|i| rest.get(i + 1).copied())
+    opt_value(rest, key).ok().flatten()
 }
 
-fn enroll(rest: &[&str]) -> Result<()> {
-    use faceauth_daemon::store::{now_secs, Template, UserTemplates};
-    let dir = models_dir(rest);
-    let store = dev_store(opt(rest, "--store").ok_or_else(|| anyhow!("--store DIR"))?)?;
-    let user = opt(rest, "--user")
-        .map(String::from)
-        .unwrap_or_else(target_user);
-    let label = opt(rest, "--label").unwrap_or("enrol").to_string();
-    let seconds: u64 = opt(rest, "--seconds").unwrap_or("12").parse()?;
-    let count: usize = opt(rest, "--count").unwrap_or("10").parse()?;
-    let mut p = faceauth_engine::Pipeline::load(&dir)?;
-    println!(
-        "Enrolling {}: look at the camera and move your head a little over the next {} s.",
-        user, seconds
-    );
-    let spacing = ((seconds.saturating_sub(2)) * 1000 / count.max(1) as u64).clamp(100, 2000);
-    let samples = capture_burst(&mut p, seconds, count, 0.6, false, spacing)?;
-    if samples.len() < 3 {
-        bail!(
-            "only {} usable frames; sit closer, face the camera, and try again",
-            samples.len()
-        );
+/// Refuse a flag no subcommand of this name takes: a misspelt `--user`
+/// must not fall through to the default user, and a misspelt `--dismiss`
+/// must not read as a password answer (J23).
+fn only_flags(rest: &[&str], allowed: &[&str]) -> Result<()> {
+    if let Some(bad) = rest
+        .iter()
+        .find(|a| a.starts_with("--") && !allowed.contains(a))
+    {
+        bail!("unknown flag {}", bad);
     }
-    let mut u = store
-        .load(&user)?
-        .unwrap_or_else(|| UserTemplates::new(&user, faceauth_engine::embed::AURAFACE_FILE));
-    if u.model != faceauth_engine::embed::AURAFACE_FILE {
-        bail!(
-            "existing templates are for model {}, delete them first",
-            u.model
-        );
-    }
-    let now = now_secs();
-    for s in &samples {
-        // Development path (direct camera): unbound templates, usable on any camera.
-        u.templates.push(Template {
-            embedding: s.embedding.clone(),
-            quality: s.score,
-            face_width: s.face_width,
-            created: now,
-            label: label.clone(),
-            device: None,
-            yaw: None,
-            nose_pitch: None,
-        });
-    }
-    let (lo, mean, hi) = u.self_consistency().unwrap_or((1.0, 1.0, 1.0));
-    let path = store.save(&u)?;
-    println!(
-        "Saved {} templates ({} new) to {}",
-        u.templates.len(),
-        samples.len(),
-        path.display()
-    );
-    println!(
-        "Template self-consistency (pairwise cosine): min {:.3} mean {:.3} max {:.3}",
-        lo, mean, hi
-    );
-    println!("{}", at_rest_note(&path.display().to_string()));
     Ok(())
+}
+
+/// The exit status for a scripted subcommand, from the daemon's answer:
+/// 0 when it did what was asked, 1 when it refused or the answer was a
+/// denial, 2 when the daemon could not do it at all (J27).
+fn exit_for(o: &faceauth_daemon::auth::Outcome) -> i32 {
+    use faceauth_daemon::auth::Outcome;
+    match o {
+        Outcome::Match { .. }
+        | Outcome::Noted
+        | Outcome::Deleted
+        | Outcome::NotEnrolled
+        | Outcome::Enrolled { .. }
+        | Outcome::Pong { .. }
+        | Outcome::Probe { .. }
+        | Outcome::PresenceMode { .. } => 0,
+        Outcome::Error { .. } => 2,
+        _ => 1,
+    }
+}
+
+/// Print the daemon's answer as one JSON line and exit with `exit_for`.
+fn finish(o: &faceauth_daemon::auth::Outcome) -> Result<()> {
+    let line = serde_json::to_string(o)?;
+    let code = exit_for(o);
+    if code == 0 {
+        println!("{}", line);
+        Ok(())
+    } else {
+        eprintln!("{}", line);
+        std::process::exit(code)
+    }
 }
 
 /// What the saved path says about how the templates rest.
@@ -1675,382 +580,10 @@ fn enroll_guided(socket: &std::path::Path, user: &str, label: &str, only: &[Stri
     Ok(())
 }
 
-fn verify(rest: &[&str]) -> Result<()> {
-    let dir = models_dir(rest);
-    let store = dev_store(opt(rest, "--store").ok_or_else(|| anyhow!("--store DIR"))?)?;
-    let user = opt(rest, "--user")
-        .map(String::from)
-        .unwrap_or_else(target_user);
-    let seconds: u64 = opt(rest, "--seconds").unwrap_or("5").parse()?;
-    let u = store
-        .load(&user)?
-        .ok_or_else(|| anyhow!("no templates for {}", user))?;
-    let mut p = faceauth_engine::Pipeline::load(&dir)?;
-    let t = Instant::now();
-    let samples = capture_burst(&mut p, seconds, 5, 0.6, true, 0)?;
-    let elapsed = t.elapsed().as_secs_f64();
-    if samples.is_empty() {
-        println!("no face in {:.1} s", elapsed);
-        return Ok(());
-    }
-    let mut best = -1f32;
-    let label = opt(rest, "--label").unwrap_or("genuine");
-    let mut log = match opt(rest, "--log") {
-        Some(path) => Some(
-            std::fs::OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(path)?,
-        ),
-        None => None,
-    };
-    for (i, s) in samples.iter().enumerate() {
-        let (score, idx) = u.best_match(&s.embedding).unwrap();
-        best = best.max(score);
-        println!(
-            "frame {}: face {:.0}px det {:.2} best template #{} cosine {:.3}",
-            i + 1,
-            s.face_width,
-            s.score,
-            idx,
-            score
-        );
-        if let Some(f) = log.as_mut() {
-            use std::io::Write;
-            writeln!(
-                f,
-                "{},{},{},{:.3},{:.3},{:.0}",
-                faceauth_daemon::store::now_secs(),
-                label,
-                i + 1,
-                score,
-                s.score,
-                s.face_width
-            )?;
-        }
-    }
-    println!(
-        "best {:.3} over {} frames in {:.1} s ({} templates)",
-        best,
-        samples.len(),
-        elapsed,
-        u.templates.len()
-    );
-    Ok(())
-}
-
-/// Flash-response experiment. Runs the strobe in the alternating pattern (0xaa),
-/// pairs each lit frame with the unlit frame before it, aligns both with the lit
-/// frame's landmarks, and writes the crops plus the per-pair statistics that the
-/// liveness gate will be built on. The key quantity is the ratio image lit/unlit:
-/// on a flat print the albedo cancels and the ratio is smooth, on a face the
-/// geometry does not cancel and the ratio carries the relief.
-fn liveness_capture(rest: &[&str]) -> Result<()> {
-    use faceauth_engine::{align, Grey};
-    let dir = models_dir(rest);
-    let label = opt(rest, "--label").unwrap_or("unlabelled").to_string();
-    let save = PathBuf::from(opt(rest, "--save").ok_or_else(|| anyhow!("--save DIR"))?);
-    let seconds: u64 = opt(rest, "--seconds").unwrap_or("8").parse()?;
-    std::fs::create_dir_all(&save)?;
-    let mut p = faceauth_engine::Pipeline::load(&dir)?;
-    let g = faceauth_camera::ipu3::probe()?.ok_or_else(|| anyhow!("no IPU3 graph"))?;
-    let ir = g.ir_sensor().ok_or_else(|| anyhow!("no IR sensor"))?;
-    let (iw, ih) = g.configure(ir, None)?;
-    let cam = Camera::open(&ir.video, &ir.subdev, iw, ih, ir.pixelformat, 6)?;
-    let illum =
-        Illuminator::open(&ir.subdev)?.ok_or_else(|| anyhow!("IR sensor has no strobe control"))?;
-    // Settle exposure on the subject with the LEDs steady (face-box metering),
-    // then freeze it: the loop must not chase the alternation.
-    let mut lp = Loop::new(
-        cam,
-        Exposure {
-            exposure: 500,
-            gain: 16,
-            dgain: 1.0,
-        },
-    )?;
-    illum.set(true)?;
-    let settle = Instant::now();
-    let neutral = calib::IrLook {
-        dgain: 1.0,
-        brightness: 0.0,
-        contrast: 1.0,
-    };
-    while settle.elapsed() < Duration::from_millis(5000) {
-        if !lp.tick(0)? || lp.frames % 5 != 0 {
-            continue;
-        }
-        let f = &lp.frame;
-        let mut g8 = Grey::new(f.width, f.height);
-        calib::ir_to_grey8(&f.px, 0, 1023, neutral, &mut g8.data);
-        let img = g8.oriented(true, true, true);
-        if let Some(face) = p
-            .detector
-            .detect(&img, 0.5)?
-            .into_iter()
-            .max_by(|a, b| a.score.total_cmp(&b.score))
-        {
-            let (rw, rh) = (f.width as f32, f.height as f32);
-            let [bx, by, bw, bh] = face.bbox;
-            let (ox0, oy0, ox1, oy1) = (
-                bx.max(0.0),
-                by.max(0.0),
-                (bx + bw).max(0.0),
-                (by + bh).max(0.0),
-            );
-            let x0 = (rw - 1.0 - oy1).max(0.0) as usize;
-            let x1 = (rw - 1.0 - oy0).max(0.0) as usize;
-            let y0 = (rh - 1.0 - ox1).max(0.0) as usize;
-            let y1 = (rh - 1.0 - ox0).max(0.0) as usize;
-            lp.window = Some(Window {
-                x0,
-                y0,
-                x1: x1.max(x0 + 1),
-                y1: y1.max(y0 + 1),
-            });
-        }
-    }
-    println!(
-        "exposure settled at {} gain {} (face-box mean {:.2})",
-        lp.exposure.exposure, lp.exposure.gain, lp.metering.mean
-    );
-    illum.set_pattern(0xaa)?;
-    let t0 = Instant::now();
-    let mut prev: Option<(Grey, f64)> = None;
-    let mut pairs = 0usize;
-    let mut csv = String::from("label,pair,lit_mean,unlit_mean,flash_gain,ratio_hp,diff_hp,glint_r,glint_l,glint_native_r,glint_native_l,surround,reflectance,face_px,exposure\n");
-    while t0.elapsed() < Duration::from_secs(seconds) {
-        if !lp.cam.capture(&mut lp.frame, Duration::from_secs(2))? {
-            continue;
-        }
-        lp.frames += 1;
-        if t0.elapsed() < Duration::from_millis(700) {
-            continue;
-        }
-        let f = &lp.frame;
-        // Linear 8-bit (fixed mapping, no per-frame stretch) so lit/unlit are comparable.
-        let mut g8 = Grey::new(f.width, f.height);
-        for (o, &v) in g8.data.iter_mut().zip(&f.px) {
-            *o = (v >> 2) as u8;
-        }
-        let img = g8.oriented(true, true, true);
-        let mean = img.data.iter().map(|&v| v as f64).sum::<f64>() / img.data.len() as f64;
-        let Some((prev_img, prev_mean)) = prev.replace((img.clone(), mean)) else {
-            continue;
-        };
-        // A lit frame is the brighter of two consecutive frames by a clear margin.
-        if mean < prev_mean * 1.15 {
-            continue;
-        }
-        let (lit, unlit) = (&img, &prev_img);
-        let faces = p.detector.detect(lit, 0.6)?;
-        let Some(face) = faces.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) else {
-            continue;
-        };
-        let fwd = align::similarity(&face.landmarks, &align::ARCFACE_112);
-        let inv = align::invert(&fwd);
-        let lit_c = lit.warp_affine(&inv, 112, 112);
-        let unlit_c = unlit.warp_affine(&inv, 112, 112);
-        // Statistics on the central face region (exclude the border the warp may leave empty).
-        let idx = |x: usize, y: usize| y * 112 + x;
-        let (mut sl, mut su, mut n) = (0f64, 0f64, 0usize);
-        for y in 16..96 {
-            for x in 16..96 {
-                sl += lit_c.data[idx(x, y)] as f64;
-                su += unlit_c.data[idx(x, y)] as f64;
-                n += 1;
-            }
-        }
-        let (lm, um) = (sl / n as f64, su / n as f64);
-        let flash_gain = if um > 0.5 { lm / um } else { f64::INFINITY };
-        // Log-ratio and difference images, then their high-pass energy: subtract a
-        // 9x9 box blur and take the standard deviation of what remains.
-        let mut ratio = vec![0f32; 112 * 112];
-        let mut diff = vec![0f32; 112 * 112];
-        for i in 0..112 * 112 {
-            let l = lit_c.data[i] as f32 + 1.0;
-            let u = unlit_c.data[i] as f32 + 1.0;
-            ratio[i] = (l / u).ln();
-            diff[i] = l - u;
-        }
-        let hp_energy = |m: &[f32]| -> f64 {
-            let mut acc = 0f64;
-            let mut cnt = 0usize;
-            for y in 16..96 {
-                for x in 16..96 {
-                    let mut s = 0f32;
-                    for dy in 0..9 {
-                        for dx in 0..9 {
-                            s += m[idx(x + dx - 4, y + dy - 4)];
-                        }
-                    }
-                    let hp = m[idx(x, y)] - s / 81.0;
-                    acc += (hp * hp) as f64;
-                    cnt += 1;
-                }
-            }
-            (acc / cnt as f64).sqrt()
-        };
-        let ratio_hp = hp_energy(&ratio);
-        let diff_hp = hp_energy(&diff) / lm.max(1.0);
-        // Corneal glint: the brightest pixel within 6 px of each eye landmark in the
-        // difference image, relative to the local mean. A real eye mirrors the LED.
-        let glint = |ex: f32, ey: f32| -> f64 {
-            let (x, y) = (
-                fwd[0][0] * ex + fwd[0][1] * ey + fwd[0][2],
-                fwd[1][0] * ex + fwd[1][1] * ey + fwd[1][2],
-            );
-            let (cx, cy) = (x.round() as i32, y.round() as i32);
-            let (mut mx, mut sum, mut cnt) = (0f32, 0f32, 0usize);
-            for dy in -6..=6 {
-                for dx in -6..=6 {
-                    let (px, py) = (cx + dx, cy + dy);
-                    if px < 0 || py < 0 || px >= 112 || py >= 112 {
-                        continue;
-                    }
-                    let v = diff[idx(px as usize, py as usize)];
-                    mx = mx.max(v);
-                    sum += v;
-                    cnt += 1;
-                }
-            }
-            if cnt == 0 {
-                0.0
-            } else {
-                (mx / (sum / cnt as f32).max(1.0)) as f64
-            }
-        };
-        let glint_r = glint(face.landmarks[0][0], face.landmarks[0][1]);
-        let glint_l = glint(face.landmarks[1][0], face.landmarks[1][1]);
-        // Full-resolution cues on the flash response (lit minus unlit) of the oriented frame.
-        let (fw, fh) = (lit.width, lit.height);
-        let flash_at = |x: i32, y: i32| -> f32 {
-            if x < 0 || y < 0 || x >= fw as i32 || y >= fh as i32 {
-                return 0.0;
-            }
-            let i = y as usize * fw + x as usize;
-            (lit.data[i] as f32 - unlit.data[i] as f32).max(0.0)
-        };
-        let [bx, by, bw, bh] = face.bbox;
-        let (cx, cy) = (bx + bw / 2.0, by + bh / 2.0);
-        // Face region: the inner 70% of the box. Surround: a ring from 1.4x to 2.0x the
-        // box, which on a real head is the space beside the ears and above the hair.
-        let mean_region = |scale_lo: f32, scale_hi: f32| -> f32 {
-            let (mut s, mut n) = (0f32, 0usize);
-            let (rx_lo, ry_lo, rx_hi, ry_hi) = (
-                bw * scale_lo / 2.0,
-                bh * scale_lo / 2.0,
-                bw * scale_hi / 2.0,
-                bh * scale_hi / 2.0,
-            );
-            let (x0, x1) = (
-                (cx - rx_hi).max(0.0) as i32,
-                (cx + rx_hi).min(fw as f32 - 1.0) as i32,
-            );
-            let (y0, y1) = (
-                (cy - ry_hi).max(0.0) as i32,
-                (cy + ry_hi).min(fh as f32 - 1.0) as i32,
-            );
-            let mut y = y0;
-            while y <= y1 {
-                let mut x = x0;
-                while x <= x1 {
-                    let inside_lo =
-                        ((x as f32 - cx).abs() < rx_lo) && ((y as f32 - cy).abs() < ry_lo);
-                    if !inside_lo {
-                        s += flash_at(x, y);
-                        n += 1;
-                    }
-                    x += 2;
-                }
-                y += 2;
-            }
-            if n == 0 {
-                0.0
-            } else {
-                s / n as f32
-            }
-        };
-        let face_flash = mean_region(0.0, 0.7);
-        let ring_flash = mean_region(1.4, 2.0);
-        let _ = (face_flash, ring_flash);
-        // Glint at native resolution: brightest flash pixel within 5 px of each eye
-        // landmark over the mean of that neighbourhood.
-        let glint_native = |ex: f32, ey: f32| -> f32 {
-            let (cx, cy) = (ex.round() as i32, ey.round() as i32);
-            let (mut mx, mut sum, mut cnt) = (0f32, 0f32, 0usize);
-            for dy in -5..=5 {
-                for dx in -5..=5 {
-                    let v = flash_at(cx + dx, cy + dy);
-                    mx = mx.max(v);
-                    sum += v;
-                    cnt += 1;
-                }
-            }
-            mx / (sum / cnt as f32).max(1.0)
-        };
-        let fr = faceauth_engine::liveness::FlashResponse::measure(
-            lit,
-            unlit,
-            &face,
-            lp.exposure.exposure,
-            lp.exposure.gain.max(16),
-        );
-        let surround = fr.surround;
-        let reflectance = fr.reflectance;
-        let gn_r = glint_native(face.landmarks[0][0], face.landmarks[0][1]);
-        let gn_l = glint_native(face.landmarks[1][0], face.landmarks[1][1]);
-        pairs += 1;
-        println!("pair {:2} lit {:5.1} gain {:4.2} ratio_hp {:.4} diff_hp {:.4} glint {:.2}/{:.2} native {:.2}/{:.2} surround {:.3} refl {:.4} face {:.0}px exp {} verdict {:?}", pairs, lm, flash_gain, ratio_hp, diff_hp, glint_r, glint_l, gn_r, gn_l, surround, reflectance, bw, lp.exposure.exposure, fr.verdict());
-        csv += &format!(
-            "{},{},{:.1},{:.1},{:.3},{:.4},{:.4},{:.2},{:.2},{:.2},{:.2},{:.3},{:.4},{:.0},{}\n",
-            label,
-            pairs,
-            lm,
-            um,
-            flash_gain,
-            ratio_hp,
-            diff_hp,
-            glint_r,
-            glint_l,
-            gn_r,
-            gn_l,
-            surround,
-            reflectance,
-            bw,
-            lp.exposure.exposure
-        );
-        if pairs <= 3 {
-            lit_c.write_pgm(save.join(format!("{}-{}-lit.pgm", label, pairs)))?;
-            unlit_c.write_pgm(save.join(format!("{}-{}-unlit.pgm", label, pairs)))?;
-            let mut r8 = Grey::new(112, 112);
-            let (rmin, rmax) = ratio
-                .iter()
-                .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
-            for (o, &v) in r8.data.iter_mut().zip(&ratio) {
-                *o = (((v - rmin) / (rmax - rmin).max(1e-3)) * 255.0) as u8;
-            }
-            r8.write_pgm(save.join(format!("{}-{}-ratio.pgm", label, pairs)))?;
-            let mut d8 = Grey::new(112, 112);
-            for (o, &v) in d8.data.iter_mut().zip(&diff) {
-                *o = v.clamp(0.0, 255.0) as u8;
-            }
-            d8.write_pgm(save.join(format!("{}-{}-diff.pgm", label, pairs)))?;
-        }
-    }
-    illum.set(false)?;
-    lp.cam.stop()?;
-    std::fs::write(save.join(format!("{}.csv", label)), csv)?;
-    println!(
-        "{} lit/unlit pairs; crops and {}.csv in {}",
-        pairs,
-        label,
-        save.display()
-    );
-    Ok(())
-}
-
 /// Download the model weights named in the manifest, verify size and SHA-256.
+/// A developer command: on an installed system the omarchy-faceauth-models
+/// package owns the files under the default directory, and setup never calls
+/// this.
 fn models_fetch(rest: &[&str]) -> Result<()> {
     let manifest =
         PathBuf::from(opt(rest, "--manifest").unwrap_or("/usr/share/faceauth/models.toml"));
@@ -2160,7 +693,7 @@ fn ir_sensor_from_sysfs(class_dir: &Path) -> Option<(String, String)> {
 /// `/run/udev/data/c<major>:<minor>`). `G:` lines are every tag the device
 /// ever carried and stay after a rule takes one away, so they are not read.
 fn udev_current_tags(db_dir: &Path, rdev: u64) -> Vec<String> {
-    let (major, minor) = (libc_major(rdev), libc_minor(rdev));
+    let (major, minor) = (nix::sys::stat::major(rdev), nix::sys::stat::minor(rdev));
     std::fs::read_to_string(db_dir.join(format!("c{}:{}", major, minor)))
         .map(|t| {
             t.lines()
@@ -2172,14 +705,6 @@ fn udev_current_tags(db_dir: &Path, rdev: u64) -> Vec<String> {
 }
 
 /// The kernel's dev_t encoding (glibc's major()/minor() macros).
-fn libc_major(rdev: u64) -> u64 {
-    ((rdev >> 32) & 0xffff_f000) | ((rdev >> 8) & 0xfff)
-}
-
-fn libc_minor(rdev: u64) -> u64 {
-    ((rdev >> 12) & 0xffff_ff00) | (rdev & 0xff)
-}
-
 /// Whether this process could open the node for writing: the ACL as the
 /// kernel applies it, which is the grant that matters.
 fn user_can_write(dev: &Path) -> bool {
@@ -2295,6 +820,12 @@ fn pam_stack_verdict(id: &str, text: &str) -> (&'static str, String) {
         }
     } else if want_deny && !deny_after_face {
         "fail"
+    } else if elevation && !consent {
+        // A face line on sudo or polkit without `consent` (a pasted lock
+        // line, a misspelt word, the older `prompt`) asks for a plain look,
+        // which the daemon refuses from a root caller: the line is dead,
+        // not passive (A3).
+        "fail"
     } else {
         "pass"
     };
@@ -2307,9 +838,9 @@ fn pam_stack_verdict(id: &str, text: &str) -> (&'static str, String) {
         d += if consent {
             ", consent (window + nod)"
         } else if prompt {
-            ", prompt (Enter to scan)"
+            ", prompt: the daemon refuses a plain look from sudo or polkit; use consent"
         } else {
-            ", NO consent or prompt: scans on presence"
+            ", NO consent or prompt: the daemon refuses a plain look from sudo or polkit; add consent"
         };
     }
     if has && want_deny {
@@ -2335,23 +866,190 @@ struct Check {
     detail: String,
 }
 
+/// How the daemon answered, as the rows read it.
+#[derive(Debug)]
+enum DaemonErr {
+    /// The socket refused the connection: the ACL admits enrolled users
+    /// and root, so for anyone else this is a running daemon, not a
+    /// failing one.
+    PermissionDenied,
+    Other(String),
+}
+
+/// The illuminator row: without a strobe control the liveness gate
+/// cannot run, and with `liveness_required` (the default) that refuses
+/// every attempt, which is a failure, not a warning (J21).
+fn illuminator_check(strobe: bool, liveness_required: bool) -> (&'static str, String) {
+    if strobe {
+        ("pass", "strobe controls present".into())
+    } else if liveness_required {
+        ("fail", "no strobe control: the liveness gate cannot run and liveness_required refuses every attempt; the ov7251 driver needs kernel patch 0002".into())
+    } else {
+        ("warn", "no strobe control: the liveness gate cannot run, and liveness_required = false lets a print authenticate".into())
+    }
+}
+
+/// The daemon rows from its answer to a ping: what each reply and each
+/// way of failing to get one means, in one place a table can test (J21,
+/// STORE-14).
+fn daemon_checks(
+    reply: std::result::Result<faceauth_daemon::auth::Outcome, DaemonErr>,
+    user: &str,
+    socket: &Path,
+) -> Vec<Check> {
+    use faceauth_daemon::auth::Outcome;
+    let mut out = Vec::new();
+    let mut push = |id: &'static str, status: &'static str, detail: String| {
+        out.push(Check { id, status, detail })
+    };
+    match reply {
+        Ok(Outcome::Pong {
+            version,
+            model,
+            templates,
+            sealed,
+            unbound,
+            floors,
+            load_error,
+        }) => {
+            push(
+                "daemon.running",
+                "pass",
+                format!("faceauthd {} answering on {}", version, socket.display()),
+            );
+            if let Some(e) = load_error {
+                push(
+                    "templates.user",
+                    "fail",
+                    format!("templates for {} cannot be read: {}; re-enrol", user, e),
+                );
+                return out;
+            }
+            push(
+                "templates.user",
+                if templates > 0 { "pass" } else { "warn" },
+                format!("{} template(s) for {} ({})", templates, user, model),
+            );
+            if templates > 0 {
+                push(
+                    "templates.at_rest",
+                    if sealed { "pass" } else { "warn" },
+                    if sealed {
+                        "sealed to the TPM, root-only: a copy is useless off this machine, and only root can open one here".into()
+                    } else {
+                        "plaintext at rest (root 0600): the daemon could not seal (its log says why)".into()
+                    },
+                );
+                push(
+                    "gestures.calibrated",
+                    if floors.is_some() { "pass" } else { "info" },
+                    match floors {
+                        Some((n, s)) => format!(
+                            "this user's floors, the ones the nod window runs at: nod {:.1} deg, shake {:.1} deg",
+                            n, s
+                        ),
+                        None => {
+                            "default floors (Tune Gestures in Setup > Security > Face records this user's own)"
+                                .into()
+                        }
+                    },
+                );
+                push(
+                    "templates.camera",
+                    if unbound == 0 { "pass" } else { "warn" },
+                    if unbound == 0 {
+                        "every template is bound to the camera that enrolled it".into()
+                    } else {
+                        format!("{} of {} template(s) predate camera binding and match on any camera; the next enrolment binds them", unbound, templates)
+                    },
+                );
+            }
+        }
+        // The daemon is up but holds the camera for a request or an
+        // enrolment; the template rows wait for a quiet moment.
+        Ok(Outcome::Error { message }) if message == "busy" => {
+            push(
+                "daemon.running",
+                "pass",
+                format!("faceauthd answering on {}, busy with the camera (a request or an enrolment is running); run again for the template rows", socket.display()),
+            );
+        }
+        Ok(o) => push(
+            "daemon.running",
+            "warn",
+            format!(
+                "unexpected reply {}",
+                serde_json::to_string(&o).unwrap_or_default()
+            ),
+        ),
+        Err(DaemonErr::PermissionDenied) => {
+            push(
+                "daemon.running",
+                "pass",
+                format!("faceauthd is running on {}; the socket admits enrolled users and root, and {} is not enrolled", socket.display(), user),
+            );
+            push(
+                "templates.user",
+                "warn",
+                format!(
+                    "no template(s) for {}: enrol from Setup > Security > Face",
+                    user
+                ),
+            );
+        }
+        Err(DaemonErr::Other(e)) => push("daemon.running", "fail", e),
+    }
+    out
+}
+
 /// Stable check identifiers are public API; add, never rename.
 fn doctor(rest: &[&str]) -> Result<()> {
     let json = rest.contains(&"--json");
-    let user = target_user();
+    only_flags(rest, &["--json", "--user"])?;
+    let user = user_arg(rest)?;
     let mut checks: Vec<Check> = Vec::new();
     let mut push = |id: &'static str, status: &'static str, detail: String| {
         checks.push(Check { id, status, detail })
     };
 
+    // The daemon's config first: the socket, the models directory and
+    // the liveness policy the rows below are judged against (J21).
+    let conf = std::fs::read_to_string("/etc/faceauth/config.toml")
+        .ok()
+        .and_then(|t| toml::from_str::<toml::Value>(&t).ok());
+    let conf_str = |key: &str, default: &str| -> String {
+        conf.as_ref()
+            .and_then(|c| c.get(key))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| default.into())
+    };
+    let socket = PathBuf::from(faceauth_daemon::config::SOCKET);
+    let models_dir = PathBuf::from(conf_str("models_dir", "/usr/share/faceauth/models"));
+    let liveness_required = conf
+        .as_ref()
+        .and_then(|c| c.get("liveness_required"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if conf.is_none() {
+        push(
+            "config.file",
+            "warn",
+            "/etc/faceauth/config.toml is not readable; the shipped defaults are assumed below"
+                .into(),
+        );
+    }
     // camera
     let sysfs_ir = ir_sensor_from_sysfs(Path::new("/sys/class/video4linux"));
     match faceauth_camera::ipu3::probe() {
         Ok(Some(g)) => match g.ir_sensor() {
             Some(ir) => {
-                let strobe = faceauth_camera::Illuminator::open(&ir.subdev).ok().flatten().is_some();
+                // A read of the control list, never an `Illuminator`, whose
+                // drop would switch the strobe off under the daemon (J22).
+                let strobe = faceauth_camera::has_strobe(&ir.subdev).unwrap_or(false);
                 push("camera.ir", "pass", format!("{} on {} ({}x{})", ir.name, ir.video.display(), ir.width, ir.height));
-                push("camera.illuminator", if strobe { "pass" } else { "warn" }, if strobe { "strobe control present".into() } else { "no strobe control: ambient light only, liveness gate off".into() });
+                let (st, d) = illuminator_check(strobe, liveness_required);
+                push("camera.illuminator", st, d);
                 push("camera.rgb", if g.colour_sensor().is_some() { "pass" } else { "warn" }, g.colour_sensor().map(|c| c.name.clone()).unwrap_or_else(|| "no front colour sensor".into()));
             }
             None => push("camera.ir", "fail", "IPU3 graph found but no front IR sensor".into()),
@@ -2392,9 +1090,6 @@ fn doctor(rest: &[&str]) -> Result<()> {
     }
     // models
     let manifest = PathBuf::from("/usr/share/faceauth/models.toml");
-    let models_dir = PathBuf::from(
-        std::env::var("FACEAUTH_MODELS").unwrap_or_else(|_| "/usr/share/faceauth/models".into()),
-    );
     match std::fs::read_to_string(&manifest)
         .ok()
         .and_then(|t| toml::from_str::<toml::Value>(&t).ok())
@@ -2418,8 +1113,14 @@ fn doctor(rest: &[&str]) -> Result<()> {
                     .to_string();
                 let lic = m.get("license").and_then(|v| v.as_str()).unwrap_or("?");
                 let p = models_dir.join(&name);
+                // Every listed model is load-bearing: the daemon does not
+                // start without the file (the mesh included, since the
+                // gestures are read from it and nothing else).
                 let (st, d) = if !p.exists() {
-                    ("fail", "missing".to_string())
+                    (
+                        "fail",
+                        "missing: the daemon refuses to start without it; the omarchy-faceauth-models package installs it".to_string(),
+                    )
                 } else if sha256_file(&p).unwrap_or_default() != sha {
                     ("fail", "checksum mismatch".into())
                 } else {
@@ -2435,101 +1136,36 @@ fn doctor(rest: &[&str]) -> Result<()> {
         ),
     }
     // daemon
-    let socket = PathBuf::from("/run/faceauth/sock");
-    match faceauth_daemon::server::ping(&socket, &user) {
-        Ok(faceauth_daemon::auth::Outcome::Pong {
-            version,
-            model,
-            templates,
-            sealed,
-            unbound,
-            floors,
-        }) => {
-            push(
-                "daemon.running",
-                "pass",
-                format!("faceauthd {} answering on {}", version, socket.display()),
-            );
-            push(
-                "templates.user",
-                if templates > 0 { "pass" } else { "warn" },
-                format!("{} template(s) for {} ({})", templates, user, model),
-            );
-            if templates > 0 {
-                push(
-                    "templates.at_rest",
-                    if sealed { "pass" } else { "warn" },
-                    if sealed {
-                        "sealed to the TPM, root-only: a copy is useless off this machine, and only root can open one here".into()
-                    } else {
-                        "plaintext at rest (root 0600): the daemon could not seal (its log says why)".into()
-                    },
-                );
-                push(
-                    "gestures.calibrated",
-                    if floors.is_some() { "pass" } else { "info" },
-                    match floors {
-                        Some((n, s)) => format!("this user's floors: nod {:.3}, shake {:.3}", n, s),
-                        None => {
-                            "default floors (run 'sudo faceauth calibrate' for this user's own)"
-                                .into()
-                        }
-                    },
-                );
-                push(
-                    "templates.camera",
-                    if unbound == 0 { "pass" } else { "warn" },
-                    if unbound == 0 {
-                        "every template is bound to the camera that enrolled it".into()
-                    } else {
-                        format!("{} of {} template(s) predate camera binding and match on any camera; the next enrolment binds them", unbound, templates)
-                    },
-                );
+    let reply = faceauth_daemon::server::ping(&socket, &user).map_err(|e| {
+        if is_permission_denied(&e) {
+            DaemonErr::PermissionDenied
+        } else {
+            DaemonErr::Other(e.to_string())
+        }
+    });
+    for c in daemon_checks(reply, &user, &socket) {
+        push(c.id, c.status, c.detail);
+    }
+    push(
+        "liveness.policy",
+        if liveness_required { "pass" } else { "warn" },
+        format!(
+            "liveness_required = {}{}",
+            liveness_required,
+            if liveness_required {
+                ""
+            } else {
+                ": a print in front of the camera can authenticate"
             }
-        }
-        Ok(o) => push(
-            "daemon.running",
-            "warn",
-            format!(
-                "unexpected reply {}",
-                serde_json::to_string(&o).unwrap_or_default()
-            ),
         ),
-        Err(e) => push("daemon.running", "fail", format!("{}", e)),
-    }
-    match std::fs::read_to_string("/etc/faceauth/config.toml")
-        .ok()
-        .and_then(|t| toml::from_str::<toml::Value>(&t).ok())
-    {
-        Some(c) => {
-            let req = c
-                .get("liveness_required")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            let on = c.get("liveness").and_then(|v| v.as_bool()).unwrap_or(true);
-            push(
-                "liveness.policy",
-                if on && req { "pass" } else { "warn" },
-                format!(
-                    "liveness = {}, liveness_required = {}{}",
-                    on,
-                    req,
-                    if !(on && req) {
-                        ": a print in front of the camera can authenticate"
-                    } else {
-                        ""
-                    }
-                ),
-            );
-        }
-        None => push("liveness.policy", "unknown", "config not readable".into()),
-    }
-    // PAM wiring
+    );
+    // PAM wiring: the three stacks setup writes. No greeter row: no setup
+    // path writes one, and a face line on a passive login is not something
+    // to report as wired (J21).
     for (id, path) in [
         ("pam.sudo", "/etc/pam.d/sudo"),
         ("pam.polkit", "/etc/pam.d/polkit-1"),
         ("pam.lock", "/etc/pam.d/omarchy-lock-face"),
-        ("pam.greeter", "/etc/pam.d/sddm"),
     ] {
         match std::fs::read_to_string(path) {
             Ok(t) => {
@@ -2539,7 +1175,6 @@ fn doctor(rest: &[&str]) -> Result<()> {
             Err(_) => push(id, "warn", "no file (not wired)".into()),
         }
     }
-    push("pam.faillock", "info", "a face match clears pam_faillock's bad-password lockout for the user, as a correct password would".into());
     // TPM
     let tpm =
         std::path::Path::new("/dev/tpmrm0").exists() || std::path::Path::new("/dev/tpm0").exists();
@@ -2577,17 +1212,134 @@ fn doctor(rest: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// The development `--store DIR` store: plaintext unless running as root.
-/// As a user, probing the TPM makes PID 1 ask polkit, which puts a real
-/// "decrypt a system credential" window on the desktop during a dev run or
-/// a test (F13); root probes as the daemon does.
-fn dev_store(dir: &str) -> Result<faceauth_daemon::store::Store> {
-    use faceauth_daemon::store::{Sealing, Store};
-    if unsafe { libc_geteuid() } == 0 {
-        Store::open(dir)
-    } else {
-        Store::open_with(dir, Sealing::Plain("development store, not root".into()))
+/// The config text with the presence watch switched: `on` sets the user
+/// and the away time (and a lock command if none is set), `off` sets only
+/// `enabled`, so the administrator's other keys and every comment stay as
+/// they are. The result is parsed and validated as the daemon would parse
+/// it before anything is written, so a value the daemon would refuse to
+/// start on (a zero or negative away time) is refused here instead (E3).
+fn presence_edit(text: &str, origin: &str, on: bool, user: &str, away: f32) -> Result<String> {
+    if on && (!away.is_finite() || away <= 0.0) {
+        bail!(
+            "--away-seconds {}: the away time must be a positive number of seconds",
+            away
+        );
     }
+    let mut keys: Vec<(&str, String)> = vec![("enabled", on.to_string())];
+    if on {
+        keys.push(("user", toml::Value::String(user.to_string()).to_string()));
+        keys.push(("away_seconds", format!("{:?}", away as f64)));
+    }
+    let edited = set_presence_keys(text, &keys);
+    let cfg = faceauth_daemon::config::Config::from_text(&edited, origin).with_context(|| {
+        format!(
+            "the change would leave {} unusable by the daemon; nothing was written",
+            origin
+        )
+    })?;
+    let took = cfg.presence.enabled == on
+        && (!on || (cfg.presence.user == user && (cfg.presence.away_seconds - away).abs() < 1e-3));
+    if !took {
+        bail!(
+            "the [presence] keys in {} did not take the new values (set elsewhere in the file?); nothing was written",
+            origin
+        );
+    }
+    Ok(edited)
+}
+
+/// The line range of the `[presence]` table in `text`: the header's index
+/// and the index one past the table's last line.
+fn presence_section(text: &str) -> Option<(usize, usize)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let header = lines
+        .iter()
+        .position(|l| toml_content(l).trim() == "[presence]")?;
+    let end = lines[header + 1..]
+        .iter()
+        .position(|l| toml_content(l).trim_start().starts_with('['))
+        .map(|i| header + 1 + i)
+        .unwrap_or(lines.len());
+    Some((header, end))
+}
+
+/// The index within `lines` of the line that sets `key`.
+fn find_key(lines: Vec<&str>, key: &str) -> Option<usize> {
+    lines.iter().position(|l| {
+        let c = toml_content(l);
+        let c = c.trim_start();
+        c.strip_prefix(key)
+            .map(|r| r.trim_start().starts_with('='))
+            .unwrap_or(false)
+    })
+}
+
+/// A line without its trailing comment: the first `#` outside a quoted
+/// string starts one.
+fn toml_content(line: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, ch) in line.char_indices() {
+        match quote {
+            Some(q) => {
+                if escaped {
+                    escaped = false;
+                } else if q == '"' && ch == '\\' {
+                    escaped = true;
+                } else if ch == q {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => quote = Some(ch),
+                '#' => return &line[..i],
+                _ => {}
+            },
+        }
+    }
+    line
+}
+
+/// `text` with each key set inside its `[presence]` table: a line that
+/// already sets the key is rewritten in place, keeping its trailing
+/// comment; a key not there yet is added at the end of the table; a file
+/// without the table gets one at its end. Every other line is untouched.
+fn set_presence_keys(text: &str, keys: &[(&str, String)]) -> String {
+    let mut lines: Vec<String> = text.lines().map(String::from).collect();
+    let (header, mut end) = match presence_section(text) {
+        Some(r) => r,
+        None => {
+            if lines.last().map(|l| !l.trim().is_empty()).unwrap_or(false) {
+                lines.push(String::new());
+            }
+            lines.push("[presence]".to_string());
+            (lines.len() - 1, lines.len())
+        }
+    };
+    for (key, value) in keys {
+        let body: Vec<&str> = lines[header + 1..end].iter().map(String::as_str).collect();
+        match find_key(body, key) {
+            Some(i) => {
+                let old = &lines[header + 1 + i];
+                let content_len = toml_content(old).trim_end().len();
+                let tail = old[content_len..].to_string();
+                lines[header + 1 + i] = format!("{} = {}{}", key, value, tail);
+            }
+            None => {
+                // After the table's last non-blank line, so blank lines
+                // that space it from the next table stay where they are.
+                let mut at = end;
+                while at > header + 1 && lines[at - 1].trim().is_empty() {
+                    at -= 1;
+                }
+                lines.insert(at, format!("{} = {}", key, value));
+                end += 1;
+            }
+        }
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
 }
 
 /// Write the config through a temporary file in the same directory and a
@@ -2628,9 +1380,284 @@ fn write_config_atomically(path: &str, text: &str) -> Result<()> {
     r
 }
 
+/// Whether the daemon's answer to `templates delete` means no templates
+/// are left: only `Deleted` and `NotEnrolled` do. Any other answer (busy,
+/// a caller refused as remote, a store error) leaves them on disk, and the
+/// command must fail so a removal script does not report a deletion that
+/// did not happen and skip its own fallback.
+#[cfg(test)]
+mod arg_tests {
+    use super::*;
+    use faceauth_daemon::auth::Outcome;
+
+    /// J23: a `--user` with no name, or followed by another flag, is an
+    /// error rather than a fall-through; an unknown flag is refused.
+    #[test]
+    fn a_valueless_user_flag_and_an_unknown_flag_are_refused() {
+        assert_eq!(
+            opt_value(&["--user", "mike"], "--user").unwrap(),
+            Some("mike")
+        );
+        assert_eq!(opt_value(&["--socket", "/x"], "--user").unwrap(), None);
+        assert!(opt_value(&["--user"], "--user").is_err());
+        assert!(opt_value(&["--user", "--dismiss"], "--user").is_err());
+        assert!(user_arg(&["--user"]).is_err());
+        assert_eq!(user_arg(&["--user", "mike"]).unwrap(), "mike");
+        assert!(only_flags(&["--user", "mike", "--dismis"], &["--user", "--dismiss"]).is_err());
+        assert!(only_flags(&["--user", "mike", "--dismiss"], &["--user", "--dismiss"]).is_ok());
+        assert!(only_flags(&["continue"], &[]).is_ok());
+    }
+
+    /// J23: the default user is never the literal "user" and never root.
+    #[test]
+    fn the_default_user_is_resolved_from_a_uid_and_is_never_root() {
+        std::env::set_var("SUDO_UID", "0");
+        let e = target_user().unwrap_err().to_string();
+        assert!(e.contains("root"), "{}", e);
+        std::env::set_var("SUDO_UID", "not-a-uid");
+        assert!(target_user().is_err());
+        std::env::remove_var("SUDO_UID");
+        match target_user() {
+            Ok(name) => {
+                assert_ne!(name, "user");
+                assert_ne!(name, "root");
+                assert_eq!(
+                    nix::unistd::User::from_name(&name).unwrap().unwrap().uid,
+                    nix::unistd::getuid()
+                );
+            }
+            Err(e) => assert!(nix::unistd::getuid().is_root(), "{}", e),
+        }
+    }
+
+    /// J27: the exit status follows the daemon's answer for every scripted
+    /// subcommand.
+    #[test]
+    fn the_exit_status_follows_the_answer() {
+        assert_eq!(exit_for(&Outcome::Noted), 0);
+        assert_eq!(exit_for(&Outcome::Deleted), 0);
+        assert_eq!(exit_for(&Outcome::NotEnrolled), 0);
+        assert_eq!(
+            exit_for(&Outcome::Probe {
+                face: false,
+                attentive: false,
+                face_px: 0.0,
+                elapsed_ms: 1
+            }),
+            0
+        );
+        assert_eq!(
+            exit_for(&Outcome::PresenceMode {
+                mode: "default".into(),
+                watching: false,
+                state: None,
+                away_for: None,
+            }),
+            0
+        );
+        assert_eq!(
+            exit_for(&Outcome::Error {
+                message: "busy".into()
+            }),
+            2
+        );
+        assert_eq!(
+            exit_for(&Outcome::ConsentDenied {
+                reason: "dismissed".into(),
+                elapsed_ms: 0
+            }),
+            1
+        );
+        assert_eq!(exit_for(&Outcome::NoFace { elapsed_ms: 0 }), 1);
+    }
+}
+
+#[cfg(test)]
+mod presence_edit_tests {
+    use super::{presence_edit, set_presence_keys, toml_content};
+
+    const SHIPPED: &str = include_str!("../../packaging/config.toml");
+
+    /// E3: an away time the daemon would refuse to start on is refused
+    /// before anything is written.
+    #[test]
+    fn a_zero_or_negative_away_time_is_refused_before_any_write() {
+        for away in [0.0f32, -5.0, f32::NAN, f32::INFINITY] {
+            let r = presence_edit(SHIPPED, "test", true, "mike", away);
+            assert!(r.is_err(), "away {} accepted", away);
+        }
+        assert!(presence_edit(SHIPPED, "test", true, "mike", 20.0).is_ok());
+    }
+
+    /// E3: the shipped, commented config keeps every comment and every
+    /// other key; only the three presence keys change.
+    #[test]
+    fn a_commented_config_keeps_its_comments() {
+        let out = presence_edit(SHIPPED, "test", true, "mike", 30.0).unwrap();
+        for line in SHIPPED.lines() {
+            let comment = line.find('#').map(|i| &line[i..]);
+            if let Some(c) = comment {
+                assert!(out.contains(c), "comment lost: {}", c);
+            }
+            let content = toml_content(line).trim();
+            let key = content.split('=').next().unwrap_or("").trim();
+            if !matches!(key, "enabled" | "user" | "away_seconds") && !content.is_empty() {
+                assert!(out.contains(line), "line changed: {}", line);
+            }
+        }
+        assert!(out.contains("\nenabled = true"), "{}", out);
+        assert!(out.contains("\nuser = \"mike\""), "{}", out);
+        assert!(out.contains("\naway_seconds = 30.0"), "{}", out);
+        assert!(
+            out.lines().count() >= SHIPPED.lines().count(),
+            "no line dropped"
+        );
+        let cfg = faceauth_daemon::config::Config::from_text(&out, "test").unwrap();
+        assert!(cfg.presence.enabled);
+        assert_eq!(cfg.presence.user, "mike");
+        assert_eq!(cfg.presence.away_seconds, 30.0);
+    }
+
+    /// E3: `off` sets only `enabled`; the user and the away time stay.
+    #[test]
+    fn off_sets_only_enabled() {
+        let on = presence_edit(SHIPPED, "test", true, "mike", 45.0).unwrap();
+        let off = presence_edit(&on, "test", false, "somebody-else", 5.0).unwrap();
+        let cfg = faceauth_daemon::config::Config::from_text(&off, "test").unwrap();
+        assert!(!cfg.presence.enabled);
+        assert_eq!(cfg.presence.user, "mike");
+        assert_eq!(cfg.presence.away_seconds, 45.0);
+        assert_eq!(off.replace("enabled = false", "enabled = true"), on);
+    }
+
+    /// A file without the table gets one; a table followed by another
+    /// keeps the new keys inside it.
+    #[test]
+    fn missing_keys_and_tables_are_added_in_place() {
+        let out = presence_edit("", "test", true, "mike", 20.0).unwrap();
+        let cfg = faceauth_daemon::config::Config::from_text(&out, "test").unwrap();
+        assert!(cfg.presence.enabled);
+        assert_eq!(cfg.presence.user, "mike");
+        let text = "accept_threshold = 0.7\n\n[presence]\nuser = \"al\" # who\n\n[other]\nx = 1\n";
+        let out = set_presence_keys(
+            text,
+            &[("enabled", "true".into()), ("user", "\"mike\"".into())],
+        );
+        assert_eq!(
+            out,
+            "accept_threshold = 0.7\n\n[presence]\nuser = \"mike\" # who\nenabled = true\n\n[other]\nx = 1\n"
+        );
+        assert_eq!(toml_content("user = \"a#b\" # c"), "user = \"a#b\" ");
+        assert_eq!(toml_content("user = 'a#b' # c"), "user = 'a#b' ");
+    }
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::exit_for;
+    use faceauth_daemon::auth::Outcome;
+
+    /// F4: a delete exits 0 only on Deleted or NotEnrolled; a daemon
+    /// error is 2, a refusal 1 (through the one `exit_for`, J27).
+    #[test]
+    fn only_deleted_or_not_enrolled_is_a_successful_delete() {
+        assert_eq!(exit_for(&Outcome::Deleted), 0);
+        assert_eq!(exit_for(&Outcome::NotEnrolled), 0);
+        for o in [
+            Outcome::Error {
+                message: "busy".into(),
+            },
+            Outcome::Error {
+                message: "face authentication is local only: started under sshd-session".into(),
+            },
+        ] {
+            assert_eq!(exit_for(&o), 2, "{:?}", serde_json::to_string(&o));
+        }
+        assert_eq!(exit_for(&Outcome::NoFace { elapsed_ms: 0 }), 1);
+    }
+}
+
 #[cfg(test)]
 mod doctor_tests {
     use super::*;
+
+    /// J21, STORE-14: every reply and every way of failing to get one maps
+    /// to the rows and statuses its label promises.
+    #[test]
+    fn the_daemon_rows_follow_the_reply() {
+        use faceauth_daemon::auth::Outcome;
+        let socket = Path::new(faceauth_daemon::config::SOCKET);
+        let ids = |checks: &[Check]| -> Vec<(&'static str, &'static str)> {
+            checks.iter().map(|c| (c.id, c.status)).collect()
+        };
+        let pong = |templates: usize, load_error: Option<&str>| Outcome::Pong {
+            version: "1".into(),
+            model: "m".into(),
+            templates,
+            sealed: true,
+            unbound: 0,
+            floors: None,
+            load_error: load_error.map(String::from),
+        };
+        assert_eq!(
+            ids(&daemon_checks(Ok(pong(3, None)), "mike", socket)),
+            vec![
+                ("daemon.running", "pass"),
+                ("templates.user", "pass"),
+                ("templates.at_rest", "pass"),
+                ("gestures.calibrated", "info"),
+                ("templates.camera", "pass"),
+            ]
+        );
+        assert_eq!(
+            ids(&daemon_checks(
+                Ok(pong(0, Some("cannot unseal"))),
+                "mike",
+                socket
+            )),
+            vec![("daemon.running", "pass"), ("templates.user", "fail")],
+            "an unreadable blob is not zero templates"
+        );
+        assert_eq!(
+            ids(&daemon_checks(
+                Err(DaemonErr::PermissionDenied),
+                "mike",
+                socket
+            )),
+            vec![("daemon.running", "pass"), ("templates.user", "warn")],
+            "a user who is not enrolled sees a running daemon"
+        );
+        assert_eq!(
+            ids(&daemon_checks(
+                Ok(Outcome::Error {
+                    message: "busy".into()
+                }),
+                "mike",
+                socket
+            )),
+            vec![("daemon.running", "pass")],
+            "a busy daemon is a running daemon"
+        );
+        assert_eq!(
+            ids(&daemon_checks(
+                Err(DaemonErr::Other("connect: no such file".into())),
+                "mike",
+                socket
+            )),
+            vec![("daemon.running", "fail")]
+        );
+        assert_eq!(
+            ids(&daemon_checks(Ok(Outcome::Noted), "mike", socket)),
+            vec![("daemon.running", "warn")]
+        );
+        assert_eq!(illuminator_check(true, true).0, "pass");
+        assert_eq!(
+            illuminator_check(false, true).0,
+            "fail",
+            "no strobe under liveness_required refuses every attempt"
+        );
+        assert_eq!(illuminator_check(false, false).0, "warn");
+    }
 
     /// E6: only a live `auth required|requisite pam_deny.so` after the face
     /// line closes the lock stack.
@@ -2685,6 +1712,29 @@ mod doctor_tests {
             pam_stack_verdict("pam.sudo", "#auth sufficient pam_faceauth.so consent\n").0,
             "warn"
         );
+    }
+
+    /// A3: an elevation line without `consent` (a pasted lock line, a
+    /// misspelt word) is a failure, not a pass with a note.
+    #[test]
+    fn an_elevation_line_without_consent_fails() {
+        for line in [
+            "auth      sufficient pam_faceauth.so socket=/run/faceauth/sock timeout=8\n",
+            "auth      sufficient pam_faceauth.so socket=/run/faceauth/sock consnet\n",
+        ] {
+            let sudo = format!("{}#%PAM-1.0\nauth\t\tinclude\t\tsystem-auth\n", line);
+            let (st, d) = pam_stack_verdict("pam.sudo", &sudo);
+            assert_eq!(st, "fail", "{}", d);
+            assert!(d.contains("NO consent"), "{}", d);
+            let polkit = format!(
+                "#%PAM-1.0\n{}auth include system-auth\n",
+                line.replace("sufficient", "[success=done auth_err=die default=ignore]")
+            );
+            assert_eq!(pam_stack_verdict("pam.polkit", &polkit).0, "fail");
+        }
+        // The lock stack is the plain-look caller and needs no consent.
+        let lock = "auth sufficient pam_faceauth.so timeout=8\nauth required pam_deny.so\n";
+        assert_eq!(pam_stack_verdict("pam.lock", lock).0, "pass");
     }
 
     /// D3: the IR sensor is found by name in sysfs without opening its node,
@@ -2760,7 +1810,10 @@ mod doctor_tests {
         std::fs::create_dir_all(&dir).unwrap();
         // 81:22 as the kernel encodes it: major in bits 8..20, minor low byte plus bits 20..32.
         let rdev: u64 = (81 << 8) | 22;
-        assert_eq!((libc_major(rdev), libc_minor(rdev)), (81, 22));
+        assert_eq!(
+            (nix::sys::stat::major(rdev), nix::sys::stat::minor(rdev)),
+            (81, 22)
+        );
         std::fs::write(
             dir.join("c81:22"),
             "I:1\nE:ID_PATH=x\nG:seat\nG:uaccess\nQ:seat\nV:1\n",

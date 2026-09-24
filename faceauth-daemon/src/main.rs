@@ -1,13 +1,16 @@
 //! `faceauthd`: the system service. Started at boot as a plain `Type=simple`
-//! unit, never socket- or D-Bus-activated (see the PAM recursion trap in the
-//! design). Owns the cameras and the templates; answers the PAM module.
+//! unit, never socket- or D-Bus-activated: an on-demand start would go
+//! through polkit into a PAM stack that contains `pam_faceauth`, which
+//! would then wait on the daemon being started. Owns the cameras and the
+//! templates; answers the PAM module.
 
 use anyhow::Result;
 use faceauth_daemon::{auth::Authenticator, config::Config, server};
 
 fn main() -> Result<()> {
+    // No timestamp of our own: journald stamps every line in local time.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp_millis()
+        .format_timestamp(None)
         .init();
     let cfg_path = std::env::args()
         .nth(1)
@@ -17,13 +20,12 @@ fn main() -> Result<()> {
         "config {}: models {} store {} socket {}",
         cfg_path,
         cfg.models_dir.display(),
-        cfg.store_dir.display(),
-        cfg.socket.display()
+        faceauth_daemon::config::STORE_DIR,
+        faceauth_daemon::config::SOCKET
     );
-    let socket = cfg.socket.clone();
+    let socket = std::path::PathBuf::from(faceauth_daemon::config::SOCKET);
     let presence = cfg.presence.clone();
-    let mut authenticator = Authenticator::new(cfg)?;
-    server::attach(&mut authenticator);
+    let authenticator = Authenticator::new(cfg)?;
     let auth = std::sync::Arc::new(std::sync::Mutex::new(authenticator));
     log::info!("models loaded; ready");
     if presence.enabled {

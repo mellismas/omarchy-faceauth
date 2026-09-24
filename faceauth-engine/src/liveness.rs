@@ -1,7 +1,8 @@
 //! Presentation-attack gate built on the illuminator's flash response.
 //!
 //! Deny-only: it can refuse a frame pair, never accept one on its own. Two
-//! physical measurements on `lit - unlit` (the strobe alternating every frame):
+//! physical measurements on `lit - unlit` (the strobe following the gate's
+//! mask, a lit frame paired with the unlit one before it):
 //!
 //! - **Reflectance.** Paper and card reflect near-infrared several times more
 //!   than skin. The face's flash response per unit exposure, normalised for
@@ -13,6 +14,12 @@
 //!   beside and above the head only; below the chin are the shoulders, as close
 //!   as the face. First measurements with the full ring: 0.31 to 0.36 for a face
 //!   and 0.44 to 0.54 for a print; re-measured with the trimmed ring in the pack.
+//!
+//! Both measurements need the lit frame to be a measurement: at the exposure
+//! a scan settles on (256 to 400 lines, from a 500-line start stepping down
+//! by a fifth every 400 ms) a print's flash is several hundred grey levels
+//! and the 8-bit frame clips at 255, which reads as an ordinary reflectance.
+//! A pair whose face is mostly clipped is therefore no signal, not a pass.
 //!
 //! Thresholds are published constants set from the first measurements with
 //! margin; re-measure before changing them and record the runs.
@@ -28,6 +35,13 @@ pub const REFLECTANCE_DENY: f32 = 0.80;
 pub const SURROUND_DENY: f32 = 0.42;
 /// Below this flash response the pair carries no usable signal (LEDs off, or too far).
 pub const MIN_FACE_FLASH: f32 = 4.0;
+/// A lit pixel at or above this is clipped: its flash is unknown.
+pub const CLIP_LEVEL: u8 = 250;
+/// When more of the face than this is clipped the reflectance cannot be
+/// read. A clipped print is clipped over its whole face; a real face wearing
+/// glasses throws two glints of a few pixels each, a percent or two of the
+/// face, so this is set well above what glints reach and well below a print.
+pub const MAX_CLIPPED: f32 = 0.20;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FlashResponse {
@@ -40,13 +54,16 @@ pub struct FlashResponse {
     /// face_flash / (exposure * gain/16), distance-normalised to REFERENCE_FACE_PX.
     pub reflectance: f32,
     pub face_px: f32,
+    /// Share of the inner face's lit pixels at or above `CLIP_LEVEL`.
+    pub clipped: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// Nothing in the flash response rules the pair out.
     Pass,
-    /// Too little flash signal to judge (treated as a failed attempt, not an attack).
+    /// Too little flash signal to judge, or a lit face too clipped to read
+    /// (treated as a failed attempt, not an attack).
     NoSignal,
     /// Reflectance says paper or card.
     DenyReflectance,
@@ -115,6 +132,39 @@ impl FlashResponse {
         };
         let face_flash = mean_region(0.0, 0.7, false);
         let ring_flash = mean_region(1.4, 2.0, true);
+        // The same inner region and sampling grid, counting lit pixels the
+        // sensor could not measure.
+        let clipped = {
+            let (rx, ry) = (bw * 0.7 / 2.0, bh * 0.7 / 2.0);
+            let (x0, x1) = (
+                (cx - rx).max(0.0) as i32,
+                (cx + rx).min(fw as f32 - 1.0) as i32,
+            );
+            let (y0, y1) = (
+                (cy - ry).max(0.0) as i32,
+                (cy + ry).min(fh as f32 - 1.0) as i32,
+            );
+            let (mut hot, mut n) = (0usize, 0usize);
+            let mut y = y0;
+            while y <= y1 {
+                let mut x = x0;
+                while x <= x1 {
+                    if x >= 0 && y >= 0 {
+                        if lit.data[y as usize * lit.width + x as usize] >= CLIP_LEVEL {
+                            hot += 1;
+                        }
+                        n += 1;
+                    }
+                    x += 2;
+                }
+                y += 2;
+            }
+            if n == 0 {
+                0.0
+            } else {
+                hot as f32 / n as f32
+            }
+        };
         let surround = if face_flash > 0.0 {
             ring_flash / face_flash
         } else {
@@ -133,11 +183,12 @@ impl FlashResponse {
             surround,
             reflectance: raw * scale,
             face_px: bw,
+            clipped,
         }
     }
 
     pub fn verdict(&self) -> Verdict {
-        if self.face_flash < MIN_FACE_FLASH {
+        if self.face_flash < MIN_FACE_FLASH || self.clipped > MAX_CLIPPED {
             Verdict::NoSignal
         } else if self.reflectance > REFLECTANCE_DENY {
             Verdict::DenyReflectance
@@ -158,16 +209,30 @@ impl FlashResponse {
 /// reads as strobed. So each gate draws a fresh mask with four lit and four
 /// unlit frames, never plain alternation, and only scores a lit/unlit pair
 /// once the last eight frames' brightness has followed a rotation of that
-/// mask. A stream that brightens on its own schedule is "no signal", not a
-/// pass. A device that honours the control but replays a face is not
-/// caught by this (see the README's "Not defended" list); the check makes
-/// a canned stream fail, no more.
+/// mask. A stream that brightens on its own schedule is never a pair.
+///
+/// What that is worth, measured (`phase_tests`): the 68 masks fall into 9
+/// rotation classes, and any rotation is accepted, so a recording that
+/// loops one fixed balanced mask is in phase for 8 of the 68 draws, one
+/// gate in nine. A gate that redraws the mask after each scored pair
+/// (`redraw`) and wants its pairs under different masks brings that to 64
+/// in 4624, about 1.4 percent. Out-of-phase frames cost the replayer
+/// nothing unless the caller charges them; `edges_off_mask` counts the
+/// brightness steps that never lined up, which a steady scene never
+/// produces. A device that honours the control but replays a face in step
+/// is not caught by any of this (see the README's "Not defended" list).
 #[derive(Clone, Debug)]
 pub struct StrobePhase {
     pattern: u8,
     /// Brightness class of the frames seen so far, newest last: true is lit.
     bits: Vec<bool>,
     last_mean: Option<f64>,
+    /// Rising edges seen while the frames were not following the mask.
+    edges_off_mask: usize,
+    /// Whether the frames have followed the mask at least once.
+    matched: bool,
+    /// Masks drawn so far, counting the first.
+    draws: usize,
 }
 
 /// A lit frame is at least this much brighter than the frame before it (the
@@ -188,12 +253,51 @@ impl StrobePhase {
             pattern,
             bits: Vec::new(),
             last_mean: None,
+            edges_off_mask: 0,
+            matched: false,
+            draws: 1,
         }
     }
 
     /// The mask to write to `strobe_frame_pattern`.
     pub fn pattern(&self) -> u8 {
         self.pattern
+    }
+
+    /// Draw a fresh mask for the next pair and forget the frames seen so
+    /// far, so the next pair is offered only once eight frames have
+    /// followed the new mask. The caller writes `pattern()` to the sensor.
+    pub fn redraw(&mut self) -> u8 {
+        self.pattern = random_pattern().unwrap_or(ALTERNATING);
+        self.bits.clear();
+        self.draws += 1;
+        self.pattern
+    }
+
+    /// Forget the frames seen so far and keep the mask: after a dropped
+    /// frame the frames either side of the gap may be any two of the mask,
+    /// so the next pair is offered only once eight frames have followed
+    /// it again (J8).
+    pub fn reset(&mut self) {
+        self.bits.clear();
+        self.last_mean = None;
+    }
+
+    /// How many masks this gate has drawn.
+    pub fn draws(&self) -> usize {
+        self.draws
+    }
+
+    /// Brightness steps up that arrived while the frames were not following
+    /// the mask. A scene under the strobe steps only on the mask; a stream
+    /// brightening on its own schedule steps and never lines up.
+    pub fn edges_off_mask(&self) -> usize {
+        self.edges_off_mask
+    }
+
+    /// Have the frames followed the mask at any point?
+    pub fn ever_in_phase(&self) -> bool {
+        self.matched
     }
 
     /// Record one frame's mean brightness. Returns true when this frame is a
@@ -213,7 +317,12 @@ impl StrobePhase {
         if self.bits.len() > 16 {
             self.bits.remove(0);
         }
-        rising && self.in_phase()
+        let in_phase = self.in_phase();
+        self.matched |= in_phase;
+        if rising && !in_phase {
+            self.edges_off_mask += 1;
+        }
+        rising && in_phase
     }
 
     /// Do the last eight frames follow some rotation of the mask?
@@ -245,6 +354,23 @@ fn random_pattern() -> Option<u8> {
 #[cfg(test)]
 mod phase_tests {
     use super::*;
+
+    /// A gap in the frames (J8): a reset forgets the frames seen, keeps
+    /// the mask, and offers no pair until eight frames have followed the
+    /// mask again from wherever the sensor resumed.
+    #[test]
+    fn a_reset_after_a_gap_keeps_the_mask_and_locks_again() {
+        let mask = 0b1100_0110u8;
+        let mut p = StrobePhase::with_pattern(mask);
+        let first = run(mask, &mut p, 0, 16);
+        assert!(first[8..].iter().any(|x| *x), "locked on the first run");
+        p.reset();
+        assert_eq!(p.pattern(), mask, "the mask is kept");
+        assert!(!p.in_phase(), "the frames are forgotten");
+        let after = run(mask, &mut p, 5, 16);
+        assert!(!after[..8].iter().any(|x| *x), "no pair before a new lock");
+        assert!(after[8..].iter().any(|x| *x), "pairs again once locked");
+    }
 
     /// Feed a phase tracker the brightness sequence a mask produces, from
     /// bit `start`, and return which frames it offered as pairs.
@@ -313,6 +439,84 @@ mod phase_tests {
         let mut phase = StrobePhase::with_pattern(0b1011_0100);
         assert!((0..30).all(|_| !phase.push(90.0)));
         assert!(!phase.in_phase());
+        assert_eq!(phase.edges_off_mask(), 0);
+        assert!(!phase.ever_in_phase());
+    }
+
+    /// Every mask `random()` can draw: four lit of eight, not 0xaa or 0x55.
+    fn balanced_masks() -> Vec<u8> {
+        (0u16..256)
+            .map(|b| b as u8)
+            .filter(|b| b.count_ones() == 4 && *b != 0xaa && *b != 0x55)
+            .collect()
+    }
+
+    /// Did a stream that loops `canned` from bit 7 get a pair offered under
+    /// a gate that drew `mask`?
+    fn canned_pairs(mask: u8, canned: u8) -> bool {
+        let mut phase = StrobePhase::with_pattern(mask);
+        run(canned, &mut phase, 0, 48).iter().any(|o| *o)
+    }
+
+    /// The doc's numbers: 68 masks in 9 rotation classes, so the best fixed
+    /// canned mask is in phase for 8 of 68 draws, and for 64 of 68 x 68
+    /// pairs of independent draws.
+    #[test]
+    fn a_canned_stream_is_in_phase_for_eight_of_sixty_eight_masks() {
+        let masks = balanced_masks();
+        assert_eq!(masks.len(), 68);
+        let classes: std::collections::BTreeSet<u8> = masks
+            .iter()
+            .map(|&m| (0..8).map(|r| m.rotate_left(r)).min().unwrap())
+            .collect();
+        assert_eq!(classes.len(), 9);
+        let best = (0u16..256)
+            .map(|c| masks.iter().filter(|&&m| canned_pairs(m, c as u8)).count())
+            .max()
+            .unwrap();
+        assert_eq!(best, 8);
+        let best_two = (0u16..256)
+            .map(|c| {
+                let hits = masks.iter().filter(|&&m| canned_pairs(m, c as u8)).count();
+                hits * hits
+            })
+            .max()
+            .unwrap();
+        assert_eq!(best_two, 64);
+        assert!((best_two as f64 / (68.0 * 68.0) - 0.0138).abs() < 0.001);
+    }
+
+    /// A stream brightening on its own schedule leaves a trail of steps that
+    /// never lined up; a scene following the mask leaves none.
+    #[test]
+    fn off_mask_steps_are_counted_and_in_phase_steps_are_not() {
+        let mask = 0b1011_0100u8;
+        let mut canned = StrobePhase::with_pattern(mask);
+        run(0xaa, &mut canned, 0, 40);
+        assert!(!canned.ever_in_phase());
+        assert!(canned.edges_off_mask() >= 16, "{}", canned.edges_off_mask());
+        let mut real = StrobePhase::with_pattern(mask);
+        run(mask, &mut real, 3, 40);
+        assert!(real.ever_in_phase());
+        // Only the edges before the first eight frames are off the mask.
+        assert!(real.edges_off_mask() <= 3, "{}", real.edges_off_mask());
+    }
+
+    /// A redraw starts the eight-frame wait again under a fresh balanced
+    /// mask, and counts the draw.
+    #[test]
+    fn a_redraw_waits_for_eight_frames_under_the_new_mask() {
+        let mask = 0b1011_0100u8;
+        let mut phase = StrobePhase::with_pattern(mask);
+        assert!(run(mask, &mut phase, 0, 24).iter().any(|o| *o));
+        assert_eq!(phase.draws(), 1);
+        let next = phase.redraw();
+        assert_eq!(phase.draws(), 2);
+        assert_eq!(next.count_ones(), 4);
+        assert!(next != 0xaa && next != 0x55);
+        let offered = run(next, &mut phase, 0, 24);
+        assert!(offered[..7].iter().all(|o| !o), "{:?}", offered);
+        assert!(offered[8..].iter().any(|o| *o), "{:?}", offered);
     }
 }
 
@@ -353,11 +557,14 @@ mod tests {
         assert!(r.reflectance < REFLECTANCE_DENY, "{:?}", r);
         assert_eq!(r.verdict(), Verdict::Pass);
 
-        // A print: everything at one distance lights up, and it is bright at a short exposure.
+        // A print: everything at one distance lights up, and it is bright at
+        // a short exposure. 164 lines is the fifth step down from the
+        // 500-line start, 2 s into a scan, where an unclipped print reads.
         let mut flat = Grey::new(200, 200);
         flat.data.iter_mut().for_each(|v| *v = 130);
-        let p = FlashResponse::measure(&flat, &unlit, &f, 66, 16);
+        let p = FlashResponse::measure(&flat, &unlit, &f, 164, 16);
         assert!(p.surround > 0.9, "{:?}", p);
+        assert!(p.clipped == 0.0, "{:?}", p);
         assert_eq!(p.verdict(), Verdict::DenyReflectance);
         let p2 = FlashResponse::measure(&flat, &unlit, &f, 1000, 16);
         assert_eq!(p2.verdict(), Verdict::DenySurround, "{:?}", p2);
@@ -369,6 +576,112 @@ mod tests {
         let f = face(60.0, 60.0, 80.0, 80.0);
         let r = FlashResponse::measure(&lit, &lit, &f, 267, 16);
         assert_eq!(r.verdict(), Verdict::NoSignal);
+    }
+
+    fn box_frame(w: usize, h: usize, f: impl Fn(usize, usize) -> u8) -> Grey {
+        let mut g = Grey::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                g.data[y * w + x] = f(x, y);
+            }
+        }
+        g
+    }
+
+    /// A cut-out print (albedo 2.02, the flash-print CSV) at the exposures a
+    /// scan freezes at, across the face widths of the reference distance.
+    /// Its flash would be several hundred levels; the lit frame clips at
+    /// 255 and the reflectance reads under the ceiling, so the pair is no
+    /// signal, never a pass. At an exposure the print does not clip at it
+    /// is denied outright.
+    #[test]
+    fn a_clipped_print_at_the_settled_exposure_is_never_a_pass() {
+        let (w, h) = (480usize, 640usize);
+        for &exposure in &[400i64, 360, 320, 256] {
+            for &bw in &[80.0f32, 87.0, 92.0, 100.0, 110.0] {
+                let bh = bw * 1.2;
+                let (bx, by) = (240.0 - bw / 2.0, 320.0 - bh / 2.0);
+                let inside = |x: usize, y: usize| {
+                    (x as f32) >= bx - 10.0
+                        && (x as f32) < bx + bw + 10.0
+                        && (y as f32) >= by - 20.0
+                        && (y as f32) < by + bh + 40.0
+                };
+                let true_flash = 2.02 * exposure as f32 * (bw / 87.0).powi(2);
+                let unlit = box_frame(w, h, |x, y| if inside(x, y) { 4 } else { 3 });
+                let lit = box_frame(w, h, |x, y| {
+                    if inside(x, y) {
+                        (4.0 + true_flash).min(255.0) as u8
+                    } else {
+                        4
+                    }
+                });
+                let r = FlashResponse::measure(&lit, &unlit, &face(bx, by, bw, bh), exposure, 16);
+                assert!(
+                    r.clipped > 0.9,
+                    "exposure {} width {}: {:?}",
+                    exposure,
+                    bw,
+                    r
+                );
+                assert_eq!(
+                    r.verdict(),
+                    Verdict::NoSignal,
+                    "exposure {} width {}: {:?}",
+                    exposure,
+                    bw,
+                    r
+                );
+            }
+        }
+        // The operating point the finding names: 360 lines, 87 px.
+        let (bx, by, bw, bh) = (196.5f32, 267.8f32, 87.0f32, 104.4f32);
+        let unlit = box_frame(w, h, |_, _| 4);
+        let lit = box_frame(w, h, |x, y| {
+            if (x as f32) >= bx && (x as f32) < bx + bw && (y as f32) >= by && (y as f32) < by + bh
+            {
+                255
+            } else {
+                4
+            }
+        });
+        let r = FlashResponse::measure(&lit, &unlit, &face(bx, by, bw, bh), 360, 16);
+        assert!(
+            r.reflectance < REFLECTANCE_DENY,
+            "clipping reads under the ceiling: {:?}",
+            r
+        );
+        assert_eq!(r.verdict(), Verdict::NoSignal, "{:?}", r);
+        // The same print once the exposure has come down enough not to clip.
+        let lit = box_frame(w, h, |x, y| {
+            if (x as f32) >= bx && (x as f32) < bx + bw && (y as f32) >= by && (y as f32) < by + bh
+            {
+                (4.0 + 2.02 * 100.0) as u8
+            } else {
+                4
+            }
+        });
+        let r = FlashResponse::measure(&lit, &unlit, &face(bx, by, bw, bh), 100, 16);
+        assert_eq!(r.clipped, 0.0, "{:?}", r);
+        assert_eq!(r.verdict(), Verdict::DenyReflectance, "{:?}", r);
+    }
+
+    /// Two glasses glints of 6x6 saturated pixels on a real face are a
+    /// percent or two of it: the pair still measures, and passes.
+    #[test]
+    fn glasses_glints_do_not_make_a_real_face_unreadable() {
+        let (mut lit, unlit) = head_only(200, 80);
+        for (gx, gy) in [(85usize, 90usize), (110, 90)] {
+            for y in gy..gy + 6 {
+                for x in gx..gx + 6 {
+                    lit.data[y * 200 + x] = 255;
+                }
+            }
+        }
+        let f = face(60.0, 60.0, 80.0, 80.0);
+        let r = FlashResponse::measure(&lit, &unlit, &f, 267, 16);
+        assert!(r.clipped > 0.0 && r.clipped < 0.05, "{:?}", r);
+        assert_eq!(r.verdict(), Verdict::Pass, "{:?}", r);
     }
 
     #[test]

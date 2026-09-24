@@ -17,7 +17,7 @@ pub mod sys;
 pub mod unpack;
 pub mod v4l2;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use calib::{Exposure, ExposureLimits};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -123,6 +123,9 @@ impl Camera {
         let exposure = find(&["exposure", "exposure_absolute", "exposure_time_absolute"])
             .ok_or_else(|| anyhow!("{}: no exposure control", controls.path().display()))?;
         let gain = find(&["analogue_gain", "gain"]);
+        // Digital gain is a multiplier the caller applies to the frame; a
+        // caller that never does must set `limits.dgain_max` to 1.0 or the
+        // loop climbs a gain that changes nothing on the sensor.
         let limits = ExposureLimits {
             exposure: (exposure.min.max(1), exposure.max),
             gain: gain.as_ref().map(|g| (g.min, g.max)),
@@ -153,7 +156,7 @@ impl Camera {
     }
 
     /// Block for the next frame and decode it into `f` (resized as needed).
-    /// `Ok(false)` on timeout.
+    /// `Ok(false)` on timeout, and for a frame the node delivered short.
     pub fn capture(&self, f: &mut Frame, timeout: Duration) -> Result<bool> {
         let (w, h) = (self.width(), self.height());
         if f.width != w || f.height != h {
@@ -163,11 +166,15 @@ impl Camera {
             return Ok(false);
         };
         if !self.decoder.decode(fr.data(), f) {
-            bail!(
-                "{}: short frame ({} bytes)",
+            // A payload shorter than the format is one bad frame, not the
+            // end of the attempt: the next poll brings the next one.
+            log::warn!(
+                "{}: short frame {} ({} bytes) skipped",
                 self.video.path().display(),
+                fr.sequence,
                 fr.bytesused
             );
+            return Ok(false);
         }
         f.sequence = fr.sequence;
         Ok(true)
@@ -205,31 +212,44 @@ impl Camera {
     }
 }
 
-/// The IR illuminator, as the `strobe_output_enable` control on the IR sensor
-/// (kernel patch 2 in the pack) plus the optional `strobe_frame_pattern`.
+/// The IR illuminator, as the `strobe_output_enable` and
+/// `strobe_frame_pattern` controls the patched ov7251 driver adds to the
+/// IR sensor. Both are needed: every gate writes a pattern, so a sensor
+/// with the standard strobe enable alone is one without an illuminator
+/// this crate can drive, and `open` says so by returning `None`. That is
+/// what makes the daemon's "liveness gate unavailable" refusal fire
+/// instead of an error out of the first `set_pattern`.
 pub struct Illuminator {
     controls: Controls,
     enable: ControlInfo,
-    pattern: Option<ControlInfo>,
+    pattern: ControlInfo,
+}
+
+/// The two strobe controls out of a sensor's control list, or `None` when
+/// either is missing.
+pub fn strobe_controls(list: &[ControlInfo]) -> Option<(ControlInfo, ControlInfo)> {
+    let find = |key: &str| list.iter().find(|c| c.key() == key).cloned();
+    Some((find("strobe_output_enable")?, find("strobe_frame_pattern")?))
+}
+
+/// Does the sensor behind `controls_path` have the two strobe controls?
+/// Reads the control list and writes nothing: an `Illuminator` switches
+/// the strobe off when it is dropped, so a probe made by constructing one
+/// (as `doctor` once did) would turn the light off under a running gate.
+pub fn has_strobe(controls_path: impl AsRef<Path>) -> Result<bool> {
+    let controls = Controls::open(controls_path)?;
+    Ok(strobe_controls(&controls.list()?).is_some())
 }
 
 impl Illuminator {
-    /// `Ok(None)` when the sensor has no strobe control: the machine has no
-    /// driver-controlled illuminator and the caller runs on ambient light.
+    /// `Ok(None)` when the sensor lacks either strobe control: the machine
+    /// has no illuminator this crate can drive and the caller decides what
+    /// that means (the daemon refuses by default).
     pub fn open(controls_path: impl AsRef<Path>) -> Result<Option<Self>> {
         let controls = Controls::open(controls_path)?;
-        let list = controls.list()?;
-        let Some(enable) = list
-            .iter()
-            .find(|c| c.key() == "strobe_output_enable")
-            .cloned()
-        else {
+        let Some((enable, pattern)) = strobe_controls(&controls.list()?) else {
             return Ok(None);
         };
-        let pattern = list
-            .iter()
-            .find(|c| c.key() == "strobe_frame_pattern")
-            .cloned();
         Ok(Some(Illuminator {
             controls,
             enable,
@@ -237,16 +257,15 @@ impl Illuminator {
         }))
     }
 
+    /// Always true for an open illuminator; kept for callers that report it.
     pub fn has_pattern(&self) -> bool {
-        self.pattern.is_some()
+        true
     }
 
     /// Light every frame (pattern 0xff) or none.
     pub fn set(&self, on: bool) -> Result<()> {
         if on {
-            if let Some(p) = &self.pattern {
-                self.controls.set(p.id, 0xff)?;
-            }
+            self.controls.set(self.pattern.id, 0xff)?;
         }
         self.controls.set(self.enable.id, on as i32)?;
         Ok(())
@@ -255,11 +274,7 @@ impl Illuminator {
     /// Light frames per an 8-frame bitmask (0xaa alternates lit/unlit), for
     /// the ambient-subtraction liveness check.
     pub fn set_pattern(&self, pattern: u8) -> Result<()> {
-        let p = self
-            .pattern
-            .as_ref()
-            .ok_or_else(|| anyhow!("sensor has no strobe_frame_pattern control"))?;
-        self.controls.set(p.id, pattern as i32)?;
+        self.controls.set(self.pattern.id, pattern as i32)?;
         self.controls.set(self.enable.id, 1)?;
         Ok(())
     }
@@ -272,6 +287,42 @@ impl Illuminator {
 impl Drop for Illuminator {
     fn drop(&mut self) {
         let _ = self.controls.set(self.enable.id, 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn control(name: &str, id: u32) -> ControlInfo {
+        ControlInfo {
+            id,
+            name: name.into(),
+            type_: 1,
+            min: 0,
+            max: 255,
+            step: 1,
+            default: 0,
+            flags: 0,
+        }
+    }
+
+    /// A sensor with the strobe enable alone is not an illuminator: the
+    /// gates need the pattern too.
+    #[test]
+    fn an_illuminator_needs_both_strobe_controls() {
+        let both = [
+            control("Exposure", 1),
+            control("Strobe Output Enable", 2),
+            control("Strobe Frame Pattern", 3),
+        ];
+        let (enable, pattern) = strobe_controls(&both).unwrap();
+        assert_eq!((enable.id, pattern.id), (2, 3));
+        let enable_only = [control("Exposure", 1), control("Strobe Output Enable", 2)];
+        assert!(strobe_controls(&enable_only).is_none());
+        let pattern_only = [control("Strobe Frame Pattern", 3)];
+        assert!(strobe_controls(&pattern_only).is_none());
+        assert!(strobe_controls(&[]).is_none());
     }
 }
 

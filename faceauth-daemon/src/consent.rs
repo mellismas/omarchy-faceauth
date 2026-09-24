@@ -6,17 +6,18 @@
 //! answer any prompt it is shown. So the yes comes from something only the
 //! daemon observes: a nod pattern in front of the camera it owns. Around it,
 //! for the human: one window on the desktop, opened by the daemon and not by
-//! the caller, naming the command and the process asking, with buttons to deny
-//! and kill it or to block it for a while. Nothing elevates silently, and no
+//! the caller, naming the command and the process asking, with buttons to
+//! dismiss it or, when the requester is named, to kill it. Nothing elevates
+//! silently, and no
 //! window means no elevation (an ssh session gets the password path).
 
 use crate::capture::IrCapture;
 use crate::config::Config;
 use anyhow::{anyhow, bail, Context, Result};
-use faceauth_engine::{pose, Grey, Pipeline};
+use faceauth_engine::{Grey, Pipeline};
 use serde::Serialize;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// A typed password on its way to the PAM check: wiped when dropped, so a
@@ -66,31 +67,565 @@ pub fn wipe_string(s: &mut String) {
     v.clear();
 }
 
-/// What the window (or the CLI) can send while a request is pending.
+/// What the window (or the CLI) can send while a request is pending, and
+/// what the flow reads off the live record between frames.
 #[derive(Clone, Debug)]
 pub enum Answer {
     /// The user typed their password into the window.
     Password(Secret),
     /// The requester hung up its socket: nobody is waiting for the verdict.
+    /// Nothing sends this; `ConsentState::poll` reads it off the request
+    /// socket itself.
     Gone,
-    /// The user dismissed, killed or blocked: refuse now.
+    /// The user dismissed or killed: refuse now.
     Dismiss,
+    /// The card's "Ready to nod" button: the user is back at the card
+    /// after a nod window passed unanswered, so the nods may be armed
+    /// again. It approves nothing and is ignored wherever nods are
+    /// already armed or the face is being scanned.
+    Rearm,
 }
 
-/// Pending answers by user name, shared between the server threads and the
-/// consent flow that owns the camera.
-pub type Answers = Arc<Mutex<std::collections::HashMap<String, Answer>>>;
-
-pub fn take_answer(answers: &Answers, user: &str) -> Option<Answer> {
-    answers.lock().ok().and_then(|mut m| m.remove(user))
+/// The passwordless-sudo rider of the live consent request. The rider is
+/// what the card's button asks for: that the approval of this request
+/// also turn passwordless sudo on for some minutes. It belongs to the one
+/// request on screen and is honoured only by the approval of that same
+/// request: a request that ends any other way takes its rider with it, so
+/// nothing armed at one card can ride on the approval of the next. The
+/// record also carries what the daemon knows at arm time, since the arm
+/// arrives on the socket thread: whether the lane is sudo (a sudoers rule
+/// means nothing to polkit) and whether the nod window is following the
+/// enrolled face right now. Both gate the arm, so a program driving the
+/// socket cannot arm a rider the person in front of the camera could not.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Rider {
+    /// The lane the card was shown on: `Some(true)` for sudo. None until
+    /// the first payload, so nothing can be armed before a card is up.
+    lane: Option<bool>,
+    face_present: bool,
+    minutes: Option<u32>,
+    /// The card has been sent a payload naming these minutes. An arm that
+    /// lands after the card's last payload is not honoured until the card
+    /// has shown it: the nod must be at a card that says what it grants.
+    shown: bool,
 }
 
-/// Who is asking, as far as /proc can say.
+/// The one consent request on screen. The answer token is handed to the
+/// window in the payload, and an answer, an acknowledgement or a rider is
+/// written in here only with it: a process that can reach the socket but
+/// did not see the window cannot cancel or answer the request. The record
+/// lives exactly as long as the request holds the window (`Turn`), so
+/// nothing from one request is left for the next to find.
+pub struct Live {
+    uid: u32,
+    user: String,
+    token: String,
+    /// The window has drawn the request this token names. The daemon
+    /// summons the window through the shell and hears "ok" from the shell,
+    /// not from the window: a disabled plugin, a shell that answers for a
+    /// window it does not have, or a window replaced by another summon all
+    /// leave the shell's answer the same. So the window itself, once it has
+    /// drawn the request, sends the token back; until that arrives no nod
+    /// is read, and if it does not arrive the request falls to the password.
+    acked: bool,
+    answer: Option<Answer>,
+    rider: Rider,
+    /// A dup of the requester's socket, polled for its hang-up.
+    requester: Option<std::os::fd::OwnedFd>,
+}
+
+struct Queue {
+    live: Option<Live>,
+    /// Requests waiting for the window, in arrival order: place id and uid.
+    waiting: std::collections::VecDeque<(u64, u32)>,
+    next_id: u64,
+}
+
+/// The consent requests of the daemon: the one on screen and the ones
+/// waiting behind it, under one lock. Requests of the same user queue and
+/// take the window in arrival order; a request of another user is refused
+/// at once and falls to its password, so one user's parked request never
+/// holds another's sudo open (B1). The condition variable wakes the
+/// waiters when the window frees and the window's first show when the
+/// acknowledgement lands.
+pub struct ConsentState {
+    q: Mutex<Queue>,
+    cv: std::sync::Condvar,
+}
+
+impl std::fmt::Debug for ConsentState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConsentState")
+    }
+}
+
+pub static CONSENT: ConsentState = ConsentState::new();
+
+/// Consent requests live or waiting, per uid. A user running many things
+/// at once (twenty agent sessions each calling sudo from its own terminal)
+/// may well have a dozen waiting; the bound is against a runaway same-uid
+/// loop holding threads open, not a limit anyone is meant to reach.
+pub const CONSENT_PER_UID: usize = 32;
+
+/// Why a request gets no place in the queue, or loses it while waiting.
+#[derive(Debug, PartialEq)]
+pub enum NoTurn {
+    /// Another user's request holds the window.
+    OtherUser(u32),
+    /// This user already has `CONSENT_PER_UID` requests live or waiting.
+    TooMany,
+    /// The requester hung up while waiting.
+    Gone,
+}
+
+/// A place in the queue, given back when dropped.
+#[derive(Debug)]
+pub struct Place<'a> {
+    id: u64,
+    uid: u32,
+    state: &'a ConsentState,
+}
+
+impl Drop for Place<'_> {
+    fn drop(&mut self) {
+        let mut q = self.state.lock();
+        q.waiting.retain(|(id, _)| *id != self.id);
+        self.state.cv.notify_all();
+    }
+}
+
+/// The window, held for the whole request and released when it ends
+/// however it ends. Dropping it forgets the live record.
+pub struct Turn<'a> {
+    state: &'a ConsentState,
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        self.state.lock().live = None;
+        self.state.cv.notify_all();
+    }
+}
+
+/// Has the peer of this socket hung up? `POLLRDHUP` says so the moment it
+/// closes, without a thread blocked in a read and without consuming a
+/// byte; an error from the poll reads as gone.
+pub fn peer_gone(fd: &std::os::fd::OwnedFd) -> bool {
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use std::os::fd::AsFd;
+    // nix 0.30 does not name POLLRDHUP; the bit is libc's.
+    let rdhup = PollFlags::from_bits_retain(libc::POLLRDHUP);
+    let hung_up = rdhup | PollFlags::POLLHUP | PollFlags::POLLERR;
+    let mut fds = [PollFd::new(fd.as_fd(), rdhup | PollFlags::POLLHUP)];
+    match poll(&mut fds, PollTimeout::ZERO) {
+        Ok(0) => false,
+        Ok(_) => fds[0]
+            .revents()
+            .map(|r| r.intersects(hung_up))
+            .unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+impl Default for ConsentState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConsentState {
+    pub const fn new() -> Self {
+        ConsentState {
+            q: Mutex::new(Queue {
+                live: None,
+                waiting: std::collections::VecDeque::new(),
+                next_id: 0,
+            }),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Queue> {
+        self.q.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The live record, if it is `user`'s.
+    fn live_of<'q>(q: &'q mut Queue, user: &str) -> Option<&'q mut Live> {
+        q.live.as_mut().filter(|l| l.user == user)
+    }
+
+    /// The live record if it is `user`'s and `token` is its token.
+    fn live_with<'q>(q: &'q mut Queue, user: &str, token: Option<&str>) -> Option<&'q mut Live> {
+        let tok = token?;
+        Self::live_of(q, user).filter(|l| same_token(&l.token, tok))
+    }
+
+    /// A request of `uid` joins the queue: refused at once when another
+    /// user's request is live (B1), or when this user already has
+    /// `CONSENT_PER_UID` requests live or waiting (B4).
+    pub fn join(&self, uid: u32) -> Result<Place<'_>, NoTurn> {
+        let mut q = self.lock();
+        if let Some(l) = &q.live {
+            if l.uid != uid {
+                return Err(NoTurn::OtherUser(l.uid));
+            }
+        }
+        if let Some((_, u)) = q.waiting.front() {
+            if *u != uid {
+                return Err(NoTurn::OtherUser(*u));
+            }
+        }
+        let held = q.waiting.iter().filter(|(_, u)| *u == uid).count()
+            + usize::from(q.live.as_ref().is_some_and(|l| l.uid == uid));
+        if held >= CONSENT_PER_UID {
+            return Err(NoTurn::TooMany);
+        }
+        let id = q.next_id;
+        q.next_id += 1;
+        q.waiting.push_back((id, uid));
+        Ok(Place {
+            id,
+            uid,
+            state: self,
+        })
+    }
+
+    /// Wait for the window: until this place is at the head of the queue
+    /// and no request is live, then take it. `requester` is a dup of the
+    /// request's socket, kept in the record and polled for its hang-up;
+    /// a requester that hangs up while waiting gets `Gone` and never a
+    /// window. `on_wait` runs once, without the lock, when the request
+    /// first has to wait (the notice that says so).
+    pub fn take_turn<'a>(
+        &'a self,
+        place: Place<'a>,
+        user: &str,
+        requester: Option<std::os::fd::OwnedFd>,
+        on_wait: &dyn Fn(),
+    ) -> Result<Turn<'a>, NoTurn> {
+        let mut waited = false;
+        loop {
+            let q = self.lock();
+            let head = q.waiting.front().map(|(id, _)| *id) == Some(place.id);
+            if head && q.live.is_none() {
+                let mut q = q;
+                q.waiting.pop_front();
+                q.live = Some(Live {
+                    uid: place.uid,
+                    user: user.to_string(),
+                    token: String::new(),
+                    acked: false,
+                    answer: None,
+                    rider: Rider::default(),
+                    requester,
+                });
+                drop(q);
+                self.cv.notify_all();
+                return Ok(Turn { state: self });
+            }
+            if let Some(l) = &q.live {
+                if l.uid != place.uid {
+                    return Err(NoTurn::OtherUser(l.uid));
+                }
+            }
+            if waited {
+                let _ = self
+                    .cv
+                    .wait_timeout(q, Duration::from_millis(300))
+                    .unwrap_or_else(|p| p.into_inner());
+            } else {
+                drop(q);
+                waited = true;
+                on_wait();
+            }
+            if requester.as_ref().is_some_and(peer_gone) {
+                return Err(NoTurn::Gone);
+            }
+        }
+    }
+
+    /// Has the live request's requester hung up?
+    pub fn requester_gone(&self, user: &str) -> bool {
+        let mut q = self.lock();
+        Self::live_of(&mut q, user)
+            .and_then(|l| l.requester.as_ref())
+            .is_some_and(peer_gone)
+    }
+
+    /// Take the answer waiting for `user`'s live request, or `Gone` when
+    /// its requester has hung up. What every wait loop reads between
+    /// frames.
+    pub fn poll(&self, user: &str) -> Option<Answer> {
+        let mut q = self.lock();
+        let l = Self::live_of(&mut q, user)?;
+        if let Some(a) = l.answer.take() {
+            return Some(a);
+        }
+        l.requester
+            .as_ref()
+            .is_some_and(peer_gone)
+            .then_some(Answer::Gone)
+    }
+
+    /// Take a "Ready to nod" if that is what waits; any other answer is
+    /// left for the scan start.
+    pub fn take_rearm(&self, user: &str) -> bool {
+        let mut q = self.lock();
+        let Some(l) = Self::live_of(&mut q, user) else {
+            return false;
+        };
+        if matches!(l.answer, Some(Answer::Rearm)) {
+            l.answer = None;
+            return true;
+        }
+        false
+    }
+
+    /// Is an answer waiting (or the requester gone), without taking it?
+    pub fn answered(&self, user: &str) -> bool {
+        let mut q = self.lock();
+        Self::live_of(&mut q, user)
+            .is_some_and(|l| l.answer.is_some() || l.requester.as_ref().is_some_and(peer_gone))
+    }
+
+    /// The window answers the live request `token` names. A re-arm never
+    /// displaces an answer already waiting. Refused, with the reason for
+    /// the caller, when the token is not the live request's.
+    pub fn answer(
+        &self,
+        user: &str,
+        token: Option<&str>,
+        answer: Answer,
+    ) -> Result<(), &'static str> {
+        let mut q = self.lock();
+        let l = Self::live_with(&mut q, user, token).ok_or("no pending request")?;
+        if matches!(answer, Answer::Rearm) && l.answer.is_some() {
+            return Ok(());
+        }
+        l.answer = Some(answer);
+        drop(q);
+        self.cv.notify_all();
+        Ok(())
+    }
+
+    /// Does `token` answer this user's live request? Compared in constant
+    /// time; a wrong token and no request read the same.
+    pub fn token_matches(&self, user: &str, token: Option<&str>) -> bool {
+        Self::live_with(&mut self.lock(), user, token).is_some()
+    }
+
+    /// The window says it has drawn the request `token` names. True when
+    /// that is this user's live request.
+    pub fn ack(&self, user: &str, token: Option<&str>) -> bool {
+        let mut q = self.lock();
+        let Some(l) = Self::live_with(&mut q, user, token) else {
+            return false;
+        };
+        l.acked = true;
+        drop(q);
+        self.cv.notify_all();
+        true
+    }
+
+    /// A new `Dialog` for the live request: its token, no acknowledgement,
+    /// no rider. False when no request of `user`'s is live.
+    fn set_token(&self, user: &str, token: &str) -> bool {
+        let mut q = self.lock();
+        let Some(l) = Self::live_of(&mut q, user) else {
+            return false;
+        };
+        l.token = token.to_string();
+        l.acked = false;
+        l.rider = Rider::default();
+        true
+    }
+
+    /// The `Dialog` is gone: its token answers nothing more, and whatever
+    /// was armed at its card ends with it, whichever way the request
+    /// ended, so nothing rides on the next approval.
+    fn clear_token(&self, user: &str, token: &str) {
+        let mut q = self.lock();
+        if let Some(l) = Self::live_with(&mut q, user, Some(token)) {
+            l.token.clear();
+            l.acked = false;
+            l.rider = Rider::default();
+        }
+    }
+
+    #[cfg(test)]
+    fn acknowledged(&self, user: &str, token: &str) -> bool {
+        Self::live_with(&mut self.lock(), user, Some(token)).is_some_and(|l| l.acked)
+    }
+
+    /// Forget the window's acknowledgement: the next show waits for a
+    /// fresh one.
+    fn reset_ack(&self, user: &str, token: &str) {
+        if let Some(l) = Self::live_with(&mut self.lock(), user, Some(token)) {
+            l.acked = false;
+        }
+    }
+
+    /// Wait for the window's acknowledgement of `token` until `deadline`.
+    fn wait_ack(&self, user: &str, token: &str, deadline: Instant) -> bool {
+        let mut q = self.lock();
+        loop {
+            if Self::live_with(&mut q, user, Some(token)).is_some_and(|l| l.acked) {
+                return true;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            q = self
+                .cv
+                .wait_timeout(q, left.min(Duration::from_millis(100)))
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+    }
+
+    /// The window asks that this user's live request, when approved, also
+    /// turn passwordless sudo on for `minutes`. Nothing is written now: the
+    /// answer waits on the approval (a nod and its confirm, or the
+    /// password), and any other end of the request drops it. Refused, with
+    /// the reason for the card, unless `token` names the request the card
+    /// is showing, that request is a sudo one, and the enrolled face is in
+    /// the nod window now.
+    pub fn arm_passwordless(
+        &self,
+        user: &str,
+        token: &str,
+        minutes: u32,
+    ) -> Result<(), &'static str> {
+        if minutes == 0 || minutes > PASSWORDLESS_MAX_MINUTES {
+            return Err("minutes out of range");
+        }
+        let mut q = self.lock();
+        let l = Self::live_with(&mut q, user, Some(token)).ok_or("no pending request")?;
+        match l.rider.lane {
+            None => return Err("no pending request"),
+            Some(false) => return Err("only a sudo request can carry it"),
+            Some(true) => {}
+        }
+        if !l.rider.face_present {
+            return Err("look at the camera first");
+        }
+        l.rider.minutes = Some(minutes);
+        l.rider.shown = false;
+        Ok(())
+    }
+
+    /// The rider armed on the request `token` names, if the card has been
+    /// shown it, and it is forgotten either way. A rider under another
+    /// token is never returned: the approval carries nothing.
+    pub fn take_passwordless(&self, user: &str, token: &str) -> Option<u32> {
+        let mut q = self.lock();
+        let l = Self::live_with(&mut q, user, Some(token))?;
+        let minutes = l.rider.minutes.take();
+        let shown = std::mem::replace(&mut l.rider.shown, false);
+        if !shown {
+            if minutes.is_some() {
+                log::warn!(
+                    "consent: a passwordless rider for {} arrived after the card's last payload; dropped",
+                    user
+                );
+            }
+            return None;
+        }
+        minutes
+    }
+
+    /// What the card's payload says about the rider: the minutes armed,
+    /// and whether the enrolled face is in frame. With `mark_shown`
+    /// sending the minutes counts as showing them; without it (a payload
+    /// that waits for no acknowledgement) a rider the card has not been
+    /// shown is left out, so that it still reaches the card on a show that
+    /// resets the acknowledgement and the dwell.
+    fn rider_for_payload(
+        &self,
+        user: &str,
+        token: &str,
+        sudo: bool,
+        mark_shown: bool,
+    ) -> (Option<u32>, bool) {
+        let mut q = self.lock();
+        let Some(l) = Self::live_with(&mut q, user, Some(token)) else {
+            return (None, false);
+        };
+        l.rider.lane = Some(sudo);
+        if mark_shown {
+            l.rider.shown = true;
+        }
+        let minutes = if l.rider.shown { l.rider.minutes } else { None };
+        (minutes, l.rider.face_present)
+    }
+
+    /// The nod window says whether it is following the enrolled face.
+    /// True when that changed the record.
+    pub fn set_face_present(&self, user: &str, present: bool) -> bool {
+        let mut q = self.lock();
+        Self::live_of(&mut q, user)
+            .filter(|l| !l.token.is_empty())
+            .map(|l| std::mem::replace(&mut l.rider.face_present, present) != present)
+            .unwrap_or(false)
+    }
+
+    /// Has a rider been armed that the card has not been shown yet? The
+    /// nod window ends on it so the card can be re-shown and the nods
+    /// start over.
+    pub fn rider_unshown(&self, user: &str) -> bool {
+        Self::live_of(&mut self.lock(), user)
+            .is_some_and(|l| l.rider.minutes.is_some() && !l.rider.shown)
+    }
+
+    /// The rider record as the tests read it: (minutes, face present).
+    #[cfg(test)]
+    fn rider_state(&self, user: &str) -> Option<(Option<u32>, bool)> {
+        Self::live_of(&mut self.lock(), user)
+            .filter(|l| !l.token.is_empty())
+            .map(|l| (l.rider.minutes, l.rider.face_present))
+    }
+
+    /// The live request's user and uid, as the tests read them.
+    #[cfg(test)]
+    pub(crate) fn live_user(&self) -> Option<(u32, String)> {
+        self.lock().live.as_ref().map(|l| (l.uid, l.user.clone()))
+    }
+
+    /// A live record for `user` without a queue or a requester: what a
+    /// test needs before it can make a `Dialog` or push an answer.
+    #[cfg(test)]
+    pub(crate) fn test_live(&self, uid: u32, user: &str) -> Turn<'_> {
+        let place = self.join(uid).expect("a free queue");
+        self.take_turn(place, user, None, &|| {})
+            .expect("the window is free")
+    }
+
+    /// An answer written past the token check, as a test stands in for the
+    /// window.
+    #[cfg(test)]
+    pub(crate) fn push_answer(&self, user: &str, answer: Answer) {
+        let mut q = self.lock();
+        if let Some(l) = Self::live_of(&mut q, user) {
+            l.answer = Some(answer);
+        }
+        drop(q);
+        self.cv.notify_all();
+    }
+}
+
+/// Who is asking, as far as /proc can say. The fields the window never
+/// reads are kept out of its payload: the raw command line would put a
+/// long sudo command past the kernel's argument limit and cost the card
+/// the ruling says it keeps (D5).
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CallerInfo {
     /// The process that holds the PAM transaction (sudo, polkit-agent-helper-1).
+    #[serde(skip)]
     pub pid: i32,
+    #[serde(skip)]
     pub exe: String,
+    #[serde(skip)]
     pub cmdline: String,
     /// What is being asked. When `verified` it is the daemon's own reading
     /// of the requesting process's command line (sudo's, pkexec's). When
@@ -108,16 +643,18 @@ pub struct CallerInfo {
     /// polkit helper's pid with a note that the asking process was not found.
     pub who: String,
     /// The chain above the requester: "alacritty (3910) <- bash (3921)".
+    #[serde(skip)]
     pub parents: String,
     /// The process to kill if the user says no: the requester, not the helper.
     pub kill_pid: i32,
     pub via: String,
     /// On the polkit lane, the requesting process as polkitd named it, when
     /// it did: the server runs the locality check on it as well.
+    #[serde(skip)]
     pub requester: Option<i32>,
 }
 
-fn real_uid_of(pid: i32) -> Option<u32> {
+pub(crate) fn real_uid_of(pid: i32) -> Option<u32> {
     read_proc(pid, "status")?
         .lines()
         .find_map(|l| l.strip_prefix("Uid:"))
@@ -153,7 +690,7 @@ pub fn polkit_requester(
     }
 }
 
-fn read_proc(pid: i32, what: &str) -> Option<String> {
+pub(crate) fn read_proc(pid: i32, what: &str) -> Option<String> {
     std::fs::read(format!("/proc/{}/{}", pid, what))
         .ok()
         .map(|b| {
@@ -258,34 +795,6 @@ pub(crate) fn comm_of(pid: i32) -> String {
     clip(&read_proc(pid, "comm").unwrap_or_default())
 }
 
-pub(crate) fn starttime_of(pid: i32) -> u64 {
-    read_proc(pid, "stat")
-        .and_then(|s| {
-            s.rsplit(')')
-                .next()
-                .and_then(|r| r.split_whitespace().nth(19).and_then(|v| v.parse().ok()))
-        })
-        .unwrap_or(0)
-}
-
-/// The answer token of each user's live consent request. The daemon hands it
-/// to the window it summons, in the payload, and accepts an answer (a
-/// dismissal, a password) only with it: a process that can reach the socket
-/// but did not see the window cannot cancel or answer the request.
-pub static TOKENS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, String>>,
-> = std::sync::LazyLock::new(Default::default);
-
-/// Per user, the token of the request whose window has said it is open.
-/// The daemon summons the window through the shell and hears "ok" from the
-/// shell, not from the window: a disabled plugin, a shell that answers for
-/// a window it does not have, or a window replaced by another summon all
-/// leave the shell's answer the same. So the window itself, once it has
-/// drawn the request, sends the token back; until that arrives no nod is
-/// read, and if it does not arrive the request falls to the password.
-pub static ACKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
-    std::sync::LazyLock::new(Default::default);
-
 /// How long a summoned window has to acknowledge before the request is
 /// denied.
 pub const ACK_WAIT: Duration = Duration::from_secs(3);
@@ -294,31 +803,16 @@ pub const ACK_WAIT: Duration = Duration::from_secs(3);
 /// already in motion when the card appeared was not a nod at this card.
 pub const ACK_DWELL: Duration = Duration::from_millis(1500);
 
-/// Per user, a passwordless-sudo spell the window asked for with the live
-/// request's token, waiting on that request's approval.
-static PASSWORDLESS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> =
-    std::sync::LazyLock::new(Default::default);
-
 /// The longest passwordless spell the card may ask for.
 pub const PASSWORDLESS_MAX_MINUTES: u32 = 24 * 60;
 
-/// The window asks that this user's live request, when approved, also turn
-/// passwordless sudo on for `minutes`. Nothing is written now: the answer
-/// waits on the approval (a nod and its confirm, or the password), and a
-/// refusal drops it.
-pub fn arm_passwordless(user: &str, minutes: u32) -> bool {
-    if minutes == 0 || minutes > PASSWORDLESS_MAX_MINUTES {
-        return false;
-    }
-    if let Ok(mut p) = PASSWORDLESS.lock() {
-        p.insert(user.to_string(), minutes);
-    }
-    true
-}
-
-/// The spell armed for this user, if any, and it is forgotten either way.
-pub fn take_passwordless(user: &str) -> Option<u32> {
-    PASSWORDLESS.lock().ok().and_then(|mut p| p.remove(user))
+/// Two tokens compared in constant time; a wrong token and no token read
+/// the same.
+fn same_token(have: &str, given: &str) -> bool {
+    let (a, b) = (have.as_bytes(), given.as_bytes());
+    !a.is_empty()
+        && a.len() == b.len()
+        && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// The sudoers.d file and the expiry timer unit Omarchy's own
@@ -365,7 +859,27 @@ pub fn enable_passwordless(
         "--".into(),
         file.display().to_string(),
     ];
-    arm(&args).context("arm the passwordless expiry timer; no rule was written")?;
+    if let Err(e) = arm(&args) {
+        // The timer could not be armed. A rule from an earlier spell may
+        // still be in place with its own timer just stopped (see
+        // `run_passwordless_timer`), and a rule with no timer would never
+        // end: the rule goes now, as Omarchy's own command does when its
+        // timer fails.
+        match std::fs::remove_file(&file) {
+            Ok(()) => log::warn!(
+                "passwordless sudo for {}: the expiry timer could not be armed; the earlier rule was removed",
+                user
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::error!(
+                "passwordless sudo for {}: no expiry timer, and {} could not be removed: {}; remove it as root",
+                user,
+                file.display(),
+                e
+            ),
+        }
+        return Err(e.context("arm the passwordless expiry timer; no rule is in place"));
+    }
     let tmp = dir.join(format!(".99-omarchy-nopasswd-{}.tmp", user));
     {
         let mut f = std::fs::OpenOptions::new()
@@ -393,7 +907,10 @@ pub fn is_passwordless_command(caller: &CallerInfo) -> bool {
 }
 
 /// `systemd-run` as root, for the expiry timer. An earlier timer of the
-/// same name (a spell being extended) is stopped first.
+/// same name (a spell being extended) is stopped first: the name is the
+/// one Omarchy's own command uses, so its toggle-off still applies, and
+/// systemd will not start a second unit under it. If the new timer then
+/// fails to start, `enable_passwordless` removes the rule.
 pub fn run_passwordless_timer(user: &str, args: &[String]) -> Result<()> {
     let unit = format!("{}.timer", passwordless_timer_unit(user));
     let _ = std::process::Command::new("/usr/bin/systemctl")
@@ -416,18 +933,6 @@ pub fn run_passwordless_timer(user: &str, args: &[String]) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// The window says it has drawn the request `token` names. True when that
-/// is this user's live request.
-pub fn ack(user: &str, token: Option<&str>) -> bool {
-    if !Dialog::token_matches(user, token) {
-        return false;
-    }
-    if let (Ok(mut a), Some(t)) = (ACKS.lock(), token) {
-        a.insert(user.to_string(), t.to_string());
-    }
-    true
 }
 
 /// Sixteen random bytes as hex, or nothing: a token that could not be drawn
@@ -455,8 +960,6 @@ fn fresh_token() -> Option<String> {
 pub struct PolkitContext {
     pub action: String,
     pub message: String,
-    pub cookie: String,
-    pub uid: u32,
     /// The peer that sent it, as the kernel reported it.
     pub agent: Option<AgentPeer>,
     /// polkitd's own details, when the agent's Quickshell exposes them:
@@ -651,31 +1154,75 @@ fn parent_chain(pid: i32) -> String {
     out.join(" <- ")
 }
 
+/// One command inside the user's own systemd manager, the route every
+/// call into the user's session takes (the window, a notice, the lock
+/// question): `systemd-run --user --machine=<user>@.host` from root, under
+/// a five-second timeout, so the daemon never switches uid itself (H18).
+/// `description` names the unit in the journal, where the default would
+/// be the command line, payload and token included; with `omarchy` the
+/// tree the shell was launched from goes in as OMARCHY_PATH; `wait` waits
+/// for the command to end and `pipe` brings its stdout back.
+fn in_user_manager(
+    user: &str,
+    description: Option<&str>,
+    omarchy: bool,
+    wait: bool,
+    pipe: bool,
+) -> std::process::Command {
+    let mut c = std::process::Command::new("/usr/bin/timeout");
+    c.args([
+        "5",
+        "/usr/bin/systemd-run",
+        "--quiet",
+        "--collect",
+        "--user",
+    ]);
+    if wait {
+        c.arg("--wait");
+    }
+    if pipe {
+        c.arg("--pipe");
+    }
+    if let Some(d) = description {
+        c.arg(format!("--description={}", d));
+    }
+    c.arg(format!("--machine={}@.host", user));
+    if omarchy {
+        c.arg(format!("-EOMARCHY_PATH={}", omarchy_path()));
+    }
+    c.env("PATH", "/usr/local/bin:/usr/bin:/bin");
+    c
+}
+
 /// One `omarchy-shell` invocation inside the user's own systemd manager,
 /// the same route the session lock uses.
-pub fn shell_call(cfg: &Config, user: &str, args: &[&str]) -> Result<()> {
-    let omarchy_path = omarchy_path(cfg);
-    // The unit's description is what the journal prints on start; the
-    // default is the command line, payload and token included.
-    let status = std::process::Command::new("/usr/bin/timeout")
-        .args([
-            "5",
-            "/usr/bin/systemd-run",
-            "--quiet",
-            "--wait",
-            "--collect",
-            "--user",
-            "--description=omarchy-faceauth window",
-        ])
-        .arg(format!("--machine={}@.host", user))
-        .arg(format!("-EOMARCHY_PATH={}", omarchy_path))
+pub fn shell_call(user: &str, args: &[&str]) -> Result<()> {
+    // The shell's answer comes back on stdout (`--pipe`), so a summon the
+    // shell could not honour is read here rather than by a change to the
+    // shared command (F2).
+    let output = in_user_manager(user, Some("omarchy-faceauth window"), true, true, true)
         .arg("/usr/bin/omarchy-shell")
         .args(args)
-        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-        .status()
+        .output()
         .context("run omarchy-shell in the user's manager")?;
-    if !status.success() {
-        return Err(anyhow!("omarchy-shell {:?} exited {}", args, status));
+    shell_answer(args, output.status.success(), &output.stdout)
+}
+
+/// What `omarchy-shell` said, read for the daemon's purposes. A failed
+/// exit is an error. A summon answered "unknown" is one too: the shell
+/// has no such window (a disabled or absent plugin), nothing was shown,
+/// and a caller that summoned something must not read the answer as
+/// shown. Every other answer is the shell's business.
+pub fn shell_answer(args: &[&str], success: bool, stdout: &[u8]) -> Result<()> {
+    if !success {
+        return Err(anyhow!("omarchy-shell {:?} failed", args));
+    }
+    let summon = args.len() >= 2 && args[0] == "shell" && args[1] == "summon";
+    if summon && String::from_utf8_lossy(stdout).trim() == "unknown" {
+        return Err(anyhow!(
+            "omarchy-shell has no such window: {}",
+            args.get(2).copied().unwrap_or("")
+        ));
     }
     Ok(())
 }
@@ -686,36 +1233,68 @@ pub struct Dialog {
     pub cfg: Config,
     user: String,
     open: bool,
-    /// The answer token for this request (see `TOKENS`).
+    /// The answer token for this request (see `Live`).
     token: String,
-    /// When the window acknowledged this request (see `ACKS`).
+    /// The record the token lives in.
+    state: &'static ConsentState,
+    /// When the window acknowledged this request.
     acked_at: Option<Instant>,
+    /// When the card was last shown the "nod" state with an
+    /// acknowledgement wait: the dwell runs from here, so nods count only
+    /// once the card asking for them has been up for `ACK_DWELL` (D4).
+    nod_shown_at: Option<Instant>,
+    /// The daemon is waiting for the user to come back to the card after
+    /// a nod window passed unanswered; the card offers "Ready to nod".
+    waiting: bool,
+    /// The last pending state and message sent, for the heartbeat.
+    last: Option<(String, String)>,
 }
+
+/// While a request waits (for attention, or parked behind a lock) the
+/// card is re-sent this often with the same state, so the window's own
+/// safety net, which hides a card no daemon has spoken to for five
+/// minutes, never fires on a live request (D1).
+pub const HEARTBEAT: Duration = Duration::from_secs(60);
 
 #[derive(Serialize)]
 struct Payload<'a> {
     state: &'a str,
     message: &'a str,
     caller: &'a CallerInfo,
-    seconds: f32,
     token: &'a str,
+    /// The nods are not armed and the daemon is waiting for the user to
+    /// come back: the card shows a "Ready to nod" button, whose answer
+    /// re-arms them (Q8).
+    waiting: bool,
+    /// The passwordless-sudo minutes the approval of this request will
+    /// grant, if the card's button armed them; the card draws its rider
+    /// row from this and nothing local, so it always says what a nod does.
+    passwordless_minutes: Option<u32>,
+    /// The nod window is following the enrolled face right now. The card
+    /// greys the passwordless button otherwise, and the daemon refuses an
+    /// arm otherwise, so the button and the socket obey one signal.
+    face_present: bool,
 }
 
 impl Dialog {
-    pub fn new(cfg: &Config, user: &str) -> Result<Self> {
+    /// A window for `user`'s live request, with a fresh answer token
+    /// written into the record. Fails when no request of theirs is live,
+    /// or when no token could be drawn.
+    pub fn new(cfg: &Config, user: &str, state: &'static ConsentState) -> Result<Self> {
         let token = fresh_token().ok_or_else(|| anyhow!("no randomness for the answer token"))?;
-        if let Ok(mut t) = TOKENS.lock() {
-            t.insert(user.to_string(), token.clone());
-        }
-        if let Ok(mut a) = ACKS.lock() {
-            a.remove(user);
+        if !state.set_token(user, &token) {
+            bail!("no live consent request for {}", user);
         }
         Ok(Dialog {
             cfg: cfg.clone(),
             user: user.to_string(),
             open: false,
             token,
+            state,
             acked_at: None,
+            nod_shown_at: None,
+            waiting: false,
+            last: None,
         })
     }
 
@@ -724,59 +1303,80 @@ impl Dialog {
         self.acked_at
     }
 
-    /// How long a nod must wait before it counts: until `ACK_DWELL` after
-    /// the acknowledgement, and the whole dwell when there is none.
-    pub fn dwell_left(&self, now: Instant) -> Duration {
-        match self.acked_at {
-            Some(at) => (at + ACK_DWELL).saturating_duration_since(now),
-            None => ACK_DWELL,
+    /// Is the card up, as far as the daemon knows?
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// Re-send the last pending state to the card, so its safety net
+    /// keeps counting from now. Nothing when no card is up.
+    pub fn heartbeat(&mut self, caller: &CallerInfo) {
+        if !self.open {
+            return;
         }
+        if let Some((state, message)) = self.last.clone() {
+            if let Err(e) = self.show_inner(&state, &message, caller, false) {
+                log::warn!("consent window: heartbeat failed: {}", e);
+            }
+        }
+    }
+
+    /// This request's answer token, for the rider record.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// Forget the window's acknowledgement: the next show waits for a
+    /// fresh one and the dwell runs whole from it. Used when what the nod
+    /// grants has changed after the card was acknowledged (a rider was
+    /// armed), so no nod counts until the card naming the rider is up.
+    pub fn reset_ack(&mut self) {
+        self.acked_at = None;
+        self.state.reset_ack(&self.user, &self.token);
+    }
+
+    /// How long a nod must wait before it counts: until `ACK_DWELL` after
+    /// the acknowledgement or after the nod card was shown, whichever is
+    /// later, and the whole dwell when there is no acknowledgement. The
+    /// acknowledgement lands during the scan, so on its own it would be
+    /// spent before the nod card is up; the nod show is what the dwell is
+    /// for (D4).
+    pub fn dwell_left(&self, now: Instant) -> Duration {
+        let Some(acked) = self.acked_at else {
+            return ACK_DWELL;
+        };
+        let from = match self.nod_shown_at {
+            Some(shown) if shown > acked => shown,
+            _ => acked,
+        };
+        (from + ACK_DWELL).saturating_duration_since(now)
     }
 
     /// Has the window acknowledged this request?
+    #[cfg(test)]
     fn acknowledged(&self) -> bool {
-        ACKS.lock()
-            .map(|a| {
-                a.get(&self.user)
-                    .map(|t| t.as_bytes() == self.token.as_bytes())
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false)
-    }
-
-    /// Does `token` answer this user's live request? Compared in constant
-    /// time; a wrong token and no request read the same.
-    pub fn token_matches(user: &str, token: Option<&str>) -> bool {
-        match (TOKENS.lock(), token) {
-            (Ok(t), Some(tok)) => t
-                .get(user)
-                .map(|have| {
-                    let (a, b) = (have.as_bytes(), tok.as_bytes());
-                    a.len() == b.len()
-                        && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-                })
-                .unwrap_or(false),
-            _ => false,
-        }
+        self.state.acknowledged(&self.user, &self.token)
     }
 
     fn shell(&self, args: &[&str]) -> Result<()> {
-        shell_call(&self.cfg, &self.user, args)
+        shell_call(&self.user, args)
     }
 
     /// Show or update the window. Fails when there is no graphical session to
     /// show it in, which callers treat as "no consent possible".
     /// The first show of a request also waits for the window's own
-    /// acknowledgement (`ACKS`); without one within `ACK_WAIT` there is no
+    /// acknowledgement; without one within `ACK_WAIT` there is no
     /// window on screen that the daemon can vouch for, and that is an error.
-    pub fn show(
-        &mut self,
-        state: &str,
-        message: &str,
-        caller: &CallerInfo,
-        seconds: f32,
-    ) -> Result<()> {
-        self.show_inner(state, message, caller, seconds, true)
+    pub fn show(&mut self, state: &str, message: &str, caller: &CallerInfo) -> Result<()> {
+        self.waiting = false;
+        self.show_inner(state, message, caller, true)
+    }
+
+    /// Show the card while the nods are not armed and the daemon waits for
+    /// the user to come back to it: the card offers "Ready to nod".
+    pub fn show_waiting(&mut self, message: &str, caller: &CallerInfo) -> Result<()> {
+        self.waiting = true;
+        self.show_inner("scanning", message, caller, true)
     }
 
     fn show_inner(
@@ -784,29 +1384,43 @@ impl Dialog {
         state: &str,
         message: &str,
         caller: &CallerInfo,
-        seconds: f32,
         need_ack: bool,
     ) -> Result<()> {
+        // A pending-state show that first carries an armed rider is a card
+        // the user has not read: the acknowledgement is reset before the
+        // summon, so this show waits for a fresh one and the dwell runs
+        // whole from it. The card acknowledges again on a changed rider.
+        if need_ack && self.state.rider_unshown(&self.user) {
+            self.reset_ack();
+        }
+        let (passwordless_minutes, face_present) =
+            self.state
+                .rider_for_payload(&self.user, &self.token, caller.via == "sudo", need_ack);
         let payload = serde_json::to_string(&Payload {
             state,
             message,
             caller,
-            seconds,
             token: &self.token,
+            waiting: self.waiting,
+            passwordless_minutes,
+            face_present,
         })?;
         self.shell(&["shell", "summon", "omarchy.faceauth", &payload])?;
         self.open = true;
+        self.last = Some((state.to_string(), message.to_string()));
+        if need_ack && state == "nod" {
+            self.nod_shown_at = Some(Instant::now());
+        }
         if need_ack && self.acked_at.is_none() {
-            let deadline = Instant::now() + ACK_WAIT;
-            while !self.acknowledged() {
-                if Instant::now() > deadline {
-                    self.open = false;
-                    return Err(anyhow!(
-                        "the consent window did not acknowledge the request within {:.0}s",
-                        ACK_WAIT.as_secs_f32()
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(25));
+            if !self
+                .state
+                .wait_ack(&self.user, &self.token, Instant::now() + ACK_WAIT)
+            {
+                self.open = false;
+                return Err(anyhow!(
+                    "the consent window did not acknowledge the request within {:.0}s",
+                    ACK_WAIT.as_secs_f32()
+                ));
             }
             self.acked_at = Some(Instant::now());
             log::info!(
@@ -817,11 +1431,20 @@ impl Dialog {
         Ok(())
     }
 
+    /// Re-send a pending state to a window that has already acknowledged
+    /// the request, with the payload's rider and face fields as they are
+    /// now, without waiting for another acknowledgement.
+    pub fn show_again(&mut self, state: &str, message: &str, caller: &CallerInfo) -> Result<()> {
+        self.show_inner(state, message, caller, false)
+    }
+
     /// A final state: the window keeps itself up for a while and closes on
     /// its own, so the daemon must not hide it (and must not wait).
     pub fn show_final(&mut self, state: &str, message: &str, caller: &CallerInfo) {
-        let _ = self.show_inner(state, message, caller, 0.0, false);
+        self.waiting = false;
+        let _ = self.show_inner(state, message, caller, false);
         self.open = false;
+        self.last = None;
     }
 
     pub fn hide(&mut self) {
@@ -830,6 +1453,7 @@ impl Dialog {
                 log::warn!("consent window: hide failed: {}", e);
             }
             self.open = false;
+            self.last = None;
         }
     }
 }
@@ -837,50 +1461,30 @@ impl Dialog {
 impl Drop for Dialog {
     fn drop(&mut self) {
         self.hide();
-        if let Ok(mut t) = TOKENS.lock() {
-            if t.get(&self.user) == Some(&self.token) {
-                t.remove(&self.user);
-            }
-        }
+        self.state.clear_token(&self.user, &self.token);
     }
 }
 
-/// A desktop notification in the user's session: every elevation by face
-/// announces itself, so a loop is visible the first time it fires.
 /// Is the user's session locked? Asked of the compositor from inside the
 /// user's manager, the same way the window is summoned. Unknown reads as
 /// not locked.
 pub fn session_locked(user: &str) -> bool {
-    std::process::Command::new("/usr/bin/timeout")
-        .args([
-            "5",
-            "/usr/bin/systemd-run",
-            "--quiet",
-            "--wait",
-            "--collect",
-            "--user",
-        ])
-        .arg(format!("--machine={}@.host", user))
+    in_user_manager(user, None, false, true, false)
         .arg("/usr/bin/omarchy-hyprland-session-locked")
-        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .status()
         .map(|st| st.success())
         .unwrap_or(false)
 }
 
-/// The Omarchy tree the running shell was launched from: the config's
-/// `omarchy_path`, else `/etc/omarchy.conf` (written by `omarchy-dev-link`
-/// as `export OMARCHY_PATH="..."`, and by hand as a bare assignment), else
-/// the package. One resolver for the window, the notices and the lock
-/// helper, so a dev-linked desktop is reached the same way by all three.
-pub fn omarchy_path(cfg: &Config) -> String {
-    cfg.omarchy_path
-        .clone()
-        .or_else(|| {
-            std::fs::read_to_string("/etc/omarchy.conf")
-                .ok()
-                .and_then(|t| omarchy_path_from_conf(&t))
-        })
+/// The Omarchy tree the running shell was launched from:
+/// `/etc/omarchy.conf` (written by `omarchy-dev-link` as `export
+/// OMARCHY_PATH="..."`, and by hand as a bare assignment), else the
+/// package. One resolver for the window, the notices and the lock helper,
+/// so a dev-linked desktop is reached the same way by all three.
+pub fn omarchy_path() -> String {
+    std::fs::read_to_string("/etc/omarchy.conf")
+        .ok()
+        .and_then(|t| omarchy_path_from_conf(&t))
         .unwrap_or_else(|| "/usr/share/omarchy".into())
 }
 
@@ -900,30 +1504,14 @@ pub fn omarchy_path_from_conf(text: &str) -> Option<String> {
     })
 }
 
-pub fn notify(cfg: &Config, user: &str, title: &str, body: &str) {
-    let omarchy_path = omarchy_path(cfg);
-    let _ = std::process::Command::new("/usr/bin/timeout")
-        .args([
-            "5",
-            "/usr/bin/systemd-run",
-            "--quiet",
-            "--collect",
-            "--user",
-            "--description=omarchy-faceauth notice",
-        ])
-        .arg(format!("--machine={}@.host", user))
-        .arg(format!("-EOMARCHY_PATH={}", omarchy_path))
+/// A desktop notification in the user's session: every elevation by face
+/// announces itself, so a loop is visible the first time it fires.
+pub fn notify(user: &str, title: &str, body: &str) {
+    let _ = in_user_manager(user, Some("omarchy-faceauth notice"), true, false, false)
         .args(["/usr/bin/omarchy-notification-send", title, body])
-        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .status();
 }
 
-/// Watch for the consent gesture: two nods within `window`. A nod is the head
-/// pitching away from its resting pose past a threshold and coming back,
-/// measured as the nose's position between the eye line and the mouth line.
-/// Measured on the reference machine, a nod moves it about 0.12 (from 0.53 to
-/// 0.41); the sign depends on the sensor mounting, so any excursion counts.
-/// Baseline is the median of the first frames.
 /// Result of the gesture phase.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Gesture {
@@ -944,6 +1532,16 @@ pub enum Gesture {
     ConfirmFailed(String),
     /// The window could not be shown, or never acknowledged the request.
     NoWindow,
+    /// The card armed a passwordless rider the card has not been shown
+    /// yet: the caller re-shows it and starts the nods over.
+    RiderArmed,
+    /// The session locked under the card (the idle lock, a key, the lid):
+    /// nobody can see the card, so nothing is read until the unlock (D2).
+    SessionLocked,
+    /// The followed face left its place and one face has been back in
+    /// view for a second: the scan says whether it is the user before any
+    /// nod counts again (E2).
+    Moved,
 }
 
 /// One gesture axis as a pure state machine over (signal, time) samples, so
@@ -983,17 +1581,9 @@ pub struct Oscillation {
     pub leg_min_s: f32,
     /// Width change allowed across a gesture (fraction of face width).
     pub width_tol: f32,
-    /// Not moving at all: frame-to-frame change under this, in signal
-    /// units. `REST_STEP` on the image-motion signal; degrees on the mesh.
+    /// Not moving at all: frame-to-frame change under this, in degrees
+    /// (`NodDetector::MESH_REST_STEP`).
     pub rest_step: f32,
-    /// Filtered samples that must advance the extreme within a leg: a real
-    /// leg is a ramp over several frames; a detector fit switching between
-    /// two solutions is one jump (recorded 2026-09-22 on the nose measure:
-    /// 0.09 in a frame, held three or four frames, and approved as a nod).
-    pub min_steps: usize,
-    /// Test-only knob (off in every live detector): require the leg's samples
-    /// to pass through the middle band on their way to the extreme.
-    pub need_ramp: bool,
     /// The whole face box must move with the leg: along x for a shake, y
     /// for a nod, by at least this fraction of the face width between the
     /// leg's start and its extreme. A head that moves carries its box; a
@@ -1002,18 +1592,6 @@ pub struct Oscillation {
     /// through a fit flip that read as a nod; 9 to 16 px through real nods).
     /// None turns the rule off.
     pub co_motion: Option<(u8, f32)>,
-    /// Samples seen during the current leg.
-    leg_samples: Vec<f32>,
-    /// The last few filtered samples (the frames just before a departure).
-    recent: Vec<f32>,
-    /// Test-only knob (off in every live detector): the four legs' amplitudes
-    /// and durations within this ratio of one another.
-    pub regular: Option<f32>,
-    /// The gesture must swing to both sides of the rest level (a shake
-    /// does; a glance goes one way and returns; a nod may not rise above).
-    both_sides: bool,
-    /// Where the head rested when the first leg began.
-    rest_level: f32,
     raw: Vec<f32>,
     settle: Vec<f32>,
     /// Slow-following baseline, for `idle` and the logs.
@@ -1035,8 +1613,6 @@ pub struct Oscillation {
     rev_count: usize,
     /// When the head stopped moving, if it has.
     rest_since: Option<f32>,
-    /// Samples that advanced the extreme in the current leg.
-    pub steps: usize,
     /// Last time the signal sat close to the pivot: where a first leg starts.
     depart: f32,
     /// Completed legs as (start, end, extreme value, amplitude).
@@ -1071,16 +1647,6 @@ impl Oscillation {
     /// Default rest: the last leg of a gesture ends at rest, and a glance
     /// holds. The slow top of a real nod is not rest: it keeps creeping.
     const REST_S: f32 = 0.5;
-    /// Not moving at all: frame-to-frame change under this, in signal units
-    /// (face widths per frame). Absolute, not a fraction of the floor: at a
-    /// calibrated floor of 0.129 a fraction became 0.045, above a nod's own
-    /// frame-to-frame motion, and the user's nods were cleared as "rest"
-    /// (recorded). A settling head wobbles 0.01; a turnaround moves 0.03+.
-    const REST_STEP: f32 = 0.02;
-    /// Filtered samples that must advance the extreme within a leg. 1 is
-    /// off: the recorded nods from a jittery face box are not clean ramps,
-    /// and fit flicker is handled before the detector (`FlickerFilter`).
-    const MIN_STEPS: usize = 1;
     /// Median window over the raw signal.
     const MEDIAN: usize = 3;
     /// The face must have been still this long before the first leg.
@@ -1095,7 +1661,7 @@ impl Oscillation {
     /// Baseline time constant in seconds.
     const TAU_S: f32 = 1.5;
 
-    // Eight tuning knobs, each named at the call sites; a builder would only
+    // Seven tuning knobs, each named at the call sites; a builder would only
     // hide which one is being set.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1106,7 +1672,6 @@ impl Oscillation {
         shift_tol_x: f32,
         shift_tol_y: f32,
         max_amp: f32,
-        both_sides: bool,
     ) -> Self {
         Oscillation {
             name,
@@ -1116,21 +1681,14 @@ impl Oscillation {
             shift_tol_x,
             shift_tol_y,
             max_amp,
-            both_sides,
-            rest_level: 0.0,
             prior_still: 0.0,
             span_s: Self::SPAN_S,
             rest_s: Self::REST_S,
             rev_frames: Self::REV_FRAMES,
             leg_min_s: Self::LEG_MIN_S,
             width_tol: Self::WIDTH_TOL,
-            rest_step: Self::REST_STEP,
-            min_steps: Self::MIN_STEPS,
-            need_ramp: false,
+            rest_step: NodDetector::MESH_REST_STEP,
             co_motion: None,
-            leg_samples: Vec::new(),
-            recent: Vec::new(),
-            regular: None,
             raw: Vec::new(),
             settle: Vec::new(),
             base: None,
@@ -1144,7 +1702,6 @@ impl Oscillation {
             dir: 0,
             rev_count: 0,
             rest_since: None,
-            steps: 0,
             depart: 0.0,
             legs: Vec::new(),
             last_active: None,
@@ -1157,10 +1714,6 @@ impl Oscillation {
     /// look at fewer frames. False once something like a gesture has begun.
     pub fn idle(&self, t: f32) -> bool {
         self.base.is_some() && self.last_active.map(|a| t - a > 1.0).unwrap_or(true)
-    }
-
-    fn rev_frames_needed(&self) -> usize {
-        self.rev_frames
     }
 
     fn set_threshold(&mut self) {
@@ -1228,40 +1781,6 @@ impl Oscillation {
                 self.legs.clear();
             }
             return false;
-        }
-        if self.both_sides {
-            let rest = self.rest_level;
-            let hi = self.legs.iter().map(|l| l.2).fold(f32::MIN, f32::max);
-            let lo = self.legs.iter().map(|l| l.2).fold(f32::MAX, f32::min);
-            if hi - rest < self.thr || rest - lo < self.thr {
-                log::debug!(
-                    "consent: {} legs rejected, one-sided ({:+.2}..{:+.2} about {:+.2})",
-                    self.name,
-                    lo,
-                    hi,
-                    rest
-                );
-                self.legs.clear();
-                return false;
-            }
-        }
-        if let Some(r) = self.regular {
-            let amps: Vec<f32> = self.legs.iter().map(|l| l.3).collect();
-            let durs: Vec<f32> = self.legs.iter().map(|l| l.1 - l.0).collect();
-            let ratio = |v: &[f32]| {
-                v.iter().cloned().fold(f32::MIN, f32::max)
-                    / v.iter().cloned().fold(f32::MAX, f32::min).max(1e-6)
-            };
-            if ratio(&amps) > r || ratio(&durs) > r {
-                log::debug!(
-                    "consent: {} legs rejected, uneven (amplitudes {:?}, durations {:?})",
-                    self.name,
-                    amps.iter().map(|a| format!("{:.3}", a)).collect::<Vec<_>>(),
-                    durs.iter().map(|d| format!("{:.2}", d)).collect::<Vec<_>>()
-                );
-                self.legs.clear();
-                return false;
-            }
         }
         let first = self.legs[0].0;
         // The head turned; the face ends the gesture the same size and place
@@ -1363,10 +1882,6 @@ impl Oscillation {
             }
         }
         self.last_p = Some(p);
-        self.recent.push(p);
-        if self.recent.len() > 4 {
-            self.recent.remove(0);
-        }
         let Some((pv, pt)) = self.pivot else {
             return false;
         };
@@ -1378,10 +1893,6 @@ impl Oscillation {
                 if p - pv >= self.thr || pv - p >= self.thr {
                     self.dir = if p > pv { 1 } else { -1 };
                     self.cand = (p, t);
-                    self.steps = 1;
-                    self.leg_samples.clear();
-                    self.leg_samples.extend(self.recent.iter().copied());
-                    self.leg_samples.push(p);
                 } else if t - pt > 0.5 {
                     // Idle: re-anchor on the drifting head.
                     self.pivot = Some((p, t));
@@ -1389,9 +1900,6 @@ impl Oscillation {
                 false
             }
             d => {
-                if self.leg_samples.len() < 256 {
-                    self.leg_samples.push(p);
-                }
                 // Strictly further: a rest at the extreme does not extend the
                 // leg, so the pause between two nods is not part of either.
                 let further = if d > 0 {
@@ -1405,7 +1913,6 @@ impl Oscillation {
                 let still = self.last_step < self.rest_step;
                 if further {
                     self.cand = (p, t);
-                    self.steps += 1;
                     self.rev_count = 0;
                     self.rest_since = if still {
                         self.rest_since.or(Some(t))
@@ -1433,7 +1940,7 @@ impl Oscillation {
                     self.rev_count += 1;
                     false
                 };
-                if !at_rest && self.rev_count < self.rev_frames_needed() {
+                if !at_rest && self.rev_count < self.rev_frames {
                     return false;
                 }
                 self.rev_count = 0;
@@ -1449,13 +1956,6 @@ impl Oscillation {
                 };
                 let (cv, ct) = self.cand;
                 let dur = ct - start;
-                let through_middle = {
-                    let (lo, hi) = (pv.min(cv), pv.max(cv));
-                    let band = (hi - lo) * 0.2;
-                    self.leg_samples
-                        .iter()
-                        .any(|&v| v > lo + band && v < hi - band)
-                };
                 let carried = match self.co_motion {
                     None => true,
                     Some((axis, min)) => {
@@ -1484,27 +1984,21 @@ impl Oscillation {
                         }
                     }
                 };
-                let ramp =
-                    self.steps >= self.min_steps && (!self.need_ramp || through_middle) && carried;
-                self.leg_samples.clear();
-                self.leg_samples.push(cv);
                 let amp = (cv - pv).abs();
-                if self.legs.is_empty() {
-                    self.rest_level = pv;
-                }
-                self.steps = 1;
                 self.pivot = Some((cv, ct));
                 // Reversed: the next leg is under way. At rest: back to
                 // waiting for the head to leave this spot.
                 self.dir = if at_rest { 0 } else { -d };
                 self.depart = ct;
                 self.cand = (p, t);
-                if !ramp || !(self.leg_min_s..=self.leg_max_s).contains(&dur) || amp > self.max_amp
+                if !carried
+                    || !(self.leg_min_s..=self.leg_max_s).contains(&dur)
+                    || amp > self.max_amp
                 {
                     log::debug!(
-                        "consent: {} leg rejected ({} steps, {:.2}s, {:.2} tall)",
+                        "consent: {} leg rejected (box {}, {:.2}s, {:.2} tall)",
                         self.name,
-                        if ramp { "enough" } else { "too few" },
+                        if carried { "carried" } else { "still" },
                         dur,
                         amp
                     );
@@ -1517,188 +2011,16 @@ impl Oscillation {
     }
 }
 
-/// A face-detector fit that flickers between two solutions moves every
-/// landmark at once and the box with them: pitch, yaw and the box width jump
-/// together in one frame, and the fit may hold the other solution for a few
-/// frames before snapping back (measured 2026-09-22, twice: a still face
-/// granted root off a one-frame flicker on alternate frames, then off a
-/// four-frame plateau 0.05 higher with the box 6% wider). A nod moves pitch
-/// over several frames with the width steady to within about 2% a frame; a
-/// shake moves yaw the same way.
-///
-/// The filter is stateful: a frame whose pitch jumps together with yaw or
-/// width starts a suspect run, and every frame that stays at the jumped
-/// level is dropped until the fit is back where it was (within the pitch
-/// threshold and 2% of width), or a dozen frames have passed, which is a
-/// head that really moved.
-#[derive(Default)]
-pub struct FlickerFilter {
-    last: Option<(f32, f32, f32)>,
-    /// (pitch, width) before the jump, and frames dropped since.
-    suspect: Option<(f32, f32, usize)>,
-}
-
-/// One-frame lookahead: a frame is emitted only once the next one is seen,
-/// and is dropped when its box width or pitch jumped away from the previous
-/// frame and the next frame is back at the previous level. A held plateau
-/// passes (the nose-based pitch is barely moved by a fit switch); real motion
-/// is never touched, because a real move does not snap back in one frame.
-#[derive(Default)]
-pub struct TransientFilter {
-    prev: Option<(f32, f32, f32)>,
-    held: Option<(f32, f32, f32)>,
-}
-
-impl TransientFilter {
-    /// Feed a frame; returns the frame to process now (the previous one), if any.
-    pub fn feed(&mut self, pitch: f32, yaw: f32, width: f32) -> Option<(f32, f32, f32)> {
-        let cur = (pitch, yaw, width);
-        let out = match (self.prev, self.held) {
-            (Some(p), Some(h)) => {
-                let jumped = (h.0 - p.0).abs() > FlickerFilter::PITCH_JUMP
-                    && ((h.2 - p.2).abs() / p.2.max(1.0) > FlickerFilter::WIDTH_JUMP
-                        || (h.1 - p.1).abs() > FlickerFilter::YAW_JUMP);
-                let back = (cur.0 - p.0).abs() <= FlickerFilter::PITCH_JUMP
-                    && (cur.2 - p.2).abs() / p.2.max(1.0) <= 0.02;
-                if jumped && back {
-                    // h was a one-frame transient: drop it, keep p as the reference.
-                    None
-                } else {
-                    self.prev = Some(h);
-                    Some(h)
-                }
-            }
-            (None, Some(h)) => {
-                self.prev = Some(h);
-                Some(h)
-            }
-            _ => None,
-        };
-        self.held = Some(cur);
-        out
-    }
-}
-
-impl FlickerFilter {
-    pub const PITCH_JUMP: f32 = 0.012;
-    pub const YAW_JUMP: f32 = 0.02;
-    pub const WIDTH_JUMP: f32 = 0.04;
-    /// A yaw step this large in one frame is a head turning, never a
-    /// flicker (flicker steps yaw by 0.01 to 0.03; a shake by 0.05 to 0.15).
-    pub const YAW_TURN: f32 = 0.05;
-    const RETURN_WIDTH: f32 = 0.02;
-    /// Longer than any flicker plateau seen (four frames), shorter than a
-    /// real leg, so a genuine move loses at most its first few frames.
-    const MAX_HOLD: usize = 5;
-
-    /// Should this frame be fed to the detectors?
-    pub fn keep(&mut self, pitch: f32, yaw: f32, width: f32) -> bool {
-        let prev = self.last;
-        self.last = Some((pitch, yaw, width));
-        let turning = prev
-            .map(|(_, py, _)| (yaw - py).abs() >= Self::YAW_TURN)
-            .unwrap_or(false);
-        if turning {
-            self.suspect = None;
-            return true;
-        }
-        if let Some((p0, w0, n)) = self.suspect {
-            let back = (pitch - p0).abs() <= Self::PITCH_JUMP
-                && (width - w0).abs() / w0.max(1.0) <= Self::RETURN_WIDTH;
-            if back {
-                self.suspect = None;
-                return true;
-            }
-            if n + 1 >= Self::MAX_HOLD {
-                self.suspect = None; // held too long to be a flicker: a real move
-                return true;
-            }
-            self.suspect = Some((p0, w0, n + 1));
-            return false;
-        }
-        let Some((pp, py, pw)) = prev else {
-            return true;
-        };
-        let jump = (pitch - pp).abs() > Self::PITCH_JUMP
-            && ((yaw - py).abs() > Self::YAW_JUMP
-                || (width - pw).abs() / pw.max(1.0) > Self::WIDTH_JUMP);
-        if jump {
-            self.suspect = Some((pp, pw, 1));
-            return false;
-        }
-        true
-    }
-}
-
-/// Nods: the pitch axis. A natural nod swings 0.03 to 0.05, a light one
-/// 0.02; the wobble of a head leaning in is the same size and is told apart
-/// by the motion gate, not by amplitude.
+/// Nods: the pitch axis, in degrees from the face mesh.
 pub struct NodDetector {
     pub inner: Oscillation,
     /// Nods counted: two per completed gesture.
     pub nods: usize,
-    /// Recent (t, yaw), for the quiet-yaw rule.
+    /// Recent (t, yaw), for the quiet-yaw and facing rules.
     yaw: Vec<(f32, f32)>,
 }
 
-impl Default for NodDetector {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl NodDetector {
-    /// On the image-motion signal (vertical position of the face in face
-    /// widths), from the calibration battery of 2026-09-22: a still face
-    /// moves 0.003, talking 0.036, the user's light nod 0.106, natural nods
-    /// 0.17 to 0.40 on the record-only battery; a detector fit flip moves no
-    /// pixels at all. 0.06 is the highest floor at which every recording of
-    /// that battery is still read correctly (the sweep), almost twice the
-    /// talking motion.
-    pub const MIN_DOWN: f32 = 0.06;
-    pub const MAX_DOWN: f32 = 0.08;
-    /// A nod keeps the head facing the camera: yaw may range this much over
-    /// the gesture's span. A still head ranges about 0.03, the user's nods up
-    /// to 0.11 (two were refused at a 0.10 limit); a head shake ranges 0.6 or
-    /// more, and its perspective wobble on the pitch measure (up to 0.12,
-    /// measured 2026-09-22) would otherwise read as nods.
-    pub const YAW_QUIET: f32 = 0.25;
-    /// A nod counts only from a head facing the camera (the presence
-    /// watch's attentive yaw): the mean yaw over the nod's span must be
-    /// within this. A head held turned toward another screen nods the same
-    /// way on the pitch axis, but it is not nodding at the card.
-    pub const YAW_FACING: f32 = 0.40;
-
-    pub fn new() -> Self {
-        Self::with_floor(Self::MIN_DOWN)
-    }
-
-    /// With this person's floor (never below the default).
-    pub fn with_floor(floor: f32) -> Self {
-        let floor = floor.max(Self::MIN_DOWN);
-        // A nod rides the box up and down: the vertical allowance is doubled.
-        // Legs to a second: deliberate nods measured 0.87 s and were refused at 0.8.
-        let mut inner = Oscillation::new(
-            "nod",
-            floor,
-            Self::MAX_DOWN.max(floor),
-            1.0,
-            0.10,
-            0.30,
-            0.5,
-            false,
-        );
-        // The box must ride each leg: a head that nods carries its box,
-        // a detector fit that flips does not (1 px through a recorded flip,
-        // 9 to 16 px through real nods). See `Oscillation::CO_MOTION`.
-        inner.co_motion = Some((2, Oscillation::CO_MOTION));
-        NodDetector {
-            inner,
-            nods: 0,
-            yaw: Vec::new(),
-        }
-    }
-
     /// On the mesh's pitch, in degrees. From the rounds of 2026-09-24
     /// (`traces/v2`): a nod's legs are 12 to 35 degrees and take 0.23 to
     /// 0.33 s, reversing at once; a look at the keyboard is 17 to 21
@@ -1711,9 +2033,24 @@ impl NodDetector {
     /// Still, on the mesh: under this many degrees between frames (a still
     /// head reads 0.7 on average, a turnaround several).
     pub const MESH_REST_STEP: f32 = 1.5;
+    /// A nod keeps the head facing the camera: yaw may range this much
+    /// over the gesture's span, in degrees. Set on the five-point yaw
+    /// measure as 0.25 of it (a still head ranged 0.03, the user's nods up
+    /// to 0.11, a head shake 0.6 or more, and a shake's perspective wobble
+    /// on the pitch measure would otherwise have read as nods) and
+    /// restated in degrees at `YAW_DEG_PER_UNIT`, so the rule did not move.
+    pub const YAW_QUIET_DEG: f32 = 21.43;
+    /// A nod counts only from a head facing the camera (the presence
+    /// watch's attentive yaw): the mean yaw over the nod's span, degrees,
+    /// must be within this. A head held turned toward another screen nods
+    /// the same way on the pitch axis, but it is not nodding at the card.
+    /// 0.40 of the five-point measure, restated as above; the reference
+    /// nods held 30 degrees off still read and are refused from 36.
+    pub const YAW_FACING_DEG: f32 = 34.29;
     /// Degrees of mesh yaw per unit of the five-point yaw measure (a 30
-    /// degree turn read about 0.35 on it), so the yaw rules keep their
-    /// numbers whichever signal feeds them.
+    /// degree turn read about 0.35 on it). The gesture rules are written
+    /// in degrees; the presence watch's `max_yaw` is still in five-point
+    /// units and converts with this.
     pub const YAW_DEG_PER_UNIT: f32 = 30.0 / 0.35;
 
     pub fn mesh(floor_deg: f32) -> Self {
@@ -1726,9 +2063,10 @@ impl NodDetector {
             0.10,
             0.30,
             Self::MESH_MAX_DEG,
-            false,
         );
-        inner.rest_step = Self::MESH_REST_STEP;
+        // The box must ride each leg: a head that nods carries its box, a
+        // detector fit that flips does not (1 px through a recorded flip,
+        // 9 to 16 px through real nods). See `Oscillation::CO_MOTION`.
         inner.co_motion = Some((2, Oscillation::CO_MOTION));
         NodDetector {
             inner,
@@ -1741,16 +2079,10 @@ impl NodDetector {
         self.inner.idle(t)
     }
 
-    pub fn push(&mut self, pitch: f32, t: f32) -> bool {
-        self.push_with(pitch, t, None)
-    }
-
-    pub fn push_with(&mut self, pitch: f32, t: f32, face: Option<(f32, f32, f32)>) -> bool {
-        self.push_full(pitch, None, t, face)
-    }
-
-    /// As `push_with`, with the frame's yaw for the quiet-yaw rule (None
-    /// when the caller has no yaw, as the older recorded traces do not).
+    /// Feed one frame: the pitch, the yaw for the quiet-yaw and facing
+    /// rules (None when the caller has none), the time, and the box's
+    /// width and centre for the motion rules. True when a nod pair just
+    /// completed.
     pub fn push_full(
         &mut self,
         pitch: f32,
@@ -1777,17 +2109,17 @@ impl NodDetector {
             span.iter().cloned().reduce(f32::min),
             span.iter().cloned().reduce(f32::max),
         ) {
-            if hi - lo > Self::YAW_QUIET {
+            if hi - lo > Self::YAW_QUIET_DEG {
                 log::debug!(
-                    "consent: nod rejected, the head turned meanwhile (yaw range {:.2})",
+                    "consent: nod rejected, the head turned meanwhile (yaw range {:.0} deg)",
                     hi - lo
                 );
                 return false;
             }
             let mean = span.iter().sum::<f32>() / span.len() as f32;
-            if mean.abs() > Self::YAW_FACING {
+            if mean.abs() > Self::YAW_FACING_DEG {
                 log::debug!(
-                    "consent: nod rejected, the head faced away (mean yaw {:.2})",
+                    "consent: nod rejected, the head faced away (mean yaw {:.0} deg)",
                     mean
                 );
                 return false;
@@ -1798,56 +2130,17 @@ impl NodDetector {
     }
 }
 
-/// Head shakes: the yaw axis (nose offset in inter-eye distances; a 30
-/// degree turn is about 0.35). A refusal, so a false positive costs a
-/// password prompt, not a root shell: the floor can sit lower than a glance
-/// at a second monitor only because a glance is one leg and a hold, never
-/// four alternating legs.
+/// Head shakes: the yaw axis, in degrees from the face mesh. A refusal,
+/// so a false positive costs a password prompt, not a root shell: the
+/// floor can sit lower than a glance at a second monitor only because a
+/// glance is one leg and a hold, never four alternating legs.
 pub struct ShakeDetector {
     pub inner: Oscillation,
     /// Shakes counted: two per completed gesture.
     pub shakes: usize,
 }
 
-impl Default for ShakeDetector {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ShakeDetector {
-    /// Reading sweeps the head about 0.04 left and right along a line
-    /// (recorded); a shake swings about 0.35. The floor sits well above the
-    /// first and far below the second.
-    /// On the image-motion signal (horizontal position of the face in face
-    /// widths): a shake slides the face about 0.17 of its width each way
-    /// (15 px on 88, recorded). First cut, to be set from the motion battery.
-    pub const MIN_TURN: f32 = 0.06;
-    pub const MAX_TURN: f32 = 0.10;
-
-    pub fn new() -> Self {
-        Self::with_floor(Self::MIN_TURN)
-    }
-
-    /// With this person's floor (never above the default, never below 0.03).
-    pub fn with_floor(floor: f32) -> Self {
-        let floor = floor.clamp(0.03, Self::MIN_TURN);
-        // A shake slides the box sideways by a fifth of its width (measured
-        // 2026-09-22: 15 px on an 80 px face) and its legs run to a second.
-        // A shake swings about 0.35 each way; a turn to another monitor
-        // measures 0.4 held, an exaggerated one past 2.0 (both recorded).
-        // No both-sides rule: the integrated image position drifts between
-        // gestures, so "centre" is not well defined; a glance is caught by
-        // its hold (the rest rule) and its size.
-        let mut inner =
-            Oscillation::new("shake", floor, Self::MAX_TURN, 1.0, 0.60, 0.30, 1.5, false);
-        // The box narrows by 7% as the head turns (recorded): not the body moving.
-        inner.width_tol = 0.15;
-        // The box must slide with each leg (see the nod detector).
-        inner.co_motion = Some((1, Oscillation::CO_MOTION));
-        ShakeDetector { inner, shakes: 0 }
-    }
-
     /// On the mesh's yaw, in degrees. From the rounds of 2026-09-24: a
     /// shake's legs are 33 to 53 degrees and take about 0.3 s; a glance
     /// aside is as large (32 to 50) but takes 0.8 to 2.2 s and holds at
@@ -1858,6 +2151,10 @@ impl ShakeDetector {
 
     pub fn mesh(floor_deg: f32) -> Self {
         let floor = floor_deg.max(Self::MESH_MIN_DEG);
+        // A shake slides the box sideways and narrows it by about 7% as
+        // the head turns (recorded): not the body moving, so the width
+        // tolerance is wider than a nod's. A glance is caught by its hold
+        // (the rest rule) and its leg time.
         let mut inner = Oscillation::new(
             "shake",
             floor,
@@ -1866,16 +2163,11 @@ impl ShakeDetector {
             0.60,
             0.30,
             Self::MESH_MAX_DEG,
-            false,
         );
-        inner.rest_step = NodDetector::MESH_REST_STEP;
         inner.width_tol = 0.15;
+        // The box must slide with each leg (see the nod detector).
         inner.co_motion = Some((1, Oscillation::CO_MOTION));
         ShakeDetector { inner, shakes: 0 }
-    }
-
-    pub fn push(&mut self, yaw: f32, t: f32) -> bool {
-        self.push_with(yaw, t, None)
     }
 
     pub fn push_with(&mut self, yaw: f32, t: f32, face: Option<(f32, f32, f32)>) -> bool {
@@ -1887,65 +2179,62 @@ impl ShakeDetector {
     }
 }
 
-/// A calibration round: watch the face for `seconds` and report how far it
-/// moved, vertically and sideways, as the largest range of the accumulated
-/// image motion over any 1.5 s (face widths). Nothing is decided; the
-/// recording is saved under `cal-<gesture>` when `gesture_trace` is on.
-/// One frame of a calibration round, enough to run the detectors on later.
+/// One frame of a recorded round: the head's angles in degrees and the
+/// detector box (width, centre x, centre y). What the detectors read.
 #[derive(Clone, Debug)]
-pub struct CalFrame {
-    pub t: f32,
-    pub pos_x: f32,
-    pub pos_y: f32,
-    pub yaw: f32,
-    pub geom: (f32, f32, f32),
-}
-
-/// A calibration round's measurement: the largest 1.5 s swing on each axis,
-/// and every frame, so the round can be replayed through the detectors once
-/// the floors are known.
-pub struct Measured {
-    pub dy: f32,
-    pub dx: f32,
-    pub frames: Vec<CalFrame>,
-}
-
-/// Run the live detectors over a recorded round at the given floors, as the
-/// consent loop would: how many nods and shakes it reads.
-/// One frame of a round recorded on the mesh (format v2): angles in
-/// degrees, the image motion in face widths, the box.
-#[derive(Clone, Debug)]
-pub struct CalFrameV2 {
+pub struct RoundFrame {
     pub t: f32,
     pub yaw: f32,
     pub pitch: f32,
     pub roll: f32,
-    pub pos_x: f32,
-    pub pos_y: f32,
     pub geom: (f32, f32, f32),
 }
 
-/// Parse a v2 recording (a header line, then `t yaw pitch roll pos_x
-/// pos_y w cx cy size score` per line).
-pub fn parse_v2(text: &str) -> Vec<CalFrameV2> {
+/// The header of a round recording (format v3): one line per frame with
+/// the mesh's angles in degrees, the detector box, the face's width as a
+/// fraction of the frame's shorter side and the mesh's confidence. Numbers
+/// only, never an image. The walk-through's rounds and the consent window
+/// write the same lines, so either replays through `replay_round`.
+pub const ROUND_HEADER: &str = "v3 t yaw pitch roll w cx cy size score";
+
+/// One line of a round recording, as `ROUND_HEADER` lays it out.
+pub fn round_line(
+    t: f32,
+    hp: &faceauth_engine::mesh::HeadPose,
+    geom: (f32, f32, f32),
+    size: f32,
+    score: f32,
+) -> String {
+    format!(
+        "{:.2} {:+.1} {:+.1} {:+.1} {:.0} {:.0} {:.0} {:.3} {:.2}",
+        t, hp.yaw, hp.pitch, hp.roll, geom.0, geom.1, geom.2, size, score
+    )
+}
+
+/// Parse a round recording: a header line naming its format, then one
+/// frame per line. The v2 files of 2026-09-24 carry two image-motion
+/// columns (`pos_x pos_y`) before the box that nothing reads any more;
+/// v3 drops them.
+pub fn parse_round(text: &str) -> Vec<RoundFrame> {
+    let header = text.lines().next().unwrap_or("");
+    let skip = if header.starts_with("v2") { 2 } else { 0 };
+    let data = if header.starts_with('v') { 1 } else { 0 };
     text.lines()
-        .filter(|l| !l.starts_with("v2"))
+        .skip(data)
         .filter_map(|l| {
             let f: Vec<f32> = l
                 .split_whitespace()
                 .filter_map(|v| v.parse().ok())
                 .collect();
-            if f.len() < 9 {
+            if f.len() < 7 + skip {
                 return None;
             }
-            Some(CalFrameV2 {
+            Some(RoundFrame {
                 t: f[0],
                 yaw: f[1],
                 pitch: f[2],
                 roll: f[3],
-                pos_x: f[4],
-                pos_y: f[5],
-                geom: (f[6], f[7], f[8]),
+                geom: (f[4 + skip], f[5 + skip], f[6 + skip]),
             })
         })
         .collect()
@@ -1953,131 +2242,61 @@ pub fn parse_v2(text: &str) -> Vec<CalFrameV2> {
 
 /// Replay a mesh recording through the mesh detectors at these floors
 /// (degrees): nods and shakes counted.
-pub fn replay_round_v2(frames: &[CalFrameV2], floors_deg: (f32, f32)) -> (usize, usize) {
+pub fn replay_round(frames: &[RoundFrame], floors_deg: (f32, f32)) -> (usize, usize) {
+    // A recorded round starts at the "go" and the still second before it
+    // was not recorded, so the replay credits it; the live nod window
+    // does not (D4), it observes the still second inside the window.
     let mut det = NodDetector::mesh(floors_deg.0);
     let mut shake = ShakeDetector::mesh(floors_deg.1);
     det.inner.prior_still = 1.0;
     shake.inner.prior_still = 1.0;
     for f in frames {
         shake.push_with(f.yaw, f.t, Some(f.geom));
-        det.push_full(
-            f.pitch,
-            Some(f.yaw / NodDetector::YAW_DEG_PER_UNIT),
-            f.t,
-            Some(f.geom),
-        );
+        det.push_full(f.pitch, Some(f.yaw), f.t, Some(f.geom));
     }
     (det.nods, shake.shakes)
 }
 
-pub fn replay_round(frames: &[CalFrame], floors: (f32, f32)) -> (usize, usize) {
-    let mut det = NodDetector::with_floor(floors.0);
-    let mut shake = ShakeDetector::with_floor(floors.1);
-    det.inner.prior_still = 1.0;
-    shake.inner.prior_still = 1.0;
-    for f in frames {
-        shake.push_with(f.pos_x, f.t, Some(f.geom));
-        det.push_full(f.pos_y, Some(f.yaw), f.t, Some(f.geom));
-    }
-    (det.nods, shake.shakes)
-}
-
-pub fn measure_motion(
-    cap: &mut IrCapture,
-    pipeline: &mut Pipeline,
-    cfg: &Config,
-    user: &str,
-    gesture: &str,
-    seconds: f32,
-) -> Result<Measured> {
-    let t0 = Instant::now();
-    // Recorded only when `gesture_trace` is on, like a consent round: the
-    // floors are what calibration keeps; a per-frame recording is a tuning
-    // aid, plaintext under the root-only gestures directory, not a template.
-    let label: &'static str = match gesture {
-        "shake" => "cal-shake",
-        "read" => "cal-read",
-        "glance" => "cal-glance",
-        "talk" => "cal-talk",
-        "lean" => "cal-lean",
-        "aside" => "cal-aside",
-        _ => "cal-nod",
+/// Where a recorded gesture round stops reading: the highest floor, in
+/// whole degrees from the detector's minimum, at which the mesh detector
+/// still counts the round as two of its gesture (`nod` picks which). The
+/// walk-through stores this per round and derives the person's floors
+/// from the lowest of them (`GestureCal::floors_deg`). None when the
+/// round does not read even at the minimum: it cannot set a floor.
+pub fn reads_to_deg(frames: &[RoundFrame], nod: bool) -> Option<f32> {
+    let (min, max) = if nod {
+        (NodDetector::MESH_MIN_DEG, NodDetector::MESH_MAX_DEG)
+    } else {
+        (ShakeDetector::MESH_MIN_DEG, ShakeDetector::MESH_MAX_DEG)
     };
-    let saver = TraceSaver {
-        cfg,
-        user: user.to_string(),
-        trace: Default::default(),
-        label: std::cell::Cell::new(label),
-    };
-    let trace = &saver.trace;
-    let mut prev: Option<(Grey, [f32; 4])> = None;
-    let (mut pos_x, mut pos_y) = (0f32, 0f32);
-    let mut series: Vec<(f32, f32, f32)> = Vec::new();
-    let mut frames: Vec<CalFrame> = Vec::new();
-    while t0.elapsed().as_secs_f32() < seconds {
-        let Some(img) = cap.next(Duration::from_secs(1))? else {
-            continue;
+    let reads = |floor: f32| {
+        let floors = if nod {
+            (floor, ShakeDetector::MESH_MIN_DEG)
+        } else {
+            (NodDetector::MESH_MIN_DEG, floor)
         };
-        let faces = pipeline.detector.detect(&img, cfg.min_detection)?;
-        let Some(face) = faces.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) else {
-            continue;
-        };
-        let t = t0.elapsed().as_secs_f32();
-        if let Some((pimg, pbox)) = &prev {
-            let region = faceauth_engine::motion::Region::around(*pbox, 0.2, img.width, img.height);
-            let (dx, dy) = faceauth_engine::motion::shift(pimg, &img, region, 24);
-            pos_x += dx / face.bbox[2].max(1.0);
-            pos_y += dy / face.bbox[2].max(1.0);
+        let (nods, shakes) = replay_round(frames, floors);
+        if nod {
+            nods >= 2
+        } else {
+            shakes >= 2
         }
-        prev = Some((img.clone(), face.bbox));
-        let pose = pose::pose(&face.landmarks);
-        let geom = (
-            face.bbox[2],
-            face.bbox[0] + face.bbox[2] / 2.0,
-            face.bbox[1] + face.bbox[3] / 2.0,
-        );
-        let l = &face.landmarks;
-        if trace.borrow().len() < 1200 {
-            trace.borrow_mut().push(format!("{:.2}/{:.3}/{:+.3}/{:.0}/{:.0}/{:.0}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.2}/{:+.3}/{:+.3}", t, pose.pitch, pose.yaw, geom.0, geom.1, geom.2, l[0][0], l[0][1], l[1][0], l[1][1], l[2][0], l[2][1], l[3][0], l[3][1], l[4][0], l[4][1], face.score, pos_x, pos_y));
-        }
-        series.push((t, pos_x, pos_y));
-        frames.push(CalFrame {
-            t,
-            pos_x,
-            pos_y,
-            yaw: pose.yaw,
-            geom,
-        });
-    }
-    let range = |pick: fn(&(f32, f32, f32)) -> f32| -> f32 {
-        let mut best = 0f32;
-        for i in 0..series.len() {
-            let (mut lo, mut hi) = (f32::MAX, f32::MIN);
-            for s in &series[i..] {
-                if s.0 - series[i].0 > 1.5 {
-                    break;
-                }
-                lo = lo.min(pick(s));
-                hi = hi.max(pick(s));
-            }
-            if hi > lo {
-                best = best.max(hi - lo);
-            }
-        }
-        best
     };
-    Ok(Measured {
-        dy: range(|s| s.2),
-        dx: range(|s| s.1),
-        frames,
-    })
+    let mut floor = min;
+    let mut best = None;
+    while floor <= max && reads(floor) {
+        best = Some(floor);
+        floor += 1.0;
+    }
+    best
 }
 
 /// Writes a round's per-frame recording when the round ends, if
-/// `gesture_trace` is on: `<store_dir>/gestures/<unix seconds>-<user>-<how
+/// `gesture_trace` is on: `<store_dir>/gestures/<user>/<unix seconds>-<how
 /// it ended>.txt`, mode 0600 in a 0700 directory, newest sixty kept. The
-/// recording is head pose, landmarks, box and image motion per frame; never
-/// an image, and never the journal.
+/// recording is `ROUND_HEADER` and one line per frame looked at: the head's
+/// angles and the box; never an image, and never the journal.
+#[cfg_attr(not(feature = "dev-tools"), allow(dead_code))]
 struct TraceSaver<'a> {
     cfg: &'a Config,
     user: String,
@@ -2087,33 +2306,46 @@ struct TraceSaver<'a> {
 
 impl Drop for TraceSaver<'_> {
     fn drop(&mut self) {
-        // The recordings exist only in a dev-tools build: the package never
-        // writes them, whatever the config says.
-        if !cfg!(feature = "dev-tools") || !self.cfg.gesture_trace {
+        // The recordings exist only in a dev-tools build: the package has
+        // no key to switch them on.
+        #[cfg(feature = "dev-tools")]
+        self.save();
+    }
+}
+
+#[cfg(feature = "dev-tools")]
+impl TraceSaver<'_> {
+    fn save(&self) {
+        if !self.cfg.gesture_trace {
             return;
         }
         let trace = self.trace.borrow();
         if trace.is_empty() {
             return;
         }
-        let dir = self.cfg.store_dir.join("gestures");
+        // One directory per user, so a delete of that user takes exactly
+        // these and never a neighbour's (the user name may hold hyphens).
+        let dir = Path::new(crate::config::STORE_DIR)
+            .join("gestures")
+            .join(&self.user);
         let res = (|| -> std::io::Result<()> {
             use std::io::Write;
             use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
             std::fs::create_dir_all(&dir)?;
+            std::fs::set_permissions(
+                dir.parent().unwrap_or(&dir),
+                std::fs::Permissions::from_mode(0o700),
+            )?;
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-            let name = format!(
-                "{}-{}-{}.txt",
-                crate::store::now_secs(),
-                self.user,
-                self.label.get()
-            );
+            let name = format!("{}-{}.txt", crate::store::now_secs(), self.label.get());
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
                 .open(dir.join(&name))?;
-            f.write_all(trace.join(" ").as_bytes())?;
+            f.write_all(ROUND_HEADER.as_bytes())?;
+            f.write_all(b"\n")?;
+            f.write_all(trace.join("\n").as_bytes())?;
             f.write_all(b"\n")?;
             let mut files: Vec<_> = std::fs::read_dir(&dir)?
                 .flatten()
@@ -2187,7 +2419,9 @@ pub const NOD_FRAMES_KEPT: usize = 8;
 /// requires each to match the templates: the nods must have come from
 /// the enrolled face, not merely from the box the confirm later finds
 /// live (D4). Nothing about identity is read here; the detectors and
-/// their floors are untouched.
+/// their floors are untouched. `seen` is the request's own away clock:
+/// every frame that finds the followed box refreshes it, and past
+/// `lost_after` without one the user has left (E2).
 #[allow(clippy::too_many_arguments)]
 pub fn wait_for_nods(
     cap: &mut IrCapture,
@@ -2195,50 +2429,49 @@ pub fn wait_for_nods(
     cfg: &Config,
     window: Duration,
     nods_needed: usize,
-    answers: Option<(&Answers, &str)>,
+    state: Option<(&ConsentState, &str)>,
     lost_after: Option<Duration>,
-    floors: (f32, f32),
     floors_deg: (f32, f32),
     start: Option<[f32; 4]>,
     dwell: Duration,
     nod_frames: &mut Vec<(Grey, faceauth_engine::Face)>,
+    presence: Option<&dyn Fn(bool)>,
+    session_locked: Option<&dyn Fn() -> bool>,
+    seen: &std::cell::Cell<Instant>,
 ) -> Result<(Gesture, Option<[f32; 4]>)> {
     let min_detection = cfg.min_detection;
-    let user_name = answers
+    #[cfg(feature = "dev-tools")]
+    let record_only = cfg.gesture_record_only;
+    #[cfg(not(feature = "dev-tools"))]
+    let record_only = false;
+    let user_name = state
         .map(|(_, u)| u.to_string())
         .unwrap_or_else(|| "unknown".into());
+    // The rider record follows the followed face: while this window runs
+    // and the matched face is in view the card may arm passwordless sudo,
+    // and at no other time. Whichever way the window ends, it ends that.
+    struct FaceMark<'a>(Option<(&'a ConsentState, &'a str)>);
+    impl FaceMark<'_> {
+        fn set(&self, present: bool) -> bool {
+            self.0
+                .is_some_and(|(state, user)| state.set_face_present(user, present))
+        }
+    }
+    impl Drop for FaceMark<'_> {
+        fn drop(&mut self) {
+            self.set(false);
+        }
+    }
+    let face_mark = FaceMark(state);
     let t0 = Instant::now();
-    let mut last_face = Instant::now();
-    // On the mesh when the model is installed: the gestures are read from
-    // the head's angles, which hold up where the image-motion signal and
-    // the five-point pose do not; the image motion still has to carry each
+    // The gestures are read from the head's angles on the face mesh, which
+    // the daemon does not start without; the box still has to carry each
     // leg (`co_motion`), so a landmark fit cannot nod on its own.
-    let on_mesh = pipeline.mesh.is_some();
-    let fresh_nod = |on_mesh: bool| {
-        if on_mesh {
-            NodDetector::mesh(floors_deg.0)
-        } else {
-            NodDetector::with_floor(floors.0)
-        }
-    };
-    let fresh_shake = |on_mesh: bool| {
-        if on_mesh {
-            ShakeDetector::mesh(floors_deg.1)
-        } else {
-            ShakeDetector::with_floor(floors.1)
-        }
-    };
-    let mut det = fresh_nod(on_mesh);
-    let mut shake = fresh_shake(on_mesh);
-    // The scan that matched the face just ran with the face steadily in
-    // view: that counts as the still second a first leg must follow.
-    det.inner.prior_still = 1.0;
-    shake.inner.prior_still = 1.0;
-    // Real image motion: the face region's pixel shift between the frames
-    // looked at, accumulated into a position in face widths. This is what
-    // the gestures are read from (see `faceauth_engine::motion`).
-    let mut prev: Option<(Grey, [f32; 4])> = None;
-    let (mut pos_x, mut pos_y) = (0f32, 0f32);
+    let mut det = NodDetector::mesh(floors_deg.0);
+    let mut shake = ShakeDetector::mesh(floors_deg.1);
+    // No still second is credited from the scan: a first leg must follow
+    // a head seen still inside this window, after the dwell, so a nod
+    // already under way when the nod card appears is not a nod at it (D4).
     // Per-frame recording: the raw material for tuning both detectors.
     // Saved to the root-only gestures directory when the round ends, if
     // enabled; never to the journal (it is per-frame head pose).
@@ -2257,8 +2490,9 @@ pub fn wait_for_nods(
     let mut lost_since: Option<Instant> = None;
     let mut paused_logged = false;
     // Until the dwell has passed frames are drained and nothing is read;
-    // when it ends the still second before a first leg is required afresh,
-    // so a nod already under way at a card that just appeared is not one.
+    // the still second before a first leg is then observed inside the
+    // window, so a nod already under way at a card that just appeared is
+    // not one.
     let mut dwelt = dwell.is_zero();
     if !dwelt {
         log::debug!(
@@ -2266,6 +2500,10 @@ pub fn wait_for_nods(
             dwell.as_secs_f32()
         );
     }
+    // The compositor is asked whether the session locked under the card
+    // every couple of seconds (the probe spawns a process, so not per
+    // frame): a card the lock screen covers is a card nobody nods at.
+    let mut last_lock_check = Instant::now();
     let summary = |det: &NodDetector, shake: &ShakeDetector, t: f32| {
         format!(
             "{} nods, {} shakes in {:.1}s, thresholds {:.3}/{:.3}",
@@ -2273,8 +2511,8 @@ pub fn wait_for_nods(
         )
     };
     while t0.elapsed() < window {
-        if let Some((answers, user)) = answers {
-            match take_answer(answers, user) {
+        if let Some((state, user)) = state {
+            match state.poll(user) {
                 Some(Answer::Password(pw)) => {
                     log::info!(
                         "consent: password answer after {}",
@@ -2299,11 +2537,23 @@ pub fn wait_for_nods(
                     label.set("gone");
                     return Ok((Gesture::Gone, tracked));
                 }
-                None => {}
+                // The nods are armed already: the button changes nothing.
+                Some(Answer::Rearm) | None => {}
+            }
+            // A rider armed since the card's last payload changes what a
+            // nod grants: the window ends here, before any frame is read,
+            // so the caller can re-show the card and start the nods over.
+            if state.rider_unshown(user) {
+                log::info!(
+                    "consent: passwordless sudo armed after {}; the card is re-shown and the nods start over",
+                    summary(&det, &shake, t0.elapsed().as_secs_f32())
+                );
+                label.set("rider-armed");
+                return Ok((Gesture::RiderArmed, tracked));
             }
         }
         if let Some(l) = lost_after {
-            if last_face.elapsed() > l {
+            if seen.get().elapsed() > l {
                 log::info!(
                     "consent: no face for {:.0}s after {} nods; the user left",
                     l.as_secs_f32(),
@@ -2311,6 +2561,19 @@ pub fn wait_for_nods(
                 );
                 label.set("face-lost");
                 return Ok((Gesture::FaceLost, tracked));
+            }
+        }
+        if let Some(locked) = session_locked {
+            if last_lock_check.elapsed() > Duration::from_secs(2) {
+                last_lock_check = Instant::now();
+                if locked() {
+                    log::info!(
+                        "consent: the session locked under the card after {}; parked",
+                        summary(&det, &shake, t0.elapsed().as_secs_f32())
+                    );
+                    label.set("session-locked");
+                    return Ok((Gesture::SessionLocked, tracked));
+                }
             }
         }
         let Some(img) = cap.next(Duration::from_secs(1))? else {
@@ -2321,8 +2584,6 @@ pub fn wait_for_nods(
                 continue;
             }
             dwelt = true;
-            det.inner.prior_still = 0.0;
-            shake.inner.prior_still = 0.0;
         }
         // Slow polling while the head is still: every other frame is looked
         // at (a leg leaves the rest for six or more frames, so its start
@@ -2347,19 +2608,25 @@ pub fn wait_for_nods(
             Some(tb) => match track(&faces, tb) {
                 Track::Found(i) => {
                     lost_since = None;
+                    if paused_logged && face_mark.set(true) {
+                        if let Some(p) = presence {
+                            p(true);
+                        }
+                    }
                     paused_logged = false;
                     faces.into_iter().nth(i).unwrap()
                 }
                 other => {
                     // The followed face is not there, or cannot be told from
                     // another: nothing counts meanwhile, and a nod begun
-                    // before is forgotten. A single face back for a second
-                    // is adopted (the user moved); the confirm at the end
-                    // still has to match it. A face that is not the followed
+                    // before is forgotten. A face that is not the followed
                     // one does not hold the request open: the away clock
                     // runs from the last sight of the followed face, so a
                     // stranger at the desk cannot keep a request pending
-                    // past the presence away time (C1, consent lane).
+                    // past the presence away time (C1, consent lane). A
+                    // single face back for a second is not adopted here,
+                    // since the tracker cannot say whose it is: the window
+                    // ends and the scan decides before the nods resume (E2).
                     if !paused_logged {
                         log::info!(
                             "consent: gesture paused, the matched face is {}",
@@ -2370,68 +2637,60 @@ pub fn wait_for_nods(
                             }
                         );
                         paused_logged = true;
+                        // The card's passwordless button follows the face:
+                        // greyed while the matched face is out of view.
+                        if face_mark.set(false) {
+                            if let Some(p) = presence {
+                                p(false);
+                            }
+                        }
                     }
-                    det = fresh_nod(on_mesh);
-                    shake = fresh_shake(on_mesh);
-                    prev = None;
+                    det = NodDetector::mesh(floors_deg.0);
+                    shake = ShakeDetector::mesh(floors_deg.1);
                     let since = *lost_since.get_or_insert(Instant::now());
                     if other == Track::Lost
                         && faces.len() == 1
                         && since.elapsed() > Duration::from_secs(1)
                     {
-                        tracked = Some(faces[0].bbox);
-                        log::info!("consent: following the one face in view again");
+                        log::info!(
+                            "consent: one face in view again after {}; the scan decides whether it is the user",
+                            summary(&det, &shake, t0.elapsed().as_secs_f32())
+                        );
+                        label.set("moved");
+                        return Ok((Gesture::Moved, tracked));
                     }
                     continue;
                 }
             },
         };
         tracked = Some(face.bbox);
-        last_face = Instant::now();
-        let pose = pose::pose(&face.landmarks);
+        seen.set(Instant::now());
         let geom = (
             face.bbox[2],
             face.bbox[0] + face.bbox[2] / 2.0,
             face.bbox[1] + face.bbox[3] / 2.0,
         );
-        if let Some((pimg, pbox)) = &prev {
-            let region = faceauth_engine::motion::Region::around(*pbox, 0.2, img.width, img.height);
-            let (dx, dy) = faceauth_engine::motion::shift(pimg, &img, region, 24);
-            pos_x += dx / face.bbox[2].max(1.0);
-            pos_y += dy / face.bbox[2].max(1.0);
-        }
-        prev = Some((img.clone(), face.bbox));
-        if trace.borrow().len() < 1200 {
-            // t/pitch/yaw/width/cx/cy, then the five landmarks (right eye,
-            // left eye, nose, right mouth, left mouth) and the detector score:
-            // enough to evaluate any pose measure offline from a recording.
-            let l = &face.landmarks;
-            // ... then the accumulated image motion (x, y) in face widths.
-            trace.borrow_mut().push(format!("{:.2}/{:.3}/{:+.3}/{:.0}/{:.0}/{:.0}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.2}/{:+.3}/{:+.3}", t, pose.pitch, pose.yaw, geom.0, geom.1, geom.2, l[0][0], l[0][1], l[1][0], l[1][1], l[2][0], l[2][1], l[3][0], l[3][1], l[4][0], l[4][1], face.score, pos_x, pos_y));
-        }
-        // Nods are read from the nose's position below the eye line, not
-        // the mouth-based pitch: the mouth landmarks jitter most in IR and
-        // move when the user talks (the calibration battery of 2026-09-22).
-        // No flicker filter: on the nose-to-eye measure the calibration
-        // battery showed every filter variant costing real gestures and
-        // buying no safety (the shape rules carry it).
-        // The signals the detectors read: angles on the mesh, image motion
-        // otherwise. A frame the mesh cannot read is skipped on the mesh.
-        let (sig_shake, sig_nod, sig_yaw) = if on_mesh {
-            let Some(m) = pipeline
-                .mesh
-                .as_mut()
-                .and_then(|mesh| mesh.for_face(&img, &face).ok().flatten())
-            else {
-                continue;
-            };
-            let hp = faceauth_engine::mesh::head_pose(&m);
-            (hp.yaw, hp.pitch, hp.yaw / NodDetector::YAW_DEG_PER_UNIT)
-        } else {
-            (pos_x, pos_y, pose.yaw)
+        // A frame the mesh cannot read is skipped: nothing else feeds the
+        // detectors.
+        let Some(m) = pipeline
+            .mesh
+            .as_mut()
+            .and_then(|mesh| mesh.for_face(&img, &face).ok().flatten())
+        else {
+            continue;
         };
-        if shake.push_with(sig_shake, t, Some(geom)) {
-            if cfg.gesture_record_only {
+        let hp = faceauth_engine::mesh::head_pose(&m);
+        // The per-frame line is built only where a recording can be
+        // written: a development build with the trace switched on.
+        #[cfg(feature = "dev-tools")]
+        if cfg.gesture_trace && trace.borrow().len() < 1200 {
+            let size = face.bbox[2] / img.width.min(img.height).max(1) as f32;
+            trace
+                .borrow_mut()
+                .push(round_line(t, &hp, geom, size, m.score));
+        }
+        if shake.push_with(hp.yaw, t, Some(geom)) {
+            if record_only {
                 log::info!(
                     "consent: head shake recorded (record-only), {}",
                     summary(&det, &shake, t)
@@ -2446,7 +2705,7 @@ pub fn wait_for_nods(
             }
         }
         let legs_before = det.inner.legs.len();
-        let counted = det.push_full(sig_nod, Some(sig_yaw), t, Some(geom));
+        let counted = det.push_full(hp.pitch, Some(hp.yaw), t, Some(geom));
         if counted || det.inner.legs.len() > legs_before {
             nod_frames.push((img.clone(), face.clone()));
             if nod_frames.len() > NOD_FRAMES_KEPT {
@@ -2456,7 +2715,7 @@ pub fn wait_for_nods(
         if counted {
             log::debug!("consent: nod {} at {:.2}s", det.nods, t);
             if det.nods >= nods_needed {
-                if cfg.gesture_record_only {
+                if record_only {
                     log::info!(
                         "consent: nods recorded (record-only), {}",
                         summary(&det, &shake, t)
@@ -2478,40 +2737,10 @@ pub fn wait_for_nods(
     Ok((Gesture::Timeout, tracked))
 }
 
+/// A consent state of a test's own, leaked so a `Dialog` can hold it.
 #[cfg(test)]
-mod replay_tests {
-    use super::{replay_round, CalFrame, NodDetector, ShakeDetector};
-
-    /// A recorded round in the 19-field trace format, as frames.
-    fn frames(text: &str) -> Vec<CalFrame> {
-        text.split_whitespace()
-            .map(|tok| {
-                let f: Vec<f32> = tok.split('/').map(|v| v.parse().unwrap()).collect();
-                CalFrame {
-                    t: f[0],
-                    pos_x: f[17],
-                    pos_y: f[18],
-                    yaw: f[2],
-                    geom: (f[3], f[4], f[5]),
-                }
-            })
-            .collect()
-    }
-
-    /// The verify step reads a recorded nod round as nods, a shake round as
-    /// shakes, and a reading round as nothing, at the default floors.
-    #[test]
-    fn the_verify_replay_reads_recorded_rounds_the_way_the_consent_loop_does() {
-        let floors = (NodDetector::MIN_DOWN, ShakeDetector::MIN_TURN);
-        let (n, s) = replay_round(&frames(include_str!("../traces/cal/03-nod.txt")), floors);
-        assert!(n >= 2 && s == 0, "nod round: {} nods, {} shakes", n, s);
-        let (n, s) = replay_round(&frames(include_str!("../traces/cal/08-shake.txt")), floors);
-        assert!(s >= 2 && n == 0, "shake round: {} nods, {} shakes", n, s);
-        let (n, s) = replay_round(&frames(include_str!("../traces/cal/16-read.txt")), floors);
-        assert_eq!((n, s), (0, 0), "reading round");
-        let (n, s) = replay_round(&frames(include_str!("../traces/cal/17-lean.txt")), floors);
-        assert_eq!((n, s), (0, 0), "lean round");
-    }
+pub(crate) fn test_state() -> &'static ConsentState {
+    Box::leak(Box::new(ConsentState::new()))
 }
 
 #[cfg(test)]
@@ -2589,7 +2818,7 @@ mod track_tests {
 
 #[cfg(test)]
 mod window_text_tests {
-    use super::{clip, Dialog, TOKENS};
+    use super::clip;
 
     #[test]
     fn the_omarchy_path_is_read_in_every_form_the_conf_takes() {
@@ -2685,1085 +2914,50 @@ mod window_text_tests {
         );
     }
 
+    /// The token answers only its own request, only while that request's
+    /// window lives, and a wrong token changes nothing in the record (H9).
     #[test]
     fn a_token_matches_only_itself_and_only_while_the_request_lives() {
+        use super::{Answer, Dialog};
         let user = "window-text-test-user";
         let cfg = crate::config::Config::default();
+        let st = super::test_state();
         assert!(
-            !Dialog::token_matches(user, Some("anything")),
+            !st.token_matches(user, Some("anything")),
             "no request, no match"
         );
-        let d = Dialog::new(&cfg, user).unwrap();
-        let tok = TOKENS.lock().unwrap().get(user).cloned().unwrap();
+        assert!(
+            Dialog::new(&cfg, user, st).is_err(),
+            "no live request, no window"
+        );
+        let _turn = st.test_live(1000, user);
+        assert!(
+            !st.token_matches(user, Some("anything")),
+            "live but no window yet: no token"
+        );
+        let d = Dialog::new(&cfg, user, st).unwrap();
+        let tok = d.token().to_string();
         assert_eq!(tok.len(), 32);
-        assert!(Dialog::token_matches(user, Some(&tok)));
-        assert!(!Dialog::token_matches(user, Some(&tok[..31])));
-        assert!(!Dialog::token_matches(user, Some(&format!("{}0", tok))));
-        assert!(!Dialog::token_matches(user, None));
+        assert!(st.token_matches(user, Some(&tok)));
+        assert!(!st.token_matches(user, Some(&tok[..31])));
+        assert!(!st.token_matches(user, Some(&format!("{}0", tok))));
+        assert!(!st.token_matches(user, None));
+        assert!(!st.token_matches("someone-else", Some(&tok)));
+        assert_eq!(
+            st.answer(user, Some("wrong"), Answer::Dismiss),
+            Err("no pending request")
+        );
+        assert!(!st.answered(user), "a wrong-token answer changes nothing");
+        assert!(!st.ack(user, Some("wrong")));
+        assert!(!d.acknowledged());
+        assert_eq!(st.answer(user, Some(&tok), Answer::Dismiss), Ok(()));
+        assert!(st.answered(user));
+        assert!(matches!(st.poll(user), Some(Answer::Dismiss)));
         drop(d);
         assert!(
-            !Dialog::token_matches(user, Some(&tok)),
+            !st.token_matches(user, Some(&tok)),
             "the token dies with the request"
         );
-    }
-}
-
-#[cfg(test)]
-mod nod_tests {
-    use super::NodDetector;
-
-    const POSTURE_TRACE: &str = "0.572 0.606 0.598 0.589 0.578 0.570 0.559 0.553 0.556 0.552 0.547 0.551 0.548 0.544 0.548 0.555 0.555 0.548 0.558 0.555 0.557 0.551 0.554 0.547 0.543 0.546 0.547 0.546 0.548 0.541 0.532 0.524 0.551 0.576 0.582 0.524 0.560 0.529 0.528 0.561 0.583 0.581 0.584 0.567 0.561 0.579 0.578 0.574 0.575 0.572 0.572 0.570 0.568 0.568 0.566 0.531 0.562 0.529 0.568 0.567 0.569 0.530 0.529 0.537 0.531 0.540 0.527 0.524 0.527 0.531 0.526 0.523 0.525 0.530 0.527 0.527 0.525 0.527 0.529 0.526 0.531 0.526 0.527 0.537 0.529 0.525 0.529 0.531 0.523 0.522 0.523 0.524 0.524 0.526 0.525 0.527 0.523 0.524 0.519 0.523 0.519 0.523 0.523 0.524 0.537 0.527 0.530 0.523 0.527 0.525 0.521 0.516 0.520 0.534 0.520 0.517 0.527 0.519 0.535 0.532 0.519 0.531 0.520 0.517 0.524 0.525 0.521 0.523 0.523 0.523 0.523 0.526 0.521 0.524 0.524 0.521 0.520 0.519 0.523 0.558 0.520 0.513 0.534 0.541 0.518 0.533 0.517 0.515 0.520 0.524 0.524 0.532 0.531 0.524 0.524 0.524 0.525 0.561 0.563 0.557 0.554 0.548 0.548 0.551 0.549 0.541 0.537 0.520 0.511 0.528 0.532 0.520 0.521 0.508 0.517 0.523 0.528 0.540 0.535 0.485 0.483 0.495 0.477 0.471 0.483 0.516 0.525 0.511 0.508 0.502 0.506 0.493 0.495 0.499 0.489 0.489 0.488 0.504 0.503 0.500 0.501 0.491 0.500 0.491 0.476 0.488 0.470 0.474 0.475 0.477 0.462 0.473 0.453 0.489 0.486 0.483 0.492 0.473 0.466 0.477 0.487 0.492 0.492 0.503 0.513 0.502 0.494 0.505 0.508 0.496 0.495 0.487 0.525 0.515 0.504 0.511 0.527 0.515 0.546 0.534 0.542 0.533 0.513 0.523 0.514 0.512 0.531 0.534 0.523 0.533 0.533 0.543 0.545 0.537 0.552 0.547 0.546 0.545 0.547 0.524 0.546 0.536 0.523 0.557 0.533 0.538 0.520 0.514 0.520 0.528 0.533 0.528 0.532 0.535 0.535 0.530 0.534 0.530 0.537 0.535 0.528 0.530 0.530 0.538 0.539 0.544 0.547 0.542 0.545 0.521 0.521 0.526 0.532 0.550 0.550 0.560 0.518 0.518 0.513 0.525 0.553 0.562 0.566 0.568 0.563 0.564 0.563 0.563 0.568 0.561 0.560 0.563 0.563 0.563 0.559 0.561 0.561 0.562 0.560 0.560 0.560 0.560 0.560 0.554 0.561 0.558 0.560 0.556 0.559 0.555 0.554 0.555 0.549 0.551 0.549 0.541 0.552 0.555 0.559 0.549 0.539 0.542 0.550 0.546 0.545 0.547 0.541 0.539 0.545 0.543 0.552 0.550 0.551 0.553 0.557 0.552 0.554 0.553 0.558 0.558 0.557 0.559 0.559 0.558 0.555 0.555 0.554 0.559 0.560 0.559 0.560 0.558 0.564 0.561 0.565 0.557 0.564 0.568 0.563 0.560 0.562 0.558 0.562 0.565 0.563 0.559 0.562 0.566 0.568 0.566 0.567 0.570 0.574 0.578 0.574 0.576 0.571 0.572 0.575 0.576";
-
-    fn run(trace: &[f32], fps: f32) -> usize {
-        let mut d = NodDetector::new();
-        for (i, &p) in trace.iter().enumerate() {
-            d.push(p, i as f32 / fps);
-        }
-        d.nods
-    }
-
-    fn run_geom(text: &str, fps: f32) -> (usize, Vec<usize>) {
-        let mut d = NodDetector::new();
-        let mut at = Vec::new();
-        for (i, rec) in text.split_whitespace().enumerate() {
-            let f: Vec<f32> = rec.split('/').map(|v| v.parse().unwrap()).collect();
-            if d.push_with(f[0], i as f32 / fps, Some((f[1], f[2], f[3]))) {
-                at.push(i);
-            }
-        }
-        (d.nods, at)
-    }
-
-    /// Recorded 2026-09-22: the user sat still for ten seconds and the first
-    /// four-leg detector granted root off a detector fit that flickered on
-    /// alternate frames (pitch/yaw/width/x/y per frame, about 28 fps).
-    #[test]
-    fn a_still_face_with_a_flickering_fit_is_not_a_nod() {
-        let text = include_str!("../traces/2026-09-22-0536-false-nods-still-face.txt");
-        let mut d = NodDetector::new();
-        let mut at = Vec::new();
-        let mut filter = super::FlickerFilter::default();
-        let mut dropped = 0;
-        for (i, tok) in text.split_whitespace().enumerate() {
-            let f: Vec<f32> = tok.split('/').map(|v| v.parse().unwrap()).collect();
-            if !filter.keep(f[0], f[1], f[2]) {
-                dropped += 1;
-                continue;
-            }
-            if d.push_full(f[0], Some(f[1]), i as f32 / 28.0, Some((f[2], f[3], f[4]))) {
-                at.push(i);
-            }
-        }
-        assert_eq!(
-            d.nods, 0,
-            "counted at {:?}, {} flicker frames dropped",
-            at, dropped
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn dump_false_trace() {
-        let text = include_str!("../traces/2026-09-22-0536-false-nods-still-face.txt");
-        let mut d = NodDetector::new();
-        for (i, tok) in text.split_whitespace().enumerate() {
-            let f: Vec<f32> = tok.split('/').map(|v| v.parse().unwrap()).collect();
-            let hit = d.push_with(f[0], i as f32 / 28.0, Some((f[2], f[3], f[4])));
-            eprintln!("{:3} p {:.3} w {:.0} y {:.0} base {:.3} e {:+.3} thr {:.3} dir {:+} steps {} legs {} {}", i, f[0], f[2], f[4], d.inner.base.unwrap_or(0.0), f[0] - d.inner.base.unwrap_or(f[0]), d.inner.thr, d.inner.dir, d.inner.steps, d.inner.legs.len(), if hit { "NOD" } else { "" });
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn dump_flicker_trace() {
-        let text = include_str!("../traces/2026-09-19-0244-nods-missed-with-motion-gate.txt");
-        let mut d = NodDetector::new();
-        for (i, rec) in text.split_whitespace().enumerate() {
-            let f: Vec<f32> = rec.split('/').map(|v| v.parse().unwrap()).collect();
-            let hit = d.push_with(f[0], i as f32 / 28.0, Some((f[1], f[2], f[3])));
-            eprintln!("{:3} p {:.3} w {:.0} y {:.0} base {:.3} e {:+.3} thr {:.3} dir {:+} steps {} legs {} {}", i, f[0], f[1], f[3], d.inner.base.unwrap_or(0.0), f[0] - d.inner.base.unwrap_or(f[0]), d.inner.thr, d.inner.dir, d.inner.steps, d.inner.legs.len(), if hit { "NOD" } else { "" });
-        }
-    }
-
-    /// Recorded 2026-09-21: the user slid into the chair and turned to the
-    /// screen (the box moved 100 px sideways and grew a third over 1.4 s),
-    /// then glanced twice between the window and the terminal. No nod; the
-    /// old gate approved. Must count zero: the face was not yet still.
-    #[test]
-    fn glances_on_arrival_are_not_a_nod() {
-        let (nods, at) = run_geom(
-            include_str!("../traces/2026-09-21-1144-false-nod-no-nod.txt"),
-            28.0,
-        );
-        assert_eq!(nods, 0, "counted at {:?}", at);
-    }
-
-    /// The trace that approved an install on 2026-09-19 with no nod: landmark
-    /// jitter between two quantised values, counted as two nods by the old
-    /// threshold logic. Must count zero.
-    #[test]
-    fn jitter_is_not_a_nod() {
-        let t: Vec<f32> = "0.57 0.57 0.57 0.54 0.57 0.54 0.57 0.54 0.54 0.54 0.57 0.54 0.54 0.57 0.54 0.54 0.54 0.54 0.54 0.54 0.54 0.54 0.54 0.54 0.54 0.57 0.57 0.54 0.55 0.54 0.54 0.54 0.54 0.58 0.57 0.54 0.54 0.54 0.57 0.57 0.57 0.53 0.57"
-            .split(' ')
-            .map(|v| v.parse().unwrap())
-            .collect();
-        assert_eq!(run(&t, 22.0), 0);
-        // Wider single-frame spikes are still one frame long.
-        let mut spiky = vec![0.55; 12];
-        for _ in 0..6 {
-            spiky.extend_from_slice(&[0.62, 0.55, 0.55, 0.55, 0.62, 0.55, 0.55]);
-        }
-        assert_eq!(run(&spiky, 22.0), 0);
-    }
-
-    /// Recorded 2026-09-19: the user leaned in to read the window, no nod,
-    /// and the old detector approved. Must count zero.
-    #[test]
-    fn leaning_in_to_read_is_not_a_nod() {
-        // The recording has pitch only. The face grew about a quarter as the
-        // user leaned in over the second or so in which the pitch wobbles
-        // (frames 8 to 44); the gate sees the width rising through each pulse.
-        let t: Vec<f32> = "0.518 0.533 0.531 0.538 0.541 0.531 0.529 0.528 0.532 0.532 0.533 0.533 0.530 0.519 0.540 0.517 0.515 0.516 0.545 0.537 0.536 0.541 0.553 0.541 0.545 0.543 0.536 0.538 0.526 0.522 0.516 0.523 0.527 0.528 0.545 0.550 0.546 0.550 0.548 0.541 0.547 0.535 0.532 0.536 0.532 0.540 0.540 0.580 0.519 0.554 0.547 0.549 0.550 0.550 0.551 0.551 0.554 0.553 0.554 0.554 0.555 0.553 0.548 0.551 0.551 0.552 0.551 0.549 0.549 0.552 0.554 0.555 0.553 0.545 0.545 0.548 0.545 0.546 0.543 0.545 0.544 0.543 0.546 0.543 0.542 0.541 0.540 0.542 0.543 0.543 0.522 0.522 0.522 0.528 0.527 0.531 0.537 0.533".split(' ').map(|v| v.parse().unwrap()).collect();
-        let mut d = NodDetector::new();
-        for (i, &p) in t.iter().enumerate() {
-            let k = ((i as f32 - 8.0) / 36.0).clamp(0.0, 1.0);
-            d.push_with(
-                p,
-                i as f32 / 28.0,
-                Some((90.0 * (1.0 + 0.25 * k), 320.0, 240.0 + 20.0 * k)),
-            );
-        }
-        assert_eq!(d.nods, 0);
-        // The same pitch trace with a still face would read as light nods,
-        // which is exactly why the gate exists.
-        let _ = run(&t, 28.0); // amplitude below the floor on the nose measure; the gate is what this test is about
-    }
-
-    #[test]
-    #[ignore]
-    fn dump_posture_trace() {
-        let t: Vec<f32> = POSTURE_TRACE
-            .split(' ')
-            .map(|v| v.parse().unwrap())
-            .collect();
-        let mut d = NodDetector::new();
-        for (i, &p) in t.iter().enumerate() {
-            let hit = d.push(p, i as f32 / 28.0);
-            eprintln!(
-                "{:3} p {:.3} base {:.3} e {:+.3} thr {:.3} legs {} {}",
-                i,
-                p,
-                d.inner.base.unwrap_or(0.0),
-                p - d.inner.base.unwrap_or(p),
-                d.inner.thr,
-                d.inner.legs.len(),
-                if hit { "NOD" } else { "" }
-            );
-        }
-    }
-
-    #[test]
-    fn two_real_nods_count() {
-        let mut t = vec![0.55; 12];
-        for _ in 0..2 {
-            t.extend_from_slice(&[
-                0.57, 0.60, 0.62, 0.63, 0.62, 0.60, 0.57, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55,
-            ]);
-        }
-        // Then the head rests: the last leg closes within a third of a second of it.
-        t.extend(std::iter::repeat_n(0.55, 12));
-        assert_eq!(run(&t, 22.0), 2);
-    }
-
-    #[test]
-    fn small_nods_at_a_jittery_distance_need_more() {
-        // Jitter of 0.03 raises the threshold to 0.09; a 0.05 nod is ignored.
-        let mut t: Vec<f32> = (0..12)
-            .map(|i| if i % 2 == 0 { 0.57 } else { 0.54 })
-            .collect();
-        t.extend_from_slice(&[
-            0.60, 0.61, 0.61, 0.60, 0.57, 0.55, 0.55, 0.55, 0.60, 0.61, 0.61, 0.60, 0.57, 0.55,
-            0.55, 0.55,
-        ]);
-        assert_eq!(run(&t, 22.0), 0);
-    }
-
-    #[test]
-    fn a_look_down_and_back_is_not_a_nod() {
-        // One real nod, then a deliberate look down for 1.2 s and back: one nod.
-        let mut t = vec![0.55; 12];
-        t.extend_from_slice(&[
-            0.57, 0.60, 0.62, 0.63, 0.62, 0.60, 0.57, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55,
-        ]);
-        t.extend(vec![0.64; 26]);
-        t.extend(vec![0.55; 10]);
-        // A lone nod is not the gesture, and the look-down forgets it.
-        assert_eq!(run(&t, 22.0), 0);
-    }
-
-    #[test]
-    fn a_posture_change_is_not_a_nod() {
-        let mut t = vec![0.55; 12];
-        t.extend(vec![0.65; 60]); // looked down and stayed there for ~2.7 s
-        t.extend(vec![0.55; 10]);
-        assert_eq!(run(&t, 22.0), 0);
-    }
-}
-
-#[cfg(test)]
-mod shake_tests {
-    use super::{NodDetector, ShakeDetector};
-
-    /// Yaw samples at 28 fps: rest, then `cycles` full left-right swings of
-    /// `amp`, `frames_per_leg` frames each, then rest.
-    fn swing(cycles: usize, amp: f32, frames_per_leg: usize, rest_after: usize) -> Vec<f32> {
-        let mut t = vec![0.0; 30];
-        for _ in 0..cycles {
-            for k in 0..frames_per_leg {
-                t.push(-amp * (k as f32 + 1.0) / frames_per_leg as f32);
-            }
-            for k in 0..frames_per_leg {
-                t.push(-amp + 2.0 * amp * (k as f32 + 1.0) / frames_per_leg as f32);
-            }
-            for k in 0..frames_per_leg {
-                t.push(amp - amp * (k as f32 + 1.0) / frames_per_leg as f32);
-            }
-        }
-        t.extend(std::iter::repeat_n(0.0, rest_after));
-        t
-    }
-
-    fn run(trace: &[f32], fps: f32) -> (usize, Vec<usize>) {
-        let mut d = ShakeDetector::new();
-        let mut at = Vec::new();
-        for (i, &y) in trace.iter().enumerate() {
-            if d.push(y, i as f32 / fps) {
-                at.push(i);
-            }
-        }
-        (d.shakes, at)
-    }
-
-    #[test]
-    fn two_shakes_count() {
-        // centre-left-right-left-right-centre: four legs, then rest.
-        let mut t = vec![0.0; 30];
-        for k in 0..5 {
-            t.push(-0.15 * (k as f32 + 1.0) / 5.0);
-        }
-        for k in 0..6 {
-            t.push(-0.15 + 0.30 * (k as f32 + 1.0) / 6.0);
-        }
-        for k in 0..6 {
-            t.push(0.15 - 0.30 * (k as f32 + 1.0) / 6.0);
-        }
-        for k in 0..6 {
-            t.push(-0.15 + 0.30 * (k as f32 + 1.0) / 6.0);
-        }
-        for k in 0..5 {
-            t.push(0.15 - 0.15 * (k as f32 + 1.0) / 5.0);
-        }
-        t.extend(std::iter::repeat_n(0.0, 20));
-        let (shakes, at) = run(&t, 28.0);
-        assert_eq!(shakes, 2, "completions at {:?}", at);
-        assert!(
-            at[0] < 60,
-            "completes as the head comes to rest, got {:?}",
-            at
-        );
-    }
-
-    #[test]
-    fn starting_on_the_other_side_counts_too() {
-        let mut t = vec![0.0; 30];
-        for k in 0..5 {
-            t.push(0.12 * (k as f32 + 1.0) / 5.0);
-        }
-        for k in 0..6 {
-            t.push(0.12 - 0.24 * (k as f32 + 1.0) / 6.0);
-        }
-        for k in 0..6 {
-            t.push(-0.12 + 0.24 * (k as f32 + 1.0) / 6.0);
-        }
-        for k in 0..6 {
-            t.push(0.12 - 0.24 * (k as f32 + 1.0) / 6.0);
-        }
-        for k in 0..5 {
-            t.push(-0.12 + 0.12 * (k as f32 + 1.0) / 5.0);
-        }
-        t.extend(std::iter::repeat_n(0.0, 20));
-        assert_eq!(run(&t, 28.0).0, 2);
-    }
-
-    #[test]
-    fn one_shake_is_not_a_refusal() {
-        // centre-left-right-centre: two legs and a half.
-        let t = swing(1, 0.15, 5, 30);
-        assert_eq!(run(&t, 28.0).0, 0);
-    }
-
-    #[test]
-    fn a_glance_at_the_other_monitor_is_not_a_refusal() {
-        let mut t = vec![0.0; 30];
-        for k in 0..8 {
-            t.push(0.30 * (k as f32 + 1.0) / 8.0);
-        }
-        t.extend(std::iter::repeat_n(0.30, 40));
-        for k in 0..8 {
-            t.push(0.30 - 0.30 * (k as f32 + 1.0) / 8.0);
-        }
-        t.extend(std::iter::repeat_n(0.0, 30));
-        assert_eq!(run(&t, 28.0).0, 0);
-    }
-
-    #[test]
-    fn two_shakes_far_apart_are_two_single_shakes() {
-        let mut t = swing(1, 0.15, 5, 90); // 3.2 s of rest between
-        t.extend(swing(1, 0.15, 5, 30).into_iter().skip(30));
-        assert_eq!(run(&t, 28.0).0, 0);
-    }
-
-    /// Recorded on the reference machine (t/pitch/yaw/width/x/y per frame,
-    /// real timestamps): a request resumed after a face unlock, the user
-    /// shook twice at about 14 s and again at about 20 s, then dismissed.
-    /// The first build rejected both because the box slid sideways.
-    #[test]
-    fn a_recorded_double_shake_is_a_refusal_and_not_a_nod() {
-        let text = include_str!("../traces/2026-09-22-0549-two-shakes-after-unlock.txt");
-        let mut shake = ShakeDetector::new();
-        let mut nod = NodDetector::new();
-        let mut at = Vec::new();
-        let mut filter = super::FlickerFilter::default();
-        for tok in text.split_whitespace() {
-            let f: Vec<f32> = tok.split('/').map(|v| v.parse().unwrap()).collect();
-            if !filter.keep(f[1], f[2], f[3]) {
-                continue;
-            }
-            let geom = Some((f[3], f[4], f[5]));
-            if shake.push_with(f[2], f[0], geom) {
-                at.push(f[0]);
-            }
-            nod.push_full(f[1], Some(f[2]), f[0], geom);
-        }
-        assert!(shake.shakes >= 2, "no shake counted");
-        assert!(
-            at[0] < 20.0,
-            "the first shake should count on its own, got {:?}",
-            at
-        );
-        assert_eq!(nod.nods, 0, "a shake must never read as a nod");
-    }
-
-    /// The nose-to-eye pitch from a recorded frame's landmarks (fields 6 to
-    /// 15), as `pose::pose` computes it; recordings without landmarks fall
-    /// back to the mouth-based pitch in field 1.
-    fn nose_pitch(f: &[f32]) -> f32 {
-        if f.len() >= 19 {
-            return f[18]; // image-motion y, the live signal
-        }
-        if f.len() < 16 {
-            return f[1];
-        }
-        let l = [
-            [f[6], f[7]],
-            [f[8], f[9]],
-            [f[10], f[11]],
-            [f[12], f[13]],
-            [f[14], f[15]],
-        ];
-        faceauth_engine::pose::pose(&l).nose_pitch
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    struct Cfg {
-        nod_min: f32,
-        shake_min: f32,
-        rest_s: f32,
-        span_s: f32,
-        rev_frames: usize,
-        leg_max: f32,
-        regular: Option<f32>,
-        filter: &'static str,
-        min_steps: usize,
-        prior_still: f32,
-        need_ramp: bool,
-        co_nod: f32,
-        co_shake: f32,
-    }
-
-    impl Cfg {
-        fn default_cfg() -> Cfg {
-            Cfg {
-                nod_min: NodDetector::MIN_DOWN,
-                shake_min: ShakeDetector::MIN_TURN,
-                rest_s: super::Oscillation::REST_S,
-                span_s: super::Oscillation::SPAN_S,
-                rev_frames: super::Oscillation::REV_FRAMES,
-                leg_max: 1.0,
-                regular: None,
-                filter: "none",
-                min_steps: 1,
-                prior_still: 1.0,
-                need_ramp: false,
-                co_nod: super::Oscillation::CO_MOTION,
-                co_shake: super::Oscillation::CO_MOTION,
-            }
-        }
-        fn apply(&self, nod: &mut NodDetector, shake: &mut ShakeDetector) {
-            nod.inner.min_thr = self.nod_min;
-            nod.inner.max_thr = nod.inner.max_thr.max(self.nod_min);
-            nod.inner.thr = self.nod_min;
-            shake.inner.min_thr = self.shake_min;
-            shake.inner.max_thr = shake.inner.max_thr.max(self.shake_min);
-            shake.inner.thr = self.shake_min;
-            for o in [&mut nod.inner, &mut shake.inner] {
-                o.rest_s = self.rest_s;
-                o.span_s = self.span_s;
-                o.rev_frames = self.rev_frames;
-                o.leg_max_s = self.leg_max;
-                o.regular = self.regular;
-                o.min_steps = self.min_steps;
-                o.prior_still = self.prior_still;
-                o.need_ramp = self.need_ramp;
-            }
-            nod.inner.co_motion = if self.co_nod > 0.0 {
-                Some((2, self.co_nod))
-            } else {
-                None
-            };
-            shake.inner.co_motion = if self.co_shake > 0.0 {
-                Some((1, self.co_shake))
-            } else {
-                None
-            };
-            {}
-        }
-    }
-
-    fn replay(text: &str) -> (usize, usize, Vec<f32>) {
-        let (s, n, at, _) = replay_full(text);
-        (s, n, at)
-    }
-
-    fn replay_full(text: &str) -> (usize, usize, Vec<f32>, Vec<f32>) {
-        let mut cfg = Cfg::default_cfg();
-        if let Ok(m) = std::env::var("FACEAUTH_FLICKER") {
-            cfg.filter = Box::leak(m.into_boxed_str());
-        }
-        replay_cfg(text, cfg)
-    }
-
-    fn replay_cfg(text: &str, cfg: Cfg) -> (usize, usize, Vec<f32>, Vec<f32>) {
-        let mut shake = ShakeDetector::new();
-        let mut nod = NodDetector::new();
-        cfg.apply(&mut nod, &mut shake);
-        let mut at = Vec::new();
-        let mut nod_at = Vec::new();
-        let mode = cfg.filter.to_string();
-        let mut hold = super::FlickerFilter::default();
-        let mut transient = super::TransientFilter::default();
-        let feed = |p: f32,
-                    sx: f32,
-                    yaw: f32,
-                    t: f32,
-                    geom: (f32, f32, f32),
-                    shake: &mut ShakeDetector,
-                    nod: &mut NodDetector,
-                    at: &mut Vec<f32>,
-                    nod_at: &mut Vec<f32>| {
-            if shake.push_with(sx, t, Some(geom)) {
-                at.push(t);
-            }
-            if nod.push_full(p, Some(yaw), t, Some(geom)) {
-                nod_at.push(t);
-            }
-        };
-        let mut pending: Option<(f32, (f32, f32, f32))> = None; // (t, geom) of the held frame
-        for tok in text.split_whitespace() {
-            let f: Vec<f32> = tok.split('/').map(|v| v.parse().unwrap()).collect();
-            let p = nose_pitch(&f);
-            let sx = if f.len() >= 19 { f[17] } else { f[2] }; // image-motion x when recorded (the shake's signal)
-            let yaw = f[2]; // landmark yaw: the nod's quiet-head rule, as in the daemon
-            let geom = (f[3], f[4], f[5]);
-            match mode.as_str() {
-                "none" => feed(
-                    p,
-                    sx,
-                    yaw,
-                    f[0],
-                    geom,
-                    &mut shake,
-                    &mut nod,
-                    &mut at,
-                    &mut nod_at,
-                ),
-                "hold" => {
-                    if hold.keep(p, f[2], f[3]) {
-                        feed(
-                            p,
-                            sx,
-                            yaw,
-                            f[0],
-                            geom,
-                            &mut shake,
-                            &mut nod,
-                            &mut at,
-                            &mut nod_at,
-                        );
-                    }
-                }
-                _ => {
-                    if let Some((pp, py, _)) = transient.feed(p, f[2], f[3]) {
-                        let (pt, pgeom) = pending.expect("a held frame has a time");
-                        feed(
-                            pp,
-                            py,
-                            py,
-                            pt,
-                            pgeom,
-                            &mut shake,
-                            &mut nod,
-                            &mut at,
-                            &mut nod_at,
-                        );
-                    }
-                    pending = Some((f[0], geom));
-                }
-            }
-        }
-        (shake.shakes, nod.nods, at, nod_at)
-    }
-
-    /// Recorded: two shakes at about 3 s, refused at 3.8 s live.
-    #[test]
-    fn a_second_recorded_double_shake_is_a_refusal() {
-        let (shakes, nods, at) = replay(include_str!("../traces/2026-09-22-0551-two-shakes.txt"));
-        assert!(shakes >= 2, "no shake counted");
-        assert!(at[0] < 5.0, "{:?}", at);
-        assert_eq!(nods, 0);
-    }
-
-    /// Recorded: two exaggerated turns to the right, each held about two
-    /// seconds, then one to the left. The first build refused on it.
-    #[test]
-    fn exaggerated_glances_are_not_a_refusal() {
-        let (shakes, nods, at) = replay(include_str!(
-            "../traces/2026-09-22-0553-exaggerated-glances.txt"
-        ));
-        assert_eq!(shakes, 0, "counted at {:?}", at);
-        assert_eq!(nods, 0);
-    }
-
-    /// Recorded: reading the window and the screen for about twenty seconds.
-    #[test]
-    fn reading_is_not_a_refusal() {
-        let (shakes, nods, at) = replay(include_str!("../traces/2026-09-22-0600-reading.txt"));
-        assert_eq!(shakes, 0, "counted at {:?}", at);
-        assert_eq!(nods, 0);
-    }
-
-    /// Replays every calibration recording (traces/cal) and prints what the
-    /// detectors make of each; the file name says what the user did.
-    #[test]
-    #[ignore]
-    fn cal_report() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/traces/cal");
-        let mut names: Vec<_> = std::fs::read_dir(dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
-            .collect();
-        names.sort();
-        for path in names {
-            let text = std::fs::read_to_string(&path).unwrap();
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            println!("CAL {}", name);
-            let (shakes, nods, at, nod_at) = replay_full(&text);
-            println!(
-                "CAL {:<22} nods {} at {:?} | shakes {} at {:?}",
-                name,
-                nods,
-                nod_at
-                    .iter()
-                    .map(|t| format!("{:.1}", t))
-                    .collect::<Vec<_>>(),
-                shakes,
-                at.iter().map(|t| format!("{:.1}", t)).collect::<Vec<_>>()
-            );
-        }
-    }
-
-    /// Expected outcome of a calibration recording from its file name:
-    /// (nods expected, shakes expected).
-    fn expected(name: &str) -> (bool, bool) {
-        let n = name
-            .split('-')
-            .nth(1)
-            .unwrap_or("")
-            .trim_end_matches(".txt");
-        let kind = name
-            .split_once('-')
-            .map(|x| x.1)
-            .unwrap_or("")
-            .trim_end_matches(".txt");
-        let _ = n;
-        match kind {
-            k if k.starts_with("still") => (false, false),
-            "nod" | "nod-slow" | "nod-light" | "nod-approval" => (true, false),
-            "shake" | "shake-slow" => (false, true),
-            _ => (false, false),
-        }
-    }
-
-    /// The calibration battery as the regression suite: no recording of a
-    /// non-gesture (still, glance, look down, read, lean, talk, single nod
-    /// or shake) may produce anything, and the gesture recordings must keep
-    /// counting at least as many as when this was written (3 of 5 nods, 4
-    /// of 4 shakes, 2026-09-22).
-    #[test]
-    fn calibration_battery_holds() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/traces/cal");
-        let mut files: Vec<_> = std::fs::read_dir(dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
-            .collect();
-        files.sort();
-        let cfg = Cfg {
-            filter: "none",
-            ..Cfg::default_cfg()
-        };
-        let (mut nods_hit, mut nods_n, mut shakes_hit, mut shakes_n) = (0, 0, 0, 0);
-        for path in files {
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            let text = std::fs::read_to_string(&path).unwrap();
-            // Only recordings that carry the image-motion signal (fields 17
-            // and 18) are the live signal's regression suite.
-            if text
-                .split_whitespace()
-                .next()
-                .map(|tok| tok.split('/').count() < 19)
-                .unwrap_or(true)
-            {
-                continue;
-            }
-            let (shakes, nods, _, _) = replay_cfg(&text, cfg);
-            let (want_n, want_s) = expected(&name);
-            if want_n {
-                nods_n += 1;
-                if nods >= 2 {
-                    nods_hit += 1;
-                }
-                assert_eq!(shakes, 0, "{}: a nod recording read as a shake", name);
-            } else if want_s {
-                shakes_n += 1;
-                if shakes >= 2 {
-                    shakes_hit += 1;
-                }
-                assert_eq!(nods, 0, "{}: a shake recording read as a nod", name);
-            } else {
-                assert_eq!(
-                    (nods, shakes),
-                    (0, 0),
-                    "{}: a non-gesture recording produced a gesture",
-                    name
-                );
-            }
-        }
-        if nods_n == 0 && shakes_n == 0 {
-            eprintln!("SKIPPED: no motion-signal recordings in traces/cal yet");
-            return;
-        }
-        assert!(
-            nods_n >= 5 && nods_hit == nods_n,
-            "nods {}/{}",
-            nods_hit,
-            nods_n
-        );
-        assert!(
-            shakes_n >= 4 && shakes_hit == shakes_n,
-            "shakes {}/{}",
-            shakes_hit,
-            shakes_n
-        );
-    }
-
-    /// Sweep the box-moves-with-the-leg rule over the recorded corpus and
-    /// the red team's synthetic traces: which thresholds keep every real
-    /// gesture, and which refuse a box that does not move. Prints a table.
-    #[test]
-    fn co_motion_sweep() {
-        let load = |dir: &str| -> Vec<(String, String)> {
-            let mut files: Vec<_> = std::fs::read_dir(dir)
-                .unwrap()
-                .flatten()
-                .map(|e| e.path())
-                .collect();
-            files.sort();
-            files
-                .into_iter()
-                .filter(|p| p.extension().map(|e| e == "txt").unwrap_or(false))
-                .map(|p| {
-                    (
-                        p.file_name().unwrap().to_string_lossy().to_string(),
-                        std::fs::read_to_string(&p).unwrap(),
-                    )
-                })
-                .filter(|(_, t)| {
-                    t.split_whitespace()
-                        .next()
-                        .map(|tok| tok.split('/').count() >= 19)
-                        .unwrap_or(false)
-                })
-                .collect()
-        };
-        let cal = load(concat!(env!("CARGO_MANIFEST_DIR"), "/traces/cal"));
-        let phone = load(concat!(env!("CARGO_MANIFEST_DIR"), "/traces/cal-phone"));
-        let red = load(concat!(env!("CARGO_MANIFEST_DIR"), "/traces/redteam"));
-        eprintln!("co_nod  co_shake  cal nods  cal shakes  cal fp  phone fp  frozen-box nods  waggled-board nods");
-        for &co in &[0.0f32, 0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10, 0.12, 0.14] {
-            let cfg = Cfg {
-                filter: "none",
-                co_nod: co,
-                co_shake: co,
-                ..Cfg::default_cfg()
-            };
-            let (mut nh, mut nn, mut sh, mut sn, mut fp) = (0, 0, 0, 0, 0);
-            for (name, text) in &cal {
-                let (shakes, nods, _, _) = replay_cfg(text, cfg);
-                let (wn, ws) = expected(name);
-                if wn {
-                    nn += 1;
-                    if nods >= 2 {
-                        nh += 1;
-                    }
-                    if shakes > 0 {
-                        fp += 1;
-                    }
-                } else if ws {
-                    sn += 1;
-                    if shakes >= 2 {
-                        sh += 1;
-                    }
-                    if nods > 0 {
-                        fp += 1;
-                    }
-                } else if nods > 0 || shakes > 0 {
-                    fp += 1;
-                }
-            }
-            let mut pfp = 0;
-            for (name, text) in &phone {
-                let (shakes, nods, _, _) = replay_cfg(text, cfg);
-                let (wn, ws) = expected(name);
-                if (wn && shakes > 0)
-                    || (ws && nods > 0)
-                    || (!wn && !ws && (nods > 0 || shakes > 0))
-                {
-                    pfp += 1;
-                }
-            }
-            let r = |n: &str| {
-                red.iter()
-                    .find(|(f, _)| f == n)
-                    .map(|(_, t)| replay_cfg(t, cfg).1)
-                    .unwrap_or(usize::MAX)
-            };
-            eprintln!(
-                "{:<7} {:<9} {:>2}/{:<6} {:>2}/{:<8} {:>5} {:>8} {:>15} {:>19}",
-                co,
-                co,
-                nh,
-                nn,
-                sh,
-                sn,
-                fp,
-                pfp,
-                r("frozen-box.txt"),
-                r("waggled-board.txt")
-            );
-        }
-    }
-
-    /// The red team's synthetic traces (traces/redteam, never part of the
-    /// recorded corpus). A box that does not move while the motion figure
-    /// oscillates is not a head, and the live rule refuses it. A waggled
-    /// board moves its box with it and passes the detector by design: the
-    /// strobed confirm after the nods is what refuses that one.
-    #[test]
-    fn a_frozen_box_is_not_a_nod_and_a_waggled_board_is_left_to_the_confirm() {
-        let cfg = Cfg {
-            filter: "none",
-            ..Cfg::default_cfg()
-        };
-        let frozen = include_str!("../traces/redteam/frozen-box.txt");
-        let (shakes, nods, _, _) = replay_cfg(frozen, cfg);
-        assert_eq!((nods, shakes), (0, 0), "a frozen box read as a gesture");
-        let board = include_str!("../traces/redteam/waggled-board.txt");
-        let (_, nods, _, _) = replay_cfg(board, cfg);
-        assert!(nods >= 2, "the waggled board is meant to pass the detector (the confirm refuses it); it read {} nods", nods);
-    }
-
-    /// A hand-held print waggled over the matched face (traces/print,
-    /// recorded 2026-09-22): its box swings about two face widths, and the
-    /// detector counts no nod from it at any point.
-    #[test]
-    fn a_hand_held_print_waggle_is_not_a_nod() {
-        let cfg = Cfg {
-            filter: "none",
-            ..Cfg::default_cfg()
-        };
-        let text = include_str!("../traces/print/2026-09-22-print-waggle-handheld.txt");
-        let (_, nods, _, _) = replay_cfg(text, cfg);
-        assert_eq!(nods, 0, "a print waggled by hand read as a nod");
-    }
-
-    /// The phone-call corpus (traces/cal-phone): recorded under distraction,
-    /// so it sets no floors, but no non-gesture window may read as a
-    /// gesture, and no gesture window may read as the other gesture.
-    #[test]
-    fn phone_call_corpus_stays_safe() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/traces/cal-phone");
-        let mut files: Vec<_> = std::fs::read_dir(dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().map(|e| e == "txt").unwrap_or(false))
-            .collect();
-        files.sort();
-        let cfg = Cfg {
-            filter: "none",
-            ..Cfg::default_cfg()
-        };
-        let (mut nods_seen, mut shakes_seen) = (0, 0);
-        for path in files {
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            let text = std::fs::read_to_string(&path).unwrap();
-            if text
-                .split_whitespace()
-                .next()
-                .map(|tok| tok.split('/').count() < 19)
-                .unwrap_or(true)
-            {
-                continue;
-            }
-            let (shakes, nods, _, _) = replay_cfg(&text, cfg);
-            let (want_n, want_s) = expected(&name);
-            if want_n {
-                if nods >= 2 {
-                    nods_seen += 1;
-                }
-                assert_eq!(shakes, 0, "{}: a nod window read as a shake", name);
-            } else if want_s {
-                if shakes >= 2 {
-                    shakes_seen += 1;
-                }
-                assert_eq!(nods, 0, "{}: a shake window read as a nod", name);
-            } else {
-                assert_eq!(
-                    (nods, shakes),
-                    (0, 0),
-                    "{}: a non-gesture window produced a gesture",
-                    name
-                );
-            }
-        }
-        eprintln!(
-            "phone corpus: nod windows counted {} of 5, shake windows {} of 4 (informational)",
-            nods_seen, shakes_seen
-        );
-    }
-
-    /// Grid search over the tunables against the whole calibration corpus.
-    /// Zero false positives is required; sensitivity ranks the rest.
-    #[test]
-    #[ignore]
-    fn cal_sweep() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/traces/cal");
-        let mut files: Vec<(String, String)> = std::fs::read_dir(dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
-            .map(|p| {
-                (
-                    p.file_name().unwrap().to_string_lossy().to_string(),
-                    std::fs::read_to_string(&p).unwrap(),
-                )
-            })
-            .collect();
-        files.sort();
-        let mut results = Vec::new();
-        for &nod_min in &[0.03f32, 0.04, 0.06, 0.08] {
-            for &shake_min in &[0.04f32, 0.06, 0.10] {
-                for &rest_s in &[0.25f32, 0.35, 0.5] {
-                    for &span_s in &[3.0f32, 3.5, 4.0] {
-                        for &rev_frames in &[1usize, 2] {
-                            for &leg_max in &[1.0f32, 1.3] {
-                                for &regular in &[None, Some(2.5f32), Some(3.5)] {
-                                    for &(need_ramp, prior_still) in &[(true, 1.0f32), (false, 1.0)]
-                                    {
-                                        for &co_nod in &[0.0f32, 0.02, 0.03, 0.05] {
-                                            for &co_shake in &[0.0f32, 0.05, 0.10] {
-                                                let (filter, min_steps) = ("none", 1);
-                                                let cfg = Cfg {
-                                                    nod_min,
-                                                    shake_min,
-                                                    rest_s,
-                                                    span_s,
-                                                    rev_frames,
-                                                    leg_max,
-                                                    regular,
-                                                    filter,
-                                                    min_steps,
-                                                    prior_still,
-                                                    need_ramp,
-                                                    co_nod,
-                                                    co_shake,
-                                                };
-                                                let (
-                                                    mut fp,
-                                                    mut hit_n,
-                                                    mut hit_s,
-                                                    mut n_n,
-                                                    mut n_s,
-                                                ) = (0, 0, 0, 0, 0);
-                                                let mut fp_names = Vec::new();
-                                                for (name, text) in &files {
-                                                    let (shakes, nods, _, _) =
-                                                        replay_cfg(text, cfg);
-                                                    let (want_n, want_s) = expected(name);
-                                                    if want_n {
-                                                        n_n += 1;
-                                                        if nods >= 2 {
-                                                            hit_n += 1;
-                                                        }
-                                                        if shakes > 0 {
-                                                            fp += 1;
-                                                            fp_names.push(name.clone());
-                                                        }
-                                                    } else if want_s {
-                                                        n_s += 1;
-                                                        if shakes >= 2 {
-                                                            hit_s += 1;
-                                                        }
-                                                        if nods > 0 {
-                                                            fp += 1;
-                                                            fp_names.push(name.clone());
-                                                        }
-                                                    } else if nods > 0 || shakes > 0 {
-                                                        fp += 1;
-                                                        fp_names.push(name.clone());
-                                                    }
-                                                }
-                                                results.push((
-                                                    fp, hit_n, hit_s, n_n, n_s, cfg, fp_names,
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // Zero false positives first, then the most gestures caught, then the
-        // HIGHEST floors (margin over the non-gestures), then fewer rules.
-        results.sort_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then((b.1 + b.2).cmp(&(a.1 + a.2)))
-                .then(b.5.nod_min.total_cmp(&a.5.nod_min))
-                .then(b.5.shake_min.total_cmp(&a.5.shake_min))
-                .then(a.5.regular.is_some().cmp(&b.5.regular.is_some()))
-                .then(a.5.need_ramp.cmp(&b.5.need_ramp))
-                .then(a.5.co_nod.total_cmp(&b.5.co_nod))
-        });
-        for r in results.iter().take(25) {
-            println!(
-                "SWEEP fp {} nods {}/{} shakes {}/{} {:?} {:?}",
-                r.0, r.1, r.3, r.2, r.4, r.5, r.6
-            );
-        }
-    }
-
-    /// Per-frame detector state for one calibration recording, named in
-    /// FACEAUTH_DUMP_CAL (e.g. 03-nod).
-    #[test]
-    #[ignore]
-    fn cal_dump() {
-        let Ok(which) = std::env::var("FACEAUTH_DUMP_CAL") else {
-            return;
-        };
-        let path = format!("{}/traces/cal/{}.txt", env!("CARGO_MANIFEST_DIR"), which);
-        let text = std::fs::read_to_string(&path).unwrap();
-        let mut shake = ShakeDetector::new();
-        let mut nod = NodDetector::new();
-        let mut filter = super::FlickerFilter::default();
-        for tok in text.split_whitespace() {
-            let f: Vec<f32> = tok.split('/').map(|v| v.parse().unwrap()).collect();
-            let p = nose_pitch(&f);
-            let kept = std::env::var("FACEAUTH_FLICKER").as_deref() == Ok("none")
-                || filter.keep(p, f[2], f[3]);
-            if !kept {
-                println!(
-                    "{:5.2} DROPPED p {:.3} y {:+.3} w {:.0}",
-                    f[0], p, f[2], f[3]
-                );
-                continue;
-            }
-            let geom = Some((f[3], f[4], f[5]));
-            let sh = shake.push_with(f[2], f[0], geom);
-            let nd = nod.push_full(p, Some(f[2]), f[0], geom);
-            println!("{:5.2} p {:.3} y {:+.3} w {:.0} cy {:.0} | nod base {:.3} thr {:.3} dir {:+} steps {} legs {} | shake base {:+.3} thr {:.3} dir {:+} legs {} {}{}",
-                f[0], p, f[2], f[3], f[5], nod.inner.base.unwrap_or(0.0), nod.inner.thr, nod.inner.dir, nod.inner.steps, nod.inner.legs.len(),
-                shake.inner.base.unwrap_or(0.0), shake.inner.thr, shake.inner.dir, shake.inner.legs.len(), if nd { "NOD" } else { "" }, if sh { "SHAKE" } else { "" });
-        }
-    }
-
-    /// Recorded at the reference user's first calibrated floor (0.129): two
-    /// double nods (at 4 s and 34 s) that the floor-relative rest bar
-    /// cleared as "rest". Both must count at that floor and at the default.
-    /// The same recording against the box-motion rule: prints the nods
-    /// counted at each threshold (the 4 s pair and the 34 s pair).
-    #[test]
-    fn co_motion_sweep_on_the_calibrated_floor_recording() {
-        let text = include_str!("../traces/2026-09-22-user-nods-at-calibrated-floor.txt");
-        for co in [0.0f32, 0.005, 0.01, 0.015, 0.02, 0.03] {
-            let cfg = Cfg {
-                nod_min: 0.09,
-                co_nod: co,
-                ..Cfg::default_cfg()
-            };
-            let (_, nods, _, nod_at) = replay_cfg(text, cfg);
-            eprintln!("co {:<6} nods {} at {:?}", co, nods, nod_at);
-        }
-    }
-
-    #[test]
-    fn the_users_nods_count_at_their_calibrated_floor() {
-        let text = include_str!("../traces/2026-09-22-user-nods-at-calibrated-floor.txt");
-        // Both count up to the per-person cap (0.09); at 0.10 the second
-        // drops out, which is why the cap is where it is.
-        for floor in [0.06f32, 0.08, 0.09] {
-            let cfg = Cfg {
-                nod_min: floor,
-                ..Cfg::default_cfg()
-            };
-            let (shakes, nods, _, nod_at) = replay_cfg(text, cfg);
-            assert!(nods >= 4, "floor {}: nods {} at {:?}", floor, nods, nod_at);
-            assert_eq!(shakes, 0);
-        }
-    }
-
-    #[test]
-    fn yaw_jitter_is_not_a_refusal() {
-        let mut t = Vec::new();
-        for i in 0..120 {
-            t.push(if i % 2 == 0 { 0.01 } else { -0.01 });
-        }
-        assert_eq!(run(&t, 28.0).0, 0);
     }
 }
 
@@ -3771,12 +2965,10 @@ mod shake_tests {
 mod polkit_context_tests {
     use super::*;
 
-    fn ctx(uid: u32, agent: Option<AgentPeer>, action: &str) -> PolkitContext {
+    fn ctx(_uid: u32, agent: Option<AgentPeer>, action: &str) -> PolkitContext {
         PolkitContext {
             action: action.into(),
             message: "m".into(),
-            cookie: String::new(),
-            uid,
             agent,
             caller_pid: None,
             subject_pid: None,
@@ -3931,31 +3123,48 @@ mod window_ack_tests {
     fn an_acknowledgement_needs_the_live_token_and_is_per_request() {
         let cfg = Config::default();
         let user = "faceauth-ack-test-user";
-        let d = Dialog::new(&cfg, user).unwrap();
+        let st = test_state();
+        let _turn = st.test_live(1000, user);
+        let mut d = Dialog::new(&cfg, user, st).unwrap();
         assert!(!d.acknowledged());
-        assert!(!ack(user, None));
-        assert!(!ack(user, Some("not-the-token")));
+        assert!(!st.ack(user, None));
+        assert!(!st.ack(user, Some("not-the-token")));
         assert!(!d.acknowledged());
-        let token = TOKENS.lock().unwrap().get(user).cloned().unwrap();
-        assert!(ack(user, Some(&token)));
+        let token = d.token().to_string();
+        assert!(st.ack(user, Some(&token)));
         assert!(d.acknowledged());
         assert_eq!(
             d.dwell_left(Instant::now()),
             ACK_DWELL,
             "no dwell has run before the show records the acknowledgement"
         );
-        let d2 = Dialog::new(&cfg, user).unwrap();
+        // The acknowledgement wakes a show waiting for it through the
+        // condition variable, not a poll.
+        d.reset_ack();
+        assert!(!d.acknowledged());
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            st.ack(user, Some(&token))
+        });
+        let started = Instant::now();
+        assert!(st.wait_ack(user, d.token(), Instant::now() + Duration::from_secs(2)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(t.join().unwrap());
+        let old = d.token().to_string();
+        drop(d);
+        let d2 = Dialog::new(&cfg, user, st).unwrap();
         assert!(!d2.acknowledged(), "a new request starts unacknowledged");
-        assert!(!ack(user, Some(&token)), "the old token no longer answers");
-        TOKENS.lock().unwrap().remove(user);
-        ACKS.lock().unwrap().remove(user);
+        assert!(!st.ack(user, Some(&old)), "the old token no longer answers");
+        assert!(!st.wait_ack(user, d2.token(), Instant::now() + Duration::from_millis(50)));
     }
 
     #[test]
     fn the_dwell_runs_from_the_acknowledgement() {
         let cfg = Config::default();
         let user = "faceauth-dwell-test-user";
-        let mut d = Dialog::new(&cfg, user).unwrap();
+        let st = test_state();
+        let _turn = st.test_live(1000, user);
+        let mut d = Dialog::new(&cfg, user, st).unwrap();
         let at = Instant::now();
         d.acked_at = Some(at);
         assert_eq!(d.dwell_left(at), ACK_DWELL);
@@ -3964,66 +3173,194 @@ mod window_ack_tests {
             Duration::from_millis(500)
         );
         assert_eq!(d.dwell_left(at + Duration::from_secs(5)), Duration::ZERO);
-        TOKENS.lock().unwrap().remove(user);
     }
 }
 
 #[cfg(test)]
-mod facing_gate_tests {
-    use super::{replay_round, CalFrame, NodDetector, ShakeDetector};
+mod dwell_tests {
+    use super::*;
 
-    fn frames(text: &str, off: f32) -> Vec<CalFrame> {
-        text.split_whitespace()
-            .filter_map(|tok| {
-                let f: Vec<f32> = tok.split('/').filter_map(|v| v.parse().ok()).collect();
-                if f.len() != 19 {
-                    return None;
-                }
-                Some(CalFrame {
-                    t: f[0],
-                    pos_x: f[17],
-                    pos_y: f[18],
-                    yaw: f[2] + off,
-                    geom: (f[3], f[4], f[5]),
-                })
-            })
-            .collect()
+    /// D4: the acknowledgement lands during the scan, so a dwell measured
+    /// from it alone is spent before the nod card is up. The dwell runs
+    /// from the nod show instead, and whole again on every re-show.
+    #[test]
+    fn the_dwell_runs_from_the_nod_show_not_the_acknowledgement() {
+        let cfg = Config::default();
+        let user = "faceauth-nod-dwell-test-user";
+        let st = test_state();
+        let _turn = st.test_live(1000, user);
+        let mut d = Dialog::new(&cfg, user, st).unwrap();
+        let acked = Instant::now();
+        d.acked_at = Some(acked);
+        // The earliest the hook can run: the settle, the pattern settle
+        // and eight frames of phase lock at 30 fps, then the nod show.
+        let hook_at = acked + Duration::from_millis(1200 + 150 + 270);
+        assert_eq!(
+            d.dwell_left(hook_at),
+            Duration::ZERO,
+            "from the ack alone the dwell has lapsed"
+        );
+        d.nod_shown_at = Some(hook_at);
+        assert_eq!(
+            d.dwell_left(hook_at),
+            ACK_DWELL,
+            "at the hook the whole dwell is left"
+        );
+        assert_eq!(
+            d.dwell_left(hook_at + Duration::from_millis(1000)),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            d.dwell_left(hook_at + Duration::from_secs(5)),
+            Duration::ZERO
+        );
+        // A re-show later (a rider armed, a re-arm) starts it over.
+        let again = hook_at + Duration::from_secs(40);
+        d.nod_shown_at = Some(again);
+        assert_eq!(d.dwell_left(again), ACK_DWELL);
+        // An acknowledgement newer than the nod show wins, as before.
+        d.acked_at = Some(again + Duration::from_secs(1));
+        assert_eq!(d.dwell_left(again + Duration::from_secs(1)), ACK_DWELL);
     }
 
-    /// Every recorded nod still reads as recorded; the same nod with the
-    /// head held turned toward another screen (yaw offset 0.50 either way)
-    /// reads as nothing.
-    #[test]
-    fn a_nod_from_a_head_held_turned_does_not_count() {
-        let floors = (NodDetector::MIN_DOWN, ShakeDetector::MIN_TURN);
-        let mut bad = Vec::new();
-        for dir in ["cal", "cal-phone"] {
-            let d = format!("{}/traces/{}", env!("CARGO_MANIFEST_DIR"), dir);
-            let mut files: Vec<_> = std::fs::read_dir(&d)
-                .unwrap()
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().map(|e| e == "txt").unwrap_or(false))
-                .collect();
-            files.sort();
-            for p in files {
-                let name = format!("{}/{}", dir, p.file_name().unwrap().to_string_lossy());
-                let text = std::fs::read_to_string(&p).unwrap();
-                let (n0, _) = replay_round(&frames(&text, 0.0), floors);
-                let (n5, _) = replay_round(&frames(&text, 0.50), floors);
-                let (nm5, _) = replay_round(&frames(&text, -0.50), floors);
-                if n5 != 0 || nm5 != 0 {
-                    bad.push(format!(
-                        "{} nods with the head held turned: {}/{}",
-                        name, n5, nm5
-                    ));
-                }
-                if dir == "cal" && name.contains("nod") && !name.contains("single") && n0 < 2 {
-                    bad.push(format!("{} lost its nods", name));
-                }
+    /// A head already nodding when the nod window opens: 0.3 s near rest
+    /// (the settle), then two nods at mesh scale (15 degrees, 0.27 s legs),
+    /// the box riding each leg by 0.08 face widths; `still_first` puts a
+    /// full still second in front instead.
+    fn nodding(still_first: bool) -> Option<f32> {
+        let mut det = NodDetector::mesh(NodDetector::MESH_MIN_DEG);
+        assert_eq!(
+            det.inner.prior_still, 0.0,
+            "the nod window credits no still second"
+        );
+        let fps = 30.0f32;
+        let mut t = 0.0f32;
+        let (w, cx, cy0) = (90.0f32, 250.0f32, 340.0f32);
+        let mut frames: Vec<(f32, f32)> = Vec::new();
+        for _ in 0..(if still_first { 45 } else { 9 }) {
+            frames.push((0.0, cy0));
+        }
+        let leg = 8usize;
+        for _ in 0..2 {
+            for k in 1..=leg {
+                let f = k as f32 / leg as f32;
+                frames.push((15.0 * f, cy0 + 7.0 * f));
+            }
+            for k in 1..=leg {
+                let f = k as f32 / leg as f32;
+                frames.push((15.0 * (1.0 - f), cy0 + 7.0 * (1.0 - f)));
             }
         }
-        assert!(bad.is_empty(), "{:?}", bad);
+        for _ in 0..30 {
+            frames.push((0.0, cy0));
+        }
+        for (p, cy) in frames {
+            if det.push_full(p, Some(0.0), t, Some((w, cx, cy))) {
+                return Some(t);
+            }
+            t += 1.0 / fps;
+        }
+        None
+    }
+
+    /// D4: a nod under way when the window opens does not count; the same
+    /// nod from a head seen still for a second does.
+    #[test]
+    fn a_nod_under_way_at_the_window_start_does_not_count() {
+        assert!(
+            nodding(false).is_none(),
+            "a nod already in motion at the card is not a nod at it"
+        );
+        assert!(
+            nodding(true).is_some(),
+            "the same nod after an observed still second counts"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shell_answer_tests {
+    use super::*;
+
+    /// F2: the "unknown" a summon gets for a window the shell does not
+    /// have is read by the daemon, not by a change to the shared command.
+    #[test]
+    fn a_summon_answered_unknown_is_an_error_and_nothing_else_is() {
+        let summon = ["shell", "summon", "omarchy.faceauth", "{}"];
+        assert!(shell_answer(&summon, true, b"unknown\n").is_err());
+        assert!(shell_answer(&summon, true, b"  unknown  ").is_err());
+        assert!(shell_answer(&summon, true, b"ok\n").is_ok());
+        assert!(shell_answer(&summon, true, b"").is_ok());
+        assert!(
+            shell_answer(&summon, false, b"ok\n").is_err(),
+            "a failed exit is an error whatever was said"
+        );
+        let hide = ["shell", "hide", "omarchy.faceauth"];
+        assert!(
+            shell_answer(&hide, true, b"unknown\n").is_ok(),
+            "only a summon has to have shown something"
+        );
+        assert!(shell_answer(&["shell", "ping"], true, b"unknown").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod payload_size_tests {
+    use super::*;
+
+    /// D5: the payload carries what the card reads and not the raw command
+    /// line, so a command of any length keeps its card. The summon is one
+    /// argv string, and the kernel refuses one over 131072 bytes.
+    #[test]
+    fn the_payload_stays_small_for_any_command() {
+        for n in [16_000usize, 100_000, 115_000, 400_000] {
+            let raw: String = "sudo cp ".to_string() + &"a/b ".repeat(n / 4);
+            let (command, clipped) = clip_command(&raw);
+            let caller = CallerInfo {
+                pid: 1234,
+                exe: "/usr/bin/sudo".into(),
+                cmdline: raw.clone(),
+                command,
+                verified: true,
+                clipped,
+                who: "sudo (pid 1234)  from  bash (1200) <- foot (1100)".into(),
+                parents: "bash (1200) <- foot (1100)".into(),
+                kill_pid: 1234,
+                via: "sudo".into(),
+                requester: Some(1234),
+            };
+            let json = serde_json::to_string(&Payload {
+                state: "scanning",
+                message: "Look at the camera.",
+                caller: &caller,
+                token: "00112233445566778899aabbccddeeff",
+                waiting: false,
+                passwordless_minutes: None,
+                face_present: false,
+            })
+            .unwrap();
+            assert!(
+                json.len() < 65_536,
+                "cmdline {} bytes: payload {} bytes",
+                raw.len(),
+                json.len()
+            );
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            for read in ["who", "command", "clipped", "verified", "kill_pid", "via"] {
+                assert!(
+                    v["caller"].get(read).is_some(),
+                    "the card reads caller.{}",
+                    read
+                );
+            }
+            for unread in ["cmdline", "exe", "pid", "parents", "requester"] {
+                assert!(
+                    v["caller"].get(unread).is_none(),
+                    "caller.{} is not the card's",
+                    unread
+                );
+            }
+        }
     }
 }
 
@@ -4031,19 +3368,247 @@ mod facing_gate_tests {
 mod passwordless_tests {
     use super::*;
 
+    /// The rider belongs to one request: it is armed only with that
+    /// request's token, on a sudo lane, while the enrolled face is in the
+    /// nod window; it is honoured only once the card has been shown it;
+    /// and it is gone when that request's Dialog drops.
     #[test]
-    fn a_spell_is_armed_only_in_range_and_taken_once() {
+    fn a_rider_is_bound_to_its_request_and_dies_with_it() {
+        let cfg = Config::default();
         let user = "faceauth-passwordless-test-user";
-        assert!(!arm_passwordless(user, 0));
-        assert!(!arm_passwordless(user, PASSWORDLESS_MAX_MINUTES + 1));
-        assert_eq!(take_passwordless(user), None);
-        assert!(arm_passwordless(user, 15));
-        assert_eq!(take_passwordless(user), Some(15));
+        let st = test_state();
+        let _turn = st.test_live(1000, user);
+        let d = Dialog::new(&cfg, user, st).unwrap();
+        let token = d.token().to_string();
         assert_eq!(
-            take_passwordless(user),
-            None,
-            "taken once; a refusal or an approval clears it"
+            st.rider_state(user),
+            Some((None, false)),
+            "a request begins with an empty rider"
         );
+        assert_eq!(
+            st.arm_passwordless(user, &token, 15),
+            Err("no pending request"),
+            "nothing to arm before the card has been shown"
+        );
+        // The first show starts the record, on a polkit lane here.
+        st.rider_for_payload(user, &token, false, true);
+        st.set_face_present(user, true);
+        assert_eq!(
+            st.arm_passwordless(user, &token, 15),
+            Err("only a sudo request can carry it")
+        );
+        // The same request on the sudo lane, with the face away.
+        st.rider_for_payload(user, &token, true, true);
+        st.set_face_present(user, false);
+        assert_eq!(
+            st.arm_passwordless(user, &token, 15),
+            Err("look at the camera first")
+        );
+        assert!(st.set_face_present(user, true));
+        assert_eq!(
+            st.arm_passwordless(user, &token, 0),
+            Err("minutes out of range")
+        );
+        assert_eq!(
+            st.arm_passwordless(user, &token, PASSWORDLESS_MAX_MINUTES + 1),
+            Err("minutes out of range")
+        );
+        assert_eq!(
+            st.arm_passwordless(user, "not-the-token", 15),
+            Err("no pending request"),
+            "another token arms nothing"
+        );
+        assert_eq!(st.arm_passwordless(user, &token, 15), Ok(()));
+        assert!(
+            st.rider_unshown(user),
+            "the nod window must re-show the card"
+        );
+        assert_eq!(
+            st.rider_for_payload(user, &token, true, false),
+            (None, true),
+            "a payload that waits for no acknowledgement does not carry an unshown rider"
+        );
+        assert!(st.rider_unshown(user), "and it stays unshown");
+        assert_eq!(
+            st.take_passwordless(user, &token),
+            None,
+            "an arm the card has not been shown is not honoured"
+        );
+        assert_eq!(st.arm_passwordless(user, &token, 15), Ok(()));
+        assert_eq!(
+            st.rider_for_payload(user, &token, true, true),
+            (Some(15), true)
+        );
+        assert!(!st.rider_unshown(user));
+        assert_eq!(
+            st.take_passwordless(user, "another-request"),
+            None,
+            "a Match under another token enables nothing"
+        );
+        assert_eq!(
+            st.rider_state(user),
+            Some((Some(15), true)),
+            "and another token does not touch the rider"
+        );
+        assert_eq!(st.take_passwordless(user, &token), Some(15));
+        assert_eq!(st.take_passwordless(user, &token), None, "taken once");
+        assert_eq!(st.arm_passwordless(user, &token, 45), Ok(()));
+        st.rider_for_payload(user, &token, true, true);
+        drop(d);
+        assert_eq!(
+            st.rider_state(user),
+            None,
+            "the rider goes when the request's Dialog drops, whichever way it ended"
+        );
+        // A new request starts clean.
+        let d2 = Dialog::new(&cfg, user, st).unwrap();
+        assert_eq!(st.rider_state(user), Some((None, false)));
+        assert_eq!(
+            st.arm_passwordless(user, &token, 15),
+            Err("no pending request"),
+            "the old request's token arms nothing on the new one"
+        );
+        drop(d2);
+    }
+
+    /// The face flag follows only a live record with a window, and the nod
+    /// window's guard clears it when the window ends.
+    #[test]
+    fn the_face_flag_follows_the_live_record_only() {
+        let cfg = Config::default();
+        let user = "faceauth-passwordless-face-test-user";
+        let st = test_state();
+        assert!(
+            !st.set_face_present(user, true),
+            "no record, nothing to set"
+        );
+        assert_eq!(st.rider_state(user), None);
+        let _turn = st.test_live(1000, user);
+        assert!(
+            !st.set_face_present(user, true),
+            "live without a window, nothing to set"
+        );
+        let d = Dialog::new(&cfg, user, st).unwrap();
+        st.rider_for_payload(user, d.token(), true, true);
+        assert!(st.set_face_present(user, true));
+        assert!(!st.set_face_present(user, true), "unchanged");
+        assert!(st.set_face_present(user, false));
+        assert!(
+            !st.set_face_present("someone-else", true),
+            "another user's name reaches nothing"
+        );
+        drop(d);
+        assert_eq!(st.rider_state(user), None);
+    }
+
+    /// An arm after the acknowledgement resets it: the next show waits for
+    /// a fresh one and the dwell runs whole from it.
+    #[test]
+    fn an_arm_after_the_ack_restarts_the_ack_and_the_dwell() {
+        let cfg = Config::default();
+        let user = "faceauth-passwordless-ack-test-user";
+        let st = test_state();
+        let _turn = st.test_live(1000, user);
+        let mut d = Dialog::new(&cfg, user, st).unwrap();
+        let token = d.token().to_string();
+        assert!(st.ack(user, Some(&token)));
+        let at = Instant::now() - Duration::from_secs(5);
+        d.acked_at = Some(at);
+        assert_eq!(d.dwell_left(Instant::now()), Duration::ZERO);
+        assert!(d.acknowledged());
+        d.reset_ack();
+        assert_eq!(d.acked_at(), None);
+        assert!(
+            !d.acknowledged(),
+            "the old acknowledgement no longer counts"
+        );
+        assert_eq!(
+            d.dwell_left(Instant::now()),
+            ACK_DWELL,
+            "the next nod window starts with a full dwell"
+        );
+        assert!(
+            st.ack(user, Some(&token)),
+            "the card acknowledges the re-shown request"
+        );
+        assert!(d.acknowledged());
+    }
+
+    /// The payload carries the armed minutes and the face flag, so the
+    /// card draws its rider row from the daemon and not from itself.
+    #[test]
+    fn the_payload_carries_the_rider_and_the_face() {
+        let cfg = Config::default();
+        let user = "faceauth-passwordless-payload-test-user";
+        let caller = CallerInfo {
+            via: "sudo".into(),
+            ..Default::default()
+        };
+        let st = test_state();
+        let _turn = st.test_live(1000, user);
+        let d = Dialog::new(&cfg, user, st).unwrap();
+        let tok = d.token();
+        st.rider_for_payload(user, tok, true, true);
+        st.set_face_present(user, true);
+        assert_eq!(st.arm_passwordless(user, tok, 15), Ok(()));
+        let (passwordless_minutes, face_present) = st.rider_for_payload(user, tok, true, true);
+        let json = serde_json::to_string(&Payload {
+            state: "nod",
+            message: "",
+            caller: &caller,
+            token: tok,
+            waiting: false,
+            passwordless_minutes,
+            face_present,
+        })
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["passwordless_minutes"], 15);
+        assert_eq!(v["face_present"], true);
+        st.set_face_present(user, false);
+        let (m, f) = st.rider_for_payload(user, tok, true, true);
+        assert_eq!((m, f), (Some(15), false));
+        let old = tok.to_string();
+        drop(d);
+        let d2 = Dialog::new(&cfg, user, st).unwrap();
+        let (m, f) = st.rider_for_payload(user, d2.token(), true, true);
+        assert_eq!((m, f), (None, false), "a fresh record carries nothing");
+        assert_eq!(
+            st.rider_for_payload(user, &old, true, true),
+            (None, false),
+            "the old token reaches nothing"
+        );
+    }
+
+    /// Re-arming with a timer that will not start leaves no rule behind:
+    /// the earlier spell's rule goes with its stopped timer.
+    #[test]
+    fn a_failed_re_arm_removes_the_earlier_rule() {
+        let dir =
+            std::env::temp_dir().join(format!("faceauth-sudoers-rearm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = std::cell::Cell::new(0u32);
+        let arm = |_: &[String]| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "Unit omarchy-nopasswd-expire-mellis.timer already exists"
+                ))
+            }
+        };
+        let file = enable_passwordless(&dir, "mellis", 20, &arm).unwrap();
+        assert!(file.exists(), "the first spell is in place with its timer");
+        let err = enable_passwordless(&dir, "mellis", 40, &arm).unwrap_err();
+        assert!(err.to_string().contains("no rule is in place"), "{:#}", err);
+        assert!(
+            !file.exists(),
+            "the earlier rule does not outlive its timer when the re-arm fails"
+        );
+        assert_eq!(calls.get(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The rule Omarchy's own command writes, root-only, and the timer it
@@ -4119,8 +3684,8 @@ mod mesh_battery {
         assert!(files.len() >= 12, "the twelve rounds are in {}", dir);
         for p in files {
             let name = p.file_stem().unwrap().to_string_lossy().to_string();
-            let frames = parse_v2(&std::fs::read_to_string(&p).unwrap());
-            let (nods, shakes) = replay_round_v2(&frames, floors);
+            let frames = parse_round(&std::fs::read_to_string(&p).unwrap());
+            let (nods, shakes) = replay_round(&frames, floors);
             eprintln!(
                 "mesh battery {:16} {} frames: {} nods, {} shakes",
                 name,
@@ -4147,5 +3712,268 @@ mod mesh_battery {
             }
         }
         assert!(bad.is_empty(), "{:#?}", bad);
+    }
+
+    /// The floors the walk-through derives from a person's own rounds keep
+    /// that person's gestures (round-4 C2). Derived the way the walk-through
+    /// does it, from where each reference round stops reading, the floors
+    /// still read both nods and both shakes as two, and the eight everyday
+    /// rounds as nothing. The swing rule they replace lost shake-1.
+    #[test]
+    fn the_derived_floors_keep_the_reference_users_own_gestures() {
+        let dir = format!("{}/traces/v2", env!("CARGO_MANIFEST_DIR"));
+        let read =
+            |n: &str| parse_round(&std::fs::read_to_string(format!("{}/{}.txt", dir, n)).unwrap());
+        let mut g = crate::store::GestureCal::default();
+        for n in ["nod-1", "nod-2"] {
+            let r = reads_to_deg(&read(n), true);
+            eprintln!("derived floors: {} reads up to {:?} degrees", n, r);
+            g.nod_reads_to_deg
+                .push(r.expect("the reference nod reads at the minimum"));
+        }
+        for n in ["shake-1", "shake-2"] {
+            let r = reads_to_deg(&read(n), false);
+            eprintln!("derived floors: {} reads up to {:?} degrees", n, r);
+            g.shake_reads_to_deg
+                .push(r.expect("the reference shake reads at the minimum"));
+        }
+        let floors = g.floors_deg(NodDetector::MESH_MIN_DEG, ShakeDetector::MESH_MIN_DEG);
+        // What 0.4 of the larger swing gave the same rounds (13.88, 22.72).
+        let swing_rule = (13.88, 22.72);
+        eprintln!(
+            "derived floors: nod {:.2} shake {:.2} (the swing rule gave nod {} shake {})",
+            floors.0, floors.1, swing_rule.0, swing_rule.1
+        );
+        assert!(
+            floors.0 > NodDetector::MESH_MIN_DEG && floors.1 > ShakeDetector::MESH_MIN_DEG,
+            "the derivation raises both floors off the minimum for this person: {:?}",
+            floors
+        );
+        let mut bad = Vec::new();
+        for n in [
+            "nod-1",
+            "nod-2",
+            "shake-1",
+            "shake-2",
+            "glance-left-1",
+            "glance-left-2",
+            "glance-right-1",
+            "glance-right-2",
+            "keyboard-1",
+            "lean-1",
+            "read-1",
+            "talk-1",
+        ] {
+            let f = read(n);
+            let at_derived = replay_round(&f, floors);
+            let at_swing = replay_round(&f, swing_rule);
+            eprintln!(
+                "derived floors: {:15} derived -> {} nods {} shakes; swing rule -> {} nods {} shakes",
+                n, at_derived.0, at_derived.1, at_swing.0, at_swing.1
+            );
+            let want = if n.starts_with("nod") {
+                (2, 0)
+            } else if n.starts_with("shake") {
+                (0, 2)
+            } else {
+                (0, 0)
+            };
+            if at_derived.0 < want.0
+                || at_derived.1 < want.1
+                || (want == (0, 0) && at_derived != (0, 0))
+            {
+                bad.push(format!(
+                    "{}: {:?} at the derived floors {:?}",
+                    n, at_derived, floors
+                ));
+            }
+        }
+        assert!(bad.is_empty(), "{:#?}", bad);
+        assert_eq!(
+            replay_round(&read("shake-1"), swing_rule).1,
+            0,
+            "the swing rule's floors lose shake-1; if this reads, the margin can be revisited"
+        );
+    }
+}
+
+/// The attack cases on the mesh detectors (round-4 C4), which are the only
+/// gesture path since round-4 C3 took the image-motion one out.
+#[cfg(test)]
+mod mesh_redteam {
+    use super::*;
+
+    const FPS: f32 = 28.0;
+    const BOX: (f32, f32, f32) = (92.0, 252.0, 342.0);
+
+    /// A pitch series: rest, then two nods of `amp` degrees at `leg`
+    /// frames a leg, then rest.
+    fn two_nods(amp: f32, leg: usize) -> Vec<f32> {
+        let mut pitch: Vec<f32> = vec![0.0; 40];
+        for _ in 0..2 {
+            for k in 1..=leg {
+                pitch.push(amp * k as f32 / leg as f32);
+            }
+            for k in 1..=leg {
+                pitch.push(amp - amp * k as f32 / leg as f32);
+            }
+        }
+        pitch.extend(std::iter::repeat_n(0.0, 30));
+        pitch
+    }
+
+    /// Frames from a pitch series; the box rides the pitch when
+    /// `box_moves`, as a head does, and stays put otherwise, as a detector
+    /// fit that flips does.
+    fn frames(pitch: &[f32], yaw: f32, box_moves: bool) -> Vec<RoundFrame> {
+        pitch
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| {
+                let cy = if box_moves { BOX.2 + p * 0.6 } else { BOX.2 };
+                RoundFrame {
+                    t: i as f32 / FPS,
+                    yaw,
+                    pitch: p,
+                    roll: 0.0,
+                    geom: (BOX.0, BOX.1, cy),
+                }
+            })
+            .collect()
+    }
+
+    fn defaults() -> (f32, f32) {
+        (NodDetector::MESH_MIN_DEG, ShakeDetector::MESH_MIN_DEG)
+    }
+
+    /// The red team's two cases in mesh form: a pitch that oscillates
+    /// while the box stays frozen is not a head and reads as nothing; a
+    /// waggled board carries its box and passes the detector by design,
+    /// left to the strobed confirm.
+    #[test]
+    fn a_frozen_box_is_not_a_nod_and_a_waggled_board_is_left_to_the_confirm() {
+        let pitch = two_nods(15.0, 8);
+        let frozen = replay_round(&frames(&pitch, 0.0, false), defaults());
+        let waggled = replay_round(&frames(&pitch, 0.0, true), defaults());
+        assert_eq!(frozen, (0, 0), "a frozen box read as a gesture");
+        assert!(
+            waggled.0 >= 2,
+            "the waggled board is meant to pass the detector (the confirm refuses it); it read {} nods",
+            waggled.0
+        );
+    }
+
+    /// The frozen box is refused by the box-motion rule and nothing else:
+    /// with `co_motion` off the same frames read as nods. The rule is
+    /// what carries the case, so it must stay on in `NodDetector::mesh`.
+    #[test]
+    fn the_box_motion_rule_is_what_refuses_the_frozen_box() {
+        let pitch = two_nods(15.0, 8);
+        let mut det = NodDetector::mesh(NodDetector::MESH_MIN_DEG);
+        assert!(
+            det.inner.co_motion.is_some(),
+            "the live detector runs the rule"
+        );
+        det.inner.co_motion = None;
+        det.inner.prior_still = 1.0;
+        for f in frames(&pitch, 0.0, false) {
+            det.push_full(f.pitch, Some(0.0), f.t, Some(f.geom));
+        }
+        assert!(
+            det.nods >= 2,
+            "with the rule off the frozen box read {} nods",
+            det.nods
+        );
+    }
+
+    /// A detector fit that flips: the pitch jumps to a plateau in one
+    /// frame, holds, and jumps back, twice, over a box that does not move
+    /// (the shape of the 2026-09-22 flicker recording that approved a
+    /// request). Nothing, at any nod-sized plateau.
+    #[test]
+    fn a_plateau_flicker_over_a_still_box_is_not_a_nod() {
+        for amp in [10.0f32, 15.0, 25.0] {
+            for hold in [1usize, 2, 4, 6] {
+                let mut pitch: Vec<f32> = vec![0.0; 40];
+                for _ in 0..2 {
+                    pitch.extend(std::iter::repeat_n(amp, hold));
+                    pitch.extend(std::iter::repeat_n(0.0, hold));
+                }
+                pitch.extend(std::iter::repeat_n(0.0, 30));
+                let got = replay_round(&frames(&pitch, 0.0, false), defaults());
+                assert_eq!(
+                    got,
+                    (0, 0),
+                    "a {} degree plateau held {} frames read as {:?}",
+                    amp,
+                    hold,
+                    got
+                );
+            }
+        }
+    }
+
+    /// A head held turned toward another screen nods the same way on the
+    /// pitch axis, but it is not nodding at the card. The reference nods,
+    /// re-centred so their mean yaw is the offset, still read as two held
+    /// 30 degrees off (the gate is `YAW_FACING_DEG`, 34.29) and read as
+    /// nothing from 36 degrees either way.
+    #[test]
+    fn a_nod_from_a_head_held_turned_does_not_count_on_the_mesh() {
+        let dir = format!("{}/traces/v2", env!("CARGO_MANIFEST_DIR"));
+        let mut bad = Vec::new();
+        for name in ["nod-1", "nod-2"] {
+            let recorded =
+                parse_round(&std::fs::read_to_string(format!("{}/{}.txt", dir, name)).unwrap());
+            let mean = recorded.iter().map(|f| f.yaw).sum::<f32>() / recorded.len() as f32;
+            let held_at = |off: f32| -> (usize, usize) {
+                let turned: Vec<RoundFrame> = recorded
+                    .iter()
+                    .map(|f| RoundFrame {
+                        yaw: f.yaw - mean + off,
+                        ..f.clone()
+                    })
+                    .collect();
+                replay_round(&turned, defaults())
+            };
+            let (n0, _) = replay_round(&recorded, defaults());
+            if n0 < 2 {
+                bad.push(format!("{} lost its nods as recorded: {}", name, n0));
+            }
+            for off in [30.0f32, -30.0] {
+                let (n, _) = held_at(off);
+                if n < 2 {
+                    bad.push(format!(
+                        "{} held {:+.0} degrees off (inside the gate): {} nods",
+                        name, off, n
+                    ));
+                }
+            }
+            for off in [36.0f32, -36.0, 43.0, -43.0, 60.0, -60.0] {
+                let (n, s) = held_at(off);
+                if n != 0 {
+                    bad.push(format!("{} held {:+.0} degrees off: {} nods", name, off, n));
+                }
+                if s != 0 {
+                    bad.push(format!(
+                        "{} held {:+.0} degrees off: {} shakes",
+                        name, off, s
+                    ));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{:#?}", bad);
+    }
+
+    /// The same synthetic nods made with the head turned: the facing gate
+    /// refuses them, not the box rule, so the box is allowed to move.
+    #[test]
+    fn a_synthetic_nod_with_the_head_turned_does_not_count() {
+        let pitch = two_nods(20.0, 8);
+        assert!(replay_round(&frames(&pitch, 0.0, true), defaults()).0 >= 2);
+        for yaw in [40.0f32, -40.0, 70.0] {
+            let got = replay_round(&frames(&pitch, yaw, true), defaults());
+            assert_eq!(got.0, 0, "nods at yaw {}: {:?}", yaw, got);
+        }
     }
 }

@@ -5,19 +5,23 @@
 //!
 //! - match                        -> PAM_SUCCESS
 //! - refused                      -> PAM_AUTH_ERR (consent lines only: a head
-//!   shake, a dismissed window, or a confirm after the nods that failed)
+//!   shake, a dismissed window, or a confirm after the nods that failed;
+//!   the daemon sends it on the polkit lane, where the agent cancels the
+//!   request on it, and answers sudo with "not by face" instead)
 //! - anything else, any failure   -> PAM_IGNORE
 //!
-//! No camera, no models, no templates, no image data in this process. Every
-//! failure path is PAM_IGNORE so that under `sufficient` or
-//! `[success=done default=ignore]` the stack falls through to the password;
-//! lockout is structurally impossible from here. Panics are caught and become
-//! PAM_IGNORE too. The one deliberate answer, a refusal, is PAM_AUTH_ERR so
-//! that a consent line written as `[success=done auth_err=die default=ignore]`
-//! ends the stack on it: the window had the password box, so closing it
-//! without a password or a nod is the answer no, and no other prompt follows.
+//! No camera, no models, no templates, no image data in this process, and no
+//! conversation with the application: the module never prompts and never
+//! sees a password. Every failure path is PAM_IGNORE so that under
+//! `sufficient` or `[success=done default=ignore]` the stack falls through to
+//! the password; lockout is structurally impossible from here. Panics are
+//! caught and become PAM_IGNORE too. The one deliberate answer, a refusal, is
+//! PAM_AUTH_ERR so that a consent line written as
+//! `[success=done auth_err=die default=ignore]` ends the stack on it: the
+//! window had the password box, so closing it without a password or a nod is
+//! the answer no, and no other prompt follows.
 //!
-//! Module arguments (in the PAM line):
+//! Module arguments (in the PAM line), and no others:
 //!
 //! - `socket=/run/faceauth/sock`: where the daemon listens.
 //! - `consent`: the elevation argument, for sudo and polkit. The daemon opens
@@ -25,15 +29,13 @@
 //!   approved by two nods or by the password typed into that window; sitting
 //!   in front of the machine never elevates anything by itself. The window
 //!   waits until it is answered, so `timeout=` is ignored on a consent line
-//!   (the module logs that it was) and `prompt` is not consulted.
+//!   (the module logs that it was).
 //! - `timeout=8`: seconds to wait for the daemon's reply on a plain look (the
 //!   lock screen, where looking at the machine is the act).
-//! - `prompt`: the older deliberate act for a caller that has a conversation:
-//!   Enter on an empty line runs the face scan, anything typed is handed on
-//!   as the password (PAM_AUTHTOK, for the `try_first_pass` module behind us,
-//!   byte for byte) and no scan runs. `consent` is preferred for elevation
-//!   because the caller relaying the conversation is the process asking to be
-//!   elevated.
+//!
+//! Any other word is ignored and logged: a misspelt `consent` must not pass
+//! in silence, and the daemon refuses the plain look it would leave from a
+//! root caller.
 //!
 //! The daemon trusts an effective-uid-0 peer with its root-only requests
 //! (enrolment, deletion, calibration), and under sudo and polkit this module
@@ -53,34 +55,6 @@ const PAM_SUCCESS: c_int = 0;
 const PAM_RHOST: c_int = 4;
 const PAM_IGNORE: c_int = 25;
 const PAM_AUTH_ERR: c_int = 7;
-const PAM_AUTHTOK: c_int = 6;
-const PAM_CONV: c_int = 5;
-const PAM_PROMPT_ECHO_OFF: c_int = 1;
-
-#[repr(C)]
-struct pam_message {
-    msg_style: c_int,
-    msg: *const c_char,
-}
-
-#[repr(C)]
-struct pam_response {
-    resp: *mut c_char,
-    resp_retcode: c_int,
-}
-
-#[repr(C)]
-struct pam_conv {
-    conv: Option<
-        unsafe extern "C" fn(
-            c_int,
-            *mut *const pam_message,
-            *mut *mut pam_response,
-            *mut c_void,
-        ) -> c_int,
-    >,
-    appdata_ptr: *mut c_void,
-}
 
 const DEFAULT_SOCKET: &str = "/run/faceauth/sock";
 const DEFAULT_TIMEOUT: u64 = 8;
@@ -91,8 +65,10 @@ pub struct pam_handle_t {
     _private: [u8; 0],
 }
 
+// Linked, not merely declared: a host that loads libpam privately (Python's
+// ctypes does) resolves these only through the module's own DT_NEEDED.
+#[link(name = "pam")]
 extern "C" {
-    fn syslog(priority: c_int, fmt: *const c_char, ...);
     fn pam_get_user(
         pamh: *mut pam_handle_t,
         user: *mut *const c_char,
@@ -100,14 +76,16 @@ extern "C" {
     ) -> c_int;
     fn pam_get_item(pamh: *const pam_handle_t, item_type: c_int, item: *mut *const c_void)
         -> c_int;
-    fn pam_set_item(pamh: *mut pam_handle_t, item_type: c_int, item: *const c_void) -> c_int;
-    fn free(p: *mut c_void);
+    fn pam_syslog(pamh: *const pam_handle_t, priority: c_int, fmt: *const c_char, ...);
+}
+
+extern "C" {
+    fn syslog(priority: c_int, fmt: *const c_char, ...);
 }
 
 struct Args {
     socket: String,
     timeout: Duration,
-    prompt: Option<String>,
     /// Elevation: the daemon opens the window and requires the nod. No
     /// conversation with the caller at all, since the caller cannot be trusted
     /// to relay a yes.
@@ -116,28 +94,37 @@ struct Args {
 
 const LOG_AUTHPRIV_INFO: c_int = (10 << 3) | 6;
 
-/// One line to the auth log per decision, for `doctor` and for measuring the
-/// stack around us. Never includes the password.
-fn log(msg: &str) {
-    if let Ok(c) = std::ffi::CString::new(msg) {
-        let fmt = b"pam_faceauth: %s\0";
+/// One line to the auth log per decision, for measuring the stack around
+/// us. Through `pam_syslog`, which prefixes the module and the service
+/// (`pam_faceauth(sudo:auth)`), so the log says which stack decided. Never
+/// includes a password: the module never holds one.
+fn log(pamh: *const pam_handle_t, msg: &str) {
+    let Ok(c) = std::ffi::CString::new(msg) else {
+        return;
+    };
+    let fmt = b"%s\0";
+    if pamh.is_null() {
+        // No transaction (a test): the plain syslog, with the name by hand.
+        let tagged = b"pam_faceauth: %s\0";
         // SAFETY: format string with one %s and a matching C string argument.
-        unsafe { syslog(LOG_AUTHPRIV_INFO, fmt.as_ptr() as *const c_char, c.as_ptr()) };
+        unsafe {
+            syslog(
+                LOG_AUTHPRIV_INFO,
+                tagged.as_ptr() as *const c_char,
+                c.as_ptr(),
+            )
+        };
+        return;
     }
-}
-
-/// Overwrite a buffer that may hold a password before it is freed.
-fn wipe_bytes(mut bytes: Vec<u8>) {
-    for b in bytes.iter_mut() {
-        // Volatile so the compiler keeps the stores to a buffer it is about to free.
-        unsafe { std::ptr::write_volatile(b, 0) };
-    }
-    drop(bytes);
-}
-
-/// Overwrite a CString's bytes before it is freed.
-fn wipe(c: std::ffi::CString) {
-    wipe_bytes(c.into_bytes());
+    // SAFETY: pamh is the handle PAM gave us; one %s, one C string argument.
+    unsafe {
+        pam_syslog(
+            pamh,
+            LOG_AUTHPRIV_INFO,
+            fmt.as_ptr() as *const c_char,
+            c.as_ptr(),
+        )
+    };
 }
 
 /// Names go into the auth log; strip anything that could forge a line.
@@ -145,59 +132,10 @@ fn sanitise(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).take(64).collect()
 }
 
-const DEFAULT_PROMPT: &str = "Press Enter to authenticate by face, or type your password: ";
-
-/// Ask through the application's conversation. `Ok(Some(bytes))` is what the
-/// user typed (empty for a bare Enter), kept as the bytes the application
-/// handed over because a password is not text: rewriting it into UTF-8 would
-/// hand the module behind us a password that can never match. `Ok(None)`
-/// means no conversation is available, `Err` that the application refused.
-fn converse(pamh: *mut pam_handle_t, text: &str) -> Result<Option<Vec<u8>>, ()> {
-    let mut item: *const c_void = std::ptr::null();
-    // SAFETY: pamh is PAM's handle; item is a valid out-pointer.
-    let rc = unsafe { pam_get_item(pamh, PAM_CONV, &mut item) };
-    if rc != PAM_SUCCESS || item.is_null() {
-        return Ok(None);
-    }
-    let conv = unsafe { &*(item as *const pam_conv) };
-    let Some(f) = conv.conv else { return Ok(None) };
-    let ctext = std::ffi::CString::new(text).map_err(|_| ())?;
-    let msg = pam_message {
-        msg_style: PAM_PROMPT_ECHO_OFF,
-        msg: ctext.as_ptr(),
-    };
-    let mut msg_ptr: *const pam_message = &msg;
-    let mut resp: *mut pam_response = std::ptr::null_mut();
-    // SAFETY: one message, one response slot; the application allocates the
-    // response array with malloc and we free it (the PAM contract).
-    let rc = unsafe { f(1, &mut msg_ptr, &mut resp, conv.appdata_ptr) };
-    if rc != PAM_SUCCESS || resp.is_null() {
-        return Err(());
-    }
-    let out = unsafe {
-        let r = &*resp;
-        let bytes = if r.resp.is_null() {
-            Vec::new()
-        } else {
-            CStr::from_ptr(r.resp).to_bytes().to_vec()
-        };
-        if !r.resp.is_null() {
-            // Wipe before freeing: it may be a password.
-            let len = bytes.len();
-            std::ptr::write_bytes(r.resp, 0, len);
-            free(r.resp as *mut c_void);
-        }
-        free(resp as *mut c_void);
-        bytes
-    };
-    Ok(Some(out))
-}
-
-fn parse_args(argc: c_int, argv: *const *const c_char) -> Args {
+fn parse_args(pamh: *const pam_handle_t, argc: c_int, argv: *const *const c_char) -> Args {
     let mut a = Args {
         socket: DEFAULT_SOCKET.to_string(),
         timeout: Duration::from_secs(DEFAULT_TIMEOUT),
-        prompt: None,
         consent: false,
     };
     let mut timeout_given = false;
@@ -222,21 +160,27 @@ fn parse_args(argc: c_int, argv: *const *const c_char) -> Args {
             }
         } else if s == "consent" {
             a.consent = true;
-        } else if s == "prompt" {
-            a.prompt = Some(DEFAULT_PROMPT.to_string());
-        } else if let Some(v) = s.strip_prefix("prompt=") {
-            a.prompt = Some(v.replace('_', " "));
+        } else {
+            // A word the module does not know is dropped, and said so: a
+            // misspelt `consent` must not pass in silence. The daemon
+            // refuses the plain look it would leave from a root caller.
+            log(
+                pamh,
+                &format!("unknown argument {:?} ignored", sanitise(&s)),
+            );
         }
     }
     if a.consent && timeout_given {
         // A consent line waits for the user, without limit: the window sits
         // there until it is answered. `timeout=` bounds a plain look only.
-        log("timeout= is ignored on a consent line; the window waits until it is answered");
+        log(
+            pamh,
+            "timeout= is ignored on a consent line; the window waits until it is answered",
+        );
     }
     a
 }
 
-/// The whole conversation with the daemon. Any error is `false`.
 /// Is the process on the other end of `stream` running as root?
 fn peer_is_root(stream: &UnixStream) -> bool {
     use std::os::unix::io::AsRawFd;
@@ -288,9 +232,17 @@ fn request_line(user: &str, consent: bool) -> Option<String> {
     })
 }
 
-fn daemon_says(socket: &Path, user: &str, timeout: Duration, consent: bool) -> Said {
+/// The whole conversation with the daemon. Anything but a match or a
+/// refusal, and any error, is `Said::Other`.
+fn daemon_says(
+    pamh: *const pam_handle_t,
+    socket: &Path,
+    user: &str,
+    timeout: Duration,
+    consent: bool,
+) -> Said {
     let Some(req) = request_line(user, consent) else {
-        log("user name would need escaping; not asking the daemon");
+        log(pamh, "user name would need escaping; not asking the daemon");
         return Said::Other;
     };
     let Ok(mut stream) = UnixStream::connect(socket) else {
@@ -300,7 +252,10 @@ fn daemon_says(socket: &Path, user: &str, timeout: Duration, consent: bool) -> S
     // can put a listener there; this check is the belt to that suspender. A
     // peer that is not root is not the daemon, and its answers are nobody's.
     if !peer_is_root(&stream) {
-        log("the socket's peer is not root; not the daemon, ignoring it");
+        log(
+            pamh,
+            "the socket's peer is not root; not the daemon, ignoring it",
+        );
         return Said::Other;
     }
     // A consent request has no deadline: the daemon answers when the user does.
@@ -323,13 +278,14 @@ fn daemon_says(socket: &Path, user: &str, timeout: Duration, consent: bool) -> S
     classify(&line, consent)
 }
 
-/// The daemon serialises the tag first: the reply must BEGIN with the match
-/// object, so no later field (which may echo request bytes) can ever make a
-/// non-match read as one. A refusal is read the same way, and only on a
-/// consent line: a plain scan has no answer no.
+/// The daemon serialises the tag first and always follows it with more
+/// fields: the reply must BEGIN with the match object, so no later field
+/// (which may echo request bytes) can ever make a non-match read as one. A
+/// refusal is read the same way, and only on a consent line: a plain scan
+/// has no answer no.
 fn classify(line: &str, consent: bool) -> Said {
     let t = line.trim_start();
-    if t.starts_with("{\"result\":\"match\",") || t == "{\"result\":\"match\"}" {
+    if t.starts_with("{\"result\":\"match\",") {
         Said::Match
     } else if consent && t.starts_with("{\"result\":\"refused\",") {
         Said::Refused
@@ -339,7 +295,7 @@ fn classify(line: &str, consent: bool) -> Said {
 }
 
 fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char) -> c_int {
-    let args = parse_args(argc, argv);
+    let args = parse_args(pamh, argc, argv);
     let mut user_ptr: *const c_char = std::ptr::null();
     // SAFETY: pamh is the handle PAM gave us; user_ptr is a valid out-pointer.
     let rc = unsafe { pam_get_user(pamh, &mut user_ptr, std::ptr::null()) };
@@ -352,7 +308,7 @@ fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char
         .to_str()
         .map(str::to_owned)
     else {
-        log("user name is not UTF-8, ignoring");
+        log(pamh, "user name is not UTF-8, ignoring");
         return PAM_IGNORE;
     };
     if user.is_empty() || user.len() > 256 {
@@ -367,51 +323,38 @@ fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char
     if unsafe { pam_get_item(pamh, PAM_RHOST, &mut rhost) } == PAM_SUCCESS && !rhost.is_null() {
         let host = unsafe { CStr::from_ptr(rhost as *const c_char) }.to_string_lossy();
         if !host.is_empty() {
-            log(&format!(
-                "user {}: remote host {} on the transaction, no scan",
-                sanitise(&user),
-                sanitise(&host)
-            ));
+            log(
+                pamh,
+                &format!(
+                    "user {}: remote host {} on the transaction, no scan",
+                    sanitise(&user),
+                    sanitise(&host)
+                ),
+            );
             return PAM_IGNORE;
         }
     }
     let t0 = std::time::Instant::now();
-    if let (Some(text), false) = (&args.prompt, args.consent) {
-        match converse(pamh, text) {
-            // Typed something: that is the password for the module behind us,
-            // handed on as the bytes typed; no scan.
-            Ok(Some(typed)) if !typed.is_empty() => {
-                // The bytes came from a C string, so they hold no NUL and this cannot fail.
-                if let Ok(tok) = std::ffi::CString::new(typed) {
-                    // SAFETY: PAM copies the item.
-                    unsafe { pam_set_item(pamh, PAM_AUTHTOK, tok.as_ptr() as *const c_void) };
-                    // The password must not linger in freed heap.
-                    wipe(tok);
-                }
-                log(&format!(
-                    "user {}: password typed at the prompt, no scan",
-                    sanitise(&user)
-                ));
-                return PAM_IGNORE;
-            }
-            // Bare Enter: the deliberate act. Scan.
-            Ok(Some(_)) => {}
-            // No conversation (a non-interactive caller): do not scan on our own initiative.
-            Ok(None) => return PAM_IGNORE,
-            Err(()) => return PAM_IGNORE,
-        }
-    }
-    let said = daemon_says(Path::new(&args.socket), &user, args.timeout, args.consent);
-    log(&format!(
-        "user {}: {} after {} ms",
-        sanitise(&user),
-        match said {
-            Said::Match => "match, success",
-            Said::Refused => "refused by the user, auth error",
-            Said::Other => "no match or no daemon, ignore",
-        },
-        t0.elapsed().as_millis()
-    ));
+    let said = daemon_says(
+        pamh,
+        Path::new(&args.socket),
+        &user,
+        args.timeout,
+        args.consent,
+    );
+    log(
+        pamh,
+        &format!(
+            "user {}: {} after {} ms",
+            sanitise(&user),
+            match said {
+                Said::Match => "match, success",
+                Said::Refused => "refused by the user, auth error",
+                Said::Other => "no match or no daemon, ignore",
+            },
+            t0.elapsed().as_millis()
+        ),
+    );
     match said {
         Said::Match => PAM_SUCCESS,
         Said::Refused => PAM_AUTH_ERR,
@@ -429,6 +372,10 @@ pub extern "C" fn pam_sm_authenticate(
     catch_unwind(AssertUnwindSafe(|| authenticate(pamh, argc, argv))).unwrap_or(PAM_IGNORE)
 }
 
+/// Credentials: nothing to establish, and success rather than ignore. On
+/// the lock stack a face success freezes the chain and `pam_setcred` then
+/// runs on into `pam_deny`'s setcred; an ignore here made that transaction
+/// answer PAM_CRED_ERR, where pam_fprintd and pam_u2f answer success.
 #[no_mangle]
 pub extern "C" fn pam_sm_setcred(
     _pamh: *mut pam_handle_t,
@@ -436,7 +383,7 @@ pub extern "C" fn pam_sm_setcred(
     _argc: c_int,
     _argv: *const *const c_char,
 ) -> c_int {
-    PAM_IGNORE
+    PAM_SUCCESS
 }
 
 #[no_mangle]
@@ -448,9 +395,6 @@ pub extern "C" fn pam_sm_acct_mgmt(
 ) -> c_int {
     PAM_IGNORE
 }
-
-#[allow(dead_code)]
-fn _keep(_: *mut c_void) {}
 
 #[cfg(test)]
 mod tests {
@@ -505,33 +449,13 @@ mod tests {
     fn no_daemon_is_not_a_match() {
         assert_eq!(
             daemon_says(
+                std::ptr::null(),
                 Path::new("/nonexistent/faceauth.sock"),
                 "alice",
                 Duration::from_secs(1),
                 false
             ),
             Said::Other
-        );
-    }
-
-    /// F7: a typed password reaches PAM_AUTHTOK as the bytes typed. The
-    /// conversion the module applies is CStr bytes to CString, with no text
-    /// decoding in between, so a Latin-1 byte survives.
-    #[test]
-    fn a_typed_password_keeps_its_bytes() {
-        let typed: &[u8] = b"caf\xe9-pass\0";
-        let c = CStr::from_bytes_with_nul(typed).unwrap();
-        let as_module_keeps_it = c.to_bytes().to_vec();
-        let handed_on = std::ffi::CString::new(as_module_keeps_it).unwrap();
-        assert_eq!(
-            handed_on.as_bytes(),
-            &typed[..typed.len() - 1],
-            "the bytes handed to PAM_AUTHTOK are the bytes typed"
-        );
-        assert_ne!(
-            handed_on.as_bytes(),
-            "caf\u{FFFD}-pass".as_bytes(),
-            "no replacement character was introduced"
         );
     }
 
@@ -569,7 +493,13 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();
         assert_eq!(
-            daemon_says(&path, "ali\u{7}ce", Duration::from_secs(1), true),
+            daemon_says(
+                std::ptr::null(),
+                &path,
+                "ali\u{7}ce",
+                Duration::from_secs(1),
+                true
+            ),
             Said::Other
         );
         assert_eq!(
@@ -631,37 +561,59 @@ mod tests {
 
     #[test]
     fn args_parse_with_defaults() {
-        let a = parse_args(0, std::ptr::null());
+        let a = parse_args(std::ptr::null(), 0, std::ptr::null());
         assert_eq!(a.socket, DEFAULT_SOCKET);
         assert_eq!(a.timeout, Duration::from_secs(DEFAULT_TIMEOUT));
-        assert!(a.prompt.is_none());
+        assert!(!a.consent);
     }
 
+    fn parse(words: &[&str]) -> Args {
+        let args: Vec<std::ffi::CString> = words
+            .iter()
+            .map(|s| std::ffi::CString::new(*s).unwrap())
+            .collect();
+        let ptrs: Vec<*const c_char> = args.iter().map(|c| c.as_ptr()).collect();
+        parse_args(std::ptr::null(), words.len() as c_int, ptrs.as_ptr())
+    }
+
+    /// The module's whole argument surface: `socket=`, `timeout=` and
+    /// `consent`. The old `prompt` mode is gone, and any other word changes
+    /// nothing (it is logged), so a misspelt `consent` leaves a plain look
+    /// the daemon refuses from a root caller.
     #[test]
-    fn prompt_arguments() {
-        let args: Vec<std::ffi::CString> = ["prompt", "timeout=3"]
-            .iter()
-            .map(|s| std::ffi::CString::new(*s).unwrap())
-            .collect();
-        let ptrs: Vec<*const c_char> = args.iter().map(|c| c.as_ptr()).collect();
-        let a = parse_args(2, ptrs.as_ptr());
-        assert_eq!(a.prompt.as_deref(), Some(DEFAULT_PROMPT));
+    fn the_only_arguments_are_socket_timeout_and_consent() {
+        let a = parse(&["socket=/run/x/sock", "timeout=3", "consent"]);
+        assert_eq!(a.socket, "/run/x/sock");
         assert_eq!(a.timeout, Duration::from_secs(3));
-        let args: Vec<std::ffi::CString> = ["consent"]
-            .iter()
-            .map(|s| std::ffi::CString::new(*s).unwrap())
-            .collect();
-        let ptrs: Vec<*const c_char> = args.iter().map(|c| c.as_ptr()).collect();
-        let c = parse_args(1, ptrs.as_ptr());
-        assert!(c.consent);
-        let args: Vec<std::ffi::CString> = ["prompt=Face:_Enter_to_scan"]
-            .iter()
-            .map(|s| std::ffi::CString::new(*s).unwrap())
-            .collect();
-        let ptrs: Vec<*const c_char> = args.iter().map(|c| c.as_ptr()).collect();
+        assert!(a.consent);
+        let defaults = parse(&[]);
+        for stray in [
+            "prompt",
+            "prompt=Face:_Enter_to_scan",
+            "consnet",
+            "try_first_pass",
+            "timeout=abc",
+            "",
+        ] {
+            let b = parse(&[stray]);
+            assert_eq!(b.socket, defaults.socket, "{:?}", stray);
+            assert_eq!(b.timeout, defaults.timeout, "{:?}", stray);
+            assert!(!b.consent, "{:?}", stray);
+        }
         assert_eq!(
-            parse_args(1, ptrs.as_ptr()).prompt.as_deref(),
-            Some("Face: Enter to scan")
+            parse(&["timeout=0"]).timeout,
+            Duration::from_secs(1),
+            "clamped"
         );
+        assert_eq!(
+            parse(&["timeout=9999"]).timeout,
+            Duration::from_secs(600),
+            "clamped"
+        );
+        // The source names no other argument either.
+        let src = include_str!("lib.rs");
+        let non_test = &src[..src.find("#[cfg(test)]").unwrap()];
+        assert!(!non_test.contains("PAM_AUTHTOK") && !non_test.contains("PAM_CONV"));
+        assert!(!non_test.contains("pam_set_item"));
     }
 }

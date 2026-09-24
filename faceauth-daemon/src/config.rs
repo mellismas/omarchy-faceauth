@@ -1,18 +1,26 @@
 //! Daemon configuration: `/etc/faceauth/config.toml`, every key optional.
+//! Only what an administrator can usefully change is a key; what the
+//! system fixes is a constant here (H15).
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Where templates live (one file per user, root 0600). Fixed: the unit's
+/// sandbox makes only this directory writable and the removal script
+/// looks here, so any other value would make every save fail.
+pub const STORE_DIR: &str = "/var/lib/faceauth";
+/// The Unix socket the PAM module, the CLI and the shell's windows talk
+/// to. Fixed: the PAM lines, the windows and the CLI all name it, so a
+/// changed key would break them without a word.
+pub const SOCKET: &str = "/run/faceauth/sock";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Where the model weights live.
+    /// Where the model weights live. The omarchy-faceauth-models package
+    /// installs them under the default; nothing here downloads anything.
     pub models_dir: PathBuf,
-    /// Where templates live (one JSON per user, root 0600).
-    pub store_dir: PathBuf,
-    /// The Unix socket the PAM module and the CLI talk to.
-    pub socket: PathBuf,
     /// Cosine similarity at or above which a frame matches.
     pub accept_threshold: f32,
     /// Frames that must match within one attempt.
@@ -27,34 +35,34 @@ pub struct Config {
     pub ir_subdev: Option<PathBuf>,
     /// Frame orientation for the IR sensor: transpose, flip_x, flip_y.
     pub ir_orientation: [bool; 3],
-    /// Run the flash-response liveness gate (needs the strobe control).
-    pub liveness: bool,
-    /// Refuse to authenticate when the gate cannot run (no strobe control).
-    /// Setting this false accepts that a print can pass on that camera.
+    /// The flash-response liveness gate runs whenever the sensor has the
+    /// strobe controls. Without them it cannot run, and the daemon refuses
+    /// to authenticate unless this is false, which accepts that a print
+    /// can pass on that camera.
     pub liveness_required: bool,
     /// The presence watch (auto-lock when the enrolled user leaves).
     pub presence: crate::presence::PresenceConfig,
-    /// Omarchy tree the running shell was launched from (for the consent
-    /// window and notifications); default: /etc/omarchy.conf, else the package.
-    pub omarchy_path: Option<String>,
     /// Seconds the scan waits for a face during a consent request (the window
     /// is up; the user may not be looking yet).
     pub consent_scan_seconds: f32,
     /// Seconds the nod is read for after each match of a sudo or polkit
     /// consent request. When it passes unanswered the camera drops to the
     /// presence rhythm and an attentive face re-arms a fresh scan; the
-    /// request itself has no deadline. Clamped to 10..3600.
+    /// request itself has no deadline. Never under 10.
     pub consent_seconds: f32,
-    /// Nods required.
-    pub consent_nods: usize,
-    /// Write each consent round's per-frame gesture recording (head pose,
-    /// landmarks, image motion; never images) to `<store_dir>/gestures/`,
-    /// root-only, newest sixty kept. Off by default; calibration turns it on.
-    /// Nothing per-frame ever goes to the journal.
+    /// Write each consent round's per-frame gesture recording (the head's
+    /// angles from the face mesh and the detector box; never images) to
+    /// `<store_dir>/gestures/<user>/`, root-only, newest sixty kept. Off by
+    /// default, and the key exists only in dev-tools builds: the package
+    /// warns on it as unknown (H2). Nothing per-frame ever goes to the
+    /// journal.
+    #[cfg(feature = "dev-tools")]
     pub gesture_trace: bool,
     /// Recognise gestures but never act on them: the window waits until it
-    /// is answered or the requester gives up. For recording a calibration
-    /// battery to each gesture's rest.
+    /// is answered or the requester gives up. For recording a battery of
+    /// rounds to each gesture's rest. Development builds only, like
+    /// `gesture_trace`.
+    #[cfg(feature = "dev-tools")]
     pub gesture_record_only: bool,
 }
 
@@ -62,8 +70,6 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             models_dir: PathBuf::from("/usr/share/faceauth/models"),
-            store_dir: PathBuf::from("/var/lib/faceauth"),
-            socket: PathBuf::from("/run/faceauth/sock"),
             accept_threshold: 0.70,
             required_matches: 2,
             attempt_timeout: 6.0,
@@ -72,14 +78,13 @@ impl Default for Config {
             ir_subdev: None,
             // The reference machine (Surface Book 2): transpose plus both flips.
             ir_orientation: [true, true, true],
-            liveness: true,
             liveness_required: true,
             presence: Default::default(),
-            omarchy_path: None,
             consent_scan_seconds: 20.0,
             consent_seconds: 90.0,
-            consent_nods: 2,
+            #[cfg(feature = "dev-tools")]
             gesture_trace: false,
+            #[cfg(feature = "dev-tools")]
             gesture_record_only: false,
         }
     }
@@ -133,19 +138,10 @@ impl Config {
                 self.attempt_timeout
             );
         }
-        if self.consent_nods < 1 {
-            bail!(
-                "consent_nods = {} would approve without a nod; it must be 1 or more",
-                self.consent_nods
-            );
-        }
         if !positive(self.consent_scan_seconds) || !positive(self.consent_seconds) {
             bail!("consent_scan_seconds and consent_seconds must be positive");
         }
         let pr = &self.presence;
-        if pr.lock_command.is_empty() || pr.lock_command[0].is_empty() {
-            bail!("[presence] lock_command is empty: the walk-away lock would have nothing to run");
-        }
         if !positive(pr.tick_seconds) || !positive(pr.away_seconds) {
             bail!("[presence] tick_seconds and away_seconds must be positive");
         }
@@ -184,7 +180,6 @@ fn every_key() -> Config {
     Config {
         ir_video: Some(PathBuf::from("/dev/video0")),
         ir_subdev: Some(PathBuf::from("/dev/v4l-subdev0")),
-        omarchy_path: Some("/usr/share/omarchy".into()),
         ..Config::default()
     }
 }
@@ -262,7 +257,52 @@ mod tests {
             "unknown keys warn; they do not refuse"
         );
         assert!(unknown_keys("").is_empty());
-        assert!(unknown_keys("omarchy_path = \"/x\"\nir_video = \"/dev/video2\"\nir_subdev = \"/dev/v4l-subdev8\"\n").is_empty(), "optional keys are known keys");
+        assert!(
+            unknown_keys("ir_video = \"/dev/video2\"\nir_subdev = \"/dev/v4l-subdev8\"\n")
+                .is_empty(),
+            "optional keys are known keys"
+        );
+    }
+
+    /// The shipped `packaging/config.toml` is the defaults, spelled out and
+    /// commented out: it parses to `Config::default()`, so a changed default
+    /// reaches every install through the package, and it names every key
+    /// the daemon reads, so an administrator can find each one.
+    #[test]
+    fn the_shipped_config_is_the_defaults_and_names_every_key() {
+        let text = include_str!("../../packaging/config.toml");
+        let shipped = Config::from_text(text, "packaging/config.toml").unwrap();
+        assert_eq!(
+            toml::to_string(&shipped).unwrap(),
+            toml::to_string(&Config::default()).unwrap(),
+            "the shipped file must not set a value"
+        );
+        assert!(unknown_keys(text).is_empty(), "{:?}", unknown_keys(text));
+        let toml::Value::Table(known) = toml::Value::try_from(every_key()).unwrap() else {
+            panic!("config serialises as a table");
+        };
+        let named = |key: &str| {
+            text.lines().any(|l| {
+                let l = l.trim_start_matches(['#', ' ']);
+                l.starts_with(key) && l[key.len()..].trim_start().starts_with('=')
+            })
+        };
+        for (k, v) in &known {
+            match v {
+                toml::Value::Table(sub) => {
+                    assert!(text.contains(&format!("[{}]", k)), "table [{}] missing", k);
+                    for sk in sub.keys() {
+                        assert!(
+                            named(sk),
+                            "[{}] key {} is not named in the shipped file",
+                            k,
+                            sk
+                        );
+                    }
+                }
+                _ => assert!(named(k), "key {} is not named in the shipped file", k),
+            }
+        }
     }
 
     #[test]
@@ -272,10 +312,7 @@ mod tests {
             "accept_threshold = 0.0",
             "accept_threshold = -1.0",
             "accept_threshold = 1.5",
-            "consent_nods = 0",
             "min_detection = 0",
-            "[presence]\nlock_command = []",
-            "[presence]\nlock_command = [\"\"]",
             "[presence]\naway_seconds = 0",
             "[presence]\nenabled = true\nuser = \"\"",
         ] {
@@ -296,10 +333,30 @@ mod tests {
             "accept_threshold = 1.0",
             "[presence]\nmode = \"secure\"",
             "[presence]\nmode = \"default\"",
+            // Keys the daemon no longer has (the lock command and the
+            // state file, H16 and H17; the fixed paths, the gate switch,
+            // the nod count and the watch's tuning knobs, H15): a config
+            // naming one warns and is otherwise ignored, like any unknown
+            // key.
+            "[presence]\nlock_command = [\"/usr/bin/faceauth-lock-session\", \"\"]\nstate_file = \"/run/faceauth/presence.json\"",
+            "socket = \"/tmp/x\"\nstore_dir = \"/tmp/y\"\nliveness = false\nomarchy_path = \"/x\"\nconsent_nods = 3\n[presence]\nidentify_every = 1\nbattery_identify_every = 1\nrequire_attention = true\nmax_yaw = 0.1\nmax_roll_degrees = 5.0",
         ] {
             Config::from_text(good, "test")
                 .unwrap_or_else(|e| panic!("{:?} should load: {:#}", good, e));
         }
+        let warned = unknown_keys("[presence]\nlock_command = [\"x\"]\nstate_file = \"y\"\n");
+        assert_eq!(warned.len(), 2, "{:?}", warned);
+        assert!(
+            warned.iter().all(|w| w.contains("[presence]")),
+            "{:?}",
+            warned
+        );
+        let warned = unknown_keys("liveness = false\nsocket = \"/x\"\n");
+        assert_eq!(warned.len(), 2, "{:?}", warned);
+        // The gate is not a switch any more: a config that says `liveness
+        // = false` gets the gate anyway, and only the warning says why.
+        let cfg = Config::from_text("liveness = false", "test").unwrap();
+        assert!(cfg.liveness_required);
         let e = Config::from_text("[presence]\nmode = \"paranoid\"", "test").unwrap_err();
         assert!(
             format!("{:#}", e).contains("parse"),

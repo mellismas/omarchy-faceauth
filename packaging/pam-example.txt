@@ -1,10 +1,18 @@
-# pam_faceauth returns PAM_IGNORE for every failure (no daemon, timeout, no match,
-# malformed reply, panic). That is what makes it safe in a stack that has a
-# password behind it. A stack with NOTHING behind it is still closed with
-# pam_deny, as belt and braces: on Linux-PAM 1.7.2 an auth stack whose only
-# module returned PAM_IGNORE answers PAM_PERM_DENIED (measured against a stopped
-# backend), so an ignore-only stack fails closed on its own, but that is a
-# library behaviour and not a promise, and `doctor` checks for the pam_deny line.
+# pam_faceauth has three answers. A match is PAM_SUCCESS. A refusal at the
+# consent window (a head shake, a dismissed card, a confirm after the nods
+# that failed) is PAM_AUTH_ERR, and only on a line carrying `consent`. Every
+# other outcome (no daemon, timeout, no face, no match, malformed reply,
+# panic) is PAM_IGNORE, which is what makes the module safe in a stack that
+# has a password behind it. A stack with NOTHING behind it is still closed
+# with pam_deny, as belt and braces: on Linux-PAM 1.7.2 an auth stack whose
+# only module returned PAM_IGNORE answers PAM_PERM_DENIED (measured against a
+# stopped backend), so an ignore-only stack fails closed on its own, but that
+# is a library behaviour and not a promise, and `doctor` checks for the
+# pam_deny line.
+#
+# The module's arguments are socket=PATH, timeout=SECONDS (a plain look only)
+# and consent. It never converses with the application: no prompt, no
+# password passes through it.
 
 # /etc/pam.d/omarchy-lock-face   (the lock screen's third stack, beside -password and -fingerprint;
 #                                 the password is a separate service on its own lane, so this one
@@ -14,11 +22,20 @@ auth       sufficient                  pam_faceauth.so socket=/run/faceauth/sock
 auth       required                    pam_deny.so
 account    include                     system-local-login
 
-# /etc/pam.d/sudo and /etc/pam.d/polkit-1: one line at the top, opt-in. The
-# password lines below it are the fallback, so no pam_deny here. `consent`
-# makes elevation a deliberate act: the daemon opens a window naming the
-# command and the requester, and the request is approved by two nods or by
-# the password typed into that window. The window waits until it is answered
-# (`timeout=` is ignored on a consent line). Sitting in front of the machine
-# never elevates anything by itself.
+# /etc/pam.d/sudo: one line at the top, opt-in. The password lines below it
+# are the fallback, so no pam_deny here. `consent` makes elevation a
+# deliberate act: the daemon opens a window naming the command and the
+# requester, and the request is approved by two nods or by the password typed
+# into that window. The window waits until it is answered (`timeout=` is
+# ignored on a consent line). Sitting in front of the machine never elevates
+# anything by itself. `sufficient` is right here: a refusal falls through to
+# the terminal's password prompt, where sudo asks anyway.
 auth      sufficient pam_faceauth.so socket=/run/faceauth/sock consent
+
+# /etc/pam.d/polkit-1: the same line with a different control. Under
+# `sufficient` a refusal would fall through to polkit's password dialog, and
+# polkit would start the helper again and ask forever; `auth_err=die` ends
+# the stack on the refusal instead, the agent cancels the request, and polkit
+# reports "Not authorized" with no password dialog. Every other answer is
+# ignored and the password lines below take over as usual.
+auth      [success=done auth_err=die default=ignore] pam_faceauth.so socket=/run/faceauth/sock consent

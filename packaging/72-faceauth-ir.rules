@@ -2,24 +2,32 @@
 #
 # logind's uaccess tag hands the seat user read-write access to every camera
 # node, which is right for the RGB webcam and wrong for the sensor that
-# authenticates. With write access, a process running as the user can change
-# exposure or gain under the daemon mid-capture, force session locks, and take
-# genuine IR frames of the user. Only faceauthd (root) needs this node.
+# authenticates. What this rule closes: with write access to the sensor's
+# subdev a process running as the user could change exposure or gain under
+# the daemon mid-capture and drive the strobe itself. After it, exposure,
+# gain and the strobe are root-only. Only faceauthd (root) needs this node.
+#
+# What it does not close: the CIO2 capture node for the IR port
+# (/dev/videoN, "ipu3-cio2 N"), the CSI-2 receiver subdevs and /dev/media0
+# stay open to the seat user, because the RGB webcam shares the receiver
+# and the port-to-sensor map is firmware-specific. Starting a stream on
+# that capture node makes the kernel start the linked sensor, so a process
+# running as the user can plausibly take ambient IR frames with the
+# illuminator off, and any process that holds the node (a browser sharing
+# the camera through PipeWire) makes a face attempt fall to the password
+# until it lets go. The README's "Not defended" list says so.
 #
 # The file name is the ordering. 70-uaccess.rules adds the tag and
 # 73-seat-late.rules turns the tag into the ACL, so this file must sort between
 # them: a 70- name sorts before 70-uaccess and the tag comes straight back.
 #
 # The sensor is matched by its sysfs name, never by node number: v4l-subdevN
-# moves between boots and module reloads. The media controller node
-# (/dev/media0) and the CIO2 capture nodes are left alone because the RGB
-# webcam needs them for video calls. GROUP and MODE are set as well as the tag
-# removed, so a user in the video group does not keep write access through the
-# group bits.
-#
-# An access grant made before this rule was installed survives until reboot or
-# `setfacl -b` on the node, so doctor reads the node's live ACL and the udev
-# database's current tags, not this file.
+# moves between boots and module reloads. GROUP and MODE are set as well as
+# the tag removed, so a user in the video group does not keep write access
+# through the group bits, and MODE="0600" sets the ACL mask to nothing, so an
+# access entry granted before this rule was installed is inert even before
+# the next reboot. doctor reads the node's live ACL and the udev database's
+# current tags, not this file.
 #
 # A UVC IR camera (a USB module rather than an IPU3 sensor) has no v4l-subdev
 # node; its control path is the capture node itself, so it cannot be locked

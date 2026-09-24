@@ -1,4 +1,8 @@
 //! Thin, safe wrappers over the V4L2 video-node and subdevice ioctls.
+//!
+//! Every ioctl call here follows the one rule in `sys`: the fd is an open
+//! V4L2 node and the struct is the one the ioctl number names. The SAFETY
+//! lines below say what else, if anything, a call relies on.
 
 use crate::sys::*;
 use anyhow::{anyhow, bail, Context, Result};
@@ -68,7 +72,8 @@ impl VideoDevice {
             .open(&path)
             .with_context(|| format!("open {}", path.display()))?;
         let caps = {
-            let mut c: v4l2_capability = unsafe { std::mem::zeroed() };
+            let mut c = v4l2_capability::default();
+            // SAFETY: the `sys` rule; the kernel fills a struct we own.
             unsafe { vidioc_querycap(file.as_raw_fd(), &mut c) }
                 .with_context(|| format!("{}: QUERYCAP", path.display()))?;
             c
@@ -107,7 +112,8 @@ impl VideoDevice {
     }
 
     pub fn driver_and_card(&self) -> Result<(String, String, String)> {
-        let mut c: v4l2_capability = unsafe { std::mem::zeroed() };
+        let mut c = v4l2_capability::default();
+        // SAFETY: the `sys` rule; the kernel fills a struct we own.
         unsafe { vidioc_querycap(self.file.as_raw_fd(), &mut c) }?;
         Ok((cstr(&c.driver), cstr(&c.card), cstr(&c.bus_info)))
     }
@@ -116,9 +122,13 @@ impl VideoDevice {
     pub fn formats(&self) -> Result<Vec<(u32, String)>> {
         let mut out = Vec::new();
         for index in 0.. {
-            let mut d: v4l2_fmtdesc = unsafe { std::mem::zeroed() };
-            d.index = index;
-            d.type_ = self.buf_type;
+            let mut d = v4l2_fmtdesc {
+                index,
+                type_: self.buf_type,
+                ..Default::default()
+            };
+            // SAFETY: the `sys` rule; EINVAL past the last format is the
+            // enumeration's end, not an error.
             match unsafe { vidioc_enum_fmt(self.file.as_raw_fd(), &mut d) } {
                 Ok(_) => out.push((d.pixelformat, cstr(&d.description))),
                 Err(nix::errno::Errno::EINVAL) => break,
@@ -148,6 +158,8 @@ impl VideoDevice {
             p.pixelformat = pixelformat;
             p.field = V4L2_FIELD_NONE;
         }
+        // SAFETY: the `sys` rule; `f` is a whole `v4l2_format` whichever
+        // union member the node reads.
         unsafe { vidioc_s_fmt(self.file.as_raw_fd(), &mut f) }.with_context(|| {
             format!(
                 "{}: S_FMT {}x{} {}",
@@ -212,12 +224,16 @@ impl VideoDevice {
             memory: V4L2_MEMORY_MMAP,
             ..Default::default()
         };
+        // SAFETY: the `sys` rule.
         unsafe { vidioc_reqbufs(self.file.as_raw_fd(), &mut r) }.context("REQBUFS")?;
         if r.count == 0 {
             bail!("{}: driver granted no buffers", self.path.display());
         }
         for index in 0..r.count {
             let (offset, length) = self.query_buffer(index)?;
+            // SAFETY: a read-only shared mapping of a buffer the driver
+            // reported at this offset and length; it is unmapped only in
+            // `Drop`, after every borrow of it has ended.
             let ptr = unsafe {
                 mmap(
                     None,
@@ -249,6 +265,9 @@ impl VideoDevice {
             b.m = &mut plane as *mut v4l2_plane as u64;
             b.length = 1;
         }
+        // SAFETY: the `sys` rule; for a multiplanar node `m` points at
+        // `plane`, which outlives the call and is the one plane `length`
+        // announces.
         unsafe { vidioc_querybuf(self.file.as_raw_fd(), &mut b) }.context("QUERYBUF")?;
         if self.multiplanar() {
             Ok((plane.m & 0xffff_ffff, plane.length as usize))
@@ -269,6 +288,7 @@ impl VideoDevice {
             b.m = &mut plane as *mut v4l2_plane as u64;
             b.length = 1;
         }
+        // SAFETY: as in `query_buffer`.
         unsafe { vidioc_qbuf(self.file.as_raw_fd(), &mut b) }.context("QBUF")?;
         Ok(())
     }
@@ -278,6 +298,7 @@ impl VideoDevice {
             bail!("stream_on before request_buffers");
         }
         let t = self.buf_type;
+        // SAFETY: the `sys` rule; the argument is one u32.
         unsafe { vidioc_streamon(self.file.as_raw_fd(), &t) }
             .with_context(|| format!("{}: STREAMON", self.path.display()))?;
         self.streaming = true;
@@ -289,72 +310,97 @@ impl VideoDevice {
             return Ok(());
         }
         let t = self.buf_type;
+        // SAFETY: the `sys` rule; the argument is one u32.
         unsafe { vidioc_streamoff(self.file.as_raw_fd(), &t) }.context("STREAMOFF")?;
         self.streaming = false;
         Ok(())
     }
 
-    /// Wait up to `timeout` for a frame, then dequeue it. `Ok(None)` on timeout.
+    /// Wait up to `timeout` for a frame, then dequeue it. `Ok(None)` on
+    /// timeout. A buffer the driver flags as an error, or hands back empty,
+    /// is requeued and the wait goes on: a transfer error on a UVC camera
+    /// costs one frame, not the attempt, and an empty buffer never
+    /// re-delivers whatever the mapping last held.
     pub fn next_frame(&self, timeout: Duration) -> Result<Option<FrameRef<'_>>> {
-        let fd: BorrowedFd = self.file.as_fd();
-        let mut pfd = [PollFd::new(fd, PollFlags::POLLIN)];
-        let ms = PollTimeout::try_from(timeout).unwrap_or(PollTimeout::MAX);
-        let n = loop {
-            match poll(&mut pfd, ms) {
-                Ok(n) => break n,
-                Err(nix::errno::Errno::EINTR) => continue,
-                Err(e) => return Err(e).context("poll"),
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let fd: BorrowedFd = self.file.as_fd();
+            let mut pfd = [PollFd::new(fd, PollFlags::POLLIN)];
+            let ms = PollTimeout::try_from(left).unwrap_or(PollTimeout::MAX);
+            let n = loop {
+                match poll(&mut pfd, ms) {
+                    Ok(n) => break n,
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(e) => return Err(e).context("poll"),
+                }
+            };
+            if n == 0 {
+                return Ok(None);
             }
-        };
-        if n == 0 {
-            return Ok(None);
+            let mut plane = v4l2_plane::default();
+            let mut b = v4l2_buffer {
+                type_: self.buf_type,
+                memory: V4L2_MEMORY_MMAP,
+                ..Default::default()
+            };
+            if self.multiplanar() {
+                b.m = &mut plane as *mut v4l2_plane as u64;
+                b.length = 1;
+            }
+            // SAFETY: as in `query_buffer`.
+            unsafe { vidioc_dqbuf(self.file.as_raw_fd(), &mut b) }.context("DQBUF")?;
+            let buf = self
+                .buffers
+                .get(b.index as usize)
+                .ok_or_else(|| anyhow!("DQBUF returned index {}", b.index))?;
+            let used = if self.multiplanar() {
+                plane.bytesused as usize
+            } else {
+                b.bytesused as usize
+            };
+            if !buffer_is_usable(b.flags, used) {
+                log::debug!(
+                    "{}: frame {} skipped (flags 0x{:x}, {} bytes)",
+                    self.path.display(),
+                    b.sequence,
+                    b.flags,
+                    used
+                );
+                self.queue(b.index)?;
+                continue;
+            }
+            let used = used.min(buf.len);
+            // SAFETY: the mapping is MAP_SHARED read-only and lives as long as
+            // `self`; the driver does not write a dequeued buffer until it is
+            // queued again, which `FrameRef::drop` does after this borrow ends.
+            let data = unsafe { std::slice::from_raw_parts(buf.ptr.as_ptr() as *const u8, used) };
+            return Ok(Some(FrameRef {
+                dev: self,
+                index: b.index,
+                sequence: b.sequence,
+                bytesused: used,
+                data,
+            }));
         }
-        let mut plane = v4l2_plane::default();
-        let mut b = v4l2_buffer {
-            type_: self.buf_type,
-            memory: V4L2_MEMORY_MMAP,
-            ..Default::default()
-        };
-        if self.multiplanar() {
-            b.m = &mut plane as *mut v4l2_plane as u64;
-            b.length = 1;
-        }
-        unsafe { vidioc_dqbuf(self.file.as_raw_fd(), &mut b) }.context("DQBUF")?;
-        let buf = self
-            .buffers
-            .get(b.index as usize)
-            .ok_or_else(|| anyhow!("DQBUF returned index {}", b.index))?;
-        let used = if self.multiplanar() {
-            plane.bytesused as usize
-        } else {
-            b.bytesused as usize
-        };
-        let used = if used == 0 || used > buf.len {
-            buf.len
-        } else {
-            used
-        };
-        // SAFETY: the mapping is MAP_SHARED read-only and lives as long as `self`;
-        // the driver does not write a dequeued buffer until it is queued again.
-        let data = unsafe { std::slice::from_raw_parts(buf.ptr.as_ptr() as *const u8, used) };
-        Ok(Some(FrameRef {
-            dev: self,
-            index: b.index,
-            sequence: b.sequence,
-            bytesused: used,
-            data,
-        }))
-    }
-
-    pub fn raw_fd(&self) -> i32 {
-        self.file.as_raw_fd()
     }
 }
+
+/// Is a dequeued buffer a frame worth reading? Not when the driver flagged
+/// it as an error, and not when it says no bytes were written: that buffer
+/// holds stale pixels from an earlier frame or nothing at all.
+pub fn buffer_is_usable(flags: u32, bytesused: usize) -> bool {
+    flags & V4L2_BUF_FLAG_ERROR == 0 && bytesused > 0
+}
+
+impl VideoDevice {}
 
 impl Drop for VideoDevice {
     fn drop(&mut self) {
         let _ = self.stream_off();
         for b in self.buffers.drain(..) {
+            // SAFETY: each mapping was made by `request_buffers` with this
+            // pointer and length, and no `FrameRef` can outlive `self`.
             unsafe {
                 let _ = munmap(b.ptr, b.len);
             }
@@ -425,6 +471,7 @@ impl Controls {
             ..Default::default()
         };
         loop {
+            // SAFETY: the `sys` rule; EINVAL past the last control ends the walk.
             match unsafe { vidioc_query_ext_ctrl(self.file.as_raw_fd(), &mut q) } {
                 Ok(_) => {}
                 Err(nix::errno::Errno::EINVAL) => break,
@@ -451,6 +498,7 @@ impl Controls {
 
     pub fn get(&self, id: u32) -> Result<i32> {
         let mut c = v4l2_control { id, value: 0 };
+        // SAFETY: the `sys` rule.
         unsafe { vidioc_g_ctrl(self.file.as_raw_fd(), &mut c) }
             .with_context(|| format!("{}: G_CTRL 0x{:08x}", self.path.display(), id))?;
         Ok(c.value)
@@ -458,6 +506,7 @@ impl Controls {
 
     pub fn set(&self, id: u32, value: i32) -> Result<i32> {
         let mut c = v4l2_control { id, value };
+        // SAFETY: the `sys` rule.
         unsafe { vidioc_s_ctrl(self.file.as_raw_fd(), &mut c) }
             .with_context(|| format!("{}: S_CTRL 0x{:08x} = {}", self.path.display(), id, value))?;
         Ok(c.value)
@@ -486,6 +535,7 @@ impl Subdev {
             pad,
             ..Default::default()
         };
+        // SAFETY: the `sys` rule, on a subdev node.
         unsafe { vidioc_subdev_g_fmt(self.controls.file.as_raw_fd(), &mut f) }
             .with_context(|| format!("{}: SUBDEV_G_FMT pad {}", self.path().display(), pad))?;
         Ok((f.format.width, f.format.height, f.format.code))
@@ -507,6 +557,7 @@ impl Subdev {
         f.format.height = height;
         f.format.code = code;
         f.format.field = V4L2_FIELD_NONE;
+        // SAFETY: the `sys` rule, on a subdev node.
         unsafe { vidioc_subdev_s_fmt(self.controls.file.as_raw_fd(), &mut f) }.with_context(
             || {
                 format!(
@@ -526,6 +577,17 @@ impl Subdev {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An error-flagged buffer and an empty one are skipped; a partial
+    /// payload without the flag is still read (the decoder decides).
+    #[test]
+    fn error_flagged_and_empty_buffers_are_not_frames() {
+        assert!(buffer_is_usable(0, 307_200));
+        assert!(buffer_is_usable(0x1 | 0x4, 100));
+        assert!(!buffer_is_usable(V4L2_BUF_FLAG_ERROR, 307_200));
+        assert!(!buffer_is_usable(0, 0));
+        assert!(!buffer_is_usable(V4L2_BUF_FLAG_ERROR, 0));
+    }
 
     #[test]
     fn control_keys_match_v4l2_ctl() {

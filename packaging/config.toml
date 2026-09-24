@@ -1,40 +1,40 @@
-# /etc/faceauth/config.toml : every key optional; these are the defaults.
+# /etc/faceauth/config.toml
+#
+# Every key is optional and every line below is commented out, so this file
+# sets nothing: the daemon runs on its built-in defaults, which are the
+# values shown, and a default that changes in a later package reaches an
+# install that never edited the file. Uncomment a line to change it. The
+# three [presence] keys left explicit are the ones `faceauth presence on|off`
+# rewrites in place; they are at their defaults too.
+#
 # Keys the daemon does not know are named in the journal at start (a value
 # meant for the top level but written under [presence] lands there). A value
 # that would switch a check off (required_matches = 0, accept_threshold
-# outside (0, 1], consent_nods = 0, an empty lock_command) stops the daemon
-# from starting, and every stack it sits in falls to the password.
-models_dir = "/usr/share/faceauth/models"
-store_dir = "/var/lib/faceauth"
-socket = "/run/faceauth/sock"
-accept_threshold = 0.70     # cosine similarity; docs/DEVELOPMENT.md has the measurements behind it
-required_matches = 2        # frames at or above the threshold within one attempt
-attempt_timeout = 6.0       # seconds
-min_detection = 0.6
-liveness = true             # flash-response gate (needs a sensor with the strobe control)
-liveness_required = true    # refuse to authenticate when the gate cannot run; false accepts that a print can pass
-# ir_video = "/dev/video2"  # override camera detection (UVC IR cameras go here)
-# ir_subdev = "/dev/v4l-subdev7"
-ir_orientation = [true, true, true]   # transpose, flip_x, flip_y: Surface Book 2 mounting
+# outside (0, 1]) stops the daemon from starting, and every stack it sits
+# in falls to the password. The store (/var/lib/faceauth), the socket
+# (/run/faceauth/sock) and the Omarchy tree (/etc/omarchy.conf, else the
+# package) are fixed; they are not keys.
 
-consent_nods = 2            # nods that approve a request; two head shakes refuse
-consent_seconds = 90        # how long nods are read after a match; then the camera rests and an attentive face re-arms it (no deadline)
-gesture_trace = false       # write each consent round's per-frame recording to <store_dir>/gestures (root-only; for tuning)
-gesture_record_only = false # recognise gestures but never act on them (for recording a calibration battery)
+# models_dir = "/usr/share/faceauth/models"   # the files come from the omarchy-faceauth-models package
+# accept_threshold = 0.70     # cosine similarity a frame must reach to match; set on one subject's face, the false-accept rate is unmeasured (README)
+# required_matches = 2        # frames at or above the threshold within one attempt
+# attempt_timeout = 6.0       # seconds an attempt may run
+# min_detection = 0.6         # detector score under which a frame is not a face
+# liveness_required = true    # the flash-response gate runs whenever the sensor has the strobe controls; when it cannot run, refuse to authenticate (false accepts that a print can pass)
+# ir_video = "/dev/video2"    # name the IR camera instead of detecting the IPU3 graph; a UVC module has no strobe control, so with liveness_required the daemon refuses every attempt on one
+# ir_subdev = "/dev/v4l-subdev7"
+# ir_orientation = [true, true, true]   # transpose, flip_x, flip_y: Surface Book 2 mounting
+# consent_scan_seconds = 20   # how long a consent request waits for a face to appear before the nods are disarmed
+# consent_seconds = 90        # how long nods are read after a match, never under 10; then the camera rests and an attentive face re-arms it (no deadline)
+# gesture_trace = false       # development builds only: write each consent round's per-frame recording under the store (docs/DEVELOPMENT.md); the package has no such key
+# gesture_record_only = false # development builds only: recognise gestures but never act on them (docs/DEVELOPMENT.md); the package has no such key
 
 [presence]
-enabled = false             # auto-lock when the enrolled user leaves; opt-in
-user = ""                   # whose templates define "present"
-mode = "default"            # "default": a stranger in view never holds the lock off past away_seconds; a hidden face (hand on chin) and one flaky identity check are tolerated
-                            # "secure": lock whenever the enrolled user is not positively in frame for away_seconds; one failed identity check counts, nothing else holds the clock
-                            # the starting mode; the watched user can switch it until the next restart (faceauth presence mode default|secure)
-tick_seconds = 5.0          # one short look (about 0.45 s of camera, 0.8 s when it also checks identity and liveness) per tick; 10 s on battery
-identify_every = 3          # identity and liveness check every N ticks; detection every tick
-battery_tick_seconds = 10.0 # the tick on battery (0 keeps the mains tick)
-battery_identify_every = 3
-away_seconds = 20.0         # unseen for this long -> lock the session
-require_attention = false   # also require the face to be turned to the camera
-max_yaw = 0.25
-max_roll_degrees = 25.0
-lock_command = ["/usr/bin/faceauth-lock-session", ""]   # an empty second arg means the presence user
-state_file = "/run/faceauth/presence.json"
+enabled = false               # auto-lock when the enrolled user leaves; opt-in (faceauth presence on|off)
+user = ""                     # whose templates define "present"
+# mode = "default"            # "default": any face turned to the screen holds the lock off, whoever it is; lock once nobody has been there for away_seconds; a hidden face (hand on chin) holds the clock too
+                              # "secure": identity checked on every tick; the first failed check locks at once unless the same shape is still in the chair (the user's own hand over the face, a look down at a phone), an empty chair locks after away_seconds, no other face holds the clock
+                              # the starting mode; the watched user can switch it until the next restart (faceauth presence mode default|secure)
+# tick_seconds = 5.0          # one short look per tick (about 0.45 s of camera; longer on a tick that also strobes for identity and liveness; in the default mode every third tick); 10 s on battery
+# battery_tick_seconds = 10.0 # the tick on battery (0 keeps the mains tick)
+# away_seconds = 20.0         # unseen for this long -> lock the session

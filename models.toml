@@ -1,6 +1,8 @@
-# Model manifest for Omarchy FaceAuth. Weights are never vendored: `faceauth models fetch`
-# downloads each file, verifies the SHA-256 and size, and records the licence beside it.
-# See ../design/models.md for the selection and the sources.
+# Model manifest for Omarchy FaceAuth. Weights are never vendored in the source tree: the
+# omarchy-faceauth-models package installs the three files from the project's models-N
+# GitHub release, with their licence texts, and `faceauth doctor` verifies the installed
+# files against the SHA-256 and size here. `faceauth models fetch` (developers) downloads
+# them from the URLs below into a directory of your choosing and verifies the same way.
 
 [[model]]
 name = "face_detection_yunet_2023mar.onnx"
@@ -27,11 +29,10 @@ input = "Nx3x112x112 float, (v - 127.5) / 127.5, aligned to the ArcFace five-poi
 [[model]]
 name = "face_landmark.onnx"
 role = "landmarks"
-# Not yet hosted: converted on 2026-09-23 from Google's canonical file
-# (below) with tf2onnx 1.17.0 on TensorFlow 2.21.0, opset 13; the ONNX is
-# published with the project's releases. Until then setup takes the file
-# from a local models directory.
-url = "https://github.com/mellismas/omarchy-faceauth/releases/download/models/face_landmark.onnx"
+# Converted on 2026-09-23 from Google's canonical file (below) with tf2onnx 1.17.0 on
+# TensorFlow 2.21.0, opset 13, and published on the project's models-1 release with
+# its licence text and a NOTICE of the conversion.
+url = "https://github.com/mellismas/omarchy-faceauth/releases/download/models-1/face_landmark.onnx"
 sha256 = "628e17ded45708571b8c6cb9da2438c32844cba8c3a9ed25e929fa9e318c5357"
 size = 2429024
 license = "Apache-2.0"

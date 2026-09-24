@@ -10,3 +10,4 @@ pub mod pamcheck;
 pub mod presence;
 pub mod server;
 pub mod store;
+pub mod strobe;

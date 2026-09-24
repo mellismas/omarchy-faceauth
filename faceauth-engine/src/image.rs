@@ -92,19 +92,62 @@ impl Grey {
     }
 
     /// Planar NCHW float tensor with the grey replicated into three channels,
-    /// each value `(v - mean) / scale`.
+    /// each value `(v - mean) / scale`. The first plane is written once and
+    /// the other two are copies of it inside the same allocation: the
+    /// detector calls this on a 640x640 canvas for every frame, and a
+    /// separate plane first cost a 1.6 MB allocation each time.
     pub fn to_nchw3(&self, mean: f32, scale: f32) -> Vec<f32> {
         let n = self.width * self.height;
         let mut v = Vec::with_capacity(3 * n);
-        let plane: Vec<f32> = self
-            .data
-            .iter()
-            .map(|&p| (p as f32 - mean) / scale)
-            .collect();
-        for _ in 0..3 {
-            v.extend_from_slice(&plane);
-        }
+        v.extend(self.data.iter().map(|&p| (p as f32 - mean) / scale));
+        v.extend_from_within(0..n);
+        v.extend_from_within(0..n);
         v
+    }
+
+    /// Mean pixel value. The sum is taken in integers: a frame's total is
+    /// far below 2^53, so this equals the floating-point running sum to the
+    /// last bit and costs a fraction of it.
+    pub fn mean(&self) -> f64 {
+        if self.data.is_empty() {
+            return 0.0;
+        }
+        let sum: u64 = self.data.iter().map(|&v| v as u64).sum();
+        sum as f64 / self.data.len() as f64
+    }
+
+    /// The 8-bit oriented frame straight from a 10-bit sensor buffer (each
+    /// sample shifted down two bits, the fixed mapping the capture uses so
+    /// consecutive frames compare), with the same orientation as `oriented`.
+    /// One pass writing the output row by row, in place of an 8-bit copy
+    /// followed by a second pass and a second allocation; the pixels are the
+    /// same. Each orientation gets its own loop so the row loop carries no
+    /// branch and the shift is a constant.
+    pub fn from_u10_oriented(
+        px: &[u16],
+        width: usize,
+        height: usize,
+        transpose: bool,
+        flip_x: bool,
+        flip_y: bool,
+    ) -> Grey {
+        assert!(px.len() >= width * height, "short sensor buffer");
+        let (ow, oh) = if transpose {
+            (height, width)
+        } else {
+            (width, height)
+        };
+        let mut out = Grey::new(ow, oh);
+        if width == 0 || height == 0 {
+            return out;
+        }
+        match (transpose, flip_x) {
+            (true, true) => orient_u10::<true, true>(px, width, &mut out, flip_y),
+            (true, false) => orient_u10::<true, false>(px, width, &mut out, flip_y),
+            (false, true) => orient_u10::<false, true>(px, width, &mut out, flip_y),
+            (false, false) => orient_u10::<false, false>(px, width, &mut out, flip_y),
+        }
+        out
     }
 
     pub fn write_pgm(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
@@ -142,6 +185,50 @@ impl Grey {
             height,
             data: bytes[i..i + width * height].to_vec(),
         })
+    }
+}
+
+/// The row loop of `from_u10_oriented` for one transpose and flip_x
+/// choice. Undoing the flips and then the transpose finds the source of
+/// each output row: a source row as it stands, or a source column walked
+/// with the row stride.
+fn orient_u10<const TRANSPOSE: bool, const FLIP_X: bool>(
+    px: &[u16],
+    width: usize,
+    out: &mut Grey,
+    flip_y: bool,
+) {
+    let (ow, oh) = (out.width, out.height);
+    for (oy, row) in out.data.chunks_exact_mut(ow).enumerate() {
+        let iy = if flip_y { oh - 1 - oy } else { oy };
+        if TRANSPOSE {
+            if FLIP_X {
+                // The column from the bottom up; the index wraps once, after
+                // the last read.
+                let mut idx = (ow - 1) * width + iy;
+                for o in row.iter_mut() {
+                    *o = (px[idx] >> 2) as u8;
+                    idx = idx.wrapping_sub(width);
+                }
+            } else {
+                let mut idx = iy;
+                for o in row.iter_mut() {
+                    *o = (px[idx] >> 2) as u8;
+                    idx += width;
+                }
+            }
+        } else {
+            let source = &px[iy * width..(iy + 1) * width];
+            if FLIP_X {
+                for (o, &v) in row.iter_mut().zip(source.iter().rev()) {
+                    *o = (v >> 2) as u8;
+                }
+            } else {
+                for (o, &v) in row.iter_mut().zip(source) {
+                    *o = (v >> 2) as u8;
+                }
+            }
+        }
     }
 }
 
@@ -184,5 +271,68 @@ mod tests {
             .for_each(|(i, v)| *v = (i * 13) as u8);
         let w = g.warp_affine(&[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], 4, 4);
         assert_eq!(w, g);
+    }
+
+    fn noisy(w: usize, h: usize) -> Grey {
+        let mut g = Grey::new(w, h);
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        for v in g.data.iter_mut() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *v = (s >> 56) as u8;
+        }
+        g
+    }
+
+    /// The single-pass tensor is the old plane-then-copy result, bit for bit.
+    #[test]
+    fn nchw3_matches_the_plane_copy() {
+        let g = noisy(37, 23);
+        let n = g.width * g.height;
+        let plane: Vec<f32> = g.data.iter().map(|&p| (p as f32 - 127.5) / 127.5).collect();
+        let mut want = Vec::with_capacity(3 * n);
+        for _ in 0..3 {
+            want.extend_from_slice(&plane);
+        }
+        assert_eq!(g.to_nchw3(127.5, 127.5), want);
+    }
+
+    /// The integer mean equals the floating-point running sum the daemon used
+    /// before, to the last bit, at the reference frame size.
+    #[test]
+    fn integer_mean_equals_the_f64_running_sum() {
+        for g in [noisy(480, 640), noisy(3, 1), Grey::new(2, 2)] {
+            let f64_sum = g.data.iter().map(|&v| v as f64).sum::<f64>() / g.data.len() as f64;
+            assert_eq!(g.mean().to_bits(), f64_sum.to_bits());
+        }
+        assert_eq!(Grey::new(0, 0).mean(), 0.0);
+    }
+
+    /// The fused 16-bit conversion and orientation equals the two-pass
+    /// result for every combination of transpose and flips (poc_hygiene_2's
+    /// equality assertion, generalised).
+    #[test]
+    fn fused_orientation_equals_the_two_pass_result() {
+        let (w, h) = (13usize, 7usize);
+        let raw: Vec<u16> = (0..w * h).map(|i| ((i * 977) % 1024) as u16).collect();
+        let mut g8 = Grey::new(w, h);
+        for (o, &v) in g8.data.iter_mut().zip(&raw) {
+            *o = (v >> 2) as u8;
+        }
+        for t in [false, true] {
+            for fx in [false, true] {
+                for fy in [false, true] {
+                    assert_eq!(
+                        Grey::from_u10_oriented(&raw, w, h, t, fx, fy),
+                        g8.oriented(t, fx, fy),
+                        "transpose {} flip_x {} flip_y {}",
+                        t,
+                        fx,
+                        fy
+                    );
+                }
+            }
+        }
     }
 }

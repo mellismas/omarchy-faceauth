@@ -5,9 +5,19 @@ reference machine: one file per round, a header line, then one line per
 frame: `t yaw pitch roll pos_x pos_y w cx cy size score`. Angles in degrees
 from the face mesh (yaw negative turned to the subject's left as this camera
 sees it, pitch positive chin down, roll positive left eye lower); pos_x and
-pos_y the accumulated image motion of the face in face widths; w, cx, cy the
+pos_y the accumulated image motion of the face in face widths, which nothing
+reads since the image-motion detectors went (round-4 C3); w, cx, cy the
 detector box; size the face width as a fraction of the frame's shorter
 side; score the mesh's face confidence. Numbers only, never an image.
+
+Recordings made since then carry the header `v3 t yaw pitch roll w cx cy
+size score`, the same columns without the two image-motion ones. The
+walk-through's rounds and the consent window write it alike
+(`consent::ROUND_HEADER`), and `consent::parse_round` reads either header,
+so a recording from a live request replays through the same tests as these
+rounds. These twelve files are the mesh battery (`mesh_battery_holds`) and
+the source of the derived-floor test and the red-team module's turned-head
+case; they are the only recorded corpus left.
 
 What they showed, and what the mesh-based detectors are built on:
 

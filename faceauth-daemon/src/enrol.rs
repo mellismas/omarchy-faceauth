@@ -51,25 +51,11 @@ pub struct Tick {
     pub target_y: f32,
     /// The dot is within the target.
     pub on_target: bool,
-    /// Smoothed readings, and the raw ones and the face's place in the
-    /// frame (0..1) for the record.
-    pub yaw: f32,
-    pub pitch: f32,
-    pub roll: f32,
-    pub raw_yaw: f32,
-    pub raw_pitch: f32,
-    /// The nose-based tilt, for comparison; `pitch` is now the mouth-based one.
-    pub nose_pitch: f32,
-    /// The dense mesh's head pose in degrees, when the model is installed.
-    pub mesh_yaw: Option<f32>,
-    pub mesh_pitch: Option<f32>,
-    pub mesh_roll: Option<f32>,
-    pub mesh_score: Option<f32>,
-    pub x: f32,
-    pub y: f32,
-    /// This person's centre, once learned.
-    pub centre_yaw: f32,
-    pub level: f32,
+    /// The readings behind the dot, for a development build's record only:
+    /// the window draws none of them, and a per-frame head-pose stream to
+    /// any same-uid watcher is not something the package sends (H23).
+    #[cfg(feature = "dev-tools")]
+    pub record: TickRecord,
     pub taken: usize,
     pub wanted: usize,
     pub message: String,
@@ -82,6 +68,31 @@ pub struct Tick {
     pub seconds_left: f32,
     pub countdown: bool,
     pub read_slot: Option<usize>,
+}
+
+/// The smoothed readings, the raw ones, the mesh's pose and the face's
+/// place in the frame (0..1), flattened into the tick in a development
+/// build.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct TickRecord {
+    pub yaw: f32,
+    pub pitch: f32,
+    pub roll: f32,
+    pub raw_yaw: f32,
+    pub raw_pitch: f32,
+    /// The nose-based tilt, for comparison; `pitch` is the mouth-based one.
+    pub nose_pitch: f32,
+    /// The dense mesh's head pose in degrees.
+    pub mesh_yaw: Option<f32>,
+    pub mesh_pitch: Option<f32>,
+    pub mesh_roll: Option<f32>,
+    pub mesh_score: Option<f32>,
+    pub x: f32,
+    pub y: f32,
+    /// This person's centre, once learned.
+    pub centre_yaw: f32,
+    pub level: f32,
 }
 
 impl Tick {
@@ -97,20 +108,12 @@ impl Tick {
             target_x: 0.0,
             target_y: 0.0,
             on_target: false,
-            yaw: 0.0,
-            pitch: 0.0,
-            roll: 0.0,
-            raw_yaw: 0.0,
-            raw_pitch: 0.0,
-            nose_pitch: 0.0,
-            mesh_yaw: None,
-            mesh_pitch: None,
-            mesh_roll: None,
-            mesh_score: None,
-            x: 0.5,
-            y: 0.5,
-            centre_yaw: 0.0,
-            level: 0.0,
+            #[cfg(feature = "dev-tools")]
+            record: TickRecord {
+                x: 0.5,
+                y: 0.5,
+                ..Default::default()
+            },
             taken: 0,
             wanted: 0,
             message: message.into(),
@@ -124,9 +127,133 @@ impl Tick {
     }
 }
 
+#[cfg(test)]
+mod tick_tests {
+    use super::Tick;
+
+    /// H23: the stream carries exactly the fields Enrol.qml reads (its
+    /// `onRead` parser), and nothing per-frame that the window never draws.
+    /// A development build adds the `record` block for tuning.
+    #[test]
+    fn the_tick_serialises_the_fields_the_window_reads() {
+        let tick = Tick::blank("welcome", "hello");
+        let v: serde_json::Value = serde_json::to_value(&tick).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        let mut window_reads = vec![
+            "step",
+            "zone",
+            "face",
+            "size",
+            "distance",
+            "dot_x",
+            "dot_y",
+            "target_x",
+            "target_y",
+            "on_target",
+            "taken",
+            "wanted",
+            "message",
+            "round",
+            "round_no",
+            "round_of",
+            "seconds_left",
+            "countdown",
+            "read_slot",
+        ];
+        if cfg!(feature = "dev-tools") {
+            window_reads.push("record");
+        }
+        window_reads.sort_unstable();
+        assert_eq!(keys, window_reads);
+    }
+}
+
+/// A session that records a kind of round replaces every earlier
+/// session's samples of that kind: the first round of the kind in this
+/// session clears them, later rounds add to the fresh set (J4). The
+/// everyday rounds count as one kind. A user re-tuning after an
+/// exaggerated calibration gets floors from this session alone.
+fn begin_kind(
+    g: &mut crate::store::GestureCal,
+    kinds_this_session: &mut Vec<&'static str>,
+    stored_as: &'static str,
+) {
+    let kind = match stored_as {
+        "nod" | "shake" => stored_as,
+        _ => "everyday",
+    };
+    if kinds_this_session.contains(&kind) {
+        return;
+    }
+    kinds_this_session.push(kind);
+    match kind {
+        "nod" => {
+            g.nod_deg.clear();
+            g.nod_reads_to_deg.clear();
+        }
+        "shake" => {
+            g.shake_deg.clear();
+            g.shake_reads_to_deg.clear();
+        }
+        _ => g.everyday_deg.clear(),
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::begin_kind;
+    use crate::store::{EverydayDeg, GestureCal};
+
+    /// J4: Tune Gestures again replaces the earlier session's rounds of
+    /// each kind it records, so the floor moves all the way to this
+    /// session's, and a kind it does not record keeps its samples.
+    #[test]
+    fn a_session_replaces_its_kinds_samples_and_keeps_the_rest() {
+        let mut g = GestureCal {
+            nod_deg: vec![30.0, 32.0],
+            nod_reads_to_deg: vec![24.0, 26.0],
+            shake_deg: vec![40.0],
+            shake_reads_to_deg: vec![30.0],
+            everyday_deg: vec![EverydayDeg {
+                kind: "read".into(),
+                dyaw: 1.0,
+                dpitch: 2.0,
+            }],
+        };
+        let mut kinds = Vec::new();
+        begin_kind(&mut g, &mut kinds, "nod");
+        assert!(g.nod_deg.is_empty() && g.nod_reads_to_deg.is_empty());
+        g.nod_reads_to_deg.push(8.0);
+        begin_kind(&mut g, &mut kinds, "nod");
+        assert_eq!(
+            g.nod_reads_to_deg,
+            vec![8.0],
+            "the second nod round of the session adds"
+        );
+        assert_eq!(
+            g.shake_reads_to_deg,
+            vec![30.0],
+            "a kind not recorded keeps its samples"
+        );
+        begin_kind(&mut g, &mut kinds, "read");
+        assert!(g.everyday_deg.is_empty());
+        begin_kind(&mut g, &mut kinds, "glance-left");
+        assert_eq!(
+            kinds,
+            vec!["nod", "everyday"],
+            "the everyday rounds are one kind"
+        );
+    }
+}
+
 /// The session's user and uid while one runs: who may watch and control it.
 static ACTIVE: Mutex<Option<(String, u32)>> = Mutex::new(None);
-/// The windows watching the stream.
+/// The window watching the stream: one per session. A second watcher
+/// replaces the first (the window reconnected), so watchers can never
+/// pile up, and the stream is written without blocking: a watcher that
+/// stops reading is dropped at the first full buffer instead of stalling
+/// the camera loop behind it (J2).
 static WATCHERS: Mutex<Vec<UnixStream>> = Mutex::new(Vec::new());
 /// Continue, redo and cancel from the window.
 static CONTROL: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -147,7 +274,11 @@ pub fn is_active() -> bool {
 }
 
 pub fn add_watcher(stream: UnixStream) {
+    if stream.set_nonblocking(true).is_err() {
+        return;
+    }
     if let Ok(mut w) = WATCHERS.lock() {
+        w.clear();
         w.push(stream);
     }
 }
@@ -174,7 +305,9 @@ fn broadcast(tick: &Tick) {
     };
     line.push('\n');
     if let Ok(mut w) = WATCHERS.lock() {
-        w.retain_mut(|s| s.write_all(line.as_bytes()).is_ok());
+        // A short write means the window is not reading: the rest of the
+        // line would not follow it in one piece, so the watcher goes.
+        w.retain_mut(|s| matches!(s.write(line.as_bytes()), Ok(n) if n == line.len()));
     }
 }
 
@@ -502,12 +635,10 @@ pub fn hold_target(zone: &str) -> (f32, f32) {
 /// step gives the person to go all the way round.
 #[cfg(feature = "dev-tools")]
 const RECORD_SECONDS: f32 = 45.0;
-/// Where a recording keeps the frames it saw (root only, for tuning the
-/// walk-through; nothing reads them but a developer). One frame in five,
+/// A recording keeps the frames it saw under the store's `record/<user>/`
+/// (root only, for tuning the walk-through; nothing reads them but a
+/// developer, and a delete of the user takes them). One frame in five,
 /// named by the readings, as 8-bit PGM.
-#[cfg(feature = "dev-tools")]
-const RECORD_DIR: &str = "/var/lib/faceauth/record";
-
 #[cfg(feature = "dev-tools")]
 fn save_pgm(dir: &std::path::Path, name: &str, img: &faceauth_engine::Grey) -> Result<()> {
     std::fs::create_dir_all(dir)?;
@@ -591,15 +722,10 @@ pub const ROUNDS: [Round; 8] = [
     },
 ];
 
-/// The reading round's texts, one per slot; the window places the slots
-/// at the corners and the centre of the screen.
-pub const READ_TEXTS: [&str; 5] = [
-    "The camera reads your head, never your eyes.",
-    "Nothing here is stored as an image.",
-    "A nod approves. A shake refuses.",
-    "Ordinary reading must never count as either.",
-    "That is what this round is for.",
-];
+/// The reading round's slots: the window keeps the texts (`readTexts` in
+/// Enrol.qml) and places them at the corners and the centre of the
+/// screen; the daemon only says which slot is showing.
+pub const READ_SLOTS: usize = 5;
 /// How long each text slot shows.
 pub const READ_SLOT_SECONDS: f32 = 2.4;
 /// The pause before a round starts recording.
@@ -725,9 +851,9 @@ fn last_step(start: Option<&str>) -> Step {
     }
 }
 
-/// A round's recording: the largest 1.5 s swing on each image-motion
-/// axis, as the terminal calibration measures it, so the stored sizes
-/// and floors are the same numbers either way.
+/// A round's largest 1.5 s swing on one axis of the recorded angles,
+/// degrees: kept with the templates for the record (the floors come from
+/// the replay, `reads_to_deg`).
 fn swing(series: &[(f32, f32, f32)], pick: fn(&(f32, f32, f32)) -> f32) -> f32 {
     let mut best = 0f32;
     for i in 0..series.len() {
@@ -747,11 +873,13 @@ fn swing(series: &[(f32, f32, f32)], pick: fn(&(f32, f32, f32)) -> f32) -> f32 {
 }
 
 /// The per-frame recording of a round, kept in dev-tools builds under the
-/// root-only gestures directory: a header, then one line per frame with
-/// the mesh's angles and the image motion, for designing the detectors.
+/// root-only gestures directory, one directory per user: the round header
+/// (`consent::ROUND_HEADER`), then one line per frame with the mesh's
+/// angles and the box, for designing the detectors. The consent window's
+/// recordings share the format, so either replays through the same test.
 #[cfg(feature = "dev-tools")]
 fn save_round_trace(
-    cfg: &crate::config::Config,
+    store: &crate::store::Store,
     user: &str,
     kind: &str,
     n: usize,
@@ -759,17 +887,20 @@ fn save_round_trace(
 ) {
     use std::io::Write as _;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let dir = cfg.store_dir.join("gestures");
-    let res = (|| -> std::io::Result<()> {
+    let res = (|| -> anyhow::Result<()> {
+        let dir = store.gestures_dir_for(user)?;
         std::fs::create_dir_all(&dir)?;
+        if let Some(parent) = dir.parent() {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-        let name = format!("{}-{}-v2-{}-{}.txt", now_secs(), user, kind, n);
+        let name = format!("{}-v3-{}-{}.txt", now_secs(), kind, n);
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(dir.join(&name))?;
-        writeln!(f, "v2 t yaw pitch roll pos_x pos_y w cx cy size score")?;
+        writeln!(f, "{}", crate::consent::ROUND_HEADER)?;
         for l in lines {
             writeln!(f, "{}", l)?;
         }
@@ -782,22 +913,82 @@ fn save_round_trace(
 
 /// Run a session on the authenticator's camera and store. Returns the
 /// enrolment outcome; the window is summoned at the start and hidden at
-/// the end.
+/// the end, whichever way the session ends.
 pub fn run(a: &mut Authenticator, user: &str, start: &Start) -> Outcome {
-    match run_inner(a, user, start) {
+    let mut session = None;
+    let outcome = match run_inner(a, user, start, &mut session) {
         Ok(o) => o,
-        Err(e) => {
-            end_session(a, user, "failed", &e.to_string());
-            Outcome::Error {
-                message: e.to_string(),
-            }
+        Err(e) => Outcome::Error {
+            message: e.to_string(),
+        },
+    };
+    // A session still claimed here ended without telling the window (an
+    // error after the summon): the window is told now, with the reason,
+    // so it closes and the next enrolment is not "already running" (C9).
+    if let Some(mut s) = session {
+        let message = match &outcome {
+            Outcome::Error { message } => message.clone(),
+            _ => "The enrolment ended.".to_string(),
+        };
+        s.end("failed", &message);
+    }
+    outcome
+}
+
+/// The claim on the one enrolment session, from the moment `ACTIVE` is set
+/// until the window has been told the session is over. Every way out of
+/// the session ends it through `end`, and a way out that forgets is caught
+/// by the drop, so the window never stays up over the screen and the
+/// watchers never loop for the daemon's life (C9).
+struct Session {
+    user: String,
+    ended: bool,
+}
+
+impl Session {
+    fn claim(user: &str, uid: u32) -> Session {
+        if let Ok(mut act) = ACTIVE.lock() {
+            *act = Some((user.to_string(), uid));
         }
+        if let Ok(mut c) = CONTROL.lock() {
+            c.clear();
+        }
+        Session {
+            user: user.to_string(),
+            ended: false,
+        }
+    }
+
+    /// Tell the window the step the session ended at, release the claim
+    /// and hide the window. Once only; later calls do nothing.
+    fn end(&mut self, step: &'static str, message: &str) {
+        if self.ended {
+            return;
+        }
+        self.ended = true;
+        broadcast(&Tick::blank(step, message));
+        std::thread::sleep(Duration::from_millis(1500));
+        release();
+        let _ =
+            crate::consent::shell_call(&self.user, &["shell", "hide", "omarchy.faceauth.enrol"]);
+    }
+
+    /// The window never opened: release the claim with nothing to tell
+    /// and nothing to hide.
+    fn abandon(mut self) {
+        self.ended = true;
+        release();
     }
 }
 
-fn end_session(a: &Authenticator, user: &str, step: &'static str, message: &str) {
-    broadcast(&Tick::blank(step, message));
-    std::thread::sleep(Duration::from_millis(1500));
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.end("failed", "The enrolment ended unexpectedly.");
+    }
+}
+
+/// Clear the claim, the watchers and the control words.
+fn release() {
     if let Ok(mut w) = WATCHERS.lock() {
         w.clear();
     }
@@ -807,10 +998,18 @@ fn end_session(a: &Authenticator, user: &str, step: &'static str, message: &str)
     if let Ok(mut act) = ACTIVE.lock() {
         *act = None;
     }
-    let _ = crate::consent::shell_call(&a.cfg, user, &["shell", "hide", "omarchy.faceauth.enrol"]);
 }
 
-fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome> {
+/// The session proper. Every precondition is checked before the claim;
+/// once `session` holds the claim, the window is up and every return
+/// goes through `Session::end`, or `run` ends it with the outcome's
+/// message.
+fn run_inner(
+    a: &mut Authenticator,
+    user: &str,
+    start: &Start,
+    session: &mut Option<Session>,
+) -> Result<Outcome> {
     let uid = nix::unistd::User::from_name(user)
         .ok()
         .flatten()
@@ -821,16 +1020,9 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
             message: "an enrolment session is already running".into(),
         });
     }
-    let existing = match a.store.load(user) {
-        Ok(t) => t,
-        Err(e) => match a.store.set_aside_unreadable(user)? {
-            Some(aside) => {
-                log::warn!("enrolment for {}: existing templates unreadable ({}); set aside as {} and starting fresh", user, e, aside.display());
-                None
-            }
-            None => return Err(e),
-        },
-    };
+    // The store's one enrolment opener: a set the TPM could not open in
+    // time stays where it is and the session fails instead (F2).
+    let existing = a.store.open_for_enrolment(user)?;
     let mut u =
         existing.unwrap_or_else(|| UserTemplates::new(user, faceauth_engine::embed::AURAFACE_FILE));
     if u.model != faceauth_engine::embed::AURAFACE_FILE {
@@ -841,25 +1033,29 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
             ),
         });
     }
-    if let Ok(mut act) = ACTIVE.lock() {
-        *act = Some((user.to_string(), uid));
+    // The daemon does not start without the mesh (C3), so this cannot
+    // fail today; it stays as a precondition, checked before the window
+    // is summoned rather than after (C9).
+    if a.pipeline.mesh.is_none() {
+        return Ok(Outcome::Error {
+            message: format!(
+                "the face mesh model ({}) is not installed; run `faceauth models fetch`",
+                faceauth_engine::mesh::FACE_MESH_FILE
+            ),
+        });
     }
-    if let Ok(mut c) = CONTROL.lock() {
-        c.clear();
-    }
+    let claim = Session::claim(user, uid);
     let payload = serde_json::json!({ "user": user, "start": start.start_at.as_deref().unwrap_or("welcome") }).to_string();
     if let Err(e) = crate::consent::shell_call(
-        &a.cfg,
         user,
         &["shell", "summon", "omarchy.faceauth.enrol", &payload],
     ) {
-        if let Ok(mut act) = ACTIVE.lock() {
-            *act = None;
-        }
+        claim.abandon();
         return Ok(Outcome::Error {
             message: format!("no enrolment window: {}", e),
         });
     }
+    let session = session.insert(claim);
     let mut cap = IrCapture::open(&a.cfg)?;
     if let Some(i) = &cap.illuminator {
         i.set(true)?;
@@ -869,14 +1065,6 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
     let mut step = Step::from_start(start.start_at.as_deref());
     // The person's centre: learned in the centre step from a still, level
     // look at the screen. Until then the stored level stands in.
-    if a.pipeline.mesh.is_none() {
-        return Ok(Outcome::Error {
-            message: format!(
-                "the face mesh model ({}) is not installed; run `faceauth models fetch`",
-                faceauth_engine::mesh::FACE_MESH_FILE
-            ),
-        });
-    }
     // The centre pose in degrees, learned in the centre step.
     let mut centre = Centre {
         yaw: 0.0,
@@ -902,15 +1090,16 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
     let mut verify_hits = 0usize;
     let mut verify_since: Option<Instant> = None;
     let last = last_step(start.start_at.as_deref());
-    // A round: when it started counting down, the motion state, the series
-    // for the swing measure, and the recording.
+    // A round: when it started counting down, the angle series for the
+    // swing measure, the recording, and the round as the detectors see it,
+    // replayed when it ends to find where it stops reading (the floors
+    // come from that).
     let mut round_started: Option<Instant> = None;
-    let mut round_prev: Option<(faceauth_engine::Grey, [f32; 4])> = None;
-    let (mut round_px, mut round_py) = (0f32, 0f32);
-    let mut round_series: Vec<(f32, f32, f32)> = Vec::new();
+    // The kinds this session has recorded so far (J4).
+    let mut kinds_this_session: Vec<&'static str> = Vec::new();
     let mut round_angles: Vec<(f32, f32, f32)> = Vec::new(); // t, yaw, pitch in degrees
     let mut round_lines: Vec<String> = Vec::new();
-    let mut round_frames: Vec<crate::consent::CalFrame> = Vec::new();
+    let mut round_frames: Vec<crate::consent::RoundFrame> = Vec::new();
     let mut added = 0usize;
     let mut filter = Filter::new();
     let take_template = |u: &mut UserTemplates,
@@ -974,8 +1163,11 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
         let face = faces.into_iter().max_by(|p, q| p.score.total_cmp(&q.score));
         let mut tick = Tick::blank(step.name(), "");
         tick.zone = step.zone();
-        tick.centre_yaw = centre.yaw;
-        tick.level = centre.level;
+        #[cfg(feature = "dev-tools")]
+        {
+            tick.record.centre_yaw = centre.yaw;
+            tick.record.level = centre.level;
+        }
         let Some(face) = face else {
             tick.message = match step {
                 Step::Welcome => message_for(step, "far"),
@@ -1029,20 +1221,25 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
         tick.face = true;
         tick.size = sm[2];
         tick.distance = distance_of(tick.size);
-        tick.yaw = sm[0];
-        tick.pitch = sm[1];
-        tick.roll = hp.roll;
-        tick.raw_yaw = hp.yaw;
-        tick.raw_pitch = hp.pitch;
-        tick.nose_pitch = raw.nose_pitch;
-        tick.mesh_yaw = Some(hp.yaw);
-        tick.mesh_pitch = Some(hp.pitch);
-        tick.mesh_roll = Some(hp.roll);
-        tick.mesh_score = Some(m.score);
-        tick.x = sm[3];
-        tick.y = sm[4];
-        tick.centre_yaw = centre.yaw;
-        tick.level = centre.level;
+        #[cfg(feature = "dev-tools")]
+        {
+            tick.record = TickRecord {
+                yaw: sm[0],
+                pitch: sm[1],
+                roll: hp.roll,
+                raw_yaw: hp.yaw,
+                raw_pitch: hp.pitch,
+                nose_pitch: raw.nose_pitch,
+                mesh_yaw: Some(hp.yaw),
+                mesh_pitch: Some(hp.pitch),
+                mesh_roll: Some(hp.roll),
+                mesh_score: Some(m.score),
+                x: sm[3],
+                y: sm[4],
+                centre_yaw: centre.yaw,
+                level: centre.level,
+            };
+        }
         let (dx, dy) = dot_of(&here, &centre, &reach);
         tick.dot_x = dx;
         tick.dot_y = dy;
@@ -1105,13 +1302,17 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
                         dy,
                         tick.size
                     );
-                    if let Err(e) = save_pgm(std::path::Path::new(RECORD_DIR), &name, &img) {
+                    if let Err(e) = a
+                        .store
+                        .record_dir_for(user)
+                        .and_then(|dir| save_pgm(&dir, &name, &img))
+                    {
                         log::warn!("recording: cannot save a frame: {}", e);
                     }
                 }
                 if t0.elapsed().as_secs_f32() > RECORD_SECONDS {
                     cap.stop()?;
-                    end_session(a, user, "done", "Recorded. Nothing was stored.");
+                    session.end("done", "Recorded. Nothing was stored.");
                     return Ok(Outcome::Enrolled {
                         added: 0,
                         total: u.templates.len(),
@@ -1152,8 +1353,11 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
                     let (cx, cy) = dot_of(&here, &running, &reach);
                     tick.dot_x = cx;
                     tick.dot_y = cy;
-                    tick.centre_yaw = running.yaw;
-                    tick.level = running.level;
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        tick.record.centre_yaw = running.yaw;
+                        tick.record.level = running.level;
+                    }
                     tick.on_target = true;
                     if since.elapsed() > Duration::from_millis(3000)
                         && centre_samples.len() >= 40
@@ -1264,7 +1468,7 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
                         }
                         .map(|p| p.display().to_string())
                         .unwrap_or_default();
-                        end_session(a, user, "done", "Recognised. Enrolment complete.");
+                        session.end("done", "Recognised. Enrolment complete.");
                         return Ok(Outcome::Enrolled {
                             added,
                             total: u.templates.len(),
@@ -1298,10 +1502,6 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
                 tick.round_of = round_count();
                 tick.on_target = true;
                 let started = *round_started.get_or_insert_with(|| {
-                    round_prev = None;
-                    round_px = 0.0;
-                    round_py = 0.0;
-                    round_series.clear();
                     round_angles.clear();
                     round_lines.clear();
                     round_frames.clear();
@@ -1317,109 +1517,83 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
                     tick.seconds_left = (r.seconds - t).max(0.0);
                     tick.message = r.prompt.to_string();
                     if r.kind == "read" {
-                        tick.read_slot =
-                            Some(((t / READ_SLOT_SECONDS) as usize) % READ_TEXTS.len());
+                        tick.read_slot = Some(((t / READ_SLOT_SECONDS) as usize) % READ_SLOTS);
                     }
-                    // Image motion of the face, as the gesture detectors read it.
-                    if let Some((pimg, pbox)) = &round_prev {
-                        let region = faceauth_engine::motion::Region::around(
-                            *pbox, 0.2, img.width, img.height,
-                        );
-                        let (mdx, mdy) = faceauth_engine::motion::shift(pimg, &img, region, 24);
-                        round_px += mdx / face.bbox[2].max(1.0);
-                        round_py += mdy / face.bbox[2].max(1.0);
-                    }
-                    round_prev = Some((img.clone(), face.bbox));
                     let geom = (
                         face.bbox[2],
                         face.bbox[0] + face.bbox[2] / 2.0,
                         face.bbox[1] + face.bbox[3] / 2.0,
                     );
-                    round_series.push((t, round_px, round_py));
                     round_angles.push((t, hp.yaw, hp.pitch));
-                    round_frames.push(crate::consent::CalFrame {
+                    round_frames.push(crate::consent::RoundFrame {
                         t,
-                        pos_x: round_px,
-                        pos_y: round_py,
-                        yaw: p.yaw,
+                        yaw: hp.yaw,
+                        pitch: hp.pitch,
+                        roll: hp.roll,
                         geom,
                     });
                     if round_lines.len() < 1500 {
-                        round_lines.push(format!("{:.2} {:+.1} {:+.1} {:+.1} {:+.3} {:+.3} {:.0} {:.0} {:.0} {:.3} {:.2}", t, hp.yaw, hp.pitch, hp.roll, round_px, round_py, geom.0, geom.1, geom.2, tick.size, m.score));
+                        round_lines
+                            .push(crate::consent::round_line(t, &hp, geom, tick.size, m.score));
                     }
                     if t >= r.seconds {
-                        // The round is over: measure it the way the terminal
-                        // calibration does and store the same numbers.
-                        let dy = swing(&round_series, |s| s.2);
-                        let dx = swing(&round_series, |s| s.1);
+                        // The round is over: its swings go with the templates
+                        // for the record, and its replay through the mesh
+                        // detectors says where it stops reading, which is
+                        // what the floors derive from (a floor at a fraction
+                        // of the swing lost the reference user's own shake).
                         let dpitch = swing(&round_angles, |s| s.2);
                         let dyaw = swing(&round_angles, |s| s.1);
-                        let (amplitude, stored) = match r.stored_as {
+                        let reads_to = match r.stored_as {
+                            "nod" => crate::consent::reads_to_deg(&round_frames, true),
+                            "shake" => crate::consent::reads_to_deg(&round_frames, false),
+                            _ => None,
+                        };
+                        begin_kind(&mut u.gesture, &mut kinds_this_session, r.stored_as);
+                        let stored = match r.stored_as {
                             "nod" => {
-                                let ok = dy >= crate::consent::NodDetector::MIN_DOWN;
-                                if ok {
-                                    u.gesture.nod.push(dy)
-                                }
                                 if dpitch >= crate::consent::NodDetector::MESH_MIN_DEG {
                                     u.gesture.nod_deg.push(dpitch)
                                 }
-                                (dy, ok)
+                                if let Some(f) = reads_to {
+                                    u.gesture.nod_reads_to_deg.push(f)
+                                }
+                                reads_to.is_some()
                             }
                             "shake" => {
-                                let ok = dx >= crate::consent::ShakeDetector::MIN_TURN;
-                                if ok {
-                                    u.gesture.shake.push(dx)
-                                }
                                 if dyaw >= crate::consent::ShakeDetector::MESH_MIN_DEG {
                                     u.gesture.shake_deg.push(dyaw)
                                 }
-                                (dx, ok)
+                                if let Some(f) = reads_to {
+                                    u.gesture.shake_reads_to_deg.push(f)
+                                }
+                                reads_to.is_some()
                             }
                             kind => {
-                                u.gesture.everyday.push(crate::store::EverydayRound {
-                                    kind: kind.to_string(),
-                                    dy,
-                                    dx,
-                                });
                                 u.gesture.everyday_deg.push(crate::store::EverydayDeg {
                                     kind: kind.to_string(),
                                     dyaw,
                                     dpitch,
                                 });
-                                u.gesture.still_nod.clear();
-                                u.gesture.still_shake.clear();
-                                (dy.max(dx), true)
+                                true
                             }
                         };
-                        a.cal_rounds.entry(user.to_string()).or_default().push(
-                            crate::auth::CalRound {
-                                kind: r.stored_as.to_string(),
-                                frames: std::mem::take(&mut round_frames),
-                                sample: if stored && matches!(r.stored_as, "nod" | "shake") {
-                                    Some(amplitude)
-                                } else {
-                                    None
-                                },
-                            },
-                        );
-                        log::info!("round {} of {} for {}: {} {} moved {:.3} vertically, {:.3} sideways ({:.0} deg pitch, {:.0} deg yaw){}", i + 1, round_count(), user, r.kind, n, dy, dx, dpitch, dyaw, if stored { "" } else { " (too small to count; not stored)" });
+                        log::info!("round {} of {} for {}: {} {} swung {:.0} deg pitch, {:.0} deg yaw{}", i + 1, round_count(), user, r.kind, n, dpitch, dyaw, match (stored, reads_to) { (true, Some(f)) => format!("; reads on the mesh up to a {:.0} degree floor", f), (false, _) => "; does not read on the mesh even at the minimum floor (sets no floor)".to_string(), _ => String::new() });
                         #[cfg(feature = "dev-tools")]
-                        save_round_trace(&a.cfg, user, r.kind, n, &round_lines);
+                        save_round_trace(&a.store, user, r.kind, n, &round_lines);
                         a.store.save(&u)?;
                         round_started = None;
                         match step.next() {
                             Some(s) if step != last => step = s,
                             _ => {
                                 cap.stop()?;
-                                let (nf, sf) = u.gesture.floors(
-                                    crate::consent::NodDetector::MIN_DOWN,
-                                    crate::consent::ShakeDetector::MIN_TURN,
+                                let (nd, sd) = crate::auth::consent_floors(&u.gesture);
+                                log::info!(
+                                    "rounds done for {}: floors nod {:.0} deg, shake {:.0} deg",
+                                    user,
+                                    nd,
+                                    sd
                                 );
-                                let (nd, sd) = u.gesture.floors_deg(
-                                    crate::consent::NodDetector::MESH_MIN_DEG,
-                                    crate::consent::ShakeDetector::MESH_MIN_DEG,
-                                );
-                                log::info!("rounds done for {}: floors nod {:.3} shake {:.3} (mesh: nod {:.0} deg, shake {:.0} deg)", user, nf, sf, nd, sd);
                                 let (lo, mean, _) = u.self_consistency().unwrap_or((1.0, 1.0, 1.0));
                                 let path = if a.store.is_sealed(user) {
                                     a.store.sealed_path_for(user)
@@ -1428,7 +1602,7 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
                                 }
                                 .map(|p| p.display().to_string())
                                 .unwrap_or_default();
-                                end_session(a, user, "done", "All done. Your nods, shakes and everyday movements are recorded.");
+                                session.end("done", "All done. Your nods, shakes and everyday movements are recorded.");
                                 return Ok(Outcome::Enrolled {
                                     added,
                                     total: u.templates.len(),
@@ -1449,6 +1623,38 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The session statics are process-wide: tests that touch them take
+    /// this so they do not see each other's claim.
+    static SESSION_STATICS: Mutex<()> = Mutex::new(());
+
+    /// C9: a claim released without an explicit end (an error after the
+    /// summon) still clears the session, so the next enrolment is not
+    /// "already running" and the watchers stop looping. A claim abandoned
+    /// before the window opened clears it too.
+    #[test]
+    fn a_dropped_claim_releases_the_session() {
+        let _serial = SESSION_STATICS.lock().unwrap_or_else(|e| e.into_inner());
+        let sess = Session {
+            user: "c9-test".into(),
+            ended: false,
+        };
+        if let Ok(mut act) = ACTIVE.lock() {
+            *act = Some(("c9-test".into(), 65534));
+        }
+        assert!(active_for("c9-test", 65534));
+        drop(sess);
+        assert!(!is_active(), "the drop ended the session");
+        let sess = Session {
+            user: "c9-test".into(),
+            ended: false,
+        };
+        if let Ok(mut act) = ACTIVE.lock() {
+            *act = Some(("c9-test".into(), 65534));
+        }
+        sess.abandon();
+        assert!(!is_active(), "the abandoned claim is released");
+    }
 
     #[test]
     fn the_steps_run_in_order_and_end_at_verify() {
@@ -1725,6 +1931,7 @@ mod tests {
 
     #[test]
     fn watchers_and_control_are_per_session() {
+        let _serial = SESSION_STATICS.lock().unwrap_or_else(|e| e.into_inner());
         assert!(!is_active());
         control("continue");
         assert_eq!(take_control().as_deref(), Some("continue"));
@@ -1749,5 +1956,30 @@ mod tests {
             WATCHERS.lock().unwrap().is_empty(),
             "a hung-up watcher is dropped"
         );
+        // J2: one watcher per session, and one that never reads is dropped
+        // at the first full buffer rather than stalling the writer.
+        let (first, _keep_first) = UnixStream::pair().unwrap();
+        add_watcher(first);
+        let (second, silent) = UnixStream::pair().unwrap();
+        add_watcher(second);
+        assert_eq!(
+            WATCHERS.lock().unwrap().len(),
+            1,
+            "the second replaces the first"
+        );
+        let started = Instant::now();
+        let mut n = 0;
+        while !WATCHERS.lock().unwrap().is_empty() {
+            broadcast(&Tick::blank("path", &"x".repeat(2000)));
+            n += 1;
+            assert!(n < 100_000, "a silent watcher was never dropped");
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the writer never blocked on the silent watcher ({} lines in {:?})",
+            n,
+            started.elapsed()
+        );
+        drop(silent);
     }
 }

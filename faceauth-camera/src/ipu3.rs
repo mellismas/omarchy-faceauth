@@ -47,7 +47,31 @@ pub struct Ipu3Graph {
     pub sensors: Vec<Ipu3Sensor>,
 }
 
-/// Find the IPU3 media device and every sensor hanging off it.
+/// What a sensor's media-bus code says it is, and the IPU3 pixel format
+/// its capture node takes for it. None for a code this crate does not
+/// handle (a compressed or packed variant, or a YUV bridge).
+pub fn classify_bus_code(code: u32) -> Option<(SensorKind, u32)> {
+    Some(match code {
+        MEDIA_BUS_FMT_Y10_1X10 => (SensorKind::Infrared, V4L2_PIX_FMT_IPU3_Y10),
+        MEDIA_BUS_FMT_SBGGR10_1X10 => (SensorKind::Colour, V4L2_PIX_FMT_IPU3_SBGGR10),
+        MEDIA_BUS_FMT_SGRBG10_1X10 => (SensorKind::Colour, V4L2_PIX_FMT_IPU3_SGRBG10),
+        MEDIA_BUS_FMT_SGBRG10_1X10 => (SensorKind::Colour, V4L2_PIX_FMT_IPU3_SGBRG10),
+        MEDIA_BUS_FMT_SRGGB10_1X10 => (SensorKind::Colour, V4L2_PIX_FMT_IPU3_SRGGB10),
+        _ => return None,
+    })
+}
+
+/// The port number in an `ipu3-csi2 N` entity name.
+pub fn csi2_port(name: &str) -> Option<u32> {
+    name.strip_prefix("ipu3-csi2 ")?.trim().parse().ok()
+}
+
+/// Find the IPU3 media device and every sensor hanging off it. A sensor
+/// that fails to answer (a rear camera whose driver is half bound, a lens
+/// controller) is logged and skipped rather than taking the whole probe
+/// down: the IR sensor is the one authentication needs, and it is asked
+/// about on its own. The probe fails only when no sensor came through and
+/// at least one failed.
 pub fn probe() -> Result<Option<Ipu3Graph>> {
     for path in MediaDevice::enumerate() {
         let md = match MediaDevice::open(&path) {
@@ -60,75 +84,23 @@ pub fn probe() -> Result<Option<Ipu3Graph>> {
         }
         let entities = md.entities()?;
         let mut sensors = Vec::new();
+        let mut failed: Option<anyhow::Error> = None;
         // Walk from the sensors: the kernel reports outgoing links only, so a
         // sensor is any entity with a link into an "ipu3-csi2 N" pad 0.
         for sensor in entities.iter().filter(|e| !e.name.starts_with("ipu3-")) {
-            let links = md.links(sensor)?;
-            let Some((csi2, _link)) = links.iter().find_map(|l| {
-                entities
-                    .iter()
-                    .find(|e| {
-                        e.id == l.sink_entity && l.sink_pad == 0 && e.name.starts_with("ipu3-csi2 ")
-                    })
-                    .map(|e| (e, l))
-            }) else {
-                continue;
-            };
-            let port: u32 = csi2.name["ipu3-csi2 ".len()..].trim().parse().unwrap_or(99);
-            let Some(cio2) = entities
-                .iter()
-                .find(|e| e.name == format!("ipu3-cio2 {}", port))
-            else {
-                continue;
-            };
-            let subdev = sensor
-                .dev_node()
-                .ok_or_else(|| anyhow!("{}: no subdev node", sensor.name))?;
-            let video = cio2
-                .dev_node()
-                .ok_or_else(|| anyhow!("{}: no video node", cio2.name))?;
-            let sd = Subdev::open(&subdev)?;
-            let (w, h, code) = sd.get_format(0)?;
-            let orientation = match sd
-                .controls
-                .find("camera_orientation")?
-                .map(|c| sd.controls.get(c.id))
-            {
-                Some(Ok(0)) => Some(Orientation::Front),
-                Some(Ok(1)) => Some(Orientation::Back),
-                Some(Ok(2)) => Some(Orientation::External),
-                _ => None,
-            };
-            let (kind, pixelformat) = match code {
-                MEDIA_BUS_FMT_Y10_1X10 => (SensorKind::Infrared, V4L2_PIX_FMT_IPU3_Y10),
-                MEDIA_BUS_FMT_SBGGR10_1X10 => (SensorKind::Colour, V4L2_PIX_FMT_IPU3_SBGGR10),
-                MEDIA_BUS_FMT_SGRBG10_1X10 => (SensorKind::Colour, V4L2_PIX_FMT_IPU3_SGRBG10),
-                0x3009 => (SensorKind::Colour, V4L2_PIX_FMT_IPU3_SGBRG10), // MEDIA_BUS_FMT_SGBRG10_1X10
-                0x300f => (SensorKind::Colour, V4L2_PIX_FMT_IPU3_SRGGB10), // MEDIA_BUS_FMT_SRGGB10_1X10
-                other => {
-                    log::warn!(
-                        "{}: unknown media-bus code 0x{:04x}, skipped",
-                        sensor.name,
-                        other
-                    );
-                    continue;
+            match read_sensor(&md, &entities, sensor) {
+                Ok(Some(s)) => sensors.push(s),
+                Ok(None) => {}
+                Err(e) => {
+                    log::warn!("{}: skipped: {:#}", sensor.name, e);
+                    failed = Some(e);
                 }
-            };
-            sensors.push(Ipu3Sensor {
-                kind,
-                orientation,
-                name: sensor.name.clone(),
-                sensor: sensor.clone(),
-                csi2: csi2.clone(),
-                cio2: cio2.clone(),
-                port,
-                subdev,
-                video,
-                width: w,
-                height: h,
-                mbus_code: code,
-                pixelformat,
-            });
+            }
+        }
+        if sensors.is_empty() {
+            if let Some(e) = failed {
+                return Err(e).context("IPU3 probe found no usable sensor");
+            }
         }
         sensors.sort_by_key(|s| s.port);
         return Ok(Some(Ipu3Graph {
@@ -137,6 +109,72 @@ pub fn probe() -> Result<Option<Ipu3Graph>> {
         }));
     }
     Ok(None)
+}
+
+/// One entity's place in the graph: `Ok(None)` when it is not a sensor on
+/// a CSI-2 receiver (or produces a code this crate does not handle), `Err`
+/// when it is one but would not answer.
+fn read_sensor(
+    md: &MediaDevice,
+    entities: &[Entity],
+    sensor: &Entity,
+) -> Result<Option<Ipu3Sensor>> {
+    let links = md.links(sensor)?;
+    let Some(csi2) = links.iter().find_map(|l| {
+        entities
+            .iter()
+            .find(|e| e.id == l.sink_entity && l.sink_pad == 0 && e.name.starts_with("ipu3-csi2 "))
+    }) else {
+        return Ok(None);
+    };
+    let port = csi2_port(&csi2.name).unwrap_or(99);
+    let Some(cio2) = entities
+        .iter()
+        .find(|e| e.name == format!("ipu3-cio2 {}", port))
+    else {
+        return Ok(None);
+    };
+    let subdev = sensor
+        .dev_node()
+        .ok_or_else(|| anyhow!("{}: no subdev node", sensor.name))?;
+    let video = cio2
+        .dev_node()
+        .ok_or_else(|| anyhow!("{}: no video node", cio2.name))?;
+    let sd = Subdev::open(&subdev)?;
+    let (w, h, code) = sd.get_format(0)?;
+    let orientation = match sd
+        .controls
+        .find("camera_orientation")?
+        .map(|c| sd.controls.get(c.id))
+    {
+        Some(Ok(0)) => Some(Orientation::Front),
+        Some(Ok(1)) => Some(Orientation::Back),
+        Some(Ok(2)) => Some(Orientation::External),
+        _ => None,
+    };
+    let Some((kind, pixelformat)) = classify_bus_code(code) else {
+        log::warn!(
+            "{}: unknown media-bus code 0x{:04x}, skipped",
+            sensor.name,
+            code
+        );
+        return Ok(None);
+    };
+    Ok(Some(Ipu3Sensor {
+        kind,
+        orientation,
+        name: sensor.name.clone(),
+        sensor: sensor.clone(),
+        csi2: csi2.clone(),
+        cio2: cio2.clone(),
+        port,
+        subdev,
+        video,
+        width: w,
+        height: h,
+        mbus_code: code,
+        pixelformat,
+    }))
 }
 
 impl Ipu3Graph {
@@ -194,5 +232,39 @@ impl Ipu3Graph {
         csi.set_format(0, w, h, code)?;
         csi.set_format(1, w, h, code)?;
         Ok((w, h))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The IR sensor is the Y10 code; every 10-bit Bayer code is a colour
+    /// sensor with the matching IPU3 packed format; a DPCM8 or unknown code
+    /// is neither.
+    #[test]
+    fn bus_codes_classify_sensors() {
+        assert_eq!(
+            classify_bus_code(MEDIA_BUS_FMT_Y10_1X10),
+            Some((SensorKind::Infrared, V4L2_PIX_FMT_IPU3_Y10))
+        );
+        assert_eq!(
+            classify_bus_code(MEDIA_BUS_FMT_SGBRG10_1X10),
+            Some((SensorKind::Colour, V4L2_PIX_FMT_IPU3_SGBRG10))
+        );
+        assert_eq!(
+            classify_bus_code(MEDIA_BUS_FMT_SRGGB10_1X10),
+            Some((SensorKind::Colour, V4L2_PIX_FMT_IPU3_SRGGB10))
+        );
+        assert_eq!(classify_bus_code(0x3009), None, "SGRBG10_DPCM8 is not GBRG");
+        assert_eq!(classify_bus_code(0x2008), None);
+    }
+
+    #[test]
+    fn csi2_ports_parse_from_the_entity_name() {
+        assert_eq!(csi2_port("ipu3-csi2 0"), Some(0));
+        assert_eq!(csi2_port("ipu3-csi2 3"), Some(3));
+        assert_eq!(csi2_port("ipu3-cio2 1"), None);
+        assert_eq!(csi2_port("ov7251 3-0060"), None);
     }
 }

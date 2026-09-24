@@ -1,11 +1,13 @@
 [Unit]
 Description=Omarchy FaceAuth daemon (camera, templates, verdicts for pam_faceauth)
-Documentation=https://github.com/basecamp/omarchy
+Documentation=https://github.com/mellismas/omarchy-faceauth
 # Started at boot as a plain service. Never socket- or D-Bus-activated and never
 # started from anything inside a PAM stack: an on-demand start would recurse
 # through polkit into the PAM stack that contains pam_faceauth.
-After=systemd-udev-settle.service
-Wants=systemd-udev-settle.service
+# The camera is opened per request, so no settled /dev is needed at start.
+# The only boot-time device is the TPM, which systemd orders through
+# tpm2.target (pulled in by its generator when firmware reports one).
+After=tpm2.target
 
 [Service]
 Type=simple
@@ -17,10 +19,10 @@ RuntimeDirectoryMode=0755
 StateDirectory=faceauth
 StateDirectoryMode=0700
 ConfigurationDirectory=faceauth
-# Root because the camera nodes and the template store are root-owned, but
-# with no capabilities at all: opening root-owned devices, binding the socket
-# and writing the store need none, and the session lock goes through PID 1.
-User=root
+# Root (the default) because the camera nodes and the template store are
+# root-owned, but with no capabilities at all: opening root-owned devices,
+# binding the socket and writing the store need none, and the session lock
+# goes through PID 1.
 CapabilityBoundingSet=
 AmbientCapabilities=
 NoNewPrivileges=yes
@@ -43,9 +45,10 @@ RestrictNamespaces=yes
 RestrictSUIDSGID=yes
 RestrictRealtime=yes
 LockPersonality=yes
-# ONNX Runtime JIT-compiles kernels; this is the one W^X concession, named here
-# so a reviewer sees it.
-MemoryDenyWriteExecute=no
+# ONNX Runtime's CPU provider runs all three models without a writable and
+# executable mapping (the engine's `mdwe` test loads and runs each under
+# the same prctl), so the daemon keeps W^X.
+MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
@@ -54,15 +57,23 @@ DeviceAllow=char-video4linux rw
 DeviceAllow=char-media rw
 # The TPM resource manager, for sealing templates through systemd-creds.
 DeviceAllow=/dev/tpmrm0 rw
-ReadWritePaths=/var/lib/faceauth /run/faceauth /etc/sudoers.d
+# StateDirectory= and RuntimeDirectory= above already make /var/lib/faceauth
+# and /run/faceauth writable. /etc/sudoers.d is here for one file:
+# /etc/sudoers.d/99-omarchy-nopasswd-<user>, the passwordless-sudo rule the
+# consent card can arm (the same file omarchy-sudo-passwordless writes),
+# which the daemon places and its timer removes. ReadWritePaths= is
+# directory-granular, so the one file cannot be named on its own; nothing
+# else under /etc is writable.
+ReadWritePaths=/etc/sudoers.d
 UMask=0077
 # Unsealed templates live in memory; a core dump would write them to disk.
 LimitCORE=0
-# The recognition model is ~700 MB resident; a runaway is killed well before
-# the system is.
-MemoryMax=1536M
+# The pipeline is about 300 MB resident with the recognition model loaded
+# and about 60 MB with it released; each load peaks near 740 MB for half
+# a second. A runaway is killed well before the system is.
+MemoryMax=1024M
 TasksMax=64
-Environment=RUST_LOG=info
+# The daemon logs at info unless RUST_LOG says otherwise; nothing to set here.
 
 [Install]
 WantedBy=multi-user.target
