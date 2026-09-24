@@ -60,7 +60,16 @@ pub const V4L2_PIX_FMT_YUYV: u32 = fourcc(b'Y', b'U', b'Y', b'V');
 pub const V4L2_PIX_FMT_MJPEG: u32 = fourcc(b'M', b'J', b'P', b'G');
 
 pub fn fourcc_str(f: u32) -> String {
-    f.to_le_bytes().iter().map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '?' }).collect()
+    f.to_le_bytes()
+        .iter()
+        .map(|&b| {
+            if b.is_ascii_graphic() || b == b' ' {
+                b as char
+            } else {
+                '?'
+            }
+        })
+        .collect()
 }
 
 #[repr(C)]
@@ -142,7 +151,11 @@ pub struct v4l2_format {
 
 impl v4l2_format {
     pub fn zeroed(type_: u32) -> Self {
-        v4l2_format { type_, _pad: 0, raw: [0; 200] }
+        v4l2_format {
+            type_,
+            _pad: 0,
+            raw: [0; 200],
+        }
     }
     pub fn pix(&self) -> &v4l2_pix_format {
         // SAFETY: repr(C) POD, in-bounds, 4-byte aligned (raw starts at offset 8).
@@ -416,16 +429,43 @@ mod layout_tests {
     #[test]
     fn ioctl_numbers_match_headers_x86_64() {
         use nix::{request_code_read, request_code_readwrite, request_code_write};
-        assert_eq!(request_code_read!(b'V', 0, size_of::<v4l2_capability>()), 0x8068_5600);
-        assert_eq!(request_code_readwrite!(b'V', 5, size_of::<v4l2_format>()), 0xc0d0_5605);
-        assert_eq!(request_code_readwrite!(b'V', 17, size_of::<v4l2_buffer>()), 0xc058_5611);
+        assert_eq!(
+            request_code_read!(b'V', 0, size_of::<v4l2_capability>()),
+            0x8068_5600
+        );
+        assert_eq!(
+            request_code_readwrite!(b'V', 5, size_of::<v4l2_format>()),
+            0xc0d0_5605
+        );
+        assert_eq!(
+            request_code_readwrite!(b'V', 17, size_of::<v4l2_buffer>()),
+            0xc058_5611
+        );
         assert_eq!(request_code_write!(b'V', 18, size_of::<u32>()), 0x4004_5612);
-        assert_eq!(request_code_readwrite!(b'V', 28, size_of::<v4l2_control>()), 0xc008_561c);
-        assert_eq!(request_code_readwrite!(b'V', 103, size_of::<v4l2_query_ext_ctrl>()), 0xc0e8_5667);
-        assert_eq!(request_code_readwrite!(b'V', 5, size_of::<v4l2_subdev_format>()), 0xc058_5605);
-        assert_eq!(request_code_readwrite!(b'|', 1, size_of::<media_entity_desc>()), 0xc100_7c01);
-        assert_eq!(request_code_readwrite!(b'|', 2, size_of::<media_links_enum>()), 0xc028_7c02);
-        assert_eq!(request_code_readwrite!(b'|', 3, size_of::<media_link_desc>()), 0xc034_7c03);
+        assert_eq!(
+            request_code_readwrite!(b'V', 28, size_of::<v4l2_control>()),
+            0xc008_561c
+        );
+        assert_eq!(
+            request_code_readwrite!(b'V', 103, size_of::<v4l2_query_ext_ctrl>()),
+            0xc0e8_5667
+        );
+        assert_eq!(
+            request_code_readwrite!(b'V', 5, size_of::<v4l2_subdev_format>()),
+            0xc058_5605
+        );
+        assert_eq!(
+            request_code_readwrite!(b'|', 1, size_of::<media_entity_desc>()),
+            0xc100_7c01
+        );
+        assert_eq!(
+            request_code_readwrite!(b'|', 2, size_of::<media_links_enum>()),
+            0xc028_7c02
+        );
+        assert_eq!(
+            request_code_readwrite!(b'|', 3, size_of::<media_link_desc>()),
+            0xc034_7c03
+        );
     }
 
     #[test]

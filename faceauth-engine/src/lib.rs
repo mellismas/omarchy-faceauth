@@ -7,11 +7,11 @@
 //! identical channels.
 
 pub mod align;
-pub mod mesh;
 pub mod detect;
 pub mod embed;
 pub mod image;
 pub mod liveness;
+pub mod mesh;
 pub mod motion;
 pub mod pose;
 pub mod runtime;
@@ -43,7 +43,14 @@ impl Pipeline {
         runtime::init()?;
         let d = models_dir.as_ref();
         let mesh_path = d.join(mesh::FACE_MESH_FILE);
-        let mesh = if mesh_path.exists() { Some(mesh::FaceMesh::load(&mesh_path).with_context(|| format!("load {}", mesh_path.display()))?) } else { None };
+        let mesh = if mesh_path.exists() {
+            Some(
+                mesh::FaceMesh::load(&mesh_path)
+                    .with_context(|| format!("load {}", mesh_path.display()))?,
+            )
+        } else {
+            None
+        };
         Ok(Pipeline {
             detector: detect::YuNet::load(d.join(detect::YUNET_FILE))?,
             embedder: embed::ArcFace::load(d.join(embed::AURAFACE_FILE))?,
@@ -52,7 +59,12 @@ impl Pipeline {
     }
 
     /// Detect every face above `score_threshold`, embed the `max_embed` best.
-    pub fn analyse(&mut self, img: &Grey, score_threshold: f32, max_embed: usize) -> Result<Vec<Face>> {
+    pub fn analyse(
+        &mut self,
+        img: &Grey,
+        score_threshold: f32,
+        max_embed: usize,
+    ) -> Result<Vec<Face>> {
         let mut faces = self.detector.detect(img, score_threshold)?;
         faces.sort_by(|a, b| b.score.total_cmp(&a.score));
         for f in faces.iter_mut().take(max_embed) {

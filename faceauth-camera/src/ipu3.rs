@@ -65,17 +65,35 @@ pub fn probe() -> Result<Option<Ipu3Graph>> {
         for sensor in entities.iter().filter(|e| !e.name.starts_with("ipu3-")) {
             let links = md.links(sensor)?;
             let Some((csi2, _link)) = links.iter().find_map(|l| {
-                entities.iter().find(|e| e.id == l.sink_entity && l.sink_pad == 0 && e.name.starts_with("ipu3-csi2 ")).map(|e| (e, l))
+                entities
+                    .iter()
+                    .find(|e| {
+                        e.id == l.sink_entity && l.sink_pad == 0 && e.name.starts_with("ipu3-csi2 ")
+                    })
+                    .map(|e| (e, l))
             }) else {
                 continue;
             };
             let port: u32 = csi2.name["ipu3-csi2 ".len()..].trim().parse().unwrap_or(99);
-            let Some(cio2) = entities.iter().find(|e| e.name == format!("ipu3-cio2 {}", port)) else { continue };
-            let subdev = sensor.dev_node().ok_or_else(|| anyhow!("{}: no subdev node", sensor.name))?;
-            let video = cio2.dev_node().ok_or_else(|| anyhow!("{}: no video node", cio2.name))?;
+            let Some(cio2) = entities
+                .iter()
+                .find(|e| e.name == format!("ipu3-cio2 {}", port))
+            else {
+                continue;
+            };
+            let subdev = sensor
+                .dev_node()
+                .ok_or_else(|| anyhow!("{}: no subdev node", sensor.name))?;
+            let video = cio2
+                .dev_node()
+                .ok_or_else(|| anyhow!("{}: no video node", cio2.name))?;
             let sd = Subdev::open(&subdev)?;
             let (w, h, code) = sd.get_format(0)?;
-            let orientation = match sd.controls.find("camera_orientation")?.map(|c| sd.controls.get(c.id)) {
+            let orientation = match sd
+                .controls
+                .find("camera_orientation")?
+                .map(|c| sd.controls.get(c.id))
+            {
                 Some(Ok(0)) => Some(Orientation::Front),
                 Some(Ok(1)) => Some(Orientation::Back),
                 Some(Ok(2)) => Some(Orientation::External),
@@ -88,7 +106,11 @@ pub fn probe() -> Result<Option<Ipu3Graph>> {
                 0x3009 => (SensorKind::Colour, V4L2_PIX_FMT_IPU3_SGBRG10), // MEDIA_BUS_FMT_SGBRG10_1X10
                 0x300f => (SensorKind::Colour, V4L2_PIX_FMT_IPU3_SRGGB10), // MEDIA_BUS_FMT_SRGGB10_1X10
                 other => {
-                    log::warn!("{}: unknown media-bus code 0x{:04x}, skipped", sensor.name, other);
+                    log::warn!(
+                        "{}: unknown media-bus code 0x{:04x}, skipped",
+                        sensor.name,
+                        other
+                    );
                     continue;
                 }
             };
@@ -109,7 +131,10 @@ pub fn probe() -> Result<Option<Ipu3Graph>> {
             });
         }
         sensors.sort_by_key(|s| s.port);
-        return Ok(Some(Ipu3Graph { media: path, sensors }));
+        return Ok(Some(Ipu3Graph {
+            media: path,
+            sensors,
+        }));
     }
     Ok(None)
 }
@@ -148,15 +173,24 @@ impl Ipu3Graph {
             .find(|l| l.sink_entity == s.csi2.id && l.sink_pad == 0)
             .ok_or_else(|| anyhow!("{} -> {}: link not found", s.name, s.csi2.name))?;
         if !link.enabled() {
-            md.setup_link(link, true).with_context(|| format!("enable {} -> {}", s.name, s.csi2.name))?;
+            md.setup_link(link, true)
+                .with_context(|| format!("enable {} -> {}", s.name, s.csi2.name))?;
         }
         let sd = Subdev::open(&s.subdev)?;
         let (w, h) = size.unwrap_or((s.width, s.height));
         let (w, h, code) = sd.set_format(0, w, h, s.mbus_code)?;
         if code != s.mbus_code {
-            bail!("{}: sensor changed media-bus code to 0x{:04x}", s.name, code);
+            bail!(
+                "{}: sensor changed media-bus code to 0x{:04x}",
+                s.name,
+                code
+            );
         }
-        let csi = Subdev::open(s.csi2.dev_node().ok_or_else(|| anyhow!("{}: no subdev node", s.csi2.name))?)?;
+        let csi = Subdev::open(
+            s.csi2
+                .dev_node()
+                .ok_or_else(|| anyhow!("{}: no subdev node", s.csi2.name))?,
+        )?;
         csi.set_format(0, w, h, code)?;
         csi.set_format(1, w, h, code)?;
         Ok((w, h))

@@ -34,7 +34,12 @@ pub struct Frame {
 
 impl Frame {
     pub fn new(width: usize, height: usize) -> Self {
-        Frame { width, height, sequence: 0, px: vec![0; width * height] }
+        Frame {
+            width,
+            height,
+            sequence: 0,
+            px: vec![0; width * height],
+        }
     }
 }
 
@@ -52,7 +57,11 @@ impl Decoder {
     pub fn for_pixelformat(f: u32) -> Option<Decoder> {
         use sys::*;
         Some(match f {
-            V4L2_PIX_FMT_IPU3_Y10 | V4L2_PIX_FMT_IPU3_SBGGR10 | V4L2_PIX_FMT_IPU3_SGBRG10 | V4L2_PIX_FMT_IPU3_SGRBG10 | V4L2_PIX_FMT_IPU3_SRGGB10 => Decoder::Ipu3Packed10,
+            V4L2_PIX_FMT_IPU3_Y10
+            | V4L2_PIX_FMT_IPU3_SBGGR10
+            | V4L2_PIX_FMT_IPU3_SGBRG10
+            | V4L2_PIX_FMT_IPU3_SGRBG10
+            | V4L2_PIX_FMT_IPU3_SRGGB10 => Decoder::Ipu3Packed10,
             V4L2_PIX_FMT_GREY => Decoder::Grey8,
             V4L2_PIX_FMT_YUYV => Decoder::YuyvLuma,
             V4L2_PIX_FMT_Y10 => Decoder::Y10,
@@ -92,14 +101,25 @@ pub struct Camera {
 impl Camera {
     /// Open a node and a control interface (the sensor subdev for IPU3, or the
     /// node itself for UVC), negotiate `pixelformat` at `width`x`height`.
-    pub fn open(video: impl AsRef<Path>, controls: impl AsRef<Path>, width: u32, height: u32, pixelformat: u32, buffers: u32) -> Result<Self> {
+    pub fn open(
+        video: impl AsRef<Path>,
+        controls: impl AsRef<Path>,
+        width: u32,
+        height: u32,
+        pixelformat: u32,
+        buffers: u32,
+    ) -> Result<Self> {
         let mut vd = VideoDevice::open(&video)?;
         let fmt = vd.set_format(width, height, pixelformat)?;
-        let decoder = Decoder::for_pixelformat(fmt.pixelformat).ok_or_else(|| anyhow!("no decoder for {}", sys::fourcc_str(fmt.pixelformat)))?;
+        let decoder = Decoder::for_pixelformat(fmt.pixelformat)
+            .ok_or_else(|| anyhow!("no decoder for {}", sys::fourcc_str(fmt.pixelformat)))?;
         vd.request_buffers(buffers)?;
         let controls = Controls::open(&controls)?;
         let list = controls.list()?;
-        let find = |keys: &[&str]| keys.iter().find_map(|k| list.iter().find(|c| c.key() == *k).cloned());
+        let find = |keys: &[&str]| {
+            keys.iter()
+                .find_map(|k| list.iter().find(|c| c.key() == *k).cloned())
+        };
         let exposure = find(&["exposure", "exposure_absolute", "exposure_time_absolute"])
             .ok_or_else(|| anyhow!("{}: no exposure control", controls.path().display()))?;
         let gain = find(&["analogue_gain", "gain"]);
@@ -108,7 +128,14 @@ impl Camera {
             gain: gain.as_ref().map(|g| (g.min, g.max)),
             dgain_max: 4.0,
         };
-        Ok(Camera { video: vd, controls, sensor: SensorControls { exposure, gain }, decoder, limits, applied: None })
+        Ok(Camera {
+            video: vd,
+            controls,
+            sensor: SensorControls { exposure, gain },
+            decoder,
+            limits,
+            applied: None,
+        })
     }
 
     pub fn width(&self) -> usize {
@@ -132,9 +159,15 @@ impl Camera {
         if f.width != w || f.height != h {
             *f = Frame::new(w, h);
         }
-        let Some(fr) = self.video.next_frame(timeout)? else { return Ok(false) };
+        let Some(fr) = self.video.next_frame(timeout)? else {
+            return Ok(false);
+        };
         if !self.decoder.decode(fr.data(), f) {
-            bail!("{}: short frame ({} bytes)", self.video.path().display(), fr.bytesused);
+            bail!(
+                "{}: short frame ({} bytes)",
+                self.video.path().display(),
+                fr.bytesused
+            );
         }
         f.sequence = fr.sequence;
         Ok(true)
@@ -147,7 +180,11 @@ impl Camera {
             Some(g) => self.controls.get(g.id)? as i64,
             None => 0,
         };
-        Ok(Exposure { exposure, gain, dgain: self.applied.map(|a| a.dgain).unwrap_or(1.0) })
+        Ok(Exposure {
+            exposure,
+            gain,
+            dgain: self.applied.map(|a| a.dgain).unwrap_or(1.0),
+        })
     }
 
     /// Write exposure and gain to the sensor (only the fields that changed).
@@ -155,7 +192,8 @@ impl Camera {
     pub fn set_exposure(&mut self, e: Exposure) -> Result<()> {
         let prev = self.applied;
         if prev.map(|p| p.exposure != e.exposure).unwrap_or(true) {
-            self.controls.set(self.sensor.exposure.id, e.exposure as i32)?;
+            self.controls
+                .set(self.sensor.exposure.id, e.exposure as i32)?;
         }
         if let Some(g) = &self.sensor.gain {
             if prev.map(|p| p.gain != e.gain).unwrap_or(true) {
@@ -181,9 +219,22 @@ impl Illuminator {
     pub fn open(controls_path: impl AsRef<Path>) -> Result<Option<Self>> {
         let controls = Controls::open(controls_path)?;
         let list = controls.list()?;
-        let Some(enable) = list.iter().find(|c| c.key() == "strobe_output_enable").cloned() else { return Ok(None) };
-        let pattern = list.iter().find(|c| c.key() == "strobe_frame_pattern").cloned();
-        Ok(Some(Illuminator { controls, enable, pattern }))
+        let Some(enable) = list
+            .iter()
+            .find(|c| c.key() == "strobe_output_enable")
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let pattern = list
+            .iter()
+            .find(|c| c.key() == "strobe_frame_pattern")
+            .cloned();
+        Ok(Some(Illuminator {
+            controls,
+            enable,
+            pattern,
+        }))
     }
 
     pub fn has_pattern(&self) -> bool {
@@ -204,7 +255,10 @@ impl Illuminator {
     /// Light frames per an 8-frame bitmask (0xaa alternates lit/unlit), for
     /// the ambient-subtraction liveness check.
     pub fn set_pattern(&self, pattern: u8) -> Result<()> {
-        let p = self.pattern.as_ref().ok_or_else(|| anyhow!("sensor has no strobe_frame_pattern control"))?;
+        let p = self
+            .pattern
+            .as_ref()
+            .ok_or_else(|| anyhow!("sensor has no strobe_frame_pattern control"))?;
         self.controls.set(p.id, pattern as i32)?;
         self.controls.set(self.enable.id, 1)?;
         Ok(())
@@ -232,13 +286,32 @@ pub fn probe() -> Result<Probe> {
     let ipu3 = ipu3::probe().context("IPU3 probe")?;
     let mut video_nodes = Vec::new();
     let mut paths: Vec<PathBuf> = std::fs::read_dir("/dev")
-        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with("video")).unwrap_or(false)).collect())
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with("video"))
+                        .unwrap_or(false)
+                })
+                .collect()
+        })
         .unwrap_or_default();
     paths.sort();
     for p in paths {
-        let Ok(vd) = VideoDevice::open(&p) else { continue };
-        let Ok((driver, card, _)) = vd.driver_and_card() else { continue };
-        let fmts = vd.formats().unwrap_or_default().into_iter().map(|(f, _)| sys::fourcc_str(f)).collect();
+        let Ok(vd) = VideoDevice::open(&p) else {
+            continue;
+        };
+        let Ok((driver, card, _)) = vd.driver_and_card() else {
+            continue;
+        };
+        let fmts = vd
+            .formats()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(f, _)| sys::fourcc_str(f))
+            .collect();
         video_nodes.push((p, driver, card, fmts));
     }
     Ok(Probe { ipu3, video_nodes })

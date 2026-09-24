@@ -167,7 +167,9 @@ impl GestureCal {
     pub const SHAKE_FLOOR_MAX: f32 = 0.12;
 
     fn largest(v: &[f32]) -> Option<f32> {
-        v.iter().copied().fold(None, |m, x| Some(m.map_or(x, |m: f32| m.max(x))))
+        v.iter()
+            .copied()
+            .fold(None, |m, x| Some(m.map_or(x, |m: f32| m.max(x))))
     }
 
     /// (nod floor, shake floor) for this person, given the defaults.
@@ -178,8 +180,12 @@ impl GestureCal {
         // Capped at 0.09: on the reference user's recording, both nods count
         // at every floor up to 0.09 and one drops out at 0.10 (its first
         // departure from rest is the small leg).
-        let mut nod = Self::typical(&self.nod).map(|a| (a * 0.4).clamp(default_nod, 0.09)).unwrap_or(default_nod);
-        let mut shake = Self::typical(&self.shake).map(|a| (a * 0.5).clamp(0.03, default_shake)).unwrap_or(default_shake);
+        let mut nod = Self::typical(&self.nod)
+            .map(|a| (a * 0.4).clamp(default_nod, 0.09))
+            .unwrap_or(default_nod);
+        let mut shake = Self::typical(&self.shake)
+            .map(|a| (a * 0.5).clamp(0.03, default_shake))
+            .unwrap_or(default_shake);
         // Everyday movement pushes a floor up, never down: what the verify
         // step found necessary for this person's own rounds to read as nothing.
         if let Some(m) = self.nod_floor_min {
@@ -197,23 +203,35 @@ impl GestureCal {
     /// to 35 degrees peak to peak with legs from 12; shakes 49 to 57 with
     /// legs from 33).
     pub fn floors_deg(&self, default_nod: f32, default_shake: f32) -> (f32, f32) {
-        let nod = Self::typical(&self.nod_deg).map(|a| (a * 0.4).clamp(default_nod, 16.0)).unwrap_or(default_nod);
-        let shake = Self::typical(&self.shake_deg).map(|a| (a * 0.4).clamp(default_shake, 24.0)).unwrap_or(default_shake);
+        let nod = Self::typical(&self.nod_deg)
+            .map(|a| (a * 0.4).clamp(default_nod, 16.0))
+            .unwrap_or(default_nod);
+        let shake = Self::typical(&self.shake_deg)
+            .map(|a| (a * 0.4).clamp(default_shake, 24.0))
+            .unwrap_or(default_shake);
         (nod, shake)
     }
 
     /// The floors with no everyday adjustment: the starting point the
     /// verify step raises from.
     pub fn base_floors(&self, default_nod: f32, default_shake: f32) -> (f32, f32) {
-        let nod = Self::typical(&self.nod).map(|a| (a * 0.4).clamp(default_nod, 0.09)).unwrap_or(default_nod);
-        let shake = Self::typical(&self.shake).map(|a| (a * 0.5).clamp(0.03, default_shake)).unwrap_or(default_shake);
+        let nod = Self::typical(&self.nod)
+            .map(|a| (a * 0.4).clamp(default_nod, 0.09))
+            .unwrap_or(default_nod);
+        let shake = Self::typical(&self.shake)
+            .map(|a| (a * 0.5).clamp(0.03, default_shake))
+            .unwrap_or(default_shake);
         (nod, shake)
     }
 
     /// The largest vertical and horizontal excursion among the jittery
     /// everyday rounds (`FLOOR_KINDS`), the ones a floor stands clear of.
     fn jitter(&self) -> (Option<f32>, Option<f32>) {
-        let rounds: Vec<&EverydayRound> = self.everyday.iter().filter(|r| FLOOR_KINDS.contains(&r.kind.as_str())).collect();
+        let rounds: Vec<&EverydayRound> = self
+            .everyday
+            .iter()
+            .filter(|r| FLOOR_KINDS.contains(&r.kind.as_str()))
+            .collect();
         let ys: Vec<f32> = rounds.iter().map(|r| r.dy).collect();
         let xs: Vec<f32> = rounds.iter().map(|r| r.dx).collect();
         (Self::largest(&ys), Self::largest(&xs))
@@ -240,7 +258,14 @@ impl GestureCal {
 
 impl UserTemplates {
     pub fn new(user: &str, model: &str) -> Self {
-        UserTemplates { version: FORMAT_VERSION, user: user.to_string(), uid: current_uid(user), model: model.to_string(), templates: Vec::new(), gesture: GestureCal::default() }
+        UserTemplates {
+            version: FORMAT_VERSION,
+            user: user.to_string(),
+            uid: current_uid(user),
+            model: model.to_string(),
+            templates: Vec::new(),
+            gesture: GestureCal::default(),
+        }
     }
 
     /// Best cosine similarity of `embedding` against every template, and which one.
@@ -264,12 +289,19 @@ impl UserTemplates {
 
     /// How many templates may match on camera `device`.
     pub fn usable_on(&self, device: &str) -> usize {
-        self.templates.iter().filter(|t| t.usable_on(device)).count()
+        self.templates
+            .iter()
+            .filter(|t| t.usable_on(device))
+            .count()
     }
 
     /// The cameras the templates are bound to, for a message.
     pub fn bound_devices(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.templates.iter().filter_map(|t| t.device.clone()).collect();
+        let mut v: Vec<String> = self
+            .templates
+            .iter()
+            .filter_map(|t| t.device.clone())
+            .collect();
         v.sort();
         v.dedup();
         v
@@ -286,7 +318,15 @@ impl UserTemplates {
             let n = self.templates.len();
             let mut worst = (0usize, -1.0f32);
             for i in 0..n {
-                let nearest = (0..n).filter(|&j| j != i).map(|j| faceauth_engine::cosine(&self.templates[i].embedding, &self.templates[j].embedding)).fold(-1.0, f32::max);
+                let nearest = (0..n)
+                    .filter(|&j| j != i)
+                    .map(|j| {
+                        faceauth_engine::cosine(
+                            &self.templates[i].embedding,
+                            &self.templates[j].embedding,
+                        )
+                    })
+                    .fold(-1.0, f32::max);
                 if nearest > worst.1 {
                     worst = (i, nearest);
                 }
@@ -305,7 +345,10 @@ impl UserTemplates {
         let (mut lo, mut hi, mut sum, mut cnt) = (1f32, -1f32, 0f32, 0usize);
         for i in 0..n {
             for j in i + 1..n {
-                let s = faceauth_engine::cosine(&self.templates[i].embedding, &self.templates[j].embedding);
+                let s = faceauth_engine::cosine(
+                    &self.templates[i].embedding,
+                    &self.templates[j].embedding,
+                );
                 lo = lo.min(s);
                 hi = hi.max(s);
                 sum += s;
@@ -344,7 +387,9 @@ impl Sealing {
         if !Path::new(TIMEOUT).exists() {
             return Sealing::Plain(format!("{} not installed", TIMEOUT));
         }
-        match seal(Path::new(SYSTEMD_CREDS), "faceauth-probe", b"probe").and_then(|blob| unseal(Path::new(SYSTEMD_CREDS), "faceauth-probe", &blob)) {
+        match seal(Path::new(SYSTEMD_CREDS), "faceauth-probe", b"probe")
+            .and_then(|blob| unseal(Path::new(SYSTEMD_CREDS), "faceauth-probe", &blob))
+        {
             Ok((back, _)) if back == b"probe" => Sealing::Tpm,
             Ok(_) => Sealing::Plain("TPM probe round trip returned different bytes".into()),
             Err(e) => Sealing::Plain(format!("TPM probe failed: {}", e)),
@@ -375,7 +420,11 @@ fn creds(bin: &Path, args: &[&str], stdin_bytes: &[u8]) -> Result<Vec<u8>> {
         .with_context(|| format!("spawn {} {}", TIMEOUT, SYSTEMD_CREDS))?;
     // A write error (the child closed its end) is reported after the child is
     // reaped, never instead of it: no zombies against the unit's TasksMax.
-    let write = child.stdin.take().map(|mut si| si.write_all(stdin_bytes)).unwrap_or(Ok(()));
+    let write = child
+        .stdin
+        .take()
+        .map(|mut si| si.write_all(stdin_bytes))
+        .unwrap_or(Ok(()));
     let out = child.wait_with_output()?;
     if let Err(e) = write {
         if !out.status.success() {
@@ -394,7 +443,13 @@ fn creds(bin: &Path, args: &[&str], stdin_bytes: &[u8]) -> Result<Vec<u8>> {
 fn creds_failure(args: &[&str], out: &std::process::Output) -> anyhow::Error {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let kind = classify_creds_failure(out.status.code(), &stderr);
-    anyhow::anyhow!("systemd-creds {}: {} {}", args.first().copied().unwrap_or(""), out.status, stderr.trim()).context(kind)
+    anyhow::anyhow!(
+        "systemd-creds {}: {} {}",
+        args.first().copied().unwrap_or(""),
+        out.status,
+        stderr.trim()
+    )
+    .context(kind)
 }
 
 /// Whether a failed unseal says anything about the blob. Enrolment sets a
@@ -413,7 +468,10 @@ pub enum UnsealFailure {
 
 impl std::fmt::Display for UnsealFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self { UnsealFailure::Definitive => "the credential cannot be decrypted", UnsealFailure::Transient => "the credential service could not be reached" })
+        f.write_str(match self {
+            UnsealFailure::Definitive => "the credential cannot be decrypted",
+            UnsealFailure::Transient => "the credential service could not be reached",
+        })
     }
 }
 
@@ -425,7 +483,20 @@ pub fn classify_creds_failure(code: Option<i32>, stderr: &str) -> UnsealFailure 
         _ => {}
     }
     let s = stderr.to_ascii_lowercase();
-    const PASSING: [&str; 12] = ["timed out", "connect", "temporarily unavailable", "no such file", "no such device", "not available", "resource busy", "operation not permitted", "input/output error", "out of memory", "permission denied", "not supported"];
+    const PASSING: [&str; 12] = [
+        "timed out",
+        "connect",
+        "temporarily unavailable",
+        "no such file",
+        "no such device",
+        "not available",
+        "resource busy",
+        "operation not permitted",
+        "input/output error",
+        "out of memory",
+        "permission denied",
+        "not supported",
+    ];
     if PASSING.iter().any(|m| s.contains(m)) {
         UnsealFailure::Transient
     } else {
@@ -448,15 +519,38 @@ pub fn is_definitive(e: &anyhow::Error) -> bool {
 
 /// Seal `plain` to the TPM under credential name `name`, scoped to root; the blob is text.
 fn seal(bin: &Path, name: &str, plain: &[u8]) -> Result<Vec<u8>> {
-    creds(bin, &["encrypt", "--with-key=host+tpm2", "--tpm2-pcrs=", "--uid=0", &format!("--name={}", name), "-", "-"], plain)
+    creds(
+        bin,
+        &[
+            "encrypt",
+            "--with-key=host+tpm2",
+            "--tpm2-pcrs=",
+            "--uid=0",
+            &format!("--name={}", name),
+            "-",
+            "-",
+        ],
+        plain,
+    )
 }
 
 /// Unseal a blob. Returns the bytes and whether the blob was of the older,
 /// system-scoped kind (which the caller should re-seal).
 fn unseal(bin: &Path, name: &str, blob: &[u8]) -> Result<(Vec<u8>, bool)> {
-    match creds(bin, &["decrypt", "--uid=0", &format!("--name={}", name), "-", "-"], blob) {
+    match creds(
+        bin,
+        &["decrypt", "--uid=0", &format!("--name={}", name), "-", "-"],
+        blob,
+    ) {
         Ok(b) => Ok((b, false)),
-        Err(e) if e.to_string().contains("scoped to the system") => Ok((creds(bin, &["decrypt", &format!("--name={}", name), "-", "-"], blob)?, true)),
+        Err(e) if e.to_string().contains("scoped to the system") => Ok((
+            creds(
+                bin,
+                &["decrypt", &format!("--name={}", name), "-", "-"],
+                blob,
+            )?,
+            true,
+        )),
         Err(e) => Err(e),
     }
 }
@@ -474,7 +568,11 @@ struct Fingerprint {
 
 fn fingerprint(p: &Path) -> Result<Fingerprint> {
     let m = std::fs::metadata(p)?;
-    Ok(Fingerprint { path: p.to_path_buf(), len: m.len(), mtime: m.modified().ok() })
+    Ok(Fingerprint {
+        path: p.to_path_buf(),
+        len: m.len(),
+        mtime: m.modified().ok(),
+    })
 }
 
 pub struct Store {
@@ -508,10 +606,21 @@ impl Store {
         Self::open_with_probe(dir, sealing, Sealing::detect)
     }
 
-    pub fn open_with_probe(dir: impl AsRef<Path>, sealing: Sealing, probe: fn() -> Sealing) -> Result<Self> {
+    pub fn open_with_probe(
+        dir: impl AsRef<Path>,
+        sealing: Sealing,
+        probe: fn() -> Sealing,
+    ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        Ok(Store { dir, sealing: Mutex::new(sealing), probe, creds_bin: PathBuf::from(SYSTEMD_CREDS), cache: Mutex::new(HashMap::new()), uid_of: current_uid })
+        Ok(Store {
+            dir,
+            sealing: Mutex::new(sealing),
+            probe,
+            creds_bin: PathBuf::from(SYSTEMD_CREDS),
+            cache: Mutex::new(HashMap::new()),
+            uid_of: current_uid,
+        })
     }
 
     /// A store that resolves account names through `f` instead of the
@@ -531,11 +640,18 @@ impl Store {
     }
 
     pub fn sealing(&self) -> Sealing {
-        self.sealing.lock().map(|s| s.clone()).unwrap_or_else(|p| p.into_inner().clone())
+        self.sealing
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_else(|p| p.into_inner().clone())
     }
 
     fn check_user(user: &str) -> Result<()> {
-        if user.is_empty() || user.contains('/') || user.contains("..") || user.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        if user.is_empty()
+            || user.contains('/')
+            || user.contains("..")
+            || user.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
             bail!("invalid user name {:?}", user);
         }
         Ok(())
@@ -555,18 +671,35 @@ impl Store {
 
     /// Are this user's templates on disk sealed?
     pub fn is_sealed(&self, user: &str) -> bool {
-        self.sealed_path_for(user).map(|p| p.exists()).unwrap_or(false)
+        self.sealed_path_for(user)
+            .map(|p| p.exists())
+            .unwrap_or(false)
     }
 
     fn parse(&self, text: &str, p: &Path, user: &str) -> Result<Option<UserTemplates>> {
-        let t: UserTemplates = serde_json::from_str(text).with_context(|| format!("parse {}", p.display()))?;
+        let t: UserTemplates =
+            serde_json::from_str(text).with_context(|| format!("parse {}", p.display()))?;
         if t.version != FORMAT_VERSION {
-            bail!("{}: template format {} (this build reads {})", p.display(), t.version, FORMAT_VERSION);
+            bail!(
+                "{}: template format {} (this build reads {})",
+                p.display(),
+                t.version,
+                FORMAT_VERSION
+            );
         }
         if t.user != user {
-            bail!("{}: templates are for {:?}, not {:?}", p.display(), t.user, user);
+            bail!(
+                "{}: templates are for {:?}, not {:?}",
+                p.display(),
+                t.user,
+                user
+            );
         }
-        Ok(if self.uid_matches(&t, p) { Some(t) } else { None })
+        Ok(if self.uid_matches(&t, p) {
+            Some(t)
+        } else {
+            None
+        })
     }
 
     /// Is the account these templates were enrolled under still the one
@@ -576,7 +709,13 @@ impl Store {
     fn uid_matches(&self, t: &UserTemplates, p: &Path) -> bool {
         if let (Some(stored), Some(now)) = (t.uid, (self.uid_of)(&t.user)) {
             if stored != now {
-                log::warn!("{}: templates belong to uid {} but {} is now uid {}; treating as not enrolled", p.display(), stored, t.user, now);
+                log::warn!(
+                    "{}: templates belong to uid {} but {} is now uid {}; treating as not enrolled",
+                    p.display(),
+                    stored,
+                    t.user,
+                    now
+                );
                 return false;
             }
         }
@@ -588,12 +727,22 @@ impl Store {
         let plain = self.path_for(user)?;
         if sealed.exists() {
             let fp = fingerprint(&sealed)?;
-            let cached = self.cache.lock().ok().and_then(|c| c.get(user).filter(|(have, _)| *have == fp).map(|(_, t)| t.clone()));
+            let cached = self.cache.lock().ok().and_then(|c| {
+                c.get(user)
+                    .filter(|(have, _)| *have == fp)
+                    .map(|(_, t)| t.clone())
+            });
             if let Some(t) = cached {
-                return Ok(if self.uid_matches(&t, &sealed) { Some(t) } else { None });
+                return Ok(if self.uid_matches(&t, &sealed) {
+                    Some(t)
+                } else {
+                    None
+                });
             }
-            let blob = std::fs::read(&sealed).with_context(|| format!("read {}", sealed.display()))?;
-            let (text, old_kind) = unseal(&self.creds_bin, &cred_name(user), &blob).with_context(|| format!("unseal {}", sealed.display()))?;
+            let blob =
+                std::fs::read(&sealed).with_context(|| format!("read {}", sealed.display()))?;
+            let (text, old_kind) = unseal(&self.creds_bin, &cred_name(user), &blob)
+                .with_context(|| format!("unseal {}", sealed.display()))?;
             let t = self.parse(&String::from_utf8_lossy(&text), &sealed, user)?;
             if let Some(t) = &t {
                 if old_kind && self.sealing() == Sealing::Tpm {
@@ -601,7 +750,9 @@ impl Store {
                     // could have asked PID 1 to open it. Re-seal root-only now.
                     match self.save(t) {
                         Ok(p) => log::info!("{}: re-sealed root-only", p.display()),
-                        Err(e) => log::warn!("{}: could not re-seal root-only: {}", sealed.display(), e),
+                        Err(e) => {
+                            log::warn!("{}: could not re-seal root-only: {}", sealed.display(), e)
+                        }
                     }
                     return Ok(Some(t.clone()));
                 }
@@ -614,12 +765,17 @@ impl Store {
         if !plain.exists() {
             return Ok(None);
         }
-        let text = std::fs::read_to_string(&plain).with_context(|| format!("read {}", plain.display()))?;
+        let text =
+            std::fs::read_to_string(&plain).with_context(|| format!("read {}", plain.display()))?;
         let t = self.parse(&text, &plain, user)?;
         if let (Some(t), Sealing::Tpm) = (&t, &self.sealing()) {
             // Found in the clear on a machine that can seal: seal it now.
             match self.save(t) {
-                Ok(p) => log::info!("{}: sealed to the TPM as {}, plaintext removed", plain.display(), p.display()),
+                Ok(p) => log::info!(
+                    "{}: sealed to the TPM as {}, plaintext removed",
+                    plain.display(),
+                    p.display()
+                ),
                 Err(e) => log::warn!("{}: could not seal: {}", plain.display(), e),
             }
         }
@@ -633,7 +789,12 @@ impl Store {
     pub fn save(&self, t: &UserTemplates) -> Result<PathBuf> {
         use std::os::unix::fs::OpenOptionsExt;
         if t.templates.len() > MAX_TEMPLATES {
-            bail!("{} templates for {}; the limit is {} (delete some looks first)", t.templates.len(), t.user, MAX_TEMPLATES);
+            bail!(
+                "{} templates for {}; the limit is {} (delete some looks first)",
+                t.templates.len(),
+                t.user,
+                MAX_TEMPLATES
+            );
         }
         let sealed_path = self.sealed_path_for(&t.user)?;
         let plain_path = self.path_for(&t.user)?;
@@ -655,14 +816,22 @@ impl Store {
         }
         let json = serde_json::to_string(t)?;
         let (target, bytes, remove) = match &sealing {
-            Sealing::Tpm => (sealed_path, seal(&self.creds_bin, &cred_name(&t.user), json.as_bytes())?, Some(plain_path)),
+            Sealing::Tpm => (
+                sealed_path,
+                seal(&self.creds_bin, &cred_name(&t.user), json.as_bytes())?,
+                Some(plain_path),
+            ),
             Sealing::Plain(_) => (plain_path, json.into_bytes(), None),
         };
         // A unique staging name per write: two saves for one user cannot
         // rename each other's partial file into place, and a failed write
         // leaves nothing behind.
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let tmp = target.with_extension(format!("tmp-{}-{}", std::process::id(), SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        let tmp = target.with_extension(format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         struct Unlink<'a>(&'a Path, bool);
         impl Drop for Unlink<'_> {
             fn drop(&mut self) {
@@ -673,7 +842,11 @@ impl Store {
         }
         let mut guard = Unlink(&tmp, true);
         {
-            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
             f.write_all(&bytes)?;
             f.sync_all()?;
         }
@@ -681,7 +854,8 @@ impl Store {
         guard.1 = false;
         if let Some(other) = remove {
             if other.exists() {
-                std::fs::remove_file(&other).with_context(|| format!("remove {}", other.display()))?;
+                std::fs::remove_file(&other)
+                    .with_context(|| format!("remove {}", other.display()))?;
             }
         }
         if let Ok(mut c) = self.cache.lock() {
@@ -708,8 +882,11 @@ impl Store {
             return Ok(None);
         }
         self.check_can_replace(user)?;
-        let aside = self.dir.join(format!("{}.cred.unreadable-{}", user, now_secs()));
-        std::fs::rename(&sealed, &aside).with_context(|| format!("set aside {}", sealed.display()))?;
+        let aside = self
+            .dir
+            .join(format!("{}.cred.unreadable-{}", user, now_secs()));
+        std::fs::rename(&sealed, &aside)
+            .with_context(|| format!("set aside {}", sealed.display()))?;
         if let Ok(mut c) = self.cache.lock() {
             c.remove(user);
         }
@@ -720,7 +897,11 @@ impl Store {
     /// only when `e` is the credential tool's verdict on it (or a parse
     /// failure of what it decrypted). A TPM that is busy, missing from the
     /// sandbox, or slow is not a reason to discard a good set (F2).
-    pub fn set_aside_if_unreadable(&self, user: &str, e: &anyhow::Error) -> Result<Option<PathBuf>> {
+    pub fn set_aside_if_unreadable(
+        &self,
+        user: &str,
+        e: &anyhow::Error,
+    ) -> Result<Option<PathBuf>> {
         if !is_definitive(e) {
             return Ok(None);
         }
@@ -742,7 +923,18 @@ impl Store {
     /// to talk to the daemon's socket.
     pub fn enrolled_users(&self) -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_dir(&self.dir)
-            .map(|rd| rd.flatten().filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".cred").or_else(|| n.strip_suffix(".json"))).map(String::from)).collect())
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| {
+                        e.file_name()
+                            .to_str()
+                            .and_then(|n| {
+                                n.strip_suffix(".cred").or_else(|| n.strip_suffix(".json"))
+                            })
+                            .map(String::from)
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         v.sort();
         v.dedup();
@@ -767,22 +959,39 @@ impl Store {
             let name = e.file_name();
             let Some(n) = name.to_str() else { continue };
             if n.starts_with(&aside_prefix) {
-                std::fs::remove_file(e.path()).with_context(|| format!("remove {}", e.path().display()))?;
+                std::fs::remove_file(e.path())
+                    .with_context(|| format!("remove {}", e.path().display()))?;
             }
         }
-        for e in std::fs::read_dir(self.dir.join("gestures")).into_iter().flatten().flatten() {
+        for e in std::fs::read_dir(self.dir.join("gestures"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
             let name = e.file_name();
             let Some(n) = name.to_str() else { continue };
             // `<unix seconds>-<user>-<how it ended>.txt`, the user matched
             // as a whole component so "al" does not take "alice"'s files.
-            let is_users = n.strip_suffix(".txt").and_then(|stem| stem.split_once('-')).map(|(secs, rest)| secs.chars().all(|c| c.is_ascii_digit()) && rest.strip_prefix(user).map(|r| r.starts_with('-')).unwrap_or(false)).unwrap_or(false);
+            let is_users = n
+                .strip_suffix(".txt")
+                .and_then(|stem| stem.split_once('-'))
+                .map(|(secs, rest)| {
+                    secs.chars().all(|c| c.is_ascii_digit())
+                        && rest
+                            .strip_prefix(user)
+                            .map(|r| r.starts_with('-'))
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false);
             if is_users {
-                std::fs::remove_file(e.path()).with_context(|| format!("remove {}", e.path().display()))?;
+                std::fs::remove_file(e.path())
+                    .with_context(|| format!("remove {}", e.path().display()))?;
             }
         }
         let record = self.dir.join("record").join(user);
         if record.is_dir() {
-            std::fs::remove_dir_all(&record).with_context(|| format!("remove {}", record.display()))?;
+            std::fs::remove_dir_all(&record)
+                .with_context(|| format!("remove {}", record.display()))?;
         }
         if let Ok(mut c) = self.cache.lock() {
             c.remove(user);
@@ -792,11 +1001,17 @@ impl Store {
 }
 
 pub fn current_uid(user: &str) -> Option<u32> {
-    nix::unistd::User::from_name(user).ok().flatten().map(|u| u.uid.as_raw())
+    nix::unistd::User::from_name(user)
+        .ok()
+        .flatten()
+        .map(|u| u.uid.as_raw())
 }
 
 pub fn now_secs() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -805,7 +1020,16 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn tmpl(e: Vec<f32>, created: u64, device: Option<&str>) -> Template {
-        Template { embedding: e, quality: 0.9, face_width: 80.0, created, label: "enrol".into(), device: device.map(String::from), yaw: None, nose_pitch: None }
+        Template {
+            embedding: e,
+            quality: 0.9,
+            face_width: 80.0,
+            created,
+            label: "enrol".into(),
+            device: device.map(String::from),
+            yaw: None,
+            nose_pitch: None,
+        }
     }
 
     fn temp(name: &str) -> PathBuf {
@@ -822,7 +1046,10 @@ mod tests {
         u.templates.push(tmpl(vec![0.0, 1.0], 2, None));
         let p = store.save(&u).unwrap();
         assert!(p.ends_with("alice.json"));
-        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let back = store.load("alice").unwrap().unwrap();
         assert_eq!(back.templates.len(), 2);
         assert_eq!(back.best_match(&[0.6, 0.8]).unwrap(), (0.8, 1));
@@ -852,25 +1079,50 @@ mod tests {
     #[test]
     fn templates_match_only_on_their_camera() {
         let mut u = UserTemplates::new("alice", "glintr100");
-        u.templates.push(tmpl(vec![1.0, 0.0], 1, Some("ipu3:ov7251 3-0060")));
+        u.templates
+            .push(tmpl(vec![1.0, 0.0], 1, Some("ipu3:ov7251 3-0060")));
         u.templates.push(tmpl(vec![0.0, 1.0], 2, None)); // pre-binding: usable anywhere
         assert_eq!(u.usable_on("ipu3:ov7251 3-0060"), 2);
         assert_eq!(u.usable_on("uvc:uvcvideo:Other Cam:usb-1"), 1);
-        assert_eq!(u.best_match_on(&[1.0, 0.0], "uvc:uvcvideo:Other Cam:usb-1").unwrap(), (0.0, 1));
-        assert_eq!(u.best_match_on(&[1.0, 0.0], "ipu3:ov7251 3-0060").unwrap(), (1.0, 0));
+        assert_eq!(
+            u.best_match_on(&[1.0, 0.0], "uvc:uvcvideo:Other Cam:usb-1")
+                .unwrap(),
+            (0.0, 1)
+        );
+        assert_eq!(
+            u.best_match_on(&[1.0, 0.0], "ipu3:ov7251 3-0060").unwrap(),
+            (1.0, 0)
+        );
         assert_eq!(u.bound_devices(), vec!["ipu3:ov7251 3-0060".to_string()]);
-        let only_bound = UserTemplates { templates: vec![tmpl(vec![1.0, 0.0], 1, Some("ipu3:x"))], ..u.clone() };
+        let only_bound = UserTemplates {
+            templates: vec![tmpl(vec![1.0, 0.0], 1, Some("ipu3:x"))],
+            ..u.clone()
+        };
         assert_eq!(only_bound.usable_on("uvc:y"), 0);
         assert!(only_bound.best_match_on(&[1.0, 0.0], "uvc:y").is_none());
     }
 
     #[test]
     fn everyday_rounds_set_margins_and_only_the_verify_step_raises_a_floor() {
-        let ev = |kind: &str, dy: f32, dx: f32| EverydayRound { kind: kind.into(), dy, dx };
+        let ev = |kind: &str, dy: f32, dx: f32| EverydayRound {
+            kind: kind.into(),
+            dy,
+            dx,
+        };
         // Sizes alone never move a floor: a talk round with a natural bob of
         // 0.07 (recorded live) would have pushed the nod floor past the 0.09
         // where a real nod drops out.
-        let g = GestureCal { nod: vec![0.26, 0.30], shake: vec![0.33, 0.36], everyday: vec![ev("read", 0.02, 0.03), ev("talk", 0.07, 0.02), ev("lean", 0.27, 0.08), ev("aside", 0.10, 0.50)], ..Default::default() };
+        let g = GestureCal {
+            nod: vec![0.26, 0.30],
+            shake: vec![0.33, 0.36],
+            everyday: vec![
+                ev("read", 0.02, 0.03),
+                ev("talk", 0.07, 0.02),
+                ev("lean", 0.27, 0.08),
+                ev("aside", 0.10, 0.50),
+            ],
+            ..Default::default()
+        };
         assert_eq!(g.floors(0.06, 0.06), (0.09, 0.06));
         let (mn, ms) = g.margins();
         // "typical" is the upper median: 0.30 of [0.26, 0.30], 0.36 of [0.33, 0.36].
@@ -878,15 +1130,29 @@ mod tests {
         assert!((ms.unwrap() - 0.36 / 0.03).abs() < 1e-3, "{:?}", ms);
         // What the verify step found necessary raises a floor, never lowers
         // one, and never past the cap.
-        let verified = GestureCal { nod_floor_min: Some(0.11), shake_floor_min: Some(0.05), ..g.clone() };
+        let verified = GestureCal {
+            nod_floor_min: Some(0.11),
+            shake_floor_min: Some(0.05),
+            ..g.clone()
+        };
         assert_eq!(verified.floors(0.06, 0.06), (0.11, 0.06));
-        let capped = GestureCal { nod_floor_min: Some(0.30), shake_floor_min: Some(0.30), ..g.clone() };
-        assert_eq!(capped.floors(0.06, 0.06), (GestureCal::NOD_FLOOR_MAX, GestureCal::SHAKE_FLOOR_MAX));
+        let capped = GestureCal {
+            nod_floor_min: Some(0.30),
+            shake_floor_min: Some(0.30),
+            ..g.clone()
+        };
+        assert_eq!(
+            capped.floors(0.06, 0.06),
+            (GestureCal::NOD_FLOOR_MAX, GestureCal::SHAKE_FLOOR_MAX)
+        );
         // A record from before these rounds existed still reads, and one from
         // the short-lived numbers-only format reads but raises nothing.
         let old: GestureCal = serde_json::from_str(r#"{"nod":[0.2],"shake":[0.3]}"#).unwrap();
         assert!(old.everyday.is_empty() && old.margins() == (None, None));
-        let numbers: GestureCal = serde_json::from_str(r#"{"nod":[0.26],"shake":[0.22],"still_nod":[0.27],"still_shake":[0.5]}"#).unwrap();
+        let numbers: GestureCal = serde_json::from_str(
+            r#"{"nod":[0.26],"shake":[0.22],"still_nod":[0.27],"still_shake":[0.5]}"#,
+        )
+        .unwrap();
         assert_eq!(numbers.floors(0.06, 0.06), (0.09, 0.06));
     }
 
@@ -896,16 +1162,24 @@ mod tests {
         assert_eq!(none.floors(0.06, 0.06), (0.06, 0.06));
         assert!(!none.is_calibrated());
         // A big nodder: floor rises to half the typical swing, capped.
-        let big = GestureCal { nod: vec![0.30, 0.26, 0.40], shake: vec![0.20, 0.24], ..Default::default() };
+        let big = GestureCal {
+            nod: vec![0.30, 0.26, 0.40],
+            shake: vec![0.20, 0.24],
+            ..Default::default()
+        };
         let (n, s) = big.floors(0.06, 0.06);
         assert!((n - 0.09).abs() < 1e-6, "{}", n); // 0.30 * 0.4 = 0.12, capped at 0.09
         assert!((s - 0.06).abs() < 1e-6, "{}", s); // 0.22 * 0.5 = 0.11 > default: stays at default
-        // A light nodder: never below the default.
-        let light = GestureCal { nod: vec![0.08, 0.09], shake: vec![0.08, 0.07], ..Default::default() };
+                                                   // A light nodder: never below the default.
+        let light = GestureCal {
+            nod: vec![0.08, 0.09],
+            shake: vec![0.08, 0.07],
+            ..Default::default()
+        };
         let (n, s) = light.floors(0.06, 0.06);
         assert!((n - 0.06).abs() < 1e-6, "{}", n);
         assert!((s - 0.04).abs() < 1e-6, "{}", s); // 0.08 * 0.5, above the 0.03 minimum
-        // Stored with the templates and read back.
+                                                   // Stored with the templates and read back.
         let dir = temp("cal");
         let store = Store::open_with(&dir, Sealing::Plain("test".into())).unwrap();
         let mut u = UserTemplates::new("alice", "glintr100");
@@ -922,29 +1196,60 @@ mod tests {
     #[test]
     fn pruning_keeps_the_different_looks() {
         let mut u = UserTemplates::new("alice", "glintr100");
-        let mk = |v: Vec<f32>| { let n = v.iter().map(|x| x * x).sum::<f32>().sqrt(); tmpl(v.iter().map(|x| x / n).collect(), 1, None) };
+        let mk = |v: Vec<f32>| {
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            tmpl(v.iter().map(|x| x / n).collect(), 1, None)
+        };
         u.templates.push(mk(vec![1.0, 0.0, 0.0]));
         u.templates.push(mk(vec![1.0, 0.05, 0.0]));
         u.templates.push(mk(vec![1.0, -0.05, 0.0]));
         u.templates.push(mk(vec![0.0, 1.0, 0.0]));
         u.templates.push(mk(vec![0.0, 0.0, 1.0]));
         assert_eq!(u.prune_to(3), 2);
-        let kept: Vec<usize> = u.templates.iter().map(|t| t.embedding.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0).collect();
-        assert_eq!(kept, vec![0, 1, 2], "one of each direction survives; the near copies go");
+        let kept: Vec<usize> = u
+            .templates
+            .iter()
+            .map(|t| {
+                t.embedding
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .unwrap()
+                    .0
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            vec![0, 1, 2],
+            "one of each direction survives; the near copies go"
+        );
         assert_eq!(u.prune_to(10), 0);
     }
 
     #[test]
     fn mesh_floors_come_from_the_recorded_swings() {
         let mut g = GestureCal::default();
-        assert_eq!(g.floors_deg(8.0, 15.0), (8.0, 15.0), "nothing recorded: the defaults");
+        assert_eq!(
+            g.floors_deg(8.0, 15.0),
+            (8.0, 15.0),
+            "nothing recorded: the defaults"
+        );
         g.nod_deg = vec![34.7, 25.7];
         g.shake_deg = vec![49.2, 56.8];
         let (n, s) = g.floors_deg(8.0, 15.0);
-        assert!((n - 13.88).abs() < 0.1 && (s - 22.72).abs() < 0.1, "0.4 of the upper median: {} {}", n, s);
+        assert!(
+            (n - 13.88).abs() < 0.1 && (s - 22.72).abs() < 0.1,
+            "0.4 of the upper median: {} {}",
+            n,
+            s
+        );
         g.nod_deg = vec![80.0];
         g.shake_deg = vec![120.0];
-        assert_eq!(g.floors_deg(8.0, 15.0), (16.0, 24.0), "capped so a light gesture still counts");
+        assert_eq!(
+            g.floors_deg(8.0, 15.0),
+            (16.0, 24.0),
+            "capped so a light gesture still counts"
+        );
     }
 
     #[test]
@@ -958,7 +1263,10 @@ mod tests {
         }
         let e = store.save(&u).unwrap_err().to_string();
         assert!(e.contains("limit is 40"), "{}", e);
-        assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "nothing staged or written");
+        assert!(
+            std::fs::read_dir(&dir).unwrap().next().is_none(),
+            "nothing staged or written"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -968,7 +1276,13 @@ mod tests {
         let dir = temp("sticky");
         // The re-probe must stay plain here: on a machine where PID 1 unseals
         // for any user, Sealing::detect() succeeds even in a user's test run.
-        let store = Store::open_with_probe(&dir, Sealing::Plain("probe failed in this test".into()), || Sealing::Plain("still failing".into())).unwrap().without_creds();
+        let store = Store::open_with_probe(
+            &dir,
+            Sealing::Plain("probe failed in this test".into()),
+            || Sealing::Plain("still failing".into()),
+        )
+        .unwrap()
+        .without_creds();
         let sealed = store.sealed_path_for("alice").unwrap();
         std::fs::write(&sealed, b"not a real blob").unwrap();
         let mut u = UserTemplates::new("alice", "glintr100");
@@ -984,7 +1298,10 @@ mod tests {
         assert!(store.load("alice").is_err());
         let e = store.set_aside_unreadable("alice").unwrap_err().to_string();
         assert!(e.contains("enrolment refused"), "{}", e);
-        assert!(sealed.exists(), "the sealed file must survive the recovery path too");
+        assert!(
+            sealed.exists(),
+            "the sealed file must survive the recovery path too"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -998,7 +1315,10 @@ mod tests {
         }
         let dir = temp("cacheuid");
         let _ = std::fs::remove_dir_all(&dir);
-        let store = Store::open_with(&dir, Sealing::Plain("test".into())).unwrap().without_creds().with_uid_resolver(resolver);
+        let store = Store::open_with(&dir, Sealing::Plain("test".into()))
+            .unwrap()
+            .without_creds()
+            .with_uid_resolver(resolver);
         let mut u = UserTemplates::new("alice", "glintr100");
         u.uid = Some(1000);
         u.templates.push(tmpl(vec![1.0, 0.0], 1, None));
@@ -1008,10 +1328,20 @@ mod tests {
         let sealed = store.sealed_path_for("alice").unwrap();
         std::fs::write(&sealed, b"blob").unwrap();
         let fp = fingerprint(&sealed).unwrap();
-        store.cache.lock().unwrap().insert("alice".into(), (fp, u.clone()));
-        assert!(store.load("alice").unwrap().is_some(), "the cached set serves while the uid holds");
+        store
+            .cache
+            .lock()
+            .unwrap()
+            .insert("alice".into(), (fp, u.clone()));
+        assert!(
+            store.load("alice").unwrap().is_some(),
+            "the cached set serves while the uid holds"
+        );
         UID.store(1001, std::sync::atomic::Ordering::SeqCst);
-        assert!(store.load("alice").unwrap().is_none(), "the same name on another uid is not enrolled, cache or no cache");
+        assert!(
+            store.load("alice").unwrap().is_none(),
+            "the same name on another uid is not enrolled, cache or no cache"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1020,40 +1350,93 @@ mod tests {
     /// store that cannot seal never sets a sealed blob aside at all (F2).
     #[test]
     fn only_a_definitive_unseal_failure_sets_a_blob_aside() {
-        assert_eq!(classify_creds_failure(Some(1), "Failed to decrypt credential: Bad message"), UnsealFailure::Definitive);
-        assert_eq!(classify_creds_failure(Some(1), "Embedded credential name 'faceauth-bob' does not match filename"), UnsealFailure::Definitive);
-        assert_eq!(classify_creds_failure(Some(124), ""), UnsealFailure::Transient, "timeout killed it");
-        assert_eq!(classify_creds_failure(None, ""), UnsealFailure::Transient, "a signal");
-        assert_eq!(classify_creds_failure(Some(1), "Failed to connect to TPM: Connection refused"), UnsealFailure::Transient);
-        assert_eq!(classify_creds_failure(Some(1), "Failed to open /dev/tpmrm0: Operation not permitted"), UnsealFailure::Transient);
-        let transient = anyhow::anyhow!("systemd-creds decrypt: exit status: 1 busy").context(UnsealFailure::Transient).context("unseal /x/alice.cred");
-        let definitive = anyhow::anyhow!("systemd-creds decrypt: exit status: 1 bad").context(UnsealFailure::Definitive).context("unseal /x/alice.cred");
+        assert_eq!(
+            classify_creds_failure(Some(1), "Failed to decrypt credential: Bad message"),
+            UnsealFailure::Definitive
+        );
+        assert_eq!(
+            classify_creds_failure(
+                Some(1),
+                "Embedded credential name 'faceauth-bob' does not match filename"
+            ),
+            UnsealFailure::Definitive
+        );
+        assert_eq!(
+            classify_creds_failure(Some(124), ""),
+            UnsealFailure::Transient,
+            "timeout killed it"
+        );
+        assert_eq!(
+            classify_creds_failure(None, ""),
+            UnsealFailure::Transient,
+            "a signal"
+        );
+        assert_eq!(
+            classify_creds_failure(Some(1), "Failed to connect to TPM: Connection refused"),
+            UnsealFailure::Transient
+        );
+        assert_eq!(
+            classify_creds_failure(
+                Some(1),
+                "Failed to open /dev/tpmrm0: Operation not permitted"
+            ),
+            UnsealFailure::Transient
+        );
+        let transient = anyhow::anyhow!("systemd-creds decrypt: exit status: 1 busy")
+            .context(UnsealFailure::Transient)
+            .context("unseal /x/alice.cred");
+        let definitive = anyhow::anyhow!("systemd-creds decrypt: exit status: 1 bad")
+            .context(UnsealFailure::Definitive)
+            .context("unseal /x/alice.cred");
         assert!(!is_definitive(&transient) && is_definitive(&definitive));
-        assert!(!is_definitive(&anyhow::Error::from(std::io::Error::other("read"))), "an I/O failure says nothing about the blob");
+        assert!(
+            !is_definitive(&anyhow::Error::from(std::io::Error::other("read"))),
+            "an I/O failure says nothing about the blob"
+        );
 
         // A store that can seal, and a sealed blob it could not open.
         let dir = temp("aside");
         let _ = std::fs::remove_dir_all(&dir);
-        let store = Store::open_with_probe(&dir, Sealing::Tpm, || Sealing::Tpm).unwrap().without_creds();
+        let store = Store::open_with_probe(&dir, Sealing::Tpm, || Sealing::Tpm)
+            .unwrap()
+            .without_creds();
         let sealed = store.sealed_path_for("alice").unwrap();
         std::fs::write(&sealed, b"blob").unwrap();
-        assert!(store.set_aside_if_unreadable("alice", &transient).unwrap().is_none());
+        assert!(store
+            .set_aside_if_unreadable("alice", &transient)
+            .unwrap()
+            .is_none());
         assert!(sealed.exists(), "a transient failure keeps the blob");
-        assert!(store.set_aside_if_unreadable("alice", &definitive).unwrap().is_some());
+        assert!(store
+            .set_aside_if_unreadable("alice", &definitive)
+            .unwrap()
+            .is_some());
         assert!(!sealed.exists(), "a definitive failure sets it aside");
 
         // A store that cannot seal refuses to replace a sealed set, so the
         // recovery cannot downgrade it (the round-3 PoC, inverted).
         let dir2 = temp("noaside");
         let _ = std::fs::remove_dir_all(&dir2);
-        let plain = Store::open_with_probe(&dir2, Sealing::Plain("TPM probe failed: timeout".into()), || Sealing::Plain("still failing".into())).unwrap().without_creds();
+        let plain = Store::open_with_probe(
+            &dir2,
+            Sealing::Plain("TPM probe failed: timeout".into()),
+            || Sealing::Plain("still failing".into()),
+        )
+        .unwrap()
+        .without_creds();
         let sealed2 = plain.sealed_path_for("alice").unwrap();
         std::fs::write(&sealed2, b"blob").unwrap();
         let e = plain.check_can_replace("alice").unwrap_err().to_string();
         assert!(e.contains("enrolment refused"), "{}", e);
-        assert!(plain.set_aside_if_unreadable("alice", &definitive).is_err(), "no set-aside on a store that would then write plaintext");
+        assert!(
+            plain.set_aside_if_unreadable("alice", &definitive).is_err(),
+            "no set-aside on a store that would then write plaintext"
+        );
         assert!(sealed2.exists());
-        assert!(plain.check_can_replace("bob").is_ok(), "a user without sealed templates may enrol plain");
+        assert!(
+            plain.check_can_replace("bob").is_ok(),
+            "a user without sealed templates may enrol plain"
+        );
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(dir2);
     }
@@ -1065,7 +1448,9 @@ mod tests {
     fn delete_removes_every_trace_of_the_user_and_only_theirs() {
         let dir = temp("deleteall");
         let _ = std::fs::remove_dir_all(&dir);
-        let store = Store::open_with(&dir, Sealing::Plain("test".into())).unwrap().without_creds();
+        let store = Store::open_with(&dir, Sealing::Plain("test".into()))
+            .unwrap()
+            .without_creds();
         let mut u = UserTemplates::new("al", "glintr100");
         u.uid = None;
         u.templates.push(tmpl(vec![1.0, 0.0], 1, None));
@@ -1081,7 +1466,16 @@ mod tests {
         std::fs::create_dir_all(dir.join("record/alice")).unwrap();
         assert!(store.delete("al").unwrap());
         let left: Vec<String> = walk(&dir);
-        assert_eq!(left, vec!["alice.cred.unreadable-1700000000", "gestures/1700000002-alice-nodded.txt", "record/alice"], "{:?}", left);
+        assert_eq!(
+            left,
+            vec![
+                "alice.cred.unreadable-1700000000",
+                "gestures/1700000002-alice-nodded.txt",
+                "record/alice"
+            ],
+            "{:?}",
+            left
+        );
         assert!(!store.delete("al").unwrap(), "nothing left to delete");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1115,10 +1509,17 @@ mod tests {
     fn sealed_roundtrip_when_this_machine_can() {
         // As a user, the probe makes PID 1 ask polkit, which raises a consent
         // window on the desktop: only root probes.
-        let sealing = if nix::unistd::geteuid().is_root() { Sealing::detect() } else { Sealing::Plain("not root".into()) };
+        let sealing = if nix::unistd::geteuid().is_root() {
+            Sealing::detect()
+        } else {
+            Sealing::Plain("not root".into())
+        };
         let Sealing::Tpm = sealing else {
             if std::env::var("FACEAUTH_REQUIRE_TPM").as_deref() == Ok("1") {
-                panic!("FACEAUTH_REQUIRE_TPM=1 and this machine cannot seal: {}", sealing.describe());
+                panic!(
+                    "FACEAUTH_REQUIRE_TPM=1 and this machine cannot seal: {}",
+                    sealing.describe()
+                );
             }
             eprintln!("SKIPPED (not a pass): {}", sealing.describe());
             return;
@@ -1136,8 +1537,16 @@ mod tests {
         assert!(!plain.exists(), "plaintext should be gone after sealing");
         let sealed = store.sealed_path_for("alice").unwrap();
         assert!(sealed.exists());
-        assert_eq!(std::fs::metadata(&sealed).unwrap().permissions().mode() & 0o777, 0o600);
-        assert!(!std::fs::read_to_string(&sealed).unwrap().contains("embedding"), "the sealed file must not carry the JSON");
+        assert_eq!(
+            std::fs::metadata(&sealed).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            !std::fs::read_to_string(&sealed)
+                .unwrap()
+                .contains("embedding"),
+            "the sealed file must not carry the JSON"
+        );
         // Renamed to another user, the blob does not open (name-bound).
         std::fs::copy(&sealed, dir.join("bob.cred")).unwrap();
         assert!(store.load("bob").is_err());

@@ -16,11 +16,21 @@ pub struct Window {
 impl Window {
     /// The default: the central 50% x 60% of the frame, where a face sits.
     pub fn centre(width: usize, height: usize) -> Self {
-        Window { x0: width / 4, y0: height / 5, x1: width * 3 / 4, y1: height * 4 / 5 }
+        Window {
+            x0: width / 4,
+            y0: height / 5,
+            x1: width * 3 / 4,
+            y1: height * 4 / 5,
+        }
     }
 
     pub fn clamp(self, width: usize, height: usize) -> Self {
-        Window { x0: self.x0.min(width), y0: self.y0.min(height), x1: self.x1.min(width), y1: self.y1.min(height) }
+        Window {
+            x0: self.x0.min(width),
+            y0: self.y0.min(height),
+            x1: self.x1.min(width),
+            y1: self.y1.min(height),
+        }
     }
 }
 
@@ -57,7 +67,10 @@ pub fn meter(px: &[u16], width: usize, black: u16, win: Window) -> Metering {
     if count == 0 {
         return Metering::default();
     }
-    Metering { mean: sum / count as f64 / (1023.0 - black as f64), clip: sat as f64 / count as f64 }
+    Metering {
+        mean: sum / count as f64 / (1023.0 - black as f64),
+        clip: sat as f64 / count as f64,
+    }
 }
 
 /// One auto-exposure step: the multiplicative correction toward `target`,
@@ -156,9 +169,17 @@ impl Exposure {
 }
 
 /// The IR loop's limits on the reference sensor (ov7251 at 30 fps).
-pub const IR_LIMITS: ExposureLimits = ExposureLimits { exposure: (1, 1704), gain: Some((16, 1023)), dgain_max: 4.0 };
+pub const IR_LIMITS: ExposureLimits = ExposureLimits {
+    exposure: (1, 1704),
+    gain: Some((16, 1023)),
+    dgain_max: 4.0,
+};
 /// The RGB loop's limits on the reference sensor (ov5693 at 1296x972).
-pub const RGB_LIMITS: ExposureLimits = ExposureLimits { exposure: (1, 1030), gain: None, dgain_max: 4.0 };
+pub const RGB_LIMITS: ExposureLimits = ExposureLimits {
+    exposure: (1, 1030),
+    gain: None,
+    dgain_max: 4.0,
+};
 /// Metering target for both loops.
 pub const AE_TARGET: f64 = 0.30;
 
@@ -191,7 +212,14 @@ impl WhiteBalance {
             sb += p[2] as f64;
             n += 1;
         }
-        let (iwr, iwb) = if n < 50 { (self.wr, self.wb) } else { (if sr > 0.0 { sg / sr } else { 1.0 }, if sb > 0.0 { sg / sb } else { 1.0 }) };
+        let (iwr, iwb) = if n < 50 {
+            (self.wr, self.wb)
+        } else {
+            (
+                if sr > 0.0 { sg / sr } else { 1.0 },
+                if sb > 0.0 { sg / sb } else { 1.0 },
+            )
+        };
         self.wr += 0.15 * (iwr - self.wr);
         self.wb += 0.15 * (iwb - self.wb);
         self
@@ -226,7 +254,11 @@ pub struct IrLook {
     pub brightness: f64,
     pub contrast: f64,
 }
-pub const IR_LOOK: IrLook = IrLook { dgain: 1.0, brightness: 0.25, contrast: 2.05 };
+pub const IR_LOOK: IrLook = IrLook {
+    dgain: 1.0,
+    brightness: 0.25,
+    contrast: 2.05,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct RgbLook {
@@ -238,7 +270,15 @@ pub struct RgbLook {
     pub contrast: f64,
     pub gamma: f64,
 }
-pub const RGB_LOOK: RgbLook = RgbLook { r_gain: 1.3, g_gain: 1.3, b_gain: 1.3, saturation: 1.7, brightness: -0.05, contrast: 1.0, gamma: 2.2 };
+pub const RGB_LOOK: RgbLook = RgbLook {
+    r_gain: 1.3,
+    g_gain: 1.3,
+    b_gain: 1.3,
+    saturation: 1.7,
+    brightness: -0.05,
+    contrast: 1.0,
+    gamma: 2.2,
+};
 
 /// IR frame to 8-bit grey with black/white stretch and the fixed look.
 pub fn ir_to_grey8(px: &[u16], black: u16, white: u16, look: IrLook, out: &mut [u8]) {
@@ -246,12 +286,26 @@ pub fn ir_to_grey8(px: &[u16], black: u16, white: u16, look: IrLook, out: &mut [
     for (o, &v) in out.iter_mut().zip(px) {
         let mut x = (v as f64 - black as f64) / span * look.dgain + look.brightness;
         x = (x - 0.5) * look.contrast + 0.5;
-        *o = if x <= 0.0 { 0 } else if x >= 1.0 { 255 } else { (x * 255.0 + 0.5) as u8 };
+        *o = if x <= 0.0 {
+            0
+        } else if x >= 1.0 {
+            255
+        } else {
+            (x * 255.0 + 0.5) as u8
+        };
     }
 }
 
 /// Bayer-reduced RGB to 8-bit sRGB-ish with white balance, the fixed look and gamma.
-pub fn rgb_to_rgb8(rgb: &[[f32; 3]], black: u16, white: u16, wb: WhiteBalance, dgain: f64, look: RgbLook, out: &mut [[u8; 3]]) {
+pub fn rgb_to_rgb8(
+    rgb: &[[f32; 3]],
+    black: u16,
+    white: u16,
+    wb: WhiteBalance,
+    dgain: f64,
+    look: RgbLook,
+    out: &mut [[u8; 3]],
+) {
     let span = (white.max(black + 1) - black) as f64;
     let mut lut = [0u8; 1024];
     for (i, l) in lut.iter_mut().enumerate() {
@@ -279,34 +333,156 @@ mod tests {
     #[test]
     fn ae_factor_rules() {
         let t = AE_TARGET;
-        assert_eq!(ae_factor(Metering { mean: 0.0, clip: 0.0 }, t), 1.25);
-        assert_eq!(ae_factor(Metering { mean: 0.30, clip: 0.0 }, t), 1.0);
-        assert_eq!(ae_factor(Metering { mean: 0.31, clip: 0.0 }, t), 1.0, "deadband");
-        assert_eq!(ae_factor(Metering { mean: 0.05, clip: 0.0 }, t), 1.25, "rate limit up");
-        assert_eq!(ae_factor(Metering { mean: 0.90, clip: 0.0 }, t), 0.8, "rate limit down");
-        assert_eq!(ae_factor(Metering { mean: 0.10, clip: 0.06 }, t), 1.0, "clip blocks brightening");
-        assert_eq!(ae_factor(Metering { mean: 0.10, clip: 0.20 }, t), 0.9, "heavy clip darkens");
+        assert_eq!(
+            ae_factor(
+                Metering {
+                    mean: 0.0,
+                    clip: 0.0
+                },
+                t
+            ),
+            1.25
+        );
+        assert_eq!(
+            ae_factor(
+                Metering {
+                    mean: 0.30,
+                    clip: 0.0
+                },
+                t
+            ),
+            1.0
+        );
+        assert_eq!(
+            ae_factor(
+                Metering {
+                    mean: 0.31,
+                    clip: 0.0
+                },
+                t
+            ),
+            1.0,
+            "deadband"
+        );
+        assert_eq!(
+            ae_factor(
+                Metering {
+                    mean: 0.05,
+                    clip: 0.0
+                },
+                t
+            ),
+            1.25,
+            "rate limit up"
+        );
+        assert_eq!(
+            ae_factor(
+                Metering {
+                    mean: 0.90,
+                    clip: 0.0
+                },
+                t
+            ),
+            0.8,
+            "rate limit down"
+        );
+        assert_eq!(
+            ae_factor(
+                Metering {
+                    mean: 0.10,
+                    clip: 0.06
+                },
+                t
+            ),
+            1.0,
+            "clip blocks brightening"
+        );
+        assert_eq!(
+            ae_factor(
+                Metering {
+                    mean: 0.10,
+                    clip: 0.20
+                },
+                t
+            ),
+            0.9,
+            "heavy clip darkens"
+        );
     }
 
     #[test]
     fn exposure_actuator_order() {
         let lim = IR_LIMITS;
-        let e = Exposure { exposure: 1000, gain: 16, dgain: 1.0 };
+        let e = Exposure {
+            exposure: 1000,
+            gain: 16,
+            dgain: 1.0,
+        };
         let up = e.step(1.25, &lim);
-        assert_eq!(up, Exposure { exposure: 1251, gain: 16, dgain: 1.0 });
-        let at_max = Exposure { exposure: 1704, gain: 16, dgain: 1.0 }.step(1.25, &lim);
+        assert_eq!(
+            up,
+            Exposure {
+                exposure: 1251,
+                gain: 16,
+                dgain: 1.0
+            }
+        );
+        let at_max = Exposure {
+            exposure: 1704,
+            gain: 16,
+            dgain: 1.0,
+        }
+        .step(1.25, &lim);
         assert_eq!(at_max.gain, 21, "gain after exposure");
-        let all_max = Exposure { exposure: 1704, gain: 1023, dgain: 1.0 }.step(1.25, &lim);
+        let all_max = Exposure {
+            exposure: 1704,
+            gain: 1023,
+            dgain: 1.0,
+        }
+        .step(1.25, &lim);
         assert_eq!(all_max.dgain, 1.25, "dgain last");
-        let capped = Exposure { exposure: 1704, gain: 1023, dgain: 4.0 }.step(1.25, &lim);
+        let capped = Exposure {
+            exposure: 1704,
+            gain: 1023,
+            dgain: 4.0,
+        }
+        .step(1.25, &lim);
         assert_eq!(capped.dgain, 4.0);
-        let down = Exposure { exposure: 1704, gain: 40, dgain: 2.0 }.step(0.8, &lim);
-        assert_eq!(down, Exposure { exposure: 1704, gain: 40, dgain: 1.6 }, "dgain unwinds first");
-        let down2 = Exposure { exposure: 1704, gain: 40, dgain: 1.0 }.step(0.8, &lim);
+        let down = Exposure {
+            exposure: 1704,
+            gain: 40,
+            dgain: 2.0,
+        }
+        .step(0.8, &lim);
+        assert_eq!(
+            down,
+            Exposure {
+                exposure: 1704,
+                gain: 40,
+                dgain: 1.6
+            },
+            "dgain unwinds first"
+        );
+        let down2 = Exposure {
+            exposure: 1704,
+            gain: 40,
+            dgain: 1.0,
+        }
+        .step(0.8, &lim);
         assert_eq!(down2.gain, 32);
-        let down3 = Exposure { exposure: 1704, gain: 16, dgain: 1.0 }.step(0.8, &lim);
+        let down3 = Exposure {
+            exposure: 1704,
+            gain: 16,
+            dgain: 1.0,
+        }
+        .step(0.8, &lim);
         assert_eq!(down3.exposure, 1363);
-        let rgb = Exposure { exposure: 1030, gain: 0, dgain: 1.0 }.step(1.25, &RGB_LIMITS);
+        let rgb = Exposure {
+            exposure: 1030,
+            gain: 0,
+            dgain: 1.0,
+        }
+        .step(1.25, &RGB_LIMITS);
         assert_eq!(rgb.dgain, 1.25, "RGB has no analogue gain");
     }
 
@@ -317,9 +493,23 @@ mod tests {
         for v in px.iter_mut().take(w * h / 2) {
             *v = 1023;
         }
-        let m = meter(&px, w, 0, Window { x0: 0, y0: 0, x1: w, y1: h });
+        let m = meter(
+            &px,
+            w,
+            0,
+            Window {
+                x0: 0,
+                y0: 0,
+                x1: w,
+                y1: h,
+            },
+        );
         assert!((m.clip - 0.5).abs() < 0.05, "{:?}", m);
-        assert!((m.mean - (0.5 * 1023.0 + 0.5 * 300.0) / 1023.0).abs() < 0.03, "{:?}", m);
+        assert!(
+            (m.mean - (0.5 * 1023.0 + 0.5 * 300.0) / 1023.0).abs() < 0.03,
+            "{:?}",
+            m
+        );
     }
 
     #[test]

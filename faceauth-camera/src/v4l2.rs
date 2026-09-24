@@ -73,7 +73,11 @@ impl VideoDevice {
                 .with_context(|| format!("{}: QUERYCAP", path.display()))?;
             c
         };
-        let dc = if caps.device_caps != 0 { caps.device_caps } else { caps.capabilities };
+        let dc = if caps.device_caps != 0 {
+            caps.device_caps
+        } else {
+            caps.capabilities
+        };
         let buf_type = if dc & V4L2_CAP_VIDEO_CAPTURE_MPLANE != 0 {
             V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
         } else if dc & V4L2_CAP_VIDEO_CAPTURE != 0 {
@@ -84,7 +88,14 @@ impl VideoDevice {
         if dc & V4L2_CAP_STREAMING == 0 {
             bail!("{}: no streaming I/O", path.display());
         }
-        Ok(VideoDevice { file, path, buf_type, format: None, buffers: Vec::new(), streaming: false })
+        Ok(VideoDevice {
+            file,
+            path,
+            buf_type,
+            format: None,
+            buffers: Vec::new(),
+            streaming: false,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -137,12 +148,23 @@ impl VideoDevice {
             p.pixelformat = pixelformat;
             p.field = V4L2_FIELD_NONE;
         }
-        unsafe { vidioc_s_fmt(self.file.as_raw_fd(), &mut f) }
-            .with_context(|| format!("{}: S_FMT {}x{} {}", self.path.display(), width, height, fourcc_str(pixelformat)))?;
+        unsafe { vidioc_s_fmt(self.file.as_raw_fd(), &mut f) }.with_context(|| {
+            format!(
+                "{}: S_FMT {}x{} {}",
+                self.path.display(),
+                width,
+                height,
+                fourcc_str(pixelformat)
+            )
+        })?;
         let fmt = if self.multiplanar() {
             let mp = f.pix_mp();
             if mp.num_planes != 1 {
-                bail!("{}: {} planes, only single-plane formats are supported", self.path.display(), mp.num_planes);
+                bail!(
+                    "{}: {} planes, only single-plane formats are supported",
+                    self.path.display(),
+                    mp.num_planes
+                );
             }
             Format {
                 width: mp.width,
@@ -184,7 +206,12 @@ impl VideoDevice {
         if self.format.is_none() {
             bail!("request_buffers before set_format");
         }
-        let mut r = v4l2_requestbuffers { count, type_: self.buf_type, memory: V4L2_MEMORY_MMAP, ..Default::default() };
+        let mut r = v4l2_requestbuffers {
+            count,
+            type_: self.buf_type,
+            memory: V4L2_MEMORY_MMAP,
+            ..Default::default()
+        };
         unsafe { vidioc_reqbufs(self.file.as_raw_fd(), &mut r) }.context("REQBUFS")?;
         if r.count == 0 {
             bail!("{}: driver granted no buffers", self.path.display());
@@ -212,7 +239,12 @@ impl VideoDevice {
 
     fn query_buffer(&self, index: u32) -> Result<(u64, usize)> {
         let mut plane = v4l2_plane::default();
-        let mut b = v4l2_buffer { index, type_: self.buf_type, memory: V4L2_MEMORY_MMAP, ..Default::default() };
+        let mut b = v4l2_buffer {
+            index,
+            type_: self.buf_type,
+            memory: V4L2_MEMORY_MMAP,
+            ..Default::default()
+        };
         if self.multiplanar() {
             b.m = &mut plane as *mut v4l2_plane as u64;
             b.length = 1;
@@ -227,7 +259,12 @@ impl VideoDevice {
 
     fn queue(&self, index: u32) -> Result<()> {
         let mut plane = v4l2_plane::default();
-        let mut b = v4l2_buffer { index, type_: self.buf_type, memory: V4L2_MEMORY_MMAP, ..Default::default() };
+        let mut b = v4l2_buffer {
+            index,
+            type_: self.buf_type,
+            memory: V4L2_MEMORY_MMAP,
+            ..Default::default()
+        };
         if self.multiplanar() {
             b.m = &mut plane as *mut v4l2_plane as u64;
             b.length = 1;
@@ -241,7 +278,8 @@ impl VideoDevice {
             bail!("stream_on before request_buffers");
         }
         let t = self.buf_type;
-        unsafe { vidioc_streamon(self.file.as_raw_fd(), &t) }.with_context(|| format!("{}: STREAMON", self.path.display()))?;
+        unsafe { vidioc_streamon(self.file.as_raw_fd(), &t) }
+            .with_context(|| format!("{}: STREAMON", self.path.display()))?;
         self.streaming = true;
         Ok(())
     }
@@ -272,19 +310,40 @@ impl VideoDevice {
             return Ok(None);
         }
         let mut plane = v4l2_plane::default();
-        let mut b = v4l2_buffer { type_: self.buf_type, memory: V4L2_MEMORY_MMAP, ..Default::default() };
+        let mut b = v4l2_buffer {
+            type_: self.buf_type,
+            memory: V4L2_MEMORY_MMAP,
+            ..Default::default()
+        };
         if self.multiplanar() {
             b.m = &mut plane as *mut v4l2_plane as u64;
             b.length = 1;
         }
         unsafe { vidioc_dqbuf(self.file.as_raw_fd(), &mut b) }.context("DQBUF")?;
-        let buf = self.buffers.get(b.index as usize).ok_or_else(|| anyhow!("DQBUF returned index {}", b.index))?;
-        let used = if self.multiplanar() { plane.bytesused as usize } else { b.bytesused as usize };
-        let used = if used == 0 || used > buf.len { buf.len } else { used };
+        let buf = self
+            .buffers
+            .get(b.index as usize)
+            .ok_or_else(|| anyhow!("DQBUF returned index {}", b.index))?;
+        let used = if self.multiplanar() {
+            plane.bytesused as usize
+        } else {
+            b.bytesused as usize
+        };
+        let used = if used == 0 || used > buf.len {
+            buf.len
+        } else {
+            used
+        };
         // SAFETY: the mapping is MAP_SHARED read-only and lives as long as `self`;
         // the driver does not write a dequeued buffer until it is queued again.
         let data = unsafe { std::slice::from_raw_parts(buf.ptr.as_ptr() as *const u8, used) };
-        Ok(Some(FrameRef { dev: self, index: b.index, sequence: b.sequence, bytesused: used, data }))
+        Ok(Some(FrameRef {
+            dev: self,
+            index: b.index,
+            sequence: b.sequence,
+            bytesused: used,
+            data,
+        }))
     }
 
     pub fn raw_fd(&self) -> i32 {
@@ -347,7 +406,11 @@ pub struct Controls {
 impl Controls {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new().read(true).write(true).open(&path).with_context(|| format!("open {}", path.display()))?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
         Ok(Controls { file, path })
     }
 
@@ -357,7 +420,10 @@ impl Controls {
 
     pub fn list(&self) -> Result<Vec<ControlInfo>> {
         let mut out = Vec::new();
-        let mut q = v4l2_query_ext_ctrl { id: V4L2_CTRL_FLAG_NEXT_CTRL, ..Default::default() };
+        let mut q = v4l2_query_ext_ctrl {
+            id: V4L2_CTRL_FLAG_NEXT_CTRL,
+            ..Default::default()
+        };
         loop {
             match unsafe { vidioc_query_ext_ctrl(self.file.as_raw_fd(), &mut q) } {
                 Ok(_) => {}
@@ -385,7 +451,8 @@ impl Controls {
 
     pub fn get(&self, id: u32) -> Result<i32> {
         let mut c = v4l2_control { id, value: 0 };
-        unsafe { vidioc_g_ctrl(self.file.as_raw_fd(), &mut c) }.with_context(|| format!("{}: G_CTRL 0x{:08x}", self.path.display(), id))?;
+        unsafe { vidioc_g_ctrl(self.file.as_raw_fd(), &mut c) }
+            .with_context(|| format!("{}: G_CTRL 0x{:08x}", self.path.display(), id))?;
         Ok(c.value)
     }
 
@@ -404,7 +471,9 @@ pub struct Subdev {
 
 impl Subdev {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Ok(Subdev { controls: Controls::open(path)? })
+        Ok(Subdev {
+            controls: Controls::open(path)?,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -412,20 +481,44 @@ impl Subdev {
     }
 
     pub fn get_format(&self, pad: u32) -> Result<(u32, u32, u32)> {
-        let mut f = v4l2_subdev_format { which: V4L2_SUBDEV_FORMAT_ACTIVE, pad, ..Default::default() };
+        let mut f = v4l2_subdev_format {
+            which: V4L2_SUBDEV_FORMAT_ACTIVE,
+            pad,
+            ..Default::default()
+        };
         unsafe { vidioc_subdev_g_fmt(self.controls.file.as_raw_fd(), &mut f) }
             .with_context(|| format!("{}: SUBDEV_G_FMT pad {}", self.path().display(), pad))?;
         Ok((f.format.width, f.format.height, f.format.code))
     }
 
-    pub fn set_format(&self, pad: u32, width: u32, height: u32, code: u32) -> Result<(u32, u32, u32)> {
-        let mut f = v4l2_subdev_format { which: V4L2_SUBDEV_FORMAT_ACTIVE, pad, ..Default::default() };
+    pub fn set_format(
+        &self,
+        pad: u32,
+        width: u32,
+        height: u32,
+        code: u32,
+    ) -> Result<(u32, u32, u32)> {
+        let mut f = v4l2_subdev_format {
+            which: V4L2_SUBDEV_FORMAT_ACTIVE,
+            pad,
+            ..Default::default()
+        };
         f.format.width = width;
         f.format.height = height;
         f.format.code = code;
         f.format.field = V4L2_FIELD_NONE;
-        unsafe { vidioc_subdev_s_fmt(self.controls.file.as_raw_fd(), &mut f) }
-            .with_context(|| format!("{}: SUBDEV_S_FMT pad {} {}x{} 0x{:04x}", self.path().display(), pad, width, height, code))?;
+        unsafe { vidioc_subdev_s_fmt(self.controls.file.as_raw_fd(), &mut f) }.with_context(
+            || {
+                format!(
+                    "{}: SUBDEV_S_FMT pad {} {}x{} 0x{:04x}",
+                    self.path().display(),
+                    pad,
+                    width,
+                    height,
+                    code
+                )
+            },
+        )?;
         Ok((f.format.width, f.format.height, f.format.code))
     }
 }

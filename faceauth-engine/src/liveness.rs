@@ -58,7 +58,13 @@ impl FlashResponse {
     /// `lit` and `unlit` are consecutive frames of the same size in the oriented
     /// orientation; `face` was detected on `lit`; `exposure` and `gain` are the
     /// sensor settings both frames were taken at (gain in the ov7251 scale, 16 = 1x).
-    pub fn measure(lit: &Grey, unlit: &Grey, face: &Face, exposure: i64, gain: i64) -> FlashResponse {
+    pub fn measure(
+        lit: &Grey,
+        unlit: &Grey,
+        face: &Face,
+        exposure: i64,
+        gain: i64,
+    ) -> FlashResponse {
         let (fw, fh) = (lit.width as i32, lit.height as i32);
         let flash_at = |x: i32, y: i32| -> f32 {
             if x < 0 || y < 0 || x >= fw || y >= fh {
@@ -73,9 +79,16 @@ impl FlashResponse {
         // beside and above the face (below the chin are the shoulders, which are
         // as close as the face and lit like it).
         let mean_region = |lo: f32, hi: f32, above_chin_only: bool| -> f32 {
-            let (rx_lo, ry_lo, rx_hi, ry_hi) = (bw * lo / 2.0, bh * lo / 2.0, bw * hi / 2.0, bh * hi / 2.0);
-            let (x0, x1) = ((cx - rx_hi).max(0.0) as i32, (cx + rx_hi).min(fw as f32 - 1.0) as i32);
-            let (y0, y1) = ((cy - ry_hi).max(0.0) as i32, (cy + ry_hi).min(fh as f32 - 1.0) as i32);
+            let (rx_lo, ry_lo, rx_hi, ry_hi) =
+                (bw * lo / 2.0, bh * lo / 2.0, bw * hi / 2.0, bh * hi / 2.0);
+            let (x0, x1) = (
+                (cx - rx_hi).max(0.0) as i32,
+                (cx + rx_hi).min(fw as f32 - 1.0) as i32,
+            );
+            let (y0, y1) = (
+                (cy - ry_hi).max(0.0) as i32,
+                (cy + ry_hi).min(fh as f32 - 1.0) as i32,
+            );
             let chin = cy + bh * 0.35;
             let (mut s, mut n) = (0f32, 0usize);
             let mut y = y0;
@@ -83,7 +96,8 @@ impl FlashResponse {
                 if !(above_chin_only && y as f32 > chin) {
                     let mut x = x0;
                     while x <= x1 {
-                        let inside = ((x as f32 - cx).abs() < rx_lo) && ((y as f32 - cy).abs() < ry_lo);
+                        let inside =
+                            ((x as f32 - cx).abs() < rx_lo) && ((y as f32 - cy).abs() < ry_lo);
                         if !inside {
                             s += flash_at(x, y);
                             n += 1;
@@ -101,11 +115,25 @@ impl FlashResponse {
         };
         let face_flash = mean_region(0.0, 0.7, false);
         let ring_flash = mean_region(1.4, 2.0, true);
-        let surround = if face_flash > 0.0 { ring_flash / face_flash } else { f32::INFINITY };
+        let surround = if face_flash > 0.0 {
+            ring_flash / face_flash
+        } else {
+            f32::INFINITY
+        };
         let denom = (exposure.max(1) as f32) * (gain.max(1) as f32 / 16.0);
         let raw = face_flash / denom;
-        let scale = if bw > 1.0 { (REFERENCE_FACE_PX / bw).powi(2) } else { 1.0 };
-        FlashResponse { face_flash, ring_flash, surround, reflectance: raw * scale, face_px: bw }
+        let scale = if bw > 1.0 {
+            (REFERENCE_FACE_PX / bw).powi(2)
+        } else {
+            1.0
+        };
+        FlashResponse {
+            face_flash,
+            ring_flash,
+            surround,
+            reflectance: raw * scale,
+            face_px: bw,
+        }
     }
 
     pub fn verdict(&self) -> Verdict {
@@ -156,7 +184,11 @@ impl StrobePhase {
     }
 
     pub fn with_pattern(pattern: u8) -> Self {
-        StrobePhase { pattern, bits: Vec::new(), last_mean: None }
+        StrobePhase {
+            pattern,
+            bits: Vec::new(),
+            last_mean: None,
+        }
     }
 
     /// The mask to write to `strobe_frame_pattern`.
@@ -217,10 +249,12 @@ mod phase_tests {
     /// Feed a phase tracker the brightness sequence a mask produces, from
     /// bit `start`, and return which frames it offered as pairs.
     fn run(mask: u8, phase: &mut StrobePhase, start: u32, n: usize) -> Vec<bool> {
-        (0..n).map(|i| {
-            let bit = (mask.rotate_left(start) >> (7 - (i % 8))) & 1;
-            phase.push(if bit == 1 { 120.0 } else { 60.0 })
-        }).collect()
+        (0..n)
+            .map(|i| {
+                let bit = (mask.rotate_left(start) >> (7 - (i % 8))) & 1;
+                phase.push(if bit == 1 { 120.0 } else { 60.0 })
+            })
+            .collect()
     }
 
     #[test]
@@ -237,8 +271,16 @@ mod phase_tests {
         let mask = 0b1011_0100u8;
         let mut phase = StrobePhase::with_pattern(mask);
         let offered = run(mask, &mut phase, 3, 24);
-        assert!(offered[..7].iter().all(|o| !o), "nothing before eight frames: {:?}", offered);
-        assert!(offered[8..].iter().any(|o| *o), "rising edges in phase are offered: {:?}", offered);
+        assert!(
+            offered[..7].iter().all(|o| !o),
+            "nothing before eight frames: {:?}",
+            offered
+        );
+        assert!(
+            offered[8..].iter().any(|o| *o),
+            "rising edges in phase are offered: {:?}",
+            offered
+        );
         // Every offer is a lit frame after an unlit one.
         for (i, o) in offered.iter().enumerate() {
             if *o {
@@ -253,10 +295,17 @@ mod phase_tests {
         let mask = 0b1011_0100u8;
         let mut phase = StrobePhase::with_pattern(mask);
         let offered = run(0xaa, &mut phase, 0, 40);
-        assert!(offered.iter().all(|o| !o), "a canned alternation must not read as strobed: {:?}", offered);
+        assert!(
+            offered.iter().all(|o| !o),
+            "a canned alternation must not read as strobed: {:?}",
+            offered
+        );
         let mut phase = StrobePhase::with_pattern(mask);
         let offered = run(0b1100_0011, &mut phase, 0, 40);
-        assert!(offered.iter().all(|o| !o), "a stream under another mask must not read as strobed");
+        assert!(
+            offered.iter().all(|o| !o),
+            "a stream under another mask must not read as strobed"
+        );
     }
 
     #[test]
@@ -272,7 +321,12 @@ mod tests {
     use super::*;
 
     fn face(x: f32, y: f32, w: f32, h: f32) -> Face {
-        Face { bbox: [x, y, w, h], score: 0.9, landmarks: [[0.0; 2]; 5], embedding: None }
+        Face {
+            bbox: [x, y, w, h],
+            score: 0.9,
+            landmarks: [[0.0; 2]; 5],
+            embedding: None,
+        }
     }
 
     /// A lit frame with a bright disc for the head and a dark surround; unlit black.
@@ -322,8 +376,14 @@ mod tests {
         // Same albedo twice as far: half the face width, a quarter of the flash.
         let (lit_near, unlit) = head_only(200, 80);
         let (lit_far, _) = head_only(200, 20);
-        let near = FlashResponse::measure(&lit_near, &unlit, &face(60.0, 60.0, 80.0, 80.0), 267, 16);
+        let near =
+            FlashResponse::measure(&lit_near, &unlit, &face(60.0, 60.0, 80.0, 80.0), 267, 16);
         let far = FlashResponse::measure(&lit_far, &unlit, &face(80.0, 80.0, 40.0, 40.0), 267, 16);
-        assert!((near.reflectance - far.reflectance).abs() / near.reflectance < 0.05, "{:?} vs {:?}", near, far);
+        assert!(
+            (near.reflectance - far.reflectance).abs() / near.reflectance < 0.05,
+            "{:?} vs {:?}",
+            near,
+            far
+        );
     }
 }

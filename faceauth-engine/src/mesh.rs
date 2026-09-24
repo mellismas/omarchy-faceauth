@@ -63,9 +63,17 @@ impl FaceMesh {
         let session = runtime::session(path, 2)?;
         let input = session.inputs().first().context("face mesh: no input")?;
         let input_name = input.name().to_string();
-        let dims: Vec<i64> = input.dtype().tensor_shape().map(|s| s.to_vec()).unwrap_or_default();
+        let dims: Vec<i64> = input
+            .dtype()
+            .tensor_shape()
+            .map(|s| s.to_vec())
+            .unwrap_or_default();
         let nhwc = dims.len() == 4 && dims[3] == 3;
-        Ok(FaceMesh { session, input_name, nhwc })
+        Ok(FaceMesh {
+            session,
+            input_name,
+            nhwc,
+        })
     }
 
     /// The mesh for the face in `bbox` (x, y, w, h in frame pixels), or
@@ -90,11 +98,15 @@ impl FaceMesh {
         } else {
             Tensor::from_array(([1usize, 3, SIDE, SIDE], crop.to_nchw3(0.0, 255.0)))?
         };
-        let outputs = self.session.run(ort::inputs![self.input_name.as_str() => tensor])?;
+        let outputs = self
+            .session
+            .run(ort::inputs![self.input_name.as_str() => tensor])?;
         let mut points: Option<Vec<f32>> = None;
         let mut score = 1.0f32;
         for i in 0..outputs.len() {
-            let Ok((_, data)) = outputs[i].try_extract_tensor::<f32>() else { continue };
+            let Ok((_, data)) = outputs[i].try_extract_tensor::<f32>() else {
+                continue;
+            };
             if data.len() == 468 * 3 {
                 points = Some(data.to_vec());
             } else if data.len() == 1 {
@@ -106,7 +118,10 @@ impl FaceMesh {
         if score < 0.5 {
             return Ok(None);
         }
-        let points = raw.chunks(3).map(|p| [x0 + p[0] * s, y0 + p[1] * s, p[2] * s]).collect();
+        let points = raw
+            .chunks(3)
+            .map(|p| [x0 + p[0] * s, y0 + p[1] * s, p[2] * s])
+            .collect();
         Ok(Some(Mesh { points, score }))
     }
 
@@ -125,9 +140,13 @@ pub fn head_pose(m: &Mesh) -> HeadPose {
     let (fh, ch) = (p[FOREHEAD], p[CHIN]);
     let (re, le) = (p[RIGHT_EYE_OUTER], p[LEFT_EYE_OUTER]);
     // Turned toward the subject's left: the left cheek recedes (larger z).
-    let yaw = (lc[2] - rc[2]).atan2((lc[0] - rc[0]).abs().max(1.0)).to_degrees();
+    let yaw = (lc[2] - rc[2])
+        .atan2((lc[0] - rc[0]).abs().max(1.0))
+        .to_degrees();
     // Chin down: the chin recedes against the forehead.
-    let pitch = (ch[2] - fh[2]).atan2((ch[1] - fh[1]).abs().max(1.0)).to_degrees();
+    let pitch = (ch[2] - fh[2])
+        .atan2((ch[1] - fh[1]).abs().max(1.0))
+        .to_degrees();
     let roll = (le[1] - re[1]).atan2(le[0] - re[0]).to_degrees();
     HeadPose { yaw, pitch, roll }
 }
@@ -137,7 +156,9 @@ pub fn head_pose(m: &Mesh) -> HeadPose {
 /// pitched within the band a person looking at their screen uses (a lid
 /// camera looks up at the face, so level already reads chin-down).
 pub fn is_attentive(hp: &HeadPose, max_yaw_deg: f32, max_roll_deg: f32) -> bool {
-    hp.yaw.abs() <= max_yaw_deg && hp.roll.abs() <= max_roll_deg && (-30.0..=40.0).contains(&hp.pitch)
+    hp.yaw.abs() <= max_yaw_deg
+        && hp.roll.abs() <= max_roll_deg
+        && (-30.0..=40.0).contains(&hp.pitch)
 }
 
 #[cfg(test)]
@@ -146,12 +167,49 @@ mod tests {
 
     #[test]
     fn attention_is_a_band_of_yaw_pitch_and_roll() {
-        let level = HeadPose { yaw: 3.0, pitch: 10.0, roll: -2.0 };
+        let level = HeadPose {
+            yaw: 3.0,
+            pitch: 10.0,
+            roll: -2.0,
+        };
         assert!(is_attentive(&level, 21.0, 25.0));
-        assert!(!is_attentive(&HeadPose { yaw: 30.0, ..level }, 21.0, 25.0), "turned away");
-        assert!(!is_attentive(&HeadPose { roll: 30.0, ..level }, 21.0, 25.0), "tilted over");
-        assert!(!is_attentive(&HeadPose { pitch: -40.0, ..level }, 21.0, 25.0), "chin right up");
-        assert!(is_attentive(&HeadPose { pitch: 35.0, ..level }, 21.0, 25.0), "reading the keyboard still counts");
+        assert!(
+            !is_attentive(&HeadPose { yaw: 30.0, ..level }, 21.0, 25.0),
+            "turned away"
+        );
+        assert!(
+            !is_attentive(
+                &HeadPose {
+                    roll: 30.0,
+                    ..level
+                },
+                21.0,
+                25.0
+            ),
+            "tilted over"
+        );
+        assert!(
+            !is_attentive(
+                &HeadPose {
+                    pitch: -40.0,
+                    ..level
+                },
+                21.0,
+                25.0
+            ),
+            "chin right up"
+        );
+        assert!(
+            is_attentive(
+                &HeadPose {
+                    pitch: 35.0,
+                    ..level
+                },
+                21.0,
+                25.0
+            ),
+            "reading the keyboard still counts"
+        );
     }
 
     fn mesh_with(points: &[(usize, [f32; 3])]) -> Mesh {
@@ -159,27 +217,62 @@ mod tests {
         for &(i, v) in points {
             p[i] = v;
         }
-        Mesh { points: p, score: 1.0 }
+        Mesh {
+            points: p,
+            score: 1.0,
+        }
     }
 
     #[test]
     fn a_level_frontal_face_reads_zero() {
-        let m = mesh_with(&[(RIGHT_CHEEK, [0.0, 50.0, 0.0]), (LEFT_CHEEK, [100.0, 50.0, 0.0]), (FOREHEAD, [50.0, 0.0, 0.0]), (CHIN, [50.0, 120.0, 0.0]), (RIGHT_EYE_OUTER, [20.0, 40.0, 0.0]), (LEFT_EYE_OUTER, [80.0, 40.0, 0.0])]);
+        let m = mesh_with(&[
+            (RIGHT_CHEEK, [0.0, 50.0, 0.0]),
+            (LEFT_CHEEK, [100.0, 50.0, 0.0]),
+            (FOREHEAD, [50.0, 0.0, 0.0]),
+            (CHIN, [50.0, 120.0, 0.0]),
+            (RIGHT_EYE_OUTER, [20.0, 40.0, 0.0]),
+            (LEFT_EYE_OUTER, [80.0, 40.0, 0.0]),
+        ]);
         let hp = head_pose(&m);
-        assert!(hp.yaw.abs() < 0.01 && hp.pitch.abs() < 0.01 && hp.roll.abs() < 0.01, "{:?}", hp);
+        assert!(
+            hp.yaw.abs() < 0.01 && hp.pitch.abs() < 0.01 && hp.roll.abs() < 0.01,
+            "{:?}",
+            hp
+        );
     }
 
     #[test]
     fn the_signs_follow_the_geometry() {
         // Chin nearer the camera than the forehead: chin up, pitch negative.
-        let up = mesh_with(&[(RIGHT_CHEEK, [0.0, 50.0, 0.0]), (LEFT_CHEEK, [100.0, 50.0, 0.0]), (FOREHEAD, [50.0, 0.0, 10.0]), (CHIN, [50.0, 100.0, -30.0]), (RIGHT_EYE_OUTER, [20.0, 40.0, 0.0]), (LEFT_EYE_OUTER, [80.0, 40.0, 0.0])]);
+        let up = mesh_with(&[
+            (RIGHT_CHEEK, [0.0, 50.0, 0.0]),
+            (LEFT_CHEEK, [100.0, 50.0, 0.0]),
+            (FOREHEAD, [50.0, 0.0, 10.0]),
+            (CHIN, [50.0, 100.0, -30.0]),
+            (RIGHT_EYE_OUTER, [20.0, 40.0, 0.0]),
+            (LEFT_EYE_OUTER, [80.0, 40.0, 0.0]),
+        ]);
         let hp = head_pose(&up);
         assert!(hp.pitch < -15.0, "{:?}", hp);
         // Left cheek receding: turned toward the subject's left, yaw positive.
-        let left = mesh_with(&[(RIGHT_CHEEK, [0.0, 50.0, -20.0]), (LEFT_CHEEK, [80.0, 50.0, 20.0]), (FOREHEAD, [50.0, 0.0, 0.0]), (CHIN, [50.0, 120.0, 0.0]), (RIGHT_EYE_OUTER, [20.0, 40.0, 0.0]), (LEFT_EYE_OUTER, [80.0, 40.0, 0.0])]);
+        let left = mesh_with(&[
+            (RIGHT_CHEEK, [0.0, 50.0, -20.0]),
+            (LEFT_CHEEK, [80.0, 50.0, 20.0]),
+            (FOREHEAD, [50.0, 0.0, 0.0]),
+            (CHIN, [50.0, 120.0, 0.0]),
+            (RIGHT_EYE_OUTER, [20.0, 40.0, 0.0]),
+            (LEFT_EYE_OUTER, [80.0, 40.0, 0.0]),
+        ]);
         assert!(head_pose(&left).yaw > 15.0);
         // Left eye lower: roll positive.
-        let tilt = mesh_with(&[(RIGHT_CHEEK, [0.0, 50.0, 0.0]), (LEFT_CHEEK, [100.0, 50.0, 0.0]), (FOREHEAD, [50.0, 0.0, 0.0]), (CHIN, [50.0, 120.0, 0.0]), (RIGHT_EYE_OUTER, [20.0, 40.0, 0.0]), (LEFT_EYE_OUTER, [80.0, 60.0, 0.0])]);
+        let tilt = mesh_with(&[
+            (RIGHT_CHEEK, [0.0, 50.0, 0.0]),
+            (LEFT_CHEEK, [100.0, 50.0, 0.0]),
+            (FOREHEAD, [50.0, 0.0, 0.0]),
+            (CHIN, [50.0, 120.0, 0.0]),
+            (RIGHT_EYE_OUTER, [20.0, 40.0, 0.0]),
+            (LEFT_EYE_OUTER, [80.0, 60.0, 0.0]),
+        ]);
         assert!(head_pose(&tilt).roll > 15.0);
     }
 }

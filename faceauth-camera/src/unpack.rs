@@ -21,7 +21,9 @@ fn plane(width: usize, height: usize, per: usize) -> Option<usize> {
 
 pub fn unpack_ipu3_10(src: &[u8], width: usize, height: usize, dst: &mut [u16]) -> bool {
     let stride = ipu3_row_stride(width);
-    let (Some(packed), Some(pixels)) = (stride.checked_mul(height), plane(width, height, 1)) else { return false };
+    let (Some(packed), Some(pixels)) = (stride.checked_mul(height), plane(width, height, 1)) else {
+        return false;
+    };
     if src.len() < packed || dst.len() < pixels {
         return false;
     }
@@ -50,7 +52,9 @@ pub fn unpack_ipu3_10(src: &[u8], width: usize, height: usize, dst: &mut [u16]) 
 
 /// 8-bit grey (UVC `GREY`) widened to the 10-bit scale used everywhere else.
 pub fn unpack_grey8(src: &[u8], width: usize, height: usize, dst: &mut [u16]) -> bool {
-    let Some(pixels) = plane(width, height, 1) else { return false };
+    let Some(pixels) = plane(width, height, 1) else {
+        return false;
+    };
     if src.len() < pixels || dst.len() < pixels {
         return false;
     }
@@ -62,7 +66,9 @@ pub fn unpack_grey8(src: &[u8], width: usize, height: usize, dst: &mut [u16]) ->
 
 /// `YUYV`: luma only, widened to 10 bits.
 pub fn unpack_yuyv_luma(src: &[u8], width: usize, height: usize, dst: &mut [u16]) -> bool {
-    let (Some(bytes), Some(pixels)) = (plane(width, height, 2), plane(width, height, 1)) else { return false };
+    let (Some(bytes), Some(pixels)) = (plane(width, height, 2), plane(width, height, 1)) else {
+        return false;
+    };
     if src.len() < bytes || dst.len() < pixels {
         return false;
     }
@@ -73,8 +79,16 @@ pub fn unpack_yuyv_luma(src: &[u8], width: usize, height: usize, dst: &mut [u16]
 }
 
 /// 10-bit or 16-bit little-endian grey (`Y10 `, `Y16 `), normalised to 10 bits.
-pub fn unpack_y16(src: &[u8], width: usize, height: usize, shift_down: u32, dst: &mut [u16]) -> bool {
-    let (Some(bytes), Some(pixels)) = (plane(width, height, 2), plane(width, height, 1)) else { return false };
+pub fn unpack_y16(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    shift_down: u32,
+    dst: &mut [u16],
+) -> bool {
+    let (Some(bytes), Some(pixels)) = (plane(width, height, 2), plane(width, height, 1)) else {
+        return false;
+    };
     if src.len() < bytes || dst.len() < pixels {
         return false;
     }
@@ -98,10 +112,19 @@ pub enum BayerOrder {
 
 /// The last raw row pair of the IPU3 RGB frame is not image data; `rows_out`
 /// callers pass `height / 2 - 1` for it.
-pub fn bayer_reduce(src: &[u16], width: usize, height: usize, order: BayerOrder, black: u16, out: &mut [[f32; 3]]) -> usize {
+pub fn bayer_reduce(
+    src: &[u16],
+    width: usize,
+    height: usize,
+    order: BayerOrder,
+    black: u16,
+    out: &mut [[f32; 3]],
+) -> usize {
     let w2 = width / 2;
     let h2 = height / 2;
-    let (Some(n), Some(pixels)) = (w2.checked_mul(h2), plane(width, height, 1)) else { return 0 };
+    let (Some(n), Some(pixels)) = (w2.checked_mul(h2), plane(width, height, 1)) else {
+        return 0;
+    };
     if src.len() < pixels || out.len() < n {
         return 0;
     }
@@ -110,7 +133,12 @@ pub fn bayer_reduce(src: &[u16], width: usize, height: usize, order: BayerOrder,
         let r0 = &src[2 * y * width..2 * y * width + width];
         let r1 = &src[(2 * y + 1) * width..(2 * y + 1) * width + width];
         for x in 0..w2 {
-            let (p00, p01, p10, p11) = (r0[2 * x] as f32, r0[2 * x + 1] as f32, r1[2 * x] as f32, r1[2 * x + 1] as f32);
+            let (p00, p01, p10, p11) = (
+                r0[2 * x] as f32,
+                r0[2 * x + 1] as f32,
+                r1[2 * x] as f32,
+                r1[2 * x + 1] as f32,
+            );
             let (r, g, bl) = match order {
                 BayerOrder::Bggr => (p11, (p01 + p10) * 0.5, p00),
                 BayerOrder::Rggb => (p00, (p01 + p10) * 0.5, p11),
@@ -190,8 +218,21 @@ mod tests {
         assert!(!unpack_y16(&src, huge, 2, 0, &mut dst));
         let src16 = [0u16; 64];
         let mut out = [[0f32; 3]; 16];
-        assert_eq!(bayer_reduce(&src16, huge, 2, BayerOrder::Bggr, 0, &mut out), 0);
-        assert_eq!(bayer_reduce(&src16, usize::MAX, usize::MAX, BayerOrder::Bggr, 0, &mut out), 0);
+        assert_eq!(
+            bayer_reduce(&src16, huge, 2, BayerOrder::Bggr, 0, &mut out),
+            0
+        );
+        assert_eq!(
+            bayer_reduce(
+                &src16,
+                usize::MAX,
+                usize::MAX,
+                BayerOrder::Bggr,
+                0,
+                &mut out
+            ),
+            0
+        );
     }
 
     #[test]

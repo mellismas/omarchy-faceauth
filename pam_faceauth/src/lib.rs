@@ -71,7 +71,14 @@ struct pam_response {
 
 #[repr(C)]
 struct pam_conv {
-    conv: Option<unsafe extern "C" fn(c_int, *mut *const pam_message, *mut *mut pam_response, *mut c_void) -> c_int>,
+    conv: Option<
+        unsafe extern "C" fn(
+            c_int,
+            *mut *const pam_message,
+            *mut *mut pam_response,
+            *mut c_void,
+        ) -> c_int,
+    >,
     appdata_ptr: *mut c_void,
 }
 
@@ -86,8 +93,13 @@ pub struct pam_handle_t {
 
 extern "C" {
     fn syslog(priority: c_int, fmt: *const c_char, ...);
-    fn pam_get_user(pamh: *mut pam_handle_t, user: *mut *const c_char, prompt: *const c_char) -> c_int;
-    fn pam_get_item(pamh: *const pam_handle_t, item_type: c_int, item: *mut *const c_void) -> c_int;
+    fn pam_get_user(
+        pamh: *mut pam_handle_t,
+        user: *mut *const c_char,
+        prompt: *const c_char,
+    ) -> c_int;
+    fn pam_get_item(pamh: *const pam_handle_t, item_type: c_int, item: *mut *const c_void)
+        -> c_int;
     fn pam_set_item(pamh: *mut pam_handle_t, item_type: c_int, item: *const c_void) -> c_int;
     fn free(p: *mut c_void);
 }
@@ -150,7 +162,10 @@ fn converse(pamh: *mut pam_handle_t, text: &str) -> Result<Option<Vec<u8>>, ()> 
     let conv = unsafe { &*(item as *const pam_conv) };
     let Some(f) = conv.conv else { return Ok(None) };
     let ctext = std::ffi::CString::new(text).map_err(|_| ())?;
-    let msg = pam_message { msg_style: PAM_PROMPT_ECHO_OFF, msg: ctext.as_ptr() };
+    let msg = pam_message {
+        msg_style: PAM_PROMPT_ECHO_OFF,
+        msg: ctext.as_ptr(),
+    };
     let mut msg_ptr: *const pam_message = &msg;
     let mut resp: *mut pam_response = std::ptr::null_mut();
     // SAFETY: one message, one response slot; the application allocates the
@@ -161,7 +176,11 @@ fn converse(pamh: *mut pam_handle_t, text: &str) -> Result<Option<Vec<u8>>, ()> 
     }
     let out = unsafe {
         let r = &*resp;
-        let bytes = if r.resp.is_null() { Vec::new() } else { CStr::from_ptr(r.resp).to_bytes().to_vec() };
+        let bytes = if r.resp.is_null() {
+            Vec::new()
+        } else {
+            CStr::from_ptr(r.resp).to_bytes().to_vec()
+        };
         if !r.resp.is_null() {
             // Wipe before freeing: it may be a password.
             let len = bytes.len();
@@ -175,7 +194,12 @@ fn converse(pamh: *mut pam_handle_t, text: &str) -> Result<Option<Vec<u8>>, ()> 
 }
 
 fn parse_args(argc: c_int, argv: *const *const c_char) -> Args {
-    let mut a = Args { socket: DEFAULT_SOCKET.to_string(), timeout: Duration::from_secs(DEFAULT_TIMEOUT), prompt: None, consent: false };
+    let mut a = Args {
+        socket: DEFAULT_SOCKET.to_string(),
+        timeout: Duration::from_secs(DEFAULT_TIMEOUT),
+        prompt: None,
+        consent: false,
+    };
     let mut timeout_given = false;
     if argv.is_null() {
         return a;
@@ -216,10 +240,22 @@ fn parse_args(argc: c_int, argv: *const *const c_char) -> Args {
 /// Is the process on the other end of `stream` running as root?
 fn peer_is_root(stream: &UnixStream) -> bool {
     use std::os::unix::io::AsRawFd;
-    let mut cred = libc::ucred { pid: 0, uid: u32::MAX, gid: u32::MAX };
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: u32::MAX,
+        gid: u32::MAX,
+    };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     // SAFETY: a valid socket fd, a correctly sized out-buffer and its length.
-    let rc = unsafe { libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, &mut cred as *mut libc::ucred as *mut c_void, &mut len) };
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut c_void,
+            &mut len,
+        )
+    };
     rc == 0 && cred.uid == 0
 }
 
@@ -237,10 +273,19 @@ enum Said {
 /// refused here rather than rewritten into a different name: the daemon must
 /// be asked about PAM_USER or about nobody.
 fn request_line(user: &str, consent: bool) -> Option<String> {
-    if user.is_empty() || user.len() > 256 || user.chars().any(|c| c == '"' || c == '\\' || c.is_control()) {
+    if user.is_empty()
+        || user.len() > 256
+        || user
+            .chars()
+            .any(|c| c == '"' || c == '\\' || c.is_control())
+    {
         return None;
     }
-    Some(if consent { format!("{{\"user\":\"{}\",\"consent\":true}}\n", user) } else { format!("{{\"user\":\"{}\"}}\n", user) })
+    Some(if consent {
+        format!("{{\"user\":\"{}\",\"consent\":true}}\n", user)
+    } else {
+        format!("{{\"user\":\"{}\"}}\n", user)
+    })
 }
 
 fn daemon_says(socket: &Path, user: &str, timeout: Duration, consent: bool) -> Said {
@@ -248,7 +293,9 @@ fn daemon_says(socket: &Path, user: &str, timeout: Duration, consent: bool) -> S
         log("user name would need escaping; not asking the daemon");
         return Said::Other;
     };
-    let Ok(mut stream) = UnixStream::connect(socket) else { return Said::Other };
+    let Ok(mut stream) = UnixStream::connect(socket) else {
+        return Said::Other;
+    };
     // The socket lives under a root-owned runtime directory, so nobody else
     // can put a listener there; this check is the belt to that suspender. A
     // peer that is not root is not the daemon, and its answers are nobody's.
@@ -258,7 +305,11 @@ fn daemon_says(socket: &Path, user: &str, timeout: Duration, consent: bool) -> S
     }
     // A consent request has no deadline: the daemon answers when the user does.
     let read_timeout = if consent { None } else { Some(timeout) };
-    if stream.set_read_timeout(read_timeout).is_err() || stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
+    if stream.set_read_timeout(read_timeout).is_err()
+        || stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .is_err()
+    {
         return Said::Other;
     }
     if stream.write_all(req.as_bytes()).is_err() {
@@ -297,7 +348,10 @@ fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char
     }
     // A name that is not UTF-8 is refused, not rewritten: a rewritten name
     // would ask the daemon about a different user than PAM_USER.
-    let Ok(user) = unsafe { CStr::from_ptr(user_ptr) }.to_str().map(str::to_owned) else {
+    let Ok(user) = unsafe { CStr::from_ptr(user_ptr) }
+        .to_str()
+        .map(str::to_owned)
+    else {
         log("user name is not UTF-8, ignoring");
         return PAM_IGNORE;
     };
@@ -313,7 +367,11 @@ fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char
     if unsafe { pam_get_item(pamh, PAM_RHOST, &mut rhost) } == PAM_SUCCESS && !rhost.is_null() {
         let host = unsafe { CStr::from_ptr(rhost as *const c_char) }.to_string_lossy();
         if !host.is_empty() {
-            log(&format!("user {}: remote host {} on the transaction, no scan", sanitise(&user), sanitise(&host)));
+            log(&format!(
+                "user {}: remote host {} on the transaction, no scan",
+                sanitise(&user),
+                sanitise(&host)
+            ));
             return PAM_IGNORE;
         }
     }
@@ -330,7 +388,10 @@ fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char
                     // The password must not linger in freed heap.
                     wipe(tok);
                 }
-                log(&format!("user {}: password typed at the prompt, no scan", sanitise(&user)));
+                log(&format!(
+                    "user {}: password typed at the prompt, no scan",
+                    sanitise(&user)
+                ));
                 return PAM_IGNORE;
             }
             // Bare Enter: the deliberate act. Scan.
@@ -341,7 +402,16 @@ fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char
         }
     }
     let said = daemon_says(Path::new(&args.socket), &user, args.timeout, args.consent);
-    log(&format!("user {}: {} after {} ms", sanitise(&user), match said { Said::Match => "match, success", Said::Refused => "refused by the user, auth error", Said::Other => "no match or no daemon, ignore" }, t0.elapsed().as_millis()));
+    log(&format!(
+        "user {}: {} after {} ms",
+        sanitise(&user),
+        match said {
+            Said::Match => "match, success",
+            Said::Refused => "refused by the user, auth error",
+            Said::Other => "no match or no daemon, ignore",
+        },
+        t0.elapsed().as_millis()
+    ));
     match said {
         Said::Match => PAM_SUCCESS,
         Said::Refused => PAM_AUTH_ERR,
@@ -350,17 +420,32 @@ fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char
 }
 
 #[no_mangle]
-pub extern "C" fn pam_sm_authenticate(pamh: *mut pam_handle_t, _flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
+pub extern "C" fn pam_sm_authenticate(
+    pamh: *mut pam_handle_t,
+    _flags: c_int,
+    argc: c_int,
+    argv: *const *const c_char,
+) -> c_int {
     catch_unwind(AssertUnwindSafe(|| authenticate(pamh, argc, argv))).unwrap_or(PAM_IGNORE)
 }
 
 #[no_mangle]
-pub extern "C" fn pam_sm_setcred(_pamh: *mut pam_handle_t, _flags: c_int, _argc: c_int, _argv: *const *const c_char) -> c_int {
+pub extern "C" fn pam_sm_setcred(
+    _pamh: *mut pam_handle_t,
+    _flags: c_int,
+    _argc: c_int,
+    _argv: *const *const c_char,
+) -> c_int {
     PAM_IGNORE
 }
 
 #[no_mangle]
-pub extern "C" fn pam_sm_acct_mgmt(_pamh: *mut pam_handle_t, _flags: c_int, _argc: c_int, _argv: *const *const c_char) -> c_int {
+pub extern "C" fn pam_sm_acct_mgmt(
+    _pamh: *mut pam_handle_t,
+    _flags: c_int,
+    _argc: c_int,
+    _argv: *const *const c_char,
+) -> c_int {
     PAM_IGNORE
 }
 
@@ -373,11 +458,36 @@ mod tests {
 
     #[test]
     fn replies_are_read_by_their_leading_tag_only() {
-        assert_eq!(classify("{\"result\":\"match\",\"frames\":2}", true), Said::Match);
-        assert_eq!(classify("{\"result\":\"refused\",\"reason\":\"shaken\",\"elapsed_ms\":5}", true), Said::Refused);
-        assert_eq!(classify("{\"result\":\"refused\",\"reason\":\"shaken\"}", false), Said::Other, "a plain scan has no refusal");
-        assert_eq!(classify("{\"result\":\"consent_denied\",\"reason\":\"no answer\"}", true), Said::Other);
-        assert_eq!(classify("{\"result\":\"no_match\",\"message\":\"{\\\"result\\\":\\\"match\\\",\"}", true), Said::Other);
+        assert_eq!(
+            classify("{\"result\":\"match\",\"frames\":2}", true),
+            Said::Match
+        );
+        assert_eq!(
+            classify(
+                "{\"result\":\"refused\",\"reason\":\"shaken\",\"elapsed_ms\":5}",
+                true
+            ),
+            Said::Refused
+        );
+        assert_eq!(
+            classify("{\"result\":\"refused\",\"reason\":\"shaken\"}", false),
+            Said::Other,
+            "a plain scan has no refusal"
+        );
+        assert_eq!(
+            classify(
+                "{\"result\":\"consent_denied\",\"reason\":\"no answer\"}",
+                true
+            ),
+            Said::Other
+        );
+        assert_eq!(
+            classify(
+                "{\"result\":\"no_match\",\"message\":\"{\\\"result\\\":\\\"match\\\",\"}",
+                true
+            ),
+            Said::Other
+        );
         assert_eq!(classify("", true), Said::Other);
     }
 
@@ -393,7 +503,15 @@ mod tests {
 
     #[test]
     fn no_daemon_is_not_a_match() {
-        assert_eq!(daemon_says(Path::new("/nonexistent/faceauth.sock"), "alice", Duration::from_secs(1), false), Said::Other);
+        assert_eq!(
+            daemon_says(
+                Path::new("/nonexistent/faceauth.sock"),
+                "alice",
+                Duration::from_secs(1),
+                false
+            ),
+            Said::Other
+        );
     }
 
     /// F7: a typed password reaches PAM_AUTHTOK as the bytes typed. The
@@ -405,16 +523,37 @@ mod tests {
         let c = CStr::from_bytes_with_nul(typed).unwrap();
         let as_module_keeps_it = c.to_bytes().to_vec();
         let handed_on = std::ffi::CString::new(as_module_keeps_it).unwrap();
-        assert_eq!(handed_on.as_bytes(), &typed[..typed.len() - 1], "the bytes handed to PAM_AUTHTOK are the bytes typed");
-        assert_ne!(handed_on.as_bytes(), "caf\u{FFFD}-pass".as_bytes(), "no replacement character was introduced");
+        assert_eq!(
+            handed_on.as_bytes(),
+            &typed[..typed.len() - 1],
+            "the bytes handed to PAM_AUTHTOK are the bytes typed"
+        );
+        assert_ne!(
+            handed_on.as_bytes(),
+            "caf\u{FFFD}-pass".as_bytes(),
+            "no replacement character was introduced"
+        );
     }
 
     /// F7: a name the escaper would have altered is refused, not rewritten.
     #[test]
     fn a_name_that_needs_escaping_is_refused() {
-        assert_eq!(request_line("alice", false).as_deref(), Some("{\"user\":\"alice\"}\n"));
-        assert_eq!(request_line("alice", true).as_deref(), Some("{\"user\":\"alice\",\"consent\":true}\n"));
-        for bad in ["ali\u{7}ce", "ali\"ce", "ali\\ce", "alice\n", "", "alice\u{7f}"] {
+        assert_eq!(
+            request_line("alice", false).as_deref(),
+            Some("{\"user\":\"alice\"}\n")
+        );
+        assert_eq!(
+            request_line("alice", true).as_deref(),
+            Some("{\"user\":\"alice\",\"consent\":true}\n")
+        );
+        for bad in [
+            "ali\u{7}ce",
+            "ali\"ce",
+            "ali\\ce",
+            "alice\n",
+            "",
+            "alice\u{7f}",
+        ] {
             assert!(request_line(bad, false).is_none(), "{:?} was sent", bad);
             assert!(request_line(bad, true).is_none(), "{:?} was sent", bad);
         }
@@ -429,8 +568,15 @@ mod tests {
         let path = dir.join("sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();
-        assert_eq!(daemon_says(&path, "ali\u{7}ce", Duration::from_secs(1), true), Said::Other);
-        assert_eq!(listener.accept().map(|_| ()).unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "a connection was made for a refused name");
+        assert_eq!(
+            daemon_says(&path, "ali\u{7}ce", Duration::from_secs(1), true),
+            Said::Other
+        );
+        assert_eq!(
+            listener.accept().map(|_| ()).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "a connection was made for a refused name"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -441,25 +587,45 @@ mod tests {
     #[test]
     fn the_module_can_only_emit_a_look_or_a_consent_request() {
         let src = include_str!("lib.rs");
-        let start = src.find("fn request_line(").expect("the request builder exists");
+        let start = src
+            .find("fn request_line(")
+            .expect("the request builder exists");
         let body = &src[start..];
         let body = &body[..body.find("\n}\n").expect("the builder ends")];
         // Every JSON key the builder writes is a `\"name\":` fragment in a format string.
         let mut keys = std::collections::BTreeSet::new();
         for (i, _) in body.match_indices("\\\"") {
             let after = &body[i + 2..];
-            let ident: String = after.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            let ident: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
             if !ident.is_empty() && after[ident.len()..].starts_with("\\\":") {
                 keys.insert(ident);
             }
         }
-        assert_eq!(keys.into_iter().collect::<Vec<_>>(), ["consent", "user"], "the builder emits exactly these request keys");
+        assert_eq!(
+            keys.into_iter().collect::<Vec<_>>(),
+            ["consent", "user"],
+            "the builder emits exactly these request keys"
+        );
         // The rest of the module builds no request at all: no other format string opens a JSON object.
         let non_test = &src[..src.find("#[cfg(test)]").unwrap()];
         let object_openers = non_test.matches("format!(\"{{").count();
-        assert_eq!(object_openers, 2, "the two shapes in request_line are the only JSON objects the module formats");
-        for root_only in [["en", "rol"].concat(), ["del", "ete"].concat(), ["cali", "brate"].concat()] {
-            assert!(!body.contains(&root_only), "the builder names {}", root_only);
+        assert_eq!(
+            object_openers, 2,
+            "the two shapes in request_line are the only JSON objects the module formats"
+        );
+        for root_only in [
+            ["en", "rol"].concat(),
+            ["del", "ete"].concat(),
+            ["cali", "brate"].concat(),
+        ] {
+            assert!(
+                !body.contains(&root_only),
+                "the builder names {}",
+                root_only
+            );
         }
     }
 
@@ -473,17 +639,29 @@ mod tests {
 
     #[test]
     fn prompt_arguments() {
-        let args: Vec<std::ffi::CString> = ["prompt", "timeout=3"].iter().map(|s| std::ffi::CString::new(*s).unwrap()).collect();
+        let args: Vec<std::ffi::CString> = ["prompt", "timeout=3"]
+            .iter()
+            .map(|s| std::ffi::CString::new(*s).unwrap())
+            .collect();
         let ptrs: Vec<*const c_char> = args.iter().map(|c| c.as_ptr()).collect();
         let a = parse_args(2, ptrs.as_ptr());
         assert_eq!(a.prompt.as_deref(), Some(DEFAULT_PROMPT));
         assert_eq!(a.timeout, Duration::from_secs(3));
-        let args: Vec<std::ffi::CString> = ["consent"].iter().map(|s| std::ffi::CString::new(*s).unwrap()).collect();
+        let args: Vec<std::ffi::CString> = ["consent"]
+            .iter()
+            .map(|s| std::ffi::CString::new(*s).unwrap())
+            .collect();
         let ptrs: Vec<*const c_char> = args.iter().map(|c| c.as_ptr()).collect();
         let c = parse_args(1, ptrs.as_ptr());
         assert!(c.consent);
-        let args: Vec<std::ffi::CString> = ["prompt=Face:_Enter_to_scan"].iter().map(|s| std::ffi::CString::new(*s).unwrap()).collect();
+        let args: Vec<std::ffi::CString> = ["prompt=Face:_Enter_to_scan"]
+            .iter()
+            .map(|s| std::ffi::CString::new(*s).unwrap())
+            .collect();
         let ptrs: Vec<*const c_char> = args.iter().map(|c| c.as_ptr()).collect();
-        assert_eq!(parse_args(1, ptrs.as_ptr()).prompt.as_deref(), Some("Face: Enter to scan"));
+        assert_eq!(
+            parse_args(1, ptrs.as_ptr()).prompt.as_deref(),
+            Some("Face: Enter to scan")
+        );
     }
 }

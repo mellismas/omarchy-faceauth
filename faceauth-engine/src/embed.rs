@@ -24,17 +24,32 @@ impl ArcFace {
         let dim = session
             .outputs()
             .first()
-            .and_then(|o| o.dtype().tensor_shape().map(|s| s.last().copied().unwrap_or(-1)))
+            .and_then(|o| {
+                o.dtype()
+                    .tensor_shape()
+                    .map(|s| s.last().copied().unwrap_or(-1))
+            })
             .filter(|&d| d > 0)
             .map(|d| d as usize)
             .unwrap_or(512);
-        Ok(ArcFace { session, input_name, dim })
+        Ok(ArcFace {
+            session,
+            input_name,
+            dim,
+        })
     }
 
     pub fn embed(&mut self, crop: &Grey) -> Result<Vec<f32>> {
-        ensure!(crop.width == 112 && crop.height == 112, "embedder wants 112x112, got {}x{}", crop.width, crop.height);
+        ensure!(
+            crop.width == 112 && crop.height == 112,
+            "embedder wants 112x112, got {}x{}",
+            crop.width,
+            crop.height
+        );
         let tensor = Tensor::from_array(([1usize, 3, 112, 112], crop.to_nchw3(127.5, 127.5)))?;
-        let outputs = self.session.run(ort::inputs![self.input_name.as_str() => tensor])?;
+        let outputs = self
+            .session
+            .run(ort::inputs![self.input_name.as_str() => tensor])?;
         let (_, data) = outputs[0].try_extract_tensor::<f32>()?;
         let mut v = data.to_vec();
         let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();

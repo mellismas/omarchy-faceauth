@@ -23,8 +23,15 @@ impl Entity {
         if self.major == 0 {
             return None;
         }
-        let uevent = std::fs::read_to_string(format!("/sys/dev/char/{}:{}/uevent", self.major, self.minor)).ok()?;
-        uevent.lines().find_map(|l| l.strip_prefix("DEVNAME=")).map(|n| Path::new("/dev").join(n))
+        let uevent = std::fs::read_to_string(format!(
+            "/sys/dev/char/{}:{}/uevent",
+            self.major, self.minor
+        ))
+        .ok()?;
+        uevent
+            .lines()
+            .find_map(|l| l.strip_prefix("DEVNAME="))
+            .map(|n| Path::new("/dev").join(n))
     }
 }
 
@@ -51,7 +58,11 @@ pub struct MediaDevice {
 impl MediaDevice {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new().read(true).write(true).open(&path).with_context(|| format!("open {}", path.display()))?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
         Ok(MediaDevice { file, path })
     }
 
@@ -61,7 +72,12 @@ impl MediaDevice {
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
                     .map(|e| e.path())
-                    .filter(|p| p.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with("media")).unwrap_or(false))
+                    .filter(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n.starts_with("media"))
+                            .unwrap_or(false)
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -75,7 +91,8 @@ impl MediaDevice {
 
     pub fn info(&self) -> Result<(String, String, String)> {
         let mut i: media_device_info = unsafe { std::mem::zeroed() };
-        unsafe { media_ioc_device_info(self.file.as_raw_fd(), &mut i) }.context("MEDIA_IOC_DEVICE_INFO")?;
+        unsafe { media_ioc_device_info(self.file.as_raw_fd(), &mut i) }
+            .context("MEDIA_IOC_DEVICE_INFO")?;
         Ok((cstr(&i.driver), cstr(&i.model), cstr(&i.bus_info)))
     }
 
@@ -91,7 +108,14 @@ impl MediaDevice {
                 Err(e) => return Err(e).context("MEDIA_IOC_ENUM_ENTITIES"),
             }
             let (major, minor) = d.dev_major_minor();
-            out.push(Entity { id: d.id, name: cstr(&d.name), pads: d.pads, links: d.links, major, minor });
+            out.push(Entity {
+                id: d.id,
+                name: cstr(&d.name),
+                pads: d.pads,
+                links: d.links,
+                major,
+                minor,
+            });
             id = d.id | MEDIA_ENT_ID_FLAG_NEXT;
         }
         Ok(out)
@@ -110,7 +134,8 @@ impl MediaDevice {
         e.entity = entity.id;
         e.pads = pads.as_mut_ptr();
         e.links = links.as_mut_ptr();
-        unsafe { media_ioc_enum_links(self.file.as_raw_fd(), &mut e) }.with_context(|| format!("MEDIA_IOC_ENUM_LINKS {}", entity.name))?;
+        unsafe { media_ioc_enum_links(self.file.as_raw_fd(), &mut e) }
+            .with_context(|| format!("MEDIA_IOC_ENUM_LINKS {}", entity.name))?;
         Ok(links
             .iter()
             .map(|l| Link {
@@ -132,7 +157,14 @@ impl MediaDevice {
         d.flags = if enable { MEDIA_LNK_FL_ENABLED } else { 0 };
         match unsafe { media_ioc_setup_link(self.file.as_raw_fd(), &mut d) } {
             Ok(_) => Ok(()),
-            Err(e) => bail!("MEDIA_IOC_SETUP_LINK {}:{} -> {}:{}: {}", link.source_entity, link.source_pad, link.sink_entity, link.sink_pad, e),
+            Err(e) => bail!(
+                "MEDIA_IOC_SETUP_LINK {}:{} -> {}:{}: {}",
+                link.source_entity,
+                link.source_pad,
+                link.sink_entity,
+                link.sink_pad,
+                e
+            ),
         }
     }
 }

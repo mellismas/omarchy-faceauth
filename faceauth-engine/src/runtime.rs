@@ -25,7 +25,10 @@ pub fn init() -> Result<()> {
 
 pub fn session(path: impl AsRef<Path>, threads: usize) -> Result<Session> {
     init()?;
-    let threads = std::env::var("FACEAUTH_ORT_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(threads);
+    let threads = std::env::var("FACEAUTH_ORT_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(threads);
     let p = path.as_ref();
     // The builder's errors carry the builder back and are not Send; flatten them to text.
     let text = |e: ort::Error<_>| anyhow!("{}", e);

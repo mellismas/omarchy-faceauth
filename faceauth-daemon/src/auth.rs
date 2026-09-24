@@ -6,8 +6,8 @@
 //! liveness gate; a gate denial ends the attempt as `Denied` immediately.
 
 use crate::capture::IrCapture;
-use crate::consent::{notify, take_answer, wait_for_nods, Answer, Answers, Dialog, Gesture};
 use crate::config::Config;
+use crate::consent::{notify, take_answer, wait_for_nods, Answer, Answers, Dialog, Gesture};
 use crate::store::{Store, UserTemplates};
 use anyhow::Result;
 use faceauth_engine::liveness::{FlashResponse, StrobePhase, Verdict};
@@ -15,6 +15,12 @@ use faceauth_engine::{Grey, Pipeline};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// The optional hook `run_with` calls on the still-open camera once two
+/// frames matched; `Ok(false)` from it turns the match into `ConsentDenied`.
+type AfterMatch<'a> = Option<
+    &'a mut (dyn FnMut(&mut IrCapture, &mut Pipeline, &faceauth_engine::Face) -> Result<bool> + 'a),
+>;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "result", rename_all = "snake_case")]
@@ -43,10 +49,19 @@ pub enum Outcome {
     /// Camera or model failure; the caller falls through to the next factor.
     Error { message: String },
     /// Answer to a presence probe: one short look, detector only.
-    Probe { face: bool, attentive: bool, face_px: f32, elapsed_ms: u64 },
+    Probe {
+        face: bool,
+        attentive: bool,
+        face_px: f32,
+        elapsed_ms: u64,
+    },
     /// Root only: every frame of a pose sweep scored against the user's
     /// templates, with the head pose it was taken at.
-    Sweep { frames: Vec<SweepFrame>, templates: usize, elapsed_ms: u64 },
+    Sweep {
+        frames: Vec<SweepFrame>,
+        templates: usize,
+        elapsed_ms: u64,
+    },
     /// Answer to a ping: the daemon is up and its models are loaded.
     Pong {
         version: String,
@@ -63,7 +78,13 @@ pub enum Outcome {
         floors: Option<(f32, f32)>,
     },
     /// Enrolment result.
-    Enrolled { added: usize, total: usize, consistency_min: f32, consistency_mean: f32, path: String },
+    Enrolled {
+        added: usize,
+        total: usize,
+        consistency_min: f32,
+        consistency_mean: f32,
+        path: String,
+    },
     /// Templates deleted.
     Deleted,
     /// A polkit context was noted for the request the agent is serving.
@@ -92,7 +113,12 @@ pub enum Outcome {
     Cooldown { seconds: u64 },
     /// Every round of a calibration session replayed through the detectors
     /// at the floors it produced.
-    Verified { rounds: Vec<RoundCheck>, all_ok: bool, nod_floor: f32, shake_floor: f32 },
+    Verified {
+        rounds: Vec<RoundCheck>,
+        all_ok: bool,
+        nod_floor: f32,
+        shake_floor: f32,
+    },
     /// The consent request ended without an answer that could count: no
     /// window to ask in, the requester gone, no answer inside a caller's
     /// budget. Not a decision; the module ignores it and the caller's stack
@@ -111,9 +137,29 @@ impl Outcome {
     /// The outcome as an unprivileged caller may see it: without scores.
     pub fn redacted(self) -> Outcome {
         match self {
-            Outcome::Match { frames, elapsed_ms, .. } => Outcome::Match { score: None, frames, elapsed_ms },
-            Outcome::NoMatch { frames, elapsed_ms, .. } => Outcome::NoMatch { score: None, frames, elapsed_ms },
-            Outcome::Sweep { templates, elapsed_ms, .. } => Outcome::Sweep { frames: Vec::new(), templates, elapsed_ms },
+            Outcome::Match {
+                frames, elapsed_ms, ..
+            } => Outcome::Match {
+                score: None,
+                frames,
+                elapsed_ms,
+            },
+            Outcome::NoMatch {
+                frames, elapsed_ms, ..
+            } => Outcome::NoMatch {
+                score: None,
+                frames,
+                elapsed_ms,
+            },
+            Outcome::Sweep {
+                templates,
+                elapsed_ms,
+                ..
+            } => Outcome::Sweep {
+                frames: Vec::new(),
+                templates,
+                elapsed_ms,
+            },
             o => o,
         }
     }
@@ -244,7 +290,12 @@ pub struct Strikes {
 
 impl Strikes {
     fn charge(&mut self, now: Instant) {
-        if self.holds > 0 && self.last.map(|l| now.duration_since(l) >= COOLDOWN_QUIET).unwrap_or(true) {
+        if self.holds > 0
+            && self
+                .last
+                .map(|l| now.duration_since(l) >= COOLDOWN_QUIET)
+                .unwrap_or(true)
+        {
             // A long quiet spell forgets the escalation, not the failure.
             self.holds = 0;
         }
@@ -266,7 +317,8 @@ impl Strikes {
             self.holds = self.holds.saturating_add(1);
             self.times.clear();
         }
-        self.times.retain(|t| now.duration_since(*t) < COOLDOWN_WINDOW);
+        self.times
+            .retain(|t| now.duration_since(*t) < COOLDOWN_WINDOW);
         let needed = if self.holds > 0 { 1 } else { COOLDOWN_FAILURES };
         if self.times.len() < needed {
             return None;
@@ -288,7 +340,19 @@ impl Authenticator {
         if let crate::store::Sealing::Plain(_) = store.sealing() {
             log::warn!("templates would be written in plaintext (see above); a store that already holds sealed templates refuses to downgrade");
         }
-        Ok(Authenticator { cfg, pipeline, store, last_match: Default::default(), failures: Default::default(), answers: Default::default(), pending: Default::default(), last_consent: Default::default(), cal_rounds: Default::default(), session_locked_at: None, last_exposure: None })
+        Ok(Authenticator {
+            cfg,
+            pipeline,
+            store,
+            last_match: Default::default(),
+            failures: Default::default(),
+            answers: Default::default(),
+            pending: Default::default(),
+            last_consent: Default::default(),
+            cal_rounds: Default::default(),
+            session_locked_at: None,
+            last_exposure: None,
+        })
     }
 
     /// One cheap look for the lock screen while its panel is blank: is anyone
@@ -304,7 +368,11 @@ impl Authenticator {
         let templates = match self.store.load(user) {
             Ok(Some(t)) => t,
             Ok(None) => return Outcome::NotEnrolled,
-            Err(e) => return Outcome::Error { message: e.to_string() },
+            Err(e) => {
+                return Outcome::Error {
+                    message: e.to_string(),
+                }
+            }
         };
         let r = (|| -> Result<Outcome> {
             let mut cap = IrCapture::open(&self.cfg)?;
@@ -315,7 +383,9 @@ impl Authenticator {
             let deadline = Duration::from_secs_f32(seconds.clamp(3.0, 60.0));
             let mut frames = Vec::new();
             while t0.elapsed() < deadline {
-                let Some(img) = cap.next(Duration::from_secs(2))? else { continue };
+                let Some(img) = cap.next(Duration::from_secs(2))? else {
+                    continue;
+                };
                 if cap.frames % 2 != 0 {
                     continue;
                 }
@@ -324,15 +394,32 @@ impl Authenticator {
                 cap.meter_on(face);
                 let Some(e) = &face.embedding else { continue };
                 let p = faceauth_engine::pose::pose(&face.landmarks);
-                let (score, template) = templates.best_match_on(e, &device).unwrap_or((-1.0, usize::MAX));
-                frames.push(SweepFrame { t: t0.elapsed().as_secs_f32(), score, template, yaw: p.yaw, pitch: p.pitch, nose_pitch: p.nose_pitch, roll: p.roll.to_degrees(), face_px: face.bbox[2] });
+                let (score, template) = templates
+                    .best_match_on(e, &device)
+                    .unwrap_or((-1.0, usize::MAX));
+                frames.push(SweepFrame {
+                    t: t0.elapsed().as_secs_f32(),
+                    score,
+                    template,
+                    yaw: p.yaw,
+                    pitch: p.pitch,
+                    nose_pitch: p.nose_pitch,
+                    roll: p.roll.to_degrees(),
+                    face_px: face.bbox[2],
+                });
             }
             cap.stop()?;
-            Ok(Outcome::Sweep { frames, templates: templates.usable_on(&device), elapsed_ms: t0.elapsed().as_millis() as u64 })
+            Ok(Outcome::Sweep {
+                frames,
+                templates: templates.usable_on(&device),
+                elapsed_ms: t0.elapsed().as_millis() as u64,
+            })
         })();
         match r {
             Ok(o) => o,
-            Err(e) => Outcome::Error { message: e.to_string() },
+            Err(e) => Outcome::Error {
+                message: e.to_string(),
+            },
         }
     }
 
@@ -351,18 +438,49 @@ impl Authenticator {
                 }
             }
             let out = match img {
-                None => Outcome::Probe { face: false, attentive: false, face_px: 0.0, elapsed_ms: 0 },
+                None => Outcome::Probe {
+                    face: false,
+                    attentive: false,
+                    face_px: 0.0,
+                    elapsed_ms: 0,
+                },
                 Some(img) => {
-                    let faces = self.pipeline.detector.detect(&img, self.cfg.min_detection)?;
+                    let faces = self
+                        .pipeline
+                        .detector
+                        .detect(&img, self.cfg.min_detection)?;
                     match faces.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) {
                         Some(f) => {
-                            let attentive = match self.pipeline.mesh.as_mut().and_then(|m| m.for_face(&img, &f).ok().flatten()) {
-                                Some(m) => faceauth_engine::mesh::is_attentive(&faceauth_engine::mesh::head_pose(&m), 0.25 * crate::consent::NodDetector::YAW_DEG_PER_UNIT, 25.0),
-                                None => faceauth_engine::pose::is_attentive(&faceauth_engine::pose::pose(&f.landmarks), 0.25, 25.0),
+                            let attentive = match self
+                                .pipeline
+                                .mesh
+                                .as_mut()
+                                .and_then(|m| m.for_face(&img, &f).ok().flatten())
+                            {
+                                Some(m) => faceauth_engine::mesh::is_attentive(
+                                    &faceauth_engine::mesh::head_pose(&m),
+                                    0.25 * crate::consent::NodDetector::YAW_DEG_PER_UNIT,
+                                    25.0,
+                                ),
+                                None => faceauth_engine::pose::is_attentive(
+                                    &faceauth_engine::pose::pose(&f.landmarks),
+                                    0.25,
+                                    25.0,
+                                ),
                             };
-                            Outcome::Probe { face: true, attentive, face_px: f.bbox[2], elapsed_ms: 0 }
+                            Outcome::Probe {
+                                face: true,
+                                attentive,
+                                face_px: f.bbox[2],
+                                elapsed_ms: 0,
+                            }
                         }
-                        None => Outcome::Probe { face: false, attentive: false, face_px: 0.0, elapsed_ms: 0 },
+                        None => Outcome::Probe {
+                            face: false,
+                            attentive: false,
+                            face_px: 0.0,
+                            elapsed_ms: 0,
+                        },
                     }
                 }
             };
@@ -370,41 +488,91 @@ impl Authenticator {
             Ok(out)
         })();
         match r {
-            Ok(Outcome::Probe { face, attentive, face_px, .. }) => Outcome::Probe { face, attentive, face_px, elapsed_ms: t0.elapsed().as_millis() as u64 },
+            Ok(Outcome::Probe {
+                face,
+                attentive,
+                face_px,
+                ..
+            }) => Outcome::Probe {
+                face,
+                attentive,
+                face_px,
+                elapsed_ms: t0.elapsed().as_millis() as u64,
+            },
             Ok(o) => o,
-            Err(e) => Outcome::Error { message: e.to_string() },
+            Err(e) => Outcome::Error {
+                message: e.to_string(),
+            },
         }
     }
 
     pub fn ping(&self, user: &str) -> Outcome {
         let loaded = self.store.load(user).ok().flatten();
         let templates = loaded.as_ref().map(|t| t.templates.len()).unwrap_or(0);
-        let unbound = loaded.as_ref().map(|t| t.templates.iter().filter(|x| x.device.is_none()).count()).unwrap_or(0);
-        let floors = loaded.as_ref().filter(|t| t.gesture.is_calibrated()).map(|t| t.gesture.floors(crate::consent::NodDetector::MIN_DOWN, crate::consent::ShakeDetector::MIN_TURN));
-        Outcome::Pong { version: env!("CARGO_PKG_VERSION").to_string(), model: faceauth_engine::embed::AURAFACE_FILE.to_string(), templates, sealed: self.store.is_sealed(user), unbound, floors }
+        let unbound = loaded
+            .as_ref()
+            .map(|t| t.templates.iter().filter(|x| x.device.is_none()).count())
+            .unwrap_or(0);
+        let floors = loaded
+            .as_ref()
+            .filter(|t| t.gesture.is_calibrated())
+            .map(|t| {
+                t.gesture.floors(
+                    crate::consent::NodDetector::MIN_DOWN,
+                    crate::consent::ShakeDetector::MIN_TURN,
+                )
+            });
+        Outcome::Pong {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            model: faceauth_engine::embed::AURAFACE_FILE.to_string(),
+            templates,
+            sealed: self.store.is_sealed(user),
+            unbound,
+            floors,
+        }
     }
 
     /// Enrol: capture `count` embeddings over `seconds`, spaced across the
     /// window so they cover different poses, LEDs on, exposure metered on the
     /// face. Stored under `label` beside any existing templates.
-    pub fn enroll(&mut self, user: &str, label: &str, seconds: f32, count: usize, pose: Option<&str>) -> Outcome {
+    pub fn enroll(
+        &mut self,
+        user: &str,
+        label: &str,
+        seconds: f32,
+        count: usize,
+        pose: Option<&str>,
+    ) -> Outcome {
         match self.run_enroll(user, label, seconds, count, pose) {
             Ok(o) => o,
-            Err(e) => Outcome::Error { message: e.to_string() },
+            Err(e) => Outcome::Error {
+                message: e.to_string(),
+            },
         }
     }
 
-    fn run_enroll(&mut self, user: &str, label: &str, seconds: f32, count: usize, pose: Option<&str>) -> Result<Outcome> {
+    fn run_enroll(
+        &mut self,
+        user: &str,
+        label: &str,
+        seconds: f32,
+        count: usize,
+        pose: Option<&str>,
+    ) -> Result<Outcome> {
         use crate::store::{now_secs, Template, UserTemplates};
         if let Some(p) = pose {
             if !POSES.contains(&p) {
-                return Ok(Outcome::Error { message: format!("unknown pose {:?}; one of {}", p, POSES.join(", ")) });
+                return Ok(Outcome::Error {
+                    message: format!("unknown pose {:?}; one of {}", p, POSES.join(", ")),
+                });
             }
         }
         // A store that cannot seal does not replace sealed templates: that
         // would write the next set in plaintext (F2).
         if let Err(e) = self.store.check_can_replace(user) {
-            return Ok(Outcome::Error { message: e.to_string() });
+            return Ok(Outcome::Error {
+                message: e.to_string(),
+            });
         }
         // Enrolment is the recovery path for a blob this machine can no longer
         // open (a cleared TPM, a firmware reset): set it aside and start fresh.
@@ -420,14 +588,22 @@ impl Authenticator {
                 None => return Err(e),
             },
         };
-        let mut u = existing.unwrap_or_else(|| UserTemplates::new(user, faceauth_engine::embed::AURAFACE_FILE));
+        let mut u = existing
+            .unwrap_or_else(|| UserTemplates::new(user, faceauth_engine::embed::AURAFACE_FILE));
         if u.model != faceauth_engine::embed::AURAFACE_FILE {
-            return Ok(Outcome::Error { message: format!("existing templates are for model {}; delete them first", u.model) });
+            return Ok(Outcome::Error {
+                message: format!(
+                    "existing templates are for model {}; delete them first",
+                    u.model
+                ),
+            });
         }
         let t0 = Instant::now();
         let deadline = Duration::from_secs_f32(seconds.clamp(4.0, 60.0));
         let count = count.clamp(3, 40);
-        let spacing = Duration::from_millis((((seconds - 2.0).max(1.0) * 1000.0) / count as f32).clamp(150.0, 2000.0) as u64);
+        let spacing = Duration::from_millis(
+            (((seconds - 2.0).max(1.0) * 1000.0) / count as f32).clamp(150.0, 2000.0) as u64,
+        );
         let mut cap = IrCapture::open(&self.cfg)?;
         if let Some(i) = &cap.illuminator {
             i.set(true)?;
@@ -442,7 +618,9 @@ impl Authenticator {
         let (mut lo_seen, mut hi_seen) = (f32::MAX, f32::MIN);
         let (mut yaw_lo, mut yaw_hi) = (f32::MAX, f32::MIN);
         while t0.elapsed() < deadline && samples.len() < count {
-            let Some(img) = cap.next(Duration::from_secs(2))? else { continue };
+            let Some(img) = cap.next(Duration::from_secs(2))? else {
+                continue;
+            };
             if cap.frames % 3 != 0 {
                 continue;
             }
@@ -477,15 +655,24 @@ impl Authenticator {
             let hint = match pose {
                 Some(p) if off_pose > 0 => {
                     let want = match p {
-                        "up" => format!("up needs a pitch reading of {:.2} or less", level - UP_BELOW_LEVEL),
+                        "up" => format!(
+                            "up needs a pitch reading of {:.2} or less",
+                            level - UP_BELOW_LEVEL
+                        ),
                         "down" => format!("down needs {:.2} or more", level + DOWN_ABOVE_LEVEL),
                         "left" => "left needs a turn reading of -0.18 or less".to_string(),
                         "right" => "right needs a turn reading of 0.18 or more".to_string(),
-                        _ => format!("centre needs a turn within 0.12 and a pitch within 0.06 of {:.2}", level),
+                        _ => format!(
+                            "centre needs a turn within 0.12 and a pitch within 0.06 of {:.2}",
+                            level
+                        ),
                     };
                     format!("only {} frames in the {} pose; the {} frames read pitch {:.2} to {:.2} and turn {:+.2} to {:+.2}, and {}. {}", samples.len(), p, off_pose, lo_seen, hi_seen, yaw_lo, yaw_hi, want, POSE_HINTS[POSES.iter().position(|q| *q == p).unwrap_or(0)])
                 }
-                _ => format!("only {} usable frames; face the camera at normal distance and try again", samples.len()),
+                _ => format!(
+                    "only {} usable frames; face the camera at normal distance and try again",
+                    samples.len()
+                ),
             };
             return Ok(Outcome::Error { message: hint });
         }
@@ -500,20 +687,45 @@ impl Authenticator {
             for t in u.templates.iter_mut().filter(|t| t.device.is_none()) {
                 t.device = Some(device.clone());
             }
-            log::info!("enrolment for {}: {} earlier template(s) bound to {}", user, legacy, device);
+            log::info!(
+                "enrolment for {}: {} earlier template(s) bound to {}",
+                user,
+                legacy,
+                device
+            );
         }
         for (e, q, w, p) in samples {
-            u.templates.push(Template { embedding: e, quality: q, face_width: w, created: now, label: label.to_string(), device: Some(device.clone()), yaw: Some(p.yaw), nose_pitch: Some(p.nose_pitch) });
+            u.templates.push(Template {
+                embedding: e,
+                quality: q,
+                face_width: w,
+                created: now,
+                label: label.to_string(),
+                device: Some(device.clone()),
+                yaw: Some(p.yaw),
+                nose_pitch: Some(p.nose_pitch),
+            });
         }
         // Over the cap, the surplus copies of looks already held go, not
         // the new look: coverage is what an identity is for.
         let pruned = u.prune_to(crate::store::MAX_TEMPLATES);
         if pruned > 0 {
-            log::info!("enrolment for {}: {} near-duplicate template(s) dropped to stay within {}", user, pruned, crate::store::MAX_TEMPLATES);
+            log::info!(
+                "enrolment for {}: {} near-duplicate template(s) dropped to stay within {}",
+                user,
+                pruned,
+                crate::store::MAX_TEMPLATES
+            );
         }
         let (lo, mean, _) = u.self_consistency().unwrap_or((1.0, 1.0, 1.0));
         let path = self.store.save(&u)?;
-        Ok(Outcome::Enrolled { added, total: u.templates.len(), consistency_min: lo, consistency_mean: mean, path: path.display().to_string() })
+        Ok(Outcome::Enrolled {
+            added,
+            total: u.templates.len(),
+            consistency_min: lo,
+            consistency_mean: mean,
+            path: path.display().to_string(),
+        })
     }
 
     /// An elevation request: the window goes up first, so nothing happens
@@ -522,7 +734,13 @@ impl Authenticator {
     /// user pending. Errors are final outcomes.
     /// With `open_window` false (the session is locked) the window is not
     /// summoned; the caller shows it when the request resumes.
-    pub fn consent_begin(&mut self, user: &str, caller: crate::consent::CallerInfo, budget: Option<f32>, open_window: bool) -> std::result::Result<ConsentSession, Outcome> {
+    pub fn consent_begin(
+        &mut self,
+        user: &str,
+        caller: crate::consent::CallerInfo,
+        budget: Option<f32>,
+        open_window: bool,
+    ) -> std::result::Result<ConsentSession, Outcome> {
         // A caller with a limit of its own (the CLI) sets the budget, minus a
         // margin so it always sees the verdict. The PAM module sets none and
         // the request has no deadline: gestures are read for
@@ -535,25 +753,45 @@ impl Authenticator {
         };
         let mut dialog = match Dialog::new(&self.cfg, user) {
             Ok(d) => d,
-            Err(e) => return Err(Outcome::Error { message: e.to_string() }),
+            Err(e) => {
+                return Err(Outcome::Error {
+                    message: e.to_string(),
+                })
+            }
         };
         if open_window {
             if let Err(e) = dialog.show("scanning", "Look at the camera.", &caller, 0.0) {
                 log::warn!("consent: no window for {}: {}", user, e);
-                return Err(Outcome::ConsentDenied { reason: "the consent window did not open".into(), elapsed_ms: 0 });
+                return Err(Outcome::ConsentDenied {
+                    reason: "the consent window did not open".into(),
+                    elapsed_ms: 0,
+                });
             }
         }
         let templates = match self.store.load(user) {
             Ok(Some(t)) => t,
             Ok(None) => return Err(Outcome::NotEnrolled),
-            Err(e) => return Err(Outcome::Error { message: e.to_string() }),
+            Err(e) => {
+                return Err(Outcome::Error {
+                    message: e.to_string(),
+                })
+            }
         };
         let _ = take_answer(&self.answers, user); // stale answers from an earlier request
         if let Ok(mut p) = self.pending.lock() {
             p.insert(user.to_string());
         }
         self.last_consent.insert(user.to_string(), Instant::now());
-        Ok(ConsentSession { user: user.to_string(), caller, dialog, started: Instant::now(), total, templates, pending: Arc::clone(&self.pending), locked_at: None })
+        Ok(ConsentSession {
+            user: user.to_string(),
+            caller,
+            dialog,
+            started: Instant::now(),
+            total,
+            templates,
+            pending: Arc::clone(&self.pending),
+            locked_at: None,
+        })
     }
 
     /// One round with the camera: scan until the face matches, then watch for
@@ -566,10 +804,20 @@ impl Authenticator {
         let user = s.user.clone();
         let total = s.total;
         let started = s.started;
-        let lost_after = if cfg.presence.enabled && cfg.presence.user == s.user { Some(Duration::from_secs_f32(cfg.presence.away_seconds)) } else { None };
+        let lost_after = if cfg.presence.enabled && cfg.presence.user == s.user {
+            Some(Duration::from_secs_f32(cfg.presence.away_seconds))
+        } else {
+            None
+        };
         let msg = format!("Recognised. Nod {} times to allow this, shake your head to refuse, or type your password.", cfg.consent_nods);
-        let floors = s.templates.gesture.floors(crate::consent::NodDetector::MIN_DOWN, crate::consent::ShakeDetector::MIN_TURN);
-        let floors_deg = s.templates.gesture.floors_deg(crate::consent::NodDetector::MESH_MIN_DEG, crate::consent::ShakeDetector::MESH_MIN_DEG);
+        let floors = s.templates.gesture.floors(
+            crate::consent::NodDetector::MIN_DOWN,
+            crate::consent::ShakeDetector::MIN_TURN,
+        );
+        let floors_deg = s.templates.gesture.floors_deg(
+            crate::consent::NodDetector::MESH_MIN_DEG,
+            crate::consent::ShakeDetector::MESH_MIN_DEG,
+        );
         let dialog_cell = std::cell::RefCell::new(&mut s.dialog);
         let caller_ref = &s.caller;
         let gesture_cell: std::cell::RefCell<Option<Gesture>> = std::cell::RefCell::new(None);
@@ -579,7 +827,10 @@ impl Authenticator {
         loop {
             let left = total - started.elapsed().as_secs_f32();
             if left < 2.0 {
-                outcome = Outcome::ConsentDenied { reason: "no answer".into(), elapsed_ms: started.elapsed().as_millis() as u64 };
+                outcome = Outcome::ConsentDenied {
+                    reason: "no answer".into(),
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                };
                 gesture = Some(Gesture::Timeout);
                 break;
             }
@@ -590,37 +841,84 @@ impl Authenticator {
             if let Some(hold) = self.hold_for(&user) {
                 // An answer already waiting (typed during the hold) goes to
                 // the scan start, which takes it before touching the camera.
-                let answered = answers.lock().map(|m| m.contains_key(&user)).unwrap_or(false);
+                let answered = answers
+                    .lock()
+                    .map(|m| m.contains_key(&user))
+                    .unwrap_or(false);
                 if !answered {
-                    log::warn!("consent for {}: {} recent failures; face checks paused for {}s", user, COOLDOWN_FAILURES, hold.as_secs());
+                    log::warn!(
+                        "consent for {}: {} recent failures; face checks paused for {}s",
+                        user,
+                        COOLDOWN_FAILURES,
+                        hold.as_secs()
+                    );
                     let _ = dialog_cell.borrow_mut().show("password", &format!("Too many failed face checks. They pause for {} seconds; type your password, or wait.", hold.as_secs().max(1)), caller_ref, 0.0);
                     self.wait_for_hold(&user, hold, &answers);
                     continue;
                 }
             }
             let templates_ref = &s.templates;
-            let mut hook = |cap: &mut IrCapture, pipeline: &mut Pipeline, matched: &faceauth_engine::Face| -> Result<bool> {
+            let mut hook = |cap: &mut IrCapture,
+                            pipeline: &mut Pipeline,
+                            matched: &faceauth_engine::Face|
+             -> Result<bool> {
                 // No window the daemon can vouch for, no nods: the request
                 // ends and the caller's stack falls to its password.
                 if let Err(e) = dialog_cell.borrow_mut().show("nod", &msg, caller_ref, 0.0) {
-                    log::warn!("consent for {}: the window is not there to nod at: {}", user, e);
+                    log::warn!(
+                        "consent for {}: the window is not there to nod at: {}",
+                        user,
+                        e
+                    );
                     *gesture_cell.borrow_mut() = Some(Gesture::NoWindow);
                     return Ok(false);
                 }
                 let left = total - started.elapsed().as_secs_f32();
-                let window = cfg.consent_seconds.clamp(10.0, MAX_BUDGET).min(left).max(1.0);
+                let window = cfg
+                    .consent_seconds
+                    .clamp(10.0, MAX_BUDGET)
+                    .min(left)
+                    .max(1.0);
                 let dwell = dialog_cell.borrow().dwell_left(Instant::now());
                 let mut nod_frames = Vec::new();
-                let (g, followed) = wait_for_nods(cap, pipeline, &cfg, Duration::from_secs_f32(window), cfg.consent_nods, Some((&answers, &user)), lost_after, floors, floors_deg, Some(matched.bbox), dwell, &mut nod_frames)?;
+                let (g, followed) = wait_for_nods(
+                    cap,
+                    pipeline,
+                    &cfg,
+                    Duration::from_secs_f32(window),
+                    cfg.consent_nods,
+                    Some((&answers, &user)),
+                    lost_after,
+                    floors,
+                    floors_deg,
+                    Some(matched.bbox),
+                    dwell,
+                    &mut nod_frames,
+                )?;
                 let g = if g == Gesture::Nodded {
                     // The nods came from the followed box; before they count,
                     // that box must be live and enrolled, right now, and the
                     // frames kept from the nods themselves must be the
                     // enrolled face too (D4): a face swapped in for the
                     // gesture and out again before the confirm is refused.
-                    let _ = dialog_cell.borrow_mut().show("confirming", "Confirming.", caller_ref, 0.0);
-                    match confirm(cap, pipeline, &cfg, templates_ref, followed.unwrap_or(matched.bbox))? {
-                        Confirm::Live => match nod_frames_match(pipeline, templates_ref, &nod_frames, &cap.identity, cfg.accept_threshold)? {
+                    let _ =
+                        dialog_cell
+                            .borrow_mut()
+                            .show("confirming", "Confirming.", caller_ref, 0.0);
+                    match confirm(
+                        cap,
+                        pipeline,
+                        &cfg,
+                        templates_ref,
+                        followed.unwrap_or(matched.bbox),
+                    )? {
+                        Confirm::Live => match nod_frames_match(
+                            pipeline,
+                            templates_ref,
+                            &nod_frames,
+                            &cap.identity,
+                            cfg.accept_threshold,
+                        )? {
                             Ok(()) => Gesture::Nodded,
                             Err(why) => Gesture::ConfirmFailed(why),
                         },
@@ -635,25 +933,51 @@ impl Authenticator {
                 Ok(ok)
             };
             let scan = cfg.consent_scan_seconds.min(left);
-            let o = match self.run_with_answers(&s.templates, Some(&mut hook), scan, Some(&scan_answers)) {
+            let o = match self.run_with_answers(
+                &s.templates,
+                Some(&mut hook),
+                scan,
+                Some(&scan_answers),
+            ) {
                 Ok(o) => o,
-                Err(e) => Outcome::Error { message: e.to_string() },
+                Err(e) => Outcome::Error {
+                    message: e.to_string(),
+                },
             };
             let g = gesture_cell.borrow_mut().take();
             match (&g, &o) {
                 // Nobody is waiting for the verdict: no verdict, and the
                 // window comes down when the session drops.
-                (Some(Gesture::Gone), _) => return Round::Done(Outcome::ConsentDenied { reason: "requester gone".into(), elapsed_ms: started.elapsed().as_millis() as u64 }),
-                (Some(Gesture::NoWindow), _) => return Round::Done(Outcome::ConsentDenied { reason: "the consent window did not open".into(), elapsed_ms: started.elapsed().as_millis() as u64 }),
-                (None, Outcome::ConsentDenied { reason, .. }) if reason == "requester gone" => return Round::Done(o.clone()),
+                (Some(Gesture::Gone), _) => {
+                    return Round::Done(Outcome::ConsentDenied {
+                        reason: "requester gone".into(),
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    })
+                }
+                (Some(Gesture::NoWindow), _) => {
+                    return Round::Done(Outcome::ConsentDenied {
+                        reason: "the consent window did not open".into(),
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    })
+                }
+                (None, Outcome::ConsentDenied { reason, .. }) if reason == "requester gone" => {
+                    return Round::Done(o.clone())
+                }
                 (Some(Gesture::FaceLost), _) => return Round::FaceLost,
                 (None, Outcome::NoFace { .. }) if lost_after.is_some() => return Round::FaceLost,
                 // The confirm could not read the strobe (a bright room, the
                 // user leaned away): not a refusal. Ask for the face and go
                 // round again.
                 (Some(Gesture::ConfirmUnclear), _) => {
-                    log::info!("consent: the confirm saw no strobe signal; asking for the face again");
-                    let _ = dialog_cell.borrow_mut().show("scanning", "Could not confirm. Face the camera and nod again, or type your password.", caller_ref, 0.0);
+                    log::info!(
+                        "consent: the confirm saw no strobe signal; asking for the face again"
+                    );
+                    let _ = dialog_cell.borrow_mut().show(
+                        "scanning",
+                        "Could not confirm. Face the camera and nod again, or type your password.",
+                        caller_ref,
+                        0.0,
+                    );
                     if let Some(r) = self.wait_for_attention(&user, &answers, lost_after) {
                         return r;
                     }
@@ -664,7 +988,11 @@ impl Authenticator {
                 (Some(Gesture::ConfirmFailed(why)), _) => {
                     log::warn!("consent: the confirm after the nods refused ({})", why);
                     let _ = self.charge(&user);
-                    outcome = refusal(&s.caller, format!("confirm: {}", why), started.elapsed().as_millis() as u64);
+                    outcome = refusal(
+                        &s.caller,
+                        format!("confirm: {}", why),
+                        started.elapsed().as_millis() as u64,
+                    );
                     gesture = g;
                     break;
                 }
@@ -673,7 +1001,12 @@ impl Authenticator {
                 // face re-arms the request, the lock screen's cycle.
                 (Some(Gesture::Timeout), _) if total >= NO_DEADLINE => {
                     log::info!("consent: no answer in the nod window; waiting for attention");
-                    let _ = dialog_cell.borrow_mut().show("scanning", "Look at the camera to nod, or type your password.", caller_ref, 0.0);
+                    let _ = dialog_cell.borrow_mut().show(
+                        "scanning",
+                        "Look at the camera to nod, or type your password.",
+                        caller_ref,
+                        0.0,
+                    );
                     if let Some(r) = self.wait_for_attention(&user, &answers, lost_after) {
                         return r;
                     }
@@ -683,7 +1016,12 @@ impl Authenticator {
                     if matches!(o, Outcome::NoMatch { .. }) && self.charge(&user).is_some() {
                         continue; // the loop top shows the hold
                     }
-                    let _ = dialog_cell.borrow_mut().show("scanning", "Face not recognised. Look at the camera, or type your password.", caller_ref, 0.0);
+                    let _ = dialog_cell.borrow_mut().show(
+                        "scanning",
+                        "Face not recognised. Look at the camera, or type your password.",
+                        caller_ref,
+                        0.0,
+                    );
                     if let Some(r) = self.wait_for_attention(&user, &answers, lost_after) {
                         return r;
                     }
@@ -693,11 +1031,19 @@ impl Authenticator {
                 // window is waiting for the user: it keeps waiting (nothing is
                 // approved by it), and the log keeps the refusal.
                 (None, Outcome::Denied { reason, .. }) if reason != "password" => {
-                    log::info!("consent: scan refused ({}); the window keeps waiting", reason);
+                    log::info!(
+                        "consent: scan refused ({}); the window keeps waiting",
+                        reason
+                    );
                     if self.charge(&user).is_some() {
                         continue; // the loop top shows the hold
                     }
-                    let _ = dialog_cell.borrow_mut().show("scanning", "Not accepted. Look straight at the camera, or type your password.", caller_ref, 0.0);
+                    let _ = dialog_cell.borrow_mut().show(
+                        "scanning",
+                        "Not accepted. Look straight at the camera, or type your password.",
+                        caller_ref,
+                        0.0,
+                    );
                     if let Some(r) = self.wait_for_attention(&user, &answers, lost_after) {
                         return r;
                     }
@@ -722,7 +1068,11 @@ impl Authenticator {
         let mut u = match self.store.load(user) {
             Ok(Some(t)) => t,
             Ok(None) => return Outcome::NotEnrolled,
-            Err(e) => return Outcome::Error { message: e.to_string() },
+            Err(e) => {
+                return Outcome::Error {
+                    message: e.to_string(),
+                }
+            }
         };
         let needed = self.cfg.consent_nods;
         let rounds = self.cal_rounds.get(user).cloned().unwrap_or_default();
@@ -730,9 +1080,15 @@ impl Authenticator {
         // gesture-derived ones and raise a floor, a step at a time and no
         // further than the cap, while any everyday round still reads as
         // that gesture. Sizes do not decide this; the detectors do.
-        let (dn, ds) = (crate::consent::NodDetector::MIN_DOWN, crate::consent::ShakeDetector::MIN_TURN);
+        let (dn, ds) = (
+            crate::consent::NodDetector::MIN_DOWN,
+            crate::consent::ShakeDetector::MIN_TURN,
+        );
         let (mut nf, mut sf) = u.gesture.base_floors(dn, ds);
-        let everyday: Vec<&CalRound> = rounds.iter().filter(|r| !matches!(r.kind.as_str(), "nod" | "shake")).collect();
+        let everyday: Vec<&CalRound> = rounds
+            .iter()
+            .filter(|r| !matches!(r.kind.as_str(), "nod" | "shake"))
+            .collect();
         for _ in 0..40 {
             let (mut nods, mut shakes) = (0usize, 0usize);
             for r in &everyday {
@@ -758,7 +1114,9 @@ impl Authenticator {
             u.gesture.nod_floor_min = if nf > bn { Some(nf) } else { None };
             u.gesture.shake_floor_min = if sf > bs { Some(sf) } else { None };
             if let Err(e) = self.store.save(&u) {
-                return Outcome::Error { message: e.to_string() };
+                return Outcome::Error {
+                    message: e.to_string(),
+                };
             }
         }
         let floors = u.gesture.floors(dn, ds);
@@ -771,22 +1129,61 @@ impl Authenticator {
                     "shake" => shakes >= needed && nods == 0,
                     _ => nods == 0 && shakes == 0,
                 };
-                RoundCheck { kind: r.kind.clone(), nods, shakes, ok }
+                RoundCheck {
+                    kind: r.kind.clone(),
+                    nods,
+                    shakes,
+                    ok,
+                }
             })
             .collect();
         let all_ok = !checks.is_empty() && checks.iter().all(|c| c.ok);
-        log::info!("calibration verified for {}: {} round(s), all ok {}; floors nod {:.3} shake {:.3}: {}", user, checks.len(), all_ok, floors.0, floors.1, checks.iter().map(|c| format!("{} {}n/{}s{}", c.kind, c.nods, c.shakes, if c.ok { "" } else { "!" })).collect::<Vec<_>>().join(" "));
-        Outcome::Verified { rounds: checks, all_ok, nod_floor: floors.0, shake_floor: floors.1 }
+        log::info!(
+            "calibration verified for {}: {} round(s), all ok {}; floors nod {:.3} shake {:.3}: {}",
+            user,
+            checks.len(),
+            all_ok,
+            floors.0,
+            floors.1,
+            checks
+                .iter()
+                .map(|c| format!(
+                    "{} {}n/{}s{}",
+                    c.kind,
+                    c.nods,
+                    c.shakes,
+                    if c.ok { "" } else { "!" }
+                ))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        Outcome::Verified {
+            rounds: checks,
+            all_ok,
+            nod_floor: floors.0,
+            shake_floor: floors.1,
+        }
     }
 
-    pub fn calibrate(&mut self, user: &str, gesture: &str, seconds: f32, start: bool, replace: bool) -> Outcome {
+    pub fn calibrate(
+        &mut self,
+        user: &str,
+        gesture: &str,
+        seconds: f32,
+        start: bool,
+        replace: bool,
+    ) -> Outcome {
         if start {
             self.cal_rounds.remove(user);
         }
         let mut u = match self.store.load(user) {
             Ok(Some(t)) => t,
             Ok(None) => return Outcome::NotEnrolled,
-            Err(e) => return Outcome::Error { message: e.to_string() },
+            Err(e) => {
+                return Outcome::Error {
+                    message: e.to_string(),
+                }
+            }
         };
         if replace {
             // Redoing a kind: this session's earlier rounds of it go, and so
@@ -800,34 +1197,67 @@ impl Authenticator {
                         continue;
                     }
                     match (r.kind.as_str(), r.sample) {
-                        ("nod", Some(v)) => { if let Some(i) = u.gesture.nod.iter().rposition(|x| *x == v) { u.gesture.nod.remove(i); changed = true; } }
-                        ("shake", Some(v)) => { if let Some(i) = u.gesture.shake.iter().rposition(|x| *x == v) { u.gesture.shake.remove(i); changed = true; } }
-                        (k, _) => { if let Some(i) = u.gesture.everyday.iter().rposition(|e| e.kind == k) { u.gesture.everyday.remove(i); changed = true; } }
+                        ("nod", Some(v)) => {
+                            if let Some(i) = u.gesture.nod.iter().rposition(|x| *x == v) {
+                                u.gesture.nod.remove(i);
+                                changed = true;
+                            }
+                        }
+                        ("shake", Some(v)) => {
+                            if let Some(i) = u.gesture.shake.iter().rposition(|x| *x == v) {
+                                u.gesture.shake.remove(i);
+                                changed = true;
+                            }
+                        }
+                        (k, _) => {
+                            if let Some(i) = u.gesture.everyday.iter().rposition(|e| e.kind == k) {
+                                u.gesture.everyday.remove(i);
+                                changed = true;
+                            }
+                        }
                     }
                 }
                 *rounds = kept;
             }
             if changed {
                 if let Err(e) = self.store.save(&u) {
-                    return Outcome::Error { message: e.to_string() };
+                    return Outcome::Error {
+                        message: e.to_string(),
+                    };
                 }
             }
         }
         let view = u.clone();
         let cfg = self.cfg.clone();
         let (ask, prompt) = calibration_text(gesture);
-        let caller = crate::consent::CallerInfo { command: format!("Calibration: {}", ask), verified: true, who: "faceauth calibrate, recording motion only".into(), via: "calibration".into(), ..Default::default() };
+        let caller = crate::consent::CallerInfo {
+            command: format!("Calibration: {}", ask),
+            verified: true,
+            who: "faceauth calibrate, recording motion only".into(),
+            via: "calibration".into(),
+            ..Default::default()
+        };
         let mut dialog = match crate::consent::Dialog::new(&cfg, user) {
             Ok(d) => d,
-            Err(e) => return Outcome::Error { message: e.to_string() },
+            Err(e) => {
+                return Outcome::Error {
+                    message: e.to_string(),
+                }
+            }
         };
         if let Err(e) = dialog.show("scanning", "Look at the camera.", &caller, seconds) {
-            return Outcome::Error { message: format!("no window to calibrate in: {}", e) };
+            return Outcome::Error {
+                message: format!("no window to calibrate in: {}", e),
+            };
         }
         let dialog_cell = std::cell::RefCell::new(&mut dialog);
-        let measured: std::cell::RefCell<Option<crate::consent::Measured>> = std::cell::RefCell::new(None);
+        let measured: std::cell::RefCell<Option<crate::consent::Measured>> =
+            std::cell::RefCell::new(None);
         let msg = prompt;
-        let mut hook = |cap: &mut IrCapture, pipeline: &mut Pipeline, _matched: &faceauth_engine::Face| -> Result<bool> {
+        let mut hook = |cap: &mut IrCapture,
+                        pipeline: &mut Pipeline,
+                        _matched: &faceauth_engine::Face|
+         -> Result<bool> {
             let _ = dialog_cell.borrow_mut().show("nod", msg, &caller, seconds);
             let m = crate::consent::measure_motion(cap, pipeline, &cfg, user, gesture, seconds)?;
             *measured.borrow_mut() = Some(m);
@@ -837,9 +1267,15 @@ impl Authenticator {
         dialog.hide();
         let Some(m) = measured.borrow_mut().take() else {
             return match scan {
-                Ok(o @ Outcome::NoFace { .. }) | Ok(o @ Outcome::NoMatch { .. }) | Ok(o @ Outcome::Denied { .. }) => o,
-                Ok(o) => Outcome::Error { message: format!("calibration did not run: {:?}", o) },
-                Err(e) => Outcome::Error { message: e.to_string() },
+                Ok(o @ Outcome::NoFace { .. })
+                | Ok(o @ Outcome::NoMatch { .. })
+                | Ok(o @ Outcome::Denied { .. }) => o,
+                Ok(o) => Outcome::Error {
+                    message: format!("calibration did not run: {:?}", o),
+                },
+                Err(e) => Outcome::Error {
+                    message: e.to_string(),
+                },
             };
         };
         let (dy, dx) = (m.dy, m.dx);
@@ -850,19 +1286,27 @@ impl Authenticator {
                 // sample is reported but not stored, so a missed attempt
                 // cannot lower a floor.
                 let stored = dx >= crate::consent::ShakeDetector::MIN_TURN;
-                if stored { u.gesture.shake.push(dx) }
+                if stored {
+                    u.gesture.shake.push(dx)
+                }
                 (dx, dy, stored)
             }
             "nod" => {
                 let stored = dy >= crate::consent::NodDetector::MIN_DOWN;
-                if stored { u.gesture.nod.push(dy) }
+                if stored {
+                    u.gesture.nod.push(dy)
+                }
                 (dy, dx, stored)
             }
             // An everyday movement: both axes are kept, however small, since
             // what matters is how far under the floors it stays. The
             // numbers-only fields of the earlier format go with the save.
             _ => {
-                u.gesture.everyday.push(crate::store::EverydayRound { kind: gesture.to_string(), dy, dx });
+                u.gesture.everyday.push(crate::store::EverydayRound {
+                    kind: gesture.to_string(),
+                    dy,
+                    dx,
+                });
                 u.gesture.still_nod.clear();
                 u.gesture.still_shake.clear();
                 (dy, dx, true)
@@ -870,15 +1314,40 @@ impl Authenticator {
         };
         if stored {
             if let Err(e) = self.store.save(&u) {
-                return Outcome::Error { message: e.to_string() };
+                return Outcome::Error {
+                    message: e.to_string(),
+                };
             }
         }
-        let sample = if stored && matches!(gesture, "nod" | "shake") { Some(amplitude) } else { None };
-        self.cal_rounds.entry(user.to_string()).or_default().push(CalRound { kind: gesture.to_string(), frames, sample });
-        let (nf, sf) = u.gesture.floors(crate::consent::NodDetector::MIN_DOWN, crate::consent::ShakeDetector::MIN_TURN);
+        let sample = if stored && matches!(gesture, "nod" | "shake") {
+            Some(amplitude)
+        } else {
+            None
+        };
+        self.cal_rounds
+            .entry(user.to_string())
+            .or_default()
+            .push(CalRound {
+                kind: gesture.to_string(),
+                frames,
+                sample,
+            });
+        let (nf, sf) = u.gesture.floors(
+            crate::consent::NodDetector::MIN_DOWN,
+            crate::consent::ShakeDetector::MIN_TURN,
+        );
         let (nm, sm) = u.gesture.margins();
         log::info!("calibration for {}: {} moved {:.3} (sideways {:.3}, stored: {}); floors now nod {:.3} shake {:.3}", user, gesture, amplitude, sideways, stored, nf, sf);
-        Outcome::Calibrated { gesture: gesture.to_string(), amplitude, sideways, stored, nod_floor: nf, shake_floor: sf, nod_margin: nm, shake_margin: sm }
+        Outcome::Calibrated {
+            gesture: gesture.to_string(),
+            amplitude,
+            sideways,
+            stored,
+            nod_floor: nf,
+            shake_floor: sf,
+            nod_margin: nm,
+            shake_margin: sm,
+        }
     }
 
     /// Turn a gesture and a face outcome into the verdict, show it, notify.
@@ -893,14 +1362,26 @@ impl Authenticator {
         let until = Instant::now() + hold;
         while Instant::now() < until {
             std::thread::sleep(Duration::from_millis(200));
-            if answers.lock().map(|m| m.contains_key(user)).unwrap_or(false) {
+            if answers
+                .lock()
+                .map(|m| m.contains_key(user))
+                .unwrap_or(false)
+            {
                 return;
             }
         }
     }
 
-    fn wait_for_attention(&mut self, user: &str, answers: &Answers, lost_after: Option<Duration>) -> Option<Round> {
-        let look = crate::presence::PresenceConfig { user: user.to_string(), ..Default::default() };
+    fn wait_for_attention(
+        &mut self,
+        user: &str,
+        answers: &Answers,
+        lost_after: Option<Duration>,
+    ) -> Option<Round> {
+        let look = crate::presence::PresenceConfig {
+            user: user.to_string(),
+            ..Default::default()
+        };
         let mut unseen_since = Instant::now();
         let mut looks = 0u32;
         // The same stranger rule as the presence watch (C1): a face that
@@ -909,19 +1390,30 @@ impl Authenticator {
         // check runs every third look (it costs the strobe and the embedder);
         // between checks a face counts, with the mode's tolerance.
         let mode = crate::presence::presence_mode();
-        let strikes = if mode == crate::presence::PresenceMode::Secure { 1 } else { 2 };
+        let strikes = if mode == crate::presence::PresenceMode::Secure {
+            1
+        } else {
+            2
+        };
         let mut identity_fails = 0u32;
         loop {
             for _ in 0..10 {
                 std::thread::sleep(Duration::from_millis(200));
-                if answers.lock().map(|m| m.contains_key(user)).unwrap_or(false) {
+                if answers
+                    .lock()
+                    .map(|m| m.contains_key(user))
+                    .unwrap_or(false)
+                {
                     return None;
                 }
             }
             looks += 1;
             match crate::presence::observe(self, &look, looks.is_multiple_of(3)) {
                 Ok(o) if o.face && o.attentive && o.identity != Some(false) => {
-                    log::info!("consent: a face turned to the camera after {} looks; scanning", looks);
+                    log::info!(
+                        "consent: a face turned to the camera after {} looks; scanning",
+                        looks
+                    );
                     return None;
                 }
                 Ok(o) => {
@@ -934,7 +1426,11 @@ impl Authenticator {
                         unseen_since = Instant::now();
                     } else if let Some(l) = lost_after {
                         if unseen_since.elapsed() > l {
-                            log::info!("consent: {} for {:.0}s while waiting; the user left", if o.face { "not the user" } else { "nobody" }, l.as_secs_f32());
+                            log::info!(
+                                "consent: {} for {:.0}s while waiting; the user left",
+                                if o.face { "not the user" } else { "nobody" },
+                                l.as_secs_f32()
+                            );
                             return Some(Round::FaceLost);
                         }
                     }
@@ -944,7 +1440,12 @@ impl Authenticator {
         }
     }
 
-    pub fn consent_finish(&mut self, s: &mut ConsentSession, gesture: Option<Gesture>, outcome: Outcome) -> Outcome {
+    pub fn consent_finish(
+        &mut self,
+        s: &mut ConsentSession,
+        gesture: Option<Gesture>,
+        outcome: Outcome,
+    ) -> Outcome {
         let user = s.user.as_str();
         let caller = &s.caller;
         // A password typed at any point is checked against the system stack;
@@ -963,7 +1464,10 @@ impl Authenticator {
         let outcome = match (&gesture, outcome) {
             // Anything that is not an approval ends as a consent refusal, so
             // the module ignores it and the terminal password is the floor.
-            (Some(Gesture::Timeout), o @ Outcome::Match { .. }) => Outcome::ConsentDenied { reason: "no answer".into(), elapsed_ms: elapsed_of(&o) },
+            (Some(Gesture::Timeout), o @ Outcome::Match { .. }) => Outcome::ConsentDenied {
+                reason: "no answer".into(),
+                elapsed_ms: elapsed_of(&o),
+            },
             // A shake or a dismissal is the answer no: the window had the
             // password box, so closing it without either is a refusal that
             // ends the request, not a hand-off to another prompt.
@@ -973,11 +1477,22 @@ impl Authenticator {
                 // A face was seen and the password behind it was wrong: it
                 // counts against the same budget as a failed scan.
                 let _ = self.charge(user);
-                Outcome::ConsentDenied { reason: "wrong password".into(), elapsed_ms: elapsed_of(&o) }
+                Outcome::ConsentDenied {
+                    reason: "wrong password".into(),
+                    elapsed_ms: elapsed_of(&o),
+                }
             }
             (_, o) => o,
         };
-        let outcome = if password_ok { Outcome::Match { score: Some(1.0), frames: 0, elapsed_ms: s.started.elapsed().as_millis() as u64 } } else { outcome };
+        let outcome = if password_ok {
+            Outcome::Match {
+                score: Some(1.0),
+                frames: 0,
+                elapsed_ms: s.started.elapsed().as_millis() as u64,
+            }
+        } else {
+            outcome
+        };
         self.last_consent.insert(user.to_string(), Instant::now());
         if !matches!(outcome, Outcome::Match { .. }) {
             // Whatever the card asked for rides on an approval only.
@@ -987,63 +1502,175 @@ impl Authenticator {
             Outcome::Match { frames, .. } => {
                 self.last_match.insert(user.to_string(), Instant::now());
                 self.failures.remove(user);
-                let how = if *frames == 0 { "password" } else { "face and nod" };
+                let how = if *frames == 0 {
+                    "password"
+                } else {
+                    "face and nod"
+                };
                 if *frames > 0 {
                     faillock_reset(user);
                 }
                 s.dialog.show_final("approved", "Allowed.", caller);
-                notify(&self.cfg, user, &format!("Root access granted by {}", how), &format!("{}\n{}", caller.command, caller.parents));
-                log::info!("consent granted ({}) for {}: {} [{}]", how, user, caller.command, caller.parents);
+                notify(
+                    &self.cfg,
+                    user,
+                    &format!("Root access granted by {}", how),
+                    &format!("{}\n{}", caller.command, caller.parents),
+                );
+                log::info!(
+                    "consent granted ({}) for {}: {} [{}]",
+                    how,
+                    user,
+                    caller.command,
+                    caller.parents
+                );
                 // The card's passwordless button: the same approval turns
                 // passwordless sudo on for the minutes asked, the way
                 // Omarchy's own command would, with no further request.
                 if let Some(minutes) = crate::consent::take_passwordless(user) {
                     if crate::consent::is_passwordless_command(caller) {
                         log::info!("passwordless sudo for {} not armed from the passwordless command's own request", user);
-                        notify(&self.cfg, user, "Passwordless sudo: use the command's own answer", "The button does not apply to omarchy-sudo-passwordless itself.");
+                        notify(
+                            &self.cfg,
+                            user,
+                            "Passwordless sudo: use the command's own answer",
+                            "The button does not apply to omarchy-sudo-passwordless itself.",
+                        );
                     } else {
-                    match crate::consent::enable_passwordless(std::path::Path::new("/etc/sudoers.d"), user, minutes, &|args| crate::consent::run_passwordless_timer(user, args)) {
-                        Ok(_) => {
-                            log::warn!("passwordless sudo on for {} for {} min, by the card's button and this approval", user, minutes);
-                            notify(&self.cfg, user, &format!("Passwordless sudo on for {} minutes", minutes), "Any process running as you can use sudo without asking until then. Setup > Security > Passwordless Sudo turns it off early.");
+                        match crate::consent::enable_passwordless(
+                            std::path::Path::new("/etc/sudoers.d"),
+                            user,
+                            minutes,
+                            &|args| crate::consent::run_passwordless_timer(user, args),
+                        ) {
+                            Ok(_) => {
+                                log::warn!("passwordless sudo on for {} for {} min, by the card's button and this approval", user, minutes);
+                                notify(&self.cfg, user, &format!("Passwordless sudo on for {} minutes", minutes), "Any process running as you can use sudo without asking until then. Setup > Security > Passwordless Sudo turns it off early.");
+                            }
+                            Err(e) => {
+                                log::warn!("passwordless sudo for {} not enabled: {:#}", user, e);
+                                notify(
+                                    &self.cfg,
+                                    user,
+                                    "Passwordless sudo not enabled",
+                                    &format!("{:#}", e),
+                                );
+                            }
                         }
-                        Err(e) => {
-                            log::warn!("passwordless sudo for {} not enabled: {:#}", user, e);
-                            notify(&self.cfg, user, "Passwordless sudo not enabled", &format!("{:#}", e));
-                        }
-                    }
                     }
                 }
             }
-            Outcome::Refused { reason, .. } | Outcome::ConsentDenied { reason, .. } if reason == "shaken" || reason == "dismissed" => {
+            Outcome::Refused { reason, .. } | Outcome::ConsentDenied { reason, .. }
+                if reason == "shaken" || reason == "dismissed" =>
+            {
                 // The user closed the window, or shook their head at it: the
                 // answer is no, and the window goes away without a verdict on it.
                 let _ = crate::consent::take_passwordless(user);
                 s.dialog.hide();
-                let how = if reason == "shaken" { "Refused by head shake" } else { "Refused: dismissed" };
-                notify(&self.cfg, user, how, &format!("{}\n{}", caller.command, caller.parents));
-                log::warn!("consent refused for {}: {} [{}] ({})", user, caller.command, caller.parents, reason);
+                let how = if reason == "shaken" {
+                    "Refused by head shake"
+                } else {
+                    "Refused: dismissed"
+                };
+                notify(
+                    &self.cfg,
+                    user,
+                    how,
+                    &format!("{}\n{}", caller.command, caller.parents),
+                );
+                log::warn!(
+                    "consent refused for {}: {} [{}] ({})",
+                    user,
+                    caller.command,
+                    caller.parents,
+                    reason
+                );
             }
-            Outcome::Refused { reason, .. } | Outcome::ConsentDenied { reason, .. } if reason.starts_with("confirm: ") => {
-                s.dialog.show_final("denied", "The nod did not come from a live, enrolled face. Refused.", caller);
-                notify(&self.cfg, user, "Refused: the nod was not a live, enrolled face", &format!("{}\n{}", caller.command, caller.parents));
-                log::warn!("consent refused for {}: {} [{}] ({})", user, caller.command, caller.parents, reason);
+            Outcome::Refused { reason, .. } | Outcome::ConsentDenied { reason, .. }
+                if reason.starts_with("confirm: ") =>
+            {
+                s.dialog.show_final(
+                    "denied",
+                    "The nod did not come from a live, enrolled face. Refused.",
+                    caller,
+                );
+                notify(
+                    &self.cfg,
+                    user,
+                    "Refused: the nod was not a live, enrolled face",
+                    &format!("{}\n{}", caller.command, caller.parents),
+                );
+                log::warn!(
+                    "consent refused for {}: {} [{}] ({})",
+                    user,
+                    caller.command,
+                    caller.parents,
+                    reason
+                );
             }
             Outcome::Cooldown { seconds } => {
-                s.dialog.show_final("denied", &format!("Too many failed attempts. Try again in {} seconds, or use your password.", seconds), caller);
-                notify(&self.cfg, user, "Refused: too many failed attempts", &format!("{}\n{}", caller.command, caller.parents));
-                log::warn!("consent refused for {}: {} [{}] (cooldown {}s)", user, caller.command, caller.parents, seconds);
+                s.dialog.show_final(
+                    "denied",
+                    &format!(
+                        "Too many failed attempts. Try again in {} seconds, or use your password.",
+                        seconds
+                    ),
+                    caller,
+                );
+                notify(
+                    &self.cfg,
+                    user,
+                    "Refused: too many failed attempts",
+                    &format!("{}\n{}", caller.command, caller.parents),
+                );
+                log::warn!(
+                    "consent refused for {}: {} [{}] (cooldown {}s)",
+                    user,
+                    caller.command,
+                    caller.parents,
+                    seconds
+                );
             }
             Outcome::ConsentDenied { .. } => {
-                let why = match gesture { Some(Gesture::Password(_)) => "Wrong password. Refused.", _ => "No answer. Refused." };
-                s.dialog.show_final("denied", &format!("{} Kill or block the requester, or dismiss.", why), caller);
-                let how = match gesture { Some(Gesture::Password(_)) => "Refused: wrong password", _ => "Refused: no answer" };
-                notify(&self.cfg, user, how, &format!("{}\n{}", caller.command, caller.parents));
-                log::warn!("consent refused for {}: {} [{}] ({})", user, caller.command, caller.parents, why);
+                let why = match gesture {
+                    Some(Gesture::Password(_)) => "Wrong password. Refused.",
+                    _ => "No answer. Refused.",
+                };
+                s.dialog.show_final(
+                    "denied",
+                    &format!("{} Kill or block the requester, or dismiss.", why),
+                    caller,
+                );
+                let how = match gesture {
+                    Some(Gesture::Password(_)) => "Refused: wrong password",
+                    _ => "Refused: no answer",
+                };
+                notify(
+                    &self.cfg,
+                    user,
+                    how,
+                    &format!("{}\n{}", caller.command, caller.parents),
+                );
+                log::warn!(
+                    "consent refused for {}: {} [{}] ({})",
+                    user,
+                    caller.command,
+                    caller.parents,
+                    why
+                );
             }
             _ => {
-                s.dialog.show_final("denied", "Refused. Kill or block the requester, or dismiss.", caller);
-                notify(&self.cfg, user, "Refused", &format!("{}\n{}", caller.command, caller.parents));
+                s.dialog.show_final(
+                    "denied",
+                    "Refused. Kill or block the requester, or dismiss.",
+                    caller,
+                );
+                notify(
+                    &self.cfg,
+                    user,
+                    "Refused",
+                    &format!("{}\n{}", caller.command, caller.parents),
+                );
             }
         }
         outcome
@@ -1053,11 +1680,17 @@ impl Authenticator {
         let templates = match self.store.load(user) {
             Ok(Some(t)) => t,
             Ok(None) => return Outcome::NotEnrolled,
-            Err(e) => return Outcome::Error { message: e.to_string() },
+            Err(e) => {
+                return Outcome::Error {
+                    message: e.to_string(),
+                }
+            }
         };
         // Cooldown: a print held up at the lock screen does not get unlimited tries.
         if let Some(hold) = self.hold_for(user) {
-            return Outcome::Cooldown { seconds: hold.as_secs().max(1) };
+            return Outcome::Cooldown {
+                seconds: hold.as_secs().max(1),
+            };
         }
         match self.run(&templates) {
             Ok(o) => {
@@ -1074,13 +1707,18 @@ impl Authenticator {
                 }
                 o
             }
-            Err(e) => Outcome::Error { message: e.to_string() },
+            Err(e) => Outcome::Error {
+                message: e.to_string(),
+            },
         }
     }
 
     /// The hold this user is under, if any.
     fn hold_for(&mut self, user: &str) -> Option<Duration> {
-        self.failures.entry(user.to_string()).or_default().hold(Instant::now())
+        self.failures
+            .entry(user.to_string())
+            .or_default()
+            .hold(Instant::now())
     }
 
     /// Record a failure where a face was seen; the hold it starts, if any.
@@ -1100,11 +1738,22 @@ impl Authenticator {
     /// the outcome is returned; `Ok(false)` from it turns the match into
     /// `ConsentDenied`. Keeping the camera open avoids the two-to-three second
     /// restart that would otherwise eat the start of a consent gesture.
-    fn run_with(&mut self, templates: &UserTemplates, after_match: Option<&mut dyn FnMut(&mut IrCapture, &mut Pipeline, &faceauth_engine::Face) -> Result<bool>>, timeout_seconds: f32) -> Result<Outcome> {
+    fn run_with(
+        &mut self,
+        templates: &UserTemplates,
+        after_match: AfterMatch<'_>,
+        timeout_seconds: f32,
+    ) -> Result<Outcome> {
         self.run_with_answers(templates, after_match, timeout_seconds, None)
     }
 
-    fn run_with_answers(&mut self, templates: &UserTemplates, after_match: Option<&mut dyn FnMut(&mut IrCapture, &mut Pipeline, &faceauth_engine::Face) -> Result<bool>>, timeout_seconds: f32, answers: Option<&(Answers, String)>) -> Result<Outcome> {
+    fn run_with_answers(
+        &mut self,
+        templates: &UserTemplates,
+        after_match: AfterMatch<'_>,
+        timeout_seconds: f32,
+        answers: Option<&(Answers, String)>,
+    ) -> Result<Outcome> {
         let t0 = Instant::now();
         let deadline = Duration::from_secs_f32(timeout_seconds);
         let ms = |t: Instant| t.elapsed().as_millis() as u64;
@@ -1115,15 +1764,30 @@ impl Authenticator {
         // administrator has explicitly accepted ungated authentication.
         if !strobe && self.cfg.liveness_required {
             cap.stop()?;
-            return Ok(Outcome::Error { message: "liveness gate unavailable (no strobe control) and liveness_required is set".into() });
+            return Ok(Outcome::Error {
+                message:
+                    "liveness gate unavailable (no strobe control) and liveness_required is set"
+                        .into(),
+            });
         }
         // Templates only match on the camera they were enrolled on: a camera
         // swapped in for it has nothing to match against.
         let device = cap.identity.clone();
         if templates.usable_on(&device) == 0 {
             cap.stop()?;
-            log::warn!("attempt for {}: templates are bound to {:?}, this camera is {:?}; re-enrol", templates.user, templates.bound_devices(), device);
-            return Ok(Outcome::Error { message: format!("templates are bound to another camera ({}); this one is {}; re-enrol", templates.bound_devices().join(", "), device) });
+            log::warn!(
+                "attempt for {}: templates are bound to {:?}, this camera is {:?}; re-enrol",
+                templates.user,
+                templates.bound_devices(),
+                device
+            );
+            return Ok(Outcome::Error {
+                message: format!(
+                    "templates are bound to another camera ({}); this one is {}; re-enrol",
+                    templates.bound_devices().join(", "),
+                    device
+                ),
+            });
         }
         if let Some(i) = &cap.illuminator {
             i.set(true)?;
@@ -1136,7 +1800,8 @@ impl Authenticator {
         let (mut best, mut matches, mut scored) = (-1f32, 0usize, 0usize);
         let mut face_seen = false;
         let mut alternating_since: Option<Instant> = None;
-        let (mut n_frames, mut n_lit, mut n_faces, mut n_nosignal) = (0usize, 0usize, 0usize, 0usize);
+        let (mut n_frames, mut n_lit, mut n_faces, mut n_nosignal) =
+            (0usize, 0usize, 0usize, 0usize);
         let mut settle_info = String::new();
         let mut score_trail: Vec<String> = Vec::new();
         loop {
@@ -1151,23 +1816,34 @@ impl Authenticator {
                             Answer::Dismiss => {
                                 m.remove(u);
                                 cap.stop()?;
-                                return Ok(Outcome::ConsentDenied { reason: "dismissed".into(), elapsed_ms: ms(t0) });
+                                return Ok(Outcome::ConsentDenied {
+                                    reason: "dismissed".into(),
+                                    elapsed_ms: ms(t0),
+                                });
                             }
                             Answer::Password(_) => {
                                 // Leave it in the map for the caller to verify.
                                 cap.stop()?;
-                                return Ok(Outcome::Denied { reason: "password".into(), elapsed_ms: ms(t0) });
+                                return Ok(Outcome::Denied {
+                                    reason: "password".into(),
+                                    elapsed_ms: ms(t0),
+                                });
                             }
                             Answer::Gone => {
                                 m.remove(u);
                                 cap.stop()?;
-                                return Ok(Outcome::ConsentDenied { reason: "requester gone".into(), elapsed_ms: ms(t0) });
+                                return Ok(Outcome::ConsentDenied {
+                                    reason: "requester gone".into(),
+                                    elapsed_ms: ms(t0),
+                                });
                             }
                         }
                     }
                 }
             }
-            let Some(img) = cap.next(Duration::from_secs(2))? else { continue };
+            let Some(img) = cap.next(Duration::from_secs(2))? else {
+                continue;
+            };
             n_frames += 1;
             let mean = img.data.iter().map(|&v| v as f64).sum::<f64>() / img.data.len() as f64;
 
@@ -1175,7 +1851,10 @@ impl Authenticator {
                 if cap.frames % 3 != 0 {
                     continue;
                 }
-                let faces = self.pipeline.detector.detect(&img, self.cfg.min_detection)?;
+                let faces = self
+                    .pipeline
+                    .detector
+                    .detect(&img, self.cfg.min_detection)?;
                 if let Some(f) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) {
                     face_seen = true;
                     cap.meter_on(f);
@@ -1184,10 +1863,20 @@ impl Authenticator {
                 if face_seen && t0.elapsed() > Duration::from_millis(1200) {
                     settled = true;
                     self.last_exposure = Some(cap.exposure);
-                    settle_info = format!("settled at {:.2}s exp {} gain {} meter {:.2} frame mean {:.0}", t0.elapsed().as_secs_f32(), cap.exposure.exposure, cap.exposure.gain, cap.metering.mean, mean);
+                    settle_info = format!(
+                        "settled at {:.2}s exp {} gain {} meter {:.2} frame mean {:.0}",
+                        t0.elapsed().as_secs_f32(),
+                        cap.exposure.exposure,
+                        cap.exposure.gain,
+                        cap.metering.mean,
+                        mean
+                    );
                     cap.freeze_exposure(true);
                     if strobe {
-                        cap.illuminator.as_ref().unwrap().set_pattern(phase.pattern())?;
+                        cap.illuminator
+                            .as_ref()
+                            .unwrap()
+                            .set_pattern(phase.pattern())?;
                         alternating_since = Some(Instant::now());
                     }
                 }
@@ -1201,9 +1890,14 @@ impl Authenticator {
             // is never a pair (D5).
             let pair = if strobe {
                 let in_phase = phase.push(mean);
-                let Some(p_img) = prev.replace(img.clone()) else { continue };
+                let Some(p_img) = prev.replace(img.clone()) else {
+                    continue;
+                };
                 // Give the pattern a few frames to take effect after switching.
-                if alternating_since.map(|t| t.elapsed() < Duration::from_millis(150)).unwrap_or(false) {
+                if alternating_since
+                    .map(|t| t.elapsed() < Duration::from_millis(150))
+                    .unwrap_or(false)
+                {
                     continue;
                 }
                 if !in_phase {
@@ -1221,7 +1915,13 @@ impl Authenticator {
             let Some(face) = faces.first() else { continue };
             n_faces += 1;
             if let Some(unlit) = &pair {
-                let fr = FlashResponse::measure(&img, unlit, face, cap.exposure.exposure, cap.exposure.gain.max(16));
+                let fr = FlashResponse::measure(
+                    &img,
+                    unlit,
+                    face,
+                    cap.exposure.exposure,
+                    cap.exposure.gain.max(16),
+                );
                 match fr.verdict() {
                     Verdict::Pass => {}
                     Verdict::NoSignal => {
@@ -1235,15 +1935,29 @@ impl Authenticator {
                         log::warn!("liveness denied: {:?}", v);
                         log::debug!("liveness denied: {:?} {:?}", v, fr);
                         cap.stop()?;
-                        return Ok(Outcome::Denied { reason: format!("{:?}", v), elapsed_ms: ms(t0) });
+                        return Ok(Outcome::Denied {
+                            reason: format!("{:?}", v),
+                            elapsed_ms: ms(t0),
+                        });
                     }
                 }
             }
             let Some(e) = &face.embedding else { continue };
-            let Some((score, _)) = templates.best_match_on(e, &device) else { continue };
+            let Some((score, _)) = templates.best_match_on(e, &device) else {
+                continue;
+            };
             scored += 1;
             if score_trail.len() < 40 {
-                score_trail.push(format!("{:.1}s:{:.2}{}", t0.elapsed().as_secs_f32(), score, if score >= self.cfg.accept_threshold { "*" } else { "" }));
+                score_trail.push(format!(
+                    "{:.1}s:{:.2}{}",
+                    t0.elapsed().as_secs_f32(),
+                    score,
+                    if score >= self.cfg.accept_threshold {
+                        "*"
+                    } else {
+                        ""
+                    }
+                ));
             }
             #[cfg(debug_assertions)]
             if let Ok(dir) = std::env::var("FACEAUTH_DUMP") {
@@ -1253,7 +1967,8 @@ impl Authenticator {
                     if let Some(u) = &pair {
                         let _ = u.write_pgm(format!("{}/scored-{}-unlit.pgm", dir, scored));
                     }
-                    let _ = faceauth_engine::align::align_112(&img, &face.landmarks).write_pgm(format!("{}/scored-{}-crop.pgm", dir, scored));
+                    let _ = faceauth_engine::align::align_112(&img, &face.landmarks)
+                        .write_pgm(format!("{}/scored-{}-crop.pgm", dir, scored));
                     log::info!("dump {}: score {:.3} det {:.2} face {:.0}px at ({:.0},{:.0}) exp {} gain {}", scored, score, face.score, face.bbox[2], face.bbox[0], face.bbox[1], cap.exposure.exposure, cap.exposure.gain);
                 }
             }
@@ -1261,13 +1976,31 @@ impl Authenticator {
             if score >= self.cfg.accept_threshold {
                 matches += 1;
             }
-            log::debug!("frame {} score {:.3} matches {}/{}", scored, score, matches, self.cfg.required_matches);
+            log::debug!(
+                "frame {} score {:.3} matches {}/{}",
+                scored,
+                score,
+                matches,
+                self.cfg.required_matches
+            );
             if matches >= self.cfg.required_matches {
                 // Scores (and the exposure they came at) are debug-only: the
                 // journal is readable by wheel on Omarchy, so at info it would
                 // be the tuning oracle the wire no longer is.
-                log::info!("attempt detail: frames {} lit {} faces {} nosignal {} scored {} matches {}", n_frames, n_lit, n_faces, n_nosignal, scored, matches);
-                log::debug!("attempt scores: {} | {}", settle_info, score_trail.join(" "));
+                log::info!(
+                    "attempt detail: frames {} lit {} faces {} nosignal {} scored {} matches {}",
+                    n_frames,
+                    n_lit,
+                    n_faces,
+                    n_nosignal,
+                    scored,
+                    matches
+                );
+                log::debug!(
+                    "attempt scores: {} | {}",
+                    settle_info,
+                    score_trail.join(" ")
+                );
                 if let Some(hook) = after_match {
                     // Steady light and free-running exposure for the gesture.
                     if let Some(i) = &cap.illuminator {
@@ -1277,23 +2010,55 @@ impl Authenticator {
                     let ok = hook(&mut cap, &mut self.pipeline, face)?;
                     cap.stop()?;
                     if !ok {
-                        return Ok(Outcome::ConsentDenied { reason: "no nod".into(), elapsed_ms: ms(t0) });
+                        return Ok(Outcome::ConsentDenied {
+                            reason: "no nod".into(),
+                            elapsed_ms: ms(t0),
+                        });
                     }
-                    return Ok(Outcome::Match { score: Some(best), frames: scored, elapsed_ms: ms(t0) });
+                    return Ok(Outcome::Match {
+                        score: Some(best),
+                        frames: scored,
+                        elapsed_ms: ms(t0),
+                    });
                 }
                 cap.stop()?;
-                return Ok(Outcome::Match { score: Some(best), frames: scored, elapsed_ms: ms(t0) });
+                return Ok(Outcome::Match {
+                    score: Some(best),
+                    frames: scored,
+                    elapsed_ms: ms(t0),
+                });
             }
         }
         // How many frames matched is logged only on success: on a failure
         // it says how close the presentation came (D6).
-        log::info!("attempt detail: frames {} lit {} faces {} nosignal {} scored {}{}", n_frames, n_lit, n_faces, n_nosignal, scored, if settle_info.is_empty() { " (never settled)" } else { "" });
-        log::debug!("attempt scores: matches {} | {} | {}", matches, settle_info, score_trail.join(" "));
+        log::info!(
+            "attempt detail: frames {} lit {} faces {} nosignal {} scored {}{}",
+            n_frames,
+            n_lit,
+            n_faces,
+            n_nosignal,
+            scored,
+            if settle_info.is_empty() {
+                " (never settled)"
+            } else {
+                ""
+            }
+        );
+        log::debug!(
+            "attempt scores: matches {} | {} | {}",
+            matches,
+            settle_info,
+            score_trail.join(" ")
+        );
         cap.stop()?;
         if scored == 0 {
             Ok(Outcome::NoFace { elapsed_ms: ms(t0) })
         } else {
-            Ok(Outcome::NoMatch { score: Some(best), frames: scored, elapsed_ms: ms(t0) })
+            Ok(Outcome::NoMatch {
+                score: Some(best),
+                frames: scored,
+                elapsed_ms: ms(t0),
+            })
         }
     }
 }
@@ -1303,9 +2068,21 @@ impl Authenticator {
 /// password would, since our line answers before faillock's own reset
 /// module ever runs. Mike's call, 2026-09-22.
 fn faillock_reset(user: &str) {
-    match std::process::Command::new("/usr/bin/faillock").env_clear().env("PATH", "/usr/bin:/bin").args(["--user", user, "--reset"]).output() {
-        Ok(o) if o.status.success() => log::info!("faillock counter reset for {} after a face match", user),
-        Ok(o) => log::warn!("faillock --reset for {} exited {}: {}", user, o.status, String::from_utf8_lossy(&o.stderr).trim()),
+    match std::process::Command::new("/usr/bin/faillock")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .args(["--user", user, "--reset"])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            log::info!("faillock counter reset for {} after a face match", user)
+        }
+        Ok(o) => log::warn!(
+            "faillock --reset for {} exited {}: {}",
+            user,
+            o.status,
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
         Err(e) => log::warn!("faillock --reset for {}: {}", user, e),
     }
 }
@@ -1339,16 +2116,29 @@ const CONFIRM_SECONDS: f32 = 2.5;
 /// and two pairs at or above the accept threshold say yes. One gate refusal
 /// or one non-match says no. Pairs with no signal are skipped; if that is
 /// all there was, nothing is decided.
-pub fn confirm(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, templates: &UserTemplates, followed: [f32; 4]) -> Result<Confirm> {
+pub fn confirm(
+    cap: &mut IrCapture,
+    pipeline: &mut Pipeline,
+    cfg: &Config,
+    templates: &UserTemplates,
+    followed: [f32; 4],
+) -> Result<Confirm> {
     if cap.illuminator.is_none() {
         // No strobe control: the scan already ran ungated under the
         // administrator's explicit setting, and so does this.
-        return Ok(if cfg.liveness_required { Confirm::Refused("no strobe control".into()) } else { Confirm::Live });
+        return Ok(if cfg.liveness_required {
+            Confirm::Refused("no strobe control".into())
+        } else {
+            Confirm::Live
+        });
     }
     cap.freeze_exposure(true);
     // A fresh mask for the confirm, and pairs only once the frames follow it (D5).
     let mut phase = StrobePhase::random();
-    cap.illuminator.as_ref().unwrap().set_pattern(phase.pattern())?;
+    cap.illuminator
+        .as_ref()
+        .unwrap()
+        .set_pattern(phase.pattern())?;
     let t0 = Instant::now();
     let device = cap.identity.clone();
     let mut prev: Option<Grey> = None;
@@ -1356,12 +2146,20 @@ pub fn confirm(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, templ
     let (mut passed, mut failed, mut nosignal, mut pairs) = (0usize, 0usize, 0usize, 0usize);
     let verdict = loop {
         if t0.elapsed().as_secs_f32() > CONFIRM_SECONDS {
-            break if pairs == 0 || nosignal == pairs { Confirm::NoSignal } else { Confirm::Refused("no match within the confirm window".into()) };
+            break if pairs == 0 || nosignal == pairs {
+                Confirm::NoSignal
+            } else {
+                Confirm::Refused("no match within the confirm window".into())
+            };
         }
-        let Some(img) = cap.next(Duration::from_secs(1))? else { continue };
+        let Some(img) = cap.next(Duration::from_secs(1))? else {
+            continue;
+        };
         let mean = img.data.iter().map(|&v| v as f64).sum::<f64>() / img.data.len() as f64;
         let in_phase = phase.push(mean);
-        let Some(p_img) = prev.replace(img.clone()) else { continue };
+        let Some(p_img) = prev.replace(img.clone()) else {
+            continue;
+        };
         if t0.elapsed() < Duration::from_millis(150) || !in_phase {
             continue;
         }
@@ -1377,7 +2175,13 @@ pub fn confirm(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, templ
         }
         tracked = face.bbox;
         pairs += 1;
-        let fr = FlashResponse::measure(&img, &p_img, face, cap.exposure.exposure, cap.exposure.gain.max(16));
+        let fr = FlashResponse::measure(
+            &img,
+            &p_img,
+            face,
+            cap.exposure.exposure,
+            cap.exposure.gain.max(16),
+        );
         match fr.verdict() {
             Verdict::Pass => {}
             Verdict::NoSignal => {
@@ -1415,11 +2219,27 @@ pub fn confirm(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, templ
     // The pair counts go to the journal on a pass only; on a refusal they
     // would say how close it came (D6).
     match &verdict {
-        Confirm::Live => log::info!("confirm: live in {:.2}s ({} pairs, {} no signal, {} matched)", t0.elapsed().as_secs_f32(), pairs, nosignal, passed),
+        Confirm::Live => log::info!(
+            "confirm: live in {:.2}s ({} pairs, {} no signal, {} matched)",
+            t0.elapsed().as_secs_f32(),
+            pairs,
+            nosignal,
+            passed
+        ),
         Confirm::NoSignal => log::info!("confirm: no signal in {:.2}s", t0.elapsed().as_secs_f32()),
-        Confirm::Refused(w) => log::info!("confirm: refused: {} ({:.2}s)", w, t0.elapsed().as_secs_f32()),
+        Confirm::Refused(w) => log::info!(
+            "confirm: refused: {} ({:.2}s)",
+            w,
+            t0.elapsed().as_secs_f32()
+        ),
     }
-    log::debug!("confirm detail: {} pairs, {} no signal, {} matched, {} under", pairs, nosignal, passed, failed);
+    log::debug!(
+        "confirm detail: {} pairs, {} no signal, {} matched, {} under",
+        pairs,
+        nosignal,
+        passed,
+        failed
+    );
     Ok(verdict)
 }
 
@@ -1427,7 +2247,13 @@ pub fn confirm(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, templ
 /// each to be the enrolled face at the accept threshold (D4). The check runs
 /// after the nods, on frames already captured, so the live nod detectors
 /// and their floors are untouched. The inner result is the refusal reason.
-pub fn nod_frames_match(pipeline: &mut Pipeline, templates: &UserTemplates, frames: &[(Grey, faceauth_engine::Face)], device: &str, threshold: f32) -> Result<std::result::Result<(), String>> {
+pub fn nod_frames_match(
+    pipeline: &mut Pipeline,
+    templates: &UserTemplates,
+    frames: &[(Grey, faceauth_engine::Face)],
+    device: &str,
+    threshold: f32,
+) -> Result<std::result::Result<(), String>> {
     let mut embeddings = Vec::with_capacity(frames.len());
     for (img, face) in frames {
         let crop = faceauth_engine::align::align_112(img, &face.landmarks);
@@ -1435,7 +2261,10 @@ pub fn nod_frames_match(pipeline: &mut Pipeline, templates: &UserTemplates, fram
     }
     let r = check_nod_embeddings(&embeddings, templates, device, threshold);
     match &r {
-        Ok(()) => log::info!("confirm: the {} nod frames are the enrolled face", embeddings.len()),
+        Ok(()) => log::info!(
+            "confirm: the {} nod frames are the enrolled face",
+            embeddings.len()
+        ),
         Err(why) => log::warn!("confirm: {}", why),
     }
     Ok(r)
@@ -1444,14 +2273,25 @@ pub fn nod_frames_match(pipeline: &mut Pipeline, templates: &UserTemplates, fram
 /// The rule behind `nod_frames_match`, on embeddings: every kept frame must
 /// score at or above `threshold` against a template usable on `device`, and
 /// there must be at least one.
-pub fn check_nod_embeddings(embeddings: &[Vec<f32>], templates: &UserTemplates, device: &str, threshold: f32) -> std::result::Result<(), String> {
+pub fn check_nod_embeddings(
+    embeddings: &[Vec<f32>],
+    templates: &UserTemplates,
+    device: &str,
+    threshold: f32,
+) -> std::result::Result<(), String> {
     if embeddings.is_empty() {
         return Err("no frames were kept from the nods".into());
     }
     for (i, e) in embeddings.iter().enumerate() {
         match templates.best_match_on(e, device) {
             Some((score, _)) if score >= threshold => {}
-            Some(_) => return Err(format!("nod frame {} of {} is not the enrolled face", i + 1, embeddings.len())),
+            Some(_) => {
+                return Err(format!(
+                    "nod frame {} of {} is not the enrolled face",
+                    i + 1,
+                    embeddings.len()
+                ))
+            }
             None => return Err("no template for this camera".into()),
         }
     }
@@ -1466,7 +2306,16 @@ mod nod_frame_tests {
     fn templates() -> UserTemplates {
         let mut u = UserTemplates::new("alice", "glintr100");
         u.uid = None;
-        u.templates.push(Template { embedding: vec![1.0, 0.0], quality: 0.9, face_width: 80.0, created: 1, label: "enrol".into(), device: Some("ipu3:x".into()), yaw: None, nose_pitch: None });
+        u.templates.push(Template {
+            embedding: vec![1.0, 0.0],
+            quality: 0.9,
+            face_width: 80.0,
+            created: 1,
+            label: "enrol".into(),
+            device: Some("ipu3:x".into()),
+            yaw: None,
+            nose_pitch: None,
+        });
         u
     }
 
@@ -1477,12 +2326,21 @@ mod nod_frame_tests {
         let u = templates();
         let me = vec![0.95, 0.31];
         let other = vec![0.0, 1.0];
-        assert_eq!(check_nod_embeddings(&[me.clone(), me.clone()], &u, "ipu3:x", 0.70), Ok(()));
-        let e = check_nod_embeddings(&[me.clone(), other.clone(), me.clone()], &u, "ipu3:x", 0.70).unwrap_err();
+        assert_eq!(
+            check_nod_embeddings(&[me.clone(), me.clone()], &u, "ipu3:x", 0.70),
+            Ok(())
+        );
+        let e = check_nod_embeddings(&[me.clone(), other.clone(), me.clone()], &u, "ipu3:x", 0.70)
+            .unwrap_err();
         assert!(e.contains("nod frame 2 of 3"), "{}", e);
         assert!(check_nod_embeddings(&[other], &u, "ipu3:x", 0.70).is_err());
-        assert!(check_nod_embeddings(&[], &u, "ipu3:x", 0.70).is_err(), "no frames is not a pass");
-        assert!(check_nod_embeddings(&[me], &u, "uvc:other", 0.70).unwrap_err().contains("no template"));
+        assert!(
+            check_nod_embeddings(&[], &u, "ipu3:x", 0.70).is_err(),
+            "no frames is not a pass"
+        );
+        assert!(check_nod_embeddings(&[me], &u, "uvc:other", 0.70)
+            .unwrap_err()
+            .contains("no template"));
     }
 }
 
@@ -1503,11 +2361,24 @@ pub fn calibration_text(gesture: &str) -> (&'static str, &'static str) {
 
 /// The rounds `faceauth calibrate` runs: the two gestures, then the
 /// everyday movements they must stand clear of.
-pub const CALIBRATION_ROUNDS: [(&str, usize, f32); 7] = [("nod", 2, 8.0), ("shake", 2, 8.0), ("read", 1, 10.0), ("glance", 1, 8.0), ("talk", 1, 8.0), ("lean", 1, 8.0), ("aside", 1, 8.0)];
+pub const CALIBRATION_ROUNDS: [(&str, usize, f32); 7] = [
+    ("nod", 2, 8.0),
+    ("shake", 2, 8.0),
+    ("read", 1, 10.0),
+    ("glance", 1, 8.0),
+    ("talk", 1, 8.0),
+    ("lean", 1, 8.0),
+    ("aside", 1, 8.0),
+];
 
 fn elapsed_of(o: &Outcome) -> u64 {
     match o {
-        Outcome::Match { elapsed_ms, .. } | Outcome::NoMatch { elapsed_ms, .. } | Outcome::NoFace { elapsed_ms, .. } | Outcome::Denied { elapsed_ms, .. } | Outcome::ConsentDenied { elapsed_ms, .. } | Outcome::Refused { elapsed_ms, .. } => *elapsed_ms,
+        Outcome::Match { elapsed_ms, .. }
+        | Outcome::NoMatch { elapsed_ms, .. }
+        | Outcome::NoFace { elapsed_ms, .. }
+        | Outcome::Denied { elapsed_ms, .. }
+        | Outcome::ConsentDenied { elapsed_ms, .. }
+        | Outcome::Refused { elapsed_ms, .. } => *elapsed_ms,
         _ => 0,
     }
 }
@@ -1518,7 +2389,8 @@ mod strikes_tests {
 
     fn t(secs: u64) -> Instant {
         // A fixed origin far enough in the past that every test time is after it.
-        static ORIGIN: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(|| Instant::now() - Duration::from_secs(100_000));
+        static ORIGIN: std::sync::LazyLock<Instant> =
+            std::sync::LazyLock::new(|| Instant::now() - Duration::from_secs(100_000));
         *ORIGIN + Duration::from_secs(secs)
     }
 
@@ -1532,7 +2404,10 @@ mod strikes_tests {
         s.charge(t(4));
         let hold = s.hold(t(4)).expect("the fifth starts a hold");
         assert_eq!(hold, COOLDOWN_HOLD);
-        assert_eq!(s.hold(t(4 + 10)), Some(COOLDOWN_HOLD - Duration::from_secs(10)));
+        assert_eq!(
+            s.hold(t(4 + 10)),
+            Some(COOLDOWN_HOLD - Duration::from_secs(10))
+        );
     }
 
     #[test]
@@ -1545,7 +2420,11 @@ mod strikes_tests {
         // Served in full: free again, but the next failure is not a fresh budget.
         assert_eq!(s.hold(t(4 + 30)), None);
         s.charge(t(35));
-        assert_eq!(s.hold(t(35)), Some(COOLDOWN_HOLD * 2), "one failure after a served hold starts the next, twice as long");
+        assert_eq!(
+            s.hold(t(35)),
+            Some(COOLDOWN_HOLD * 2),
+            "one failure after a served hold starts the next, twice as long"
+        );
         assert_eq!(s.hold(t(35 + 60)), None);
         s.charge(t(96));
         assert_eq!(s.hold(t(96)), Some(COOLDOWN_HOLD * 4));
@@ -1557,7 +2436,11 @@ mod strikes_tests {
 
     #[test]
     fn the_doubling_is_capped() {
-        let mut s = Strikes { last: Some(t(0)), holds: 40, ..Default::default() };
+        let mut s = Strikes {
+            last: Some(t(0)),
+            holds: 40,
+            ..Default::default()
+        };
         for i in 0..5 {
             s.charge(t(i));
         }
@@ -1571,7 +2454,11 @@ mod strikes_tests {
             s.charge(t(i));
         }
         s.charge(t(70));
-        assert_eq!(s.hold(t(70)), None, "four of the five are over a minute old");
+        assert_eq!(
+            s.hold(t(70)),
+            None,
+            "four of the five are over a minute old"
+        );
     }
 }
 
@@ -1598,10 +2485,19 @@ pub const UP_BELOW_LEVEL: f32 = 0.02;
 pub const DOWN_ABOVE_LEVEL: f32 = 0.08;
 
 pub fn level_of(u: &UserTemplates) -> f32 {
-    let centre: Vec<f32> = u.templates.iter().filter(|t| t.label.ends_with("-centre")).filter_map(|t| t.nose_pitch).collect();
+    let centre: Vec<f32> = u
+        .templates
+        .iter()
+        .filter(|t| t.label.ends_with("-centre"))
+        .filter_map(|t| t.nose_pitch)
+        .collect();
     let any: Vec<f32> = u.templates.iter().filter_map(|t| t.nose_pitch).collect();
     let pick = if !centre.is_empty() { centre } else { any };
-    if pick.is_empty() { LEVEL_DEFAULT } else { pick.iter().sum::<f32>() / pick.len() as f32 }
+    if pick.is_empty() {
+        LEVEL_DEFAULT
+    } else {
+        pick.iter().sum::<f32>() / pick.len() as f32
+    }
 }
 
 /// Is this frame in the pose a guided round asked for, with up and down
@@ -1629,7 +2525,14 @@ mod pose_bin_tests {
     use faceauth_engine::pose::Pose;
 
     fn at(yaw: f32, nose_pitch: f32) -> Pose {
-        Pose { yaw, pitch: 0.5, roll: 0.0, nose_pitch, mouth_drop: 1.0, inter_eye: 40.0 }
+        Pose {
+            yaw,
+            pitch: 0.5,
+            roll: 0.0,
+            nose_pitch,
+            mouth_drop: 1.0,
+            inter_eye: 40.0,
+        }
     }
 
     #[test]
@@ -1637,17 +2540,44 @@ mod pose_bin_tests {
         let frontal = at(0.0, LEVEL_DEFAULT);
         assert!(pose_bin_accepts("centre", &frontal));
         for p in ["left", "right", "up", "down"] {
-            assert!(!pose_bin_accepts(p, &frontal), "{} must not take a frontal frame", p);
+            assert!(
+                !pose_bin_accepts(p, &frontal),
+                "{} must not take a frontal frame",
+                p
+            );
         }
-        assert!(pose_bin_accepts("left", &at(-0.3, 0.5)) && !pose_bin_accepts("right", &at(-0.3, 0.5)));
-        assert!(pose_bin_accepts("right", &at(0.3, 0.5)) && !pose_bin_accepts("centre", &at(0.3, 0.5)));
-        assert!(pose_bin_accepts("up", &at(0.05, 0.50)) && !pose_bin_accepts("centre", &at(0.05, 0.44)), "a comfortable chin-up reads a couple of hundredths under level");
-        assert!(pose_bin_accepts("down", &at(0.05, 0.7)) && !pose_bin_accepts("centre", &at(0.05, 0.7)));
-        assert!(pose_bin_accepts("centre", &at(0.05, 0.55)) && !pose_bin_accepts("up", &at(0.05, 0.55)) && !pose_bin_accepts("down", &at(0.05, 0.55)), "level is level");
+        assert!(
+            pose_bin_accepts("left", &at(-0.3, 0.5)) && !pose_bin_accepts("right", &at(-0.3, 0.5))
+        );
+        assert!(
+            pose_bin_accepts("right", &at(0.3, 0.5)) && !pose_bin_accepts("centre", &at(0.3, 0.5))
+        );
+        assert!(
+            pose_bin_accepts("up", &at(0.05, 0.50)) && !pose_bin_accepts("centre", &at(0.05, 0.44)),
+            "a comfortable chin-up reads a couple of hundredths under level"
+        );
+        assert!(
+            pose_bin_accepts("down", &at(0.05, 0.7)) && !pose_bin_accepts("centre", &at(0.05, 0.7))
+        );
+        assert!(
+            pose_bin_accepts("centre", &at(0.05, 0.55))
+                && !pose_bin_accepts("up", &at(0.05, 0.55))
+                && !pose_bin_accepts("down", &at(0.05, 0.55)),
+            "level is level"
+        );
         // Relative to a person who reads higher at level, the same bands move with them.
-        assert!(pose_bin_accepts_at("up", &at(0.0, 0.57), 0.60) && !pose_bin_accepts_at("up", &at(0.0, 0.59), 0.60));
-        assert!(pose_bin_accepts_at("down", &at(0.0, 0.69), 0.60) && !pose_bin_accepts_at("down", &at(0.0, 0.66), 0.60));
-        assert!(!pose_bin_accepts("left", &at(-0.9, 0.5)), "a profile is past what the aligner can use");
+        assert!(
+            pose_bin_accepts_at("up", &at(0.0, 0.57), 0.60)
+                && !pose_bin_accepts_at("up", &at(0.0, 0.59), 0.60)
+        );
+        assert!(
+            pose_bin_accepts_at("down", &at(0.0, 0.69), 0.60)
+                && !pose_bin_accepts_at("down", &at(0.0, 0.66), 0.60)
+        );
+        assert!(
+            !pose_bin_accepts("left", &at(-0.9, 0.5)),
+            "a profile is past what the aligner can use"
+        );
         assert!(!pose_bin_accepts("sideways", &frontal));
         assert_eq!(POSES.len(), POSE_HINTS.len());
     }

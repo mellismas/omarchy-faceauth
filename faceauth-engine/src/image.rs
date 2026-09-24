@@ -10,7 +10,11 @@ pub struct Grey {
 
 impl Grey {
     pub fn new(width: usize, height: usize) -> Self {
-        Grey { width, height, data: vec![0; width * height] }
+        Grey {
+            width,
+            height,
+            data: vec![0; width * height],
+        }
     }
 
     #[inline]
@@ -38,7 +42,11 @@ impl Grey {
     /// Apply `transpose` then flips. The reference IR sensor needs transpose +
     /// both flips to come out upright; the reference RGB sensor needs both flips.
     pub fn oriented(&self, transpose: bool, flip_x: bool, flip_y: bool) -> Grey {
-        let (w, h) = if transpose { (self.height, self.width) } else { (self.width, self.height) };
+        let (w, h) = if transpose {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        };
         let mut out = Grey::new(w, h);
         for y in 0..self.height {
             for x in 0..self.width {
@@ -77,7 +85,8 @@ impl Grey {
         }
         let mut out = Grey::new(w, h);
         for y in 0..self.height {
-            out.data[y * w..y * w + self.width].copy_from_slice(&self.data[y * self.width..(y + 1) * self.width]);
+            out.data[y * w..y * w + self.width]
+                .copy_from_slice(&self.data[y * self.width..(y + 1) * self.width]);
         }
         out
     }
@@ -87,7 +96,11 @@ impl Grey {
     pub fn to_nchw3(&self, mean: f32, scale: f32) -> Vec<f32> {
         let n = self.width * self.height;
         let mut v = Vec::with_capacity(3 * n);
-        let plane: Vec<f32> = self.data.iter().map(|&p| (p as f32 - mean) / scale).collect();
+        let plane: Vec<f32> = self
+            .data
+            .iter()
+            .map(|&p| (p as f32 - mean) / scale)
+            .collect();
         for _ in 0..3 {
             v.extend_from_slice(&plane);
         }
@@ -117,11 +130,18 @@ impl Grey {
             fields.push(String::from_utf8_lossy(&bytes[s..i]).to_string());
         }
         i += 1;
-        anyhow::ensure!(fields.first().map(String::as_str) == Some("P5"), "not a P5 PGM");
+        anyhow::ensure!(
+            fields.first().map(String::as_str) == Some("P5"),
+            "not a P5 PGM"
+        );
         let width: usize = fields[1].parse()?;
         let height: usize = fields[2].parse()?;
         anyhow::ensure!(bytes.len() >= i + width * height, "short PGM");
-        Ok(Grey { width, height, data: bytes[i..i + width * height].to_vec() })
+        Ok(Grey {
+            width,
+            height,
+            data: bytes[i..i + width * height].to_vec(),
+        })
     }
 }
 
@@ -145,7 +165,10 @@ mod tests {
     #[test]
     fn padding_keeps_content() {
         let mut g = Grey::new(3, 3);
-        g.data.iter_mut().enumerate().for_each(|(i, v)| *v = i as u8);
+        g.data
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, v)| *v = i as u8);
         let p = g.padded_to_multiple(4);
         assert_eq!((p.width, p.height), (4, 4));
         assert_eq!(p.at(2, 2), 8);
@@ -155,7 +178,10 @@ mod tests {
     #[test]
     fn identity_warp_is_identity() {
         let mut g = Grey::new(4, 4);
-        g.data.iter_mut().enumerate().for_each(|(i, v)| *v = (i * 13) as u8);
+        g.data
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, v)| *v = (i * 13) as u8);
         let w = g.warp_affine(&[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], 4, 4);
         assert_eq!(w, g);
     }

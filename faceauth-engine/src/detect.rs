@@ -30,7 +30,11 @@ impl YuNet {
             Some(s) if s.len() == 4 && s[2] > 0 && s[3] > 0 => Some((s[3] as usize, s[2] as usize)),
             _ => None,
         };
-        Ok(YuNet { session, input_name, fixed })
+        Ok(YuNet {
+            session,
+            input_name,
+            fixed,
+        })
     }
 
     pub fn input_size(&self) -> Option<(usize, usize)> {
@@ -49,7 +53,8 @@ impl YuNet {
                 let inv = [[1.0 / s, 0.0, 0.0], [0.0, 1.0 / s, 0.0]];
                 let resized = img.warp_affine(&inv, rw, rh);
                 for y in 0..rh {
-                    canvas.data[y * fw..y * fw + rw].copy_from_slice(&resized.data[y * rw..(y + 1) * rw]);
+                    canvas.data[y * fw..y * fw + rw]
+                        .copy_from_slice(&resized.data[y * rw..(y + 1) * rw]);
                 }
                 (canvas, s)
             }
@@ -58,18 +63,23 @@ impl YuNet {
         let (w, h) = (net.width, net.height);
         // OpenCV feeds blobFromImage with scale 1, no mean: raw 0..255 floats.
         let tensor = Tensor::from_array(([1usize, 3, h, w], net.to_nchw3(0.0, 1.0)))?;
-        let outputs = self.session.run(ort::inputs![self.input_name.as_str() => tensor])?;
+        let outputs = self
+            .session
+            .run(ort::inputs![self.input_name.as_str() => tensor])?;
 
         let mut boxes: Vec<Face> = Vec::new();
         for &stride in &STRIDES {
             let cols = w / stride;
             let rows = h / stride;
             let get = |name: &str| -> Result<Vec<f32>> {
-                let (_, data) = outputs[format!("{}_{}", name, stride).as_str()].try_extract_tensor::<f32>()?;
+                let (_, data) =
+                    outputs[format!("{}_{}", name, stride).as_str()].try_extract_tensor::<f32>()?;
                 Ok(data.to_vec())
             };
             let (cls, obj, bbox, kps) = (get("cls")?, get("obj")?, get("bbox")?, get("kps")?);
-            boxes.extend(decode_stride(&cls, &obj, &bbox, &kps, stride, cols, rows, threshold, scale)?);
+            boxes.extend(decode_stride(
+                &cls, &obj, &bbox, &kps, stride, cols, rows, threshold, scale,
+            )?);
         }
         Ok(nms(boxes, NMS_IOU))
     }
@@ -80,10 +90,29 @@ impl YuNet {
 /// score output is refused rather than read past its end (a panic here
 /// would take the request thread with it).
 #[allow(clippy::too_many_arguments)]
-fn decode_stride(cls: &[f32], obj: &[f32], bbox: &[f32], kps: &[f32], stride: usize, cols: usize, rows: usize, threshold: f32, scale: f32) -> Result<Vec<Face>> {
+fn decode_stride(
+    cls: &[f32],
+    obj: &[f32],
+    bbox: &[f32],
+    kps: &[f32],
+    stride: usize,
+    cols: usize,
+    rows: usize,
+    threshold: f32,
+    scale: f32,
+) -> Result<Vec<Face>> {
     let cells = cols * rows;
     if cls.len() < cells || obj.len() < cells || bbox.len() < cells * 4 || kps.len() < cells * 10 {
-        anyhow::bail!("YuNet: stride {} outputs are short for {}x{} cells (cls {}, obj {}, bbox {}, kps {})", stride, cols, rows, cls.len(), obj.len(), bbox.len(), kps.len());
+        anyhow::bail!(
+            "YuNet: stride {} outputs are short for {}x{} cells (cls {}, obj {}, bbox {}, kps {})",
+            stride,
+            cols,
+            rows,
+            cls.len(),
+            obj.len(),
+            bbox.len(),
+            kps.len()
+        );
     }
     let mut boxes = Vec::new();
     for r in 0..rows {
@@ -100,10 +129,18 @@ fn decode_stride(cls: &[f32], obj: &[f32], bbox: &[f32], kps: &[f32], stride: us
             let bh = bbox[idx * 4 + 3].exp() * s;
             let mut landmarks = [[0f32; 2]; 5];
             for (n, lm) in landmarks.iter_mut().enumerate() {
-                *lm = [(kps[idx * 10 + 2 * n] + c as f32) * s / scale, (kps[idx * 10 + 2 * n + 1] + r as f32) * s / scale];
+                *lm = [
+                    (kps[idx * 10 + 2 * n] + c as f32) * s / scale,
+                    (kps[idx * 10 + 2 * n + 1] + r as f32) * s / scale,
+                ];
             }
             boxes.push(Face {
-                bbox: [(cx - bw / 2.0) / scale, (cy - bh / 2.0) / scale, bw / scale, bh / scale],
+                bbox: [
+                    (cx - bw / 2.0) / scale,
+                    (cy - bh / 2.0) / scale,
+                    bw / scale,
+                    bh / scale,
+                ],
                 score,
                 landmarks,
                 embedding: None,
@@ -152,9 +189,16 @@ mod tests {
         let obj = vec![1.0f32; cells];
         let bbox = vec![0.0f32; cells * 4];
         let kps = vec![0.0f32; cells * 10];
-        assert_eq!(decode_stride(&cls, &obj, &bbox, &kps, 8, cols, rows, 0.5, 1.0).unwrap().len(), cells);
+        assert_eq!(
+            decode_stride(&cls, &obj, &bbox, &kps, 8, cols, rows, 0.5, 1.0)
+                .unwrap()
+                .len(),
+            cells
+        );
         let short_bbox = vec![0.0f32; cells * 4 - 1];
-        let e = decode_stride(&cls, &obj, &short_bbox, &kps, 8, cols, rows, 0.5, 1.0).unwrap_err().to_string();
+        let e = decode_stride(&cls, &obj, &short_bbox, &kps, 8, cols, rows, 0.5, 1.0)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("short"), "{}", e);
         let short_kps = vec![0.0f32; 3];
         assert!(decode_stride(&cls, &obj, &bbox, &short_kps, 8, cols, rows, 0.5, 1.0).is_err());
@@ -164,7 +208,12 @@ mod tests {
 
     #[test]
     fn nms_drops_overlaps_keeps_best() {
-        let mk = |x, s| Face { bbox: [x, 0.0, 10.0, 10.0], score: s, landmarks: [[0.0; 2]; 5], embedding: None };
+        let mk = |x, s| Face {
+            bbox: [x, 0.0, 10.0, 10.0],
+            score: s,
+            landmarks: [[0.0; 2]; 5],
+            embedding: None,
+        };
         let out = nms(vec![mk(0.0, 0.5), mk(1.0, 0.9), mk(50.0, 0.7)], 0.3);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].score, 0.9);

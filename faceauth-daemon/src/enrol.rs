@@ -86,7 +86,41 @@ pub struct Tick {
 
 impl Tick {
     fn blank(step: &'static str, message: &str) -> Tick {
-        Tick { step, zone: None, face: false, size: 0.0, distance: "far", dot_x: 0.0, dot_y: 0.0, target_x: 0.0, target_y: 0.0, on_target: false, yaw: 0.0, pitch: 0.0, roll: 0.0, raw_yaw: 0.0, raw_pitch: 0.0, nose_pitch: 0.0, mesh_yaw: None, mesh_pitch: None, mesh_roll: None, mesh_score: None, x: 0.5, y: 0.5, centre_yaw: 0.0, level: 0.0, taken: 0, wanted: 0, message: message.into(), round: None, round_no: 0, round_of: 0, seconds_left: 0.0, countdown: false, read_slot: None }
+        Tick {
+            step,
+            zone: None,
+            face: false,
+            size: 0.0,
+            distance: "far",
+            dot_x: 0.0,
+            dot_y: 0.0,
+            target_x: 0.0,
+            target_y: 0.0,
+            on_target: false,
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+            raw_yaw: 0.0,
+            raw_pitch: 0.0,
+            nose_pitch: 0.0,
+            mesh_yaw: None,
+            mesh_pitch: None,
+            mesh_roll: None,
+            mesh_score: None,
+            x: 0.5,
+            y: 0.5,
+            centre_yaw: 0.0,
+            level: 0.0,
+            taken: 0,
+            wanted: 0,
+            message: message.into(),
+            round: None,
+            round_no: 0,
+            round_of: 0,
+            seconds_left: 0.0,
+            countdown: false,
+            read_slot: None,
+        }
     }
 }
 
@@ -98,7 +132,14 @@ static WATCHERS: Mutex<Vec<UnixStream>> = Mutex::new(Vec::new());
 static CONTROL: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 pub fn active_for(user: &str, uid: u32) -> bool {
-    ACTIVE.lock().map(|a| a.as_ref().map(|(u, id)| u == user && *id == uid).unwrap_or(false)).unwrap_or(false)
+    ACTIVE
+        .lock()
+        .map(|a| {
+            a.as_ref()
+                .map(|(u, id)| u == user && *id == uid)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
 }
 
 pub fn is_active() -> bool {
@@ -118,11 +159,19 @@ pub fn control(word: &str) {
 }
 
 fn take_control() -> Option<String> {
-    CONTROL.lock().ok().and_then(|mut c| if c.is_empty() { None } else { Some(c.remove(0)) })
+    CONTROL.lock().ok().and_then(|mut c| {
+        if c.is_empty() {
+            None
+        } else {
+            Some(c.remove(0))
+        }
+    })
 }
 
 fn broadcast(tick: &Tick) {
-    let Ok(mut line) = serde_json::to_string(tick) else { return };
+    let Ok(mut line) = serde_json::to_string(tick) else {
+        return;
+    };
     line.push('\n');
     if let Ok(mut w) = WATCHERS.lock() {
         w.retain_mut(|s| s.write_all(line.as_bytes()).is_ok());
@@ -176,7 +225,20 @@ pub struct Reach {
 impl Default for Reach {
     /// Degrees of head pose from the mesh (a quarter turn is about 40).
     fn default() -> Self {
-        Reach { left: 25.0, right: 25.0, up: 20.0, down: 25.0, pos_left: 0.06, pos_right: 0.06, pos_up: 0.05, pos_down: 0.05, sign_x: 1.0, sign_y: 1.0, place_x: 0.0, place_y: 0.0 }
+        Reach {
+            left: 25.0,
+            right: 25.0,
+            up: 20.0,
+            down: 25.0,
+            pos_left: 0.06,
+            pos_right: 0.06,
+            pos_up: 0.05,
+            pos_down: 0.05,
+            sign_x: 1.0,
+            sign_y: 1.0,
+            place_x: 0.0,
+            place_y: 0.0,
+        }
     }
 }
 
@@ -189,7 +251,20 @@ pub const PLACE_MIN_COVAR: f32 = 2.0;
 pub const RING_OF_REACH: f32 = 0.70;
 /// The least a direction's ring may be: below this the readings' own
 /// jitter would put the dot on and off the target by itself.
-pub const REACH_FLOOR: Reach = Reach { left: 12.0, right: 12.0, up: 10.0, down: 12.0, pos_left: 0.03, pos_right: 0.03, pos_up: 0.03, pos_down: 0.03, sign_x: 1.0, sign_y: 1.0, place_x: 0.0, place_y: 0.0 };
+pub const REACH_FLOOR: Reach = Reach {
+    left: 12.0,
+    right: 12.0,
+    up: 10.0,
+    down: 12.0,
+    pos_left: 0.03,
+    pos_right: 0.03,
+    pos_up: 0.03,
+    pos_down: 0.03,
+    sign_x: 1.0,
+    sign_y: 1.0,
+    place_x: 0.0,
+    place_y: 0.0,
+};
 /// The dot is on the target within this many ring units along the
 /// target's own axis (the radial direction, what the look is about), and
 /// within `ON_TARGET_ACROSS` across it: turning the head drags the pitch
@@ -215,7 +290,13 @@ impl Reach {
     /// The ring from a person's measured extents (as far as they went in
     /// each direction from their centre), pose and place alike.
     pub fn from_extents(left: f32, right: f32, up: f32, down: f32) -> Reach {
-        Reach { left: (left * RING_OF_REACH).max(REACH_FLOOR.left), right: (right * RING_OF_REACH).max(REACH_FLOOR.right), up: (up * RING_OF_REACH).max(REACH_FLOOR.up), down: (down * RING_OF_REACH).max(REACH_FLOOR.down), ..Reach::default() }
+        Reach {
+            left: (left * RING_OF_REACH).max(REACH_FLOOR.left),
+            right: (right * RING_OF_REACH).max(REACH_FLOOR.right),
+            up: (up * RING_OF_REACH).max(REACH_FLOOR.up),
+            down: (down * RING_OF_REACH).max(REACH_FLOOR.down),
+            ..Reach::default()
+        }
     }
 
     /// With the place extents and the axis directions as well. `covar_x`
@@ -223,15 +304,33 @@ impl Reach {
     /// step: their sign is the axis direction, their size whether the
     /// place moved with the reading at all. An axis the face did not move
     /// across, or moved without a plain direction, does not count.
-    pub fn with_place(mut self, pos_left: f32, pos_right: f32, pos_up: f32, pos_down: f32, covar_x: f32, covar_y: f32) -> Reach {
+    pub fn with_place(
+        mut self,
+        pos_left: f32,
+        pos_right: f32,
+        pos_up: f32,
+        pos_down: f32,
+        covar_x: f32,
+        covar_y: f32,
+    ) -> Reach {
         self.pos_left = (pos_left * RING_OF_REACH).max(REACH_FLOOR.pos_left);
         self.pos_right = (pos_right * RING_OF_REACH).max(REACH_FLOOR.pos_right);
         self.pos_up = (pos_up * RING_OF_REACH).max(REACH_FLOOR.pos_up);
         self.pos_down = (pos_down * RING_OF_REACH).max(REACH_FLOOR.pos_down);
         self.sign_x = if covar_x < 0.0 { -1.0 } else { 1.0 };
         self.sign_y = if covar_y < 0.0 { -1.0 } else { 1.0 };
-        self.place_x = if pos_left.max(pos_right) >= PLACE_MIN_EXTENT && covar_x.abs() >= PLACE_MIN_COVAR { 1.0 } else { 0.0 };
-        self.place_y = if pos_up.max(pos_down) >= PLACE_MIN_EXTENT && covar_y.abs() >= PLACE_MIN_COVAR { 1.0 } else { 0.0 };
+        self.place_x =
+            if pos_left.max(pos_right) >= PLACE_MIN_EXTENT && covar_x.abs() >= PLACE_MIN_COVAR {
+                1.0
+            } else {
+                0.0
+            };
+        self.place_y =
+            if pos_up.max(pos_down) >= PLACE_MIN_EXTENT && covar_y.abs() >= PLACE_MIN_COVAR {
+                1.0
+            } else {
+                0.0
+            };
         self
     }
 }
@@ -259,13 +358,29 @@ pub struct Centre {
 
 pub fn dot_of(w: &Where, c: &Centre, reach: &Reach) -> (f32, f32) {
     let dyaw = w.yaw - c.yaw;
-    let px = if dyaw < 0.0 { dyaw / reach.left } else { dyaw / reach.right };
+    let px = if dyaw < 0.0 {
+        dyaw / reach.left
+    } else {
+        dyaw / reach.right
+    };
     let d = w.pitch - c.level;
-    let py = if d < 0.0 { d / reach.up } else { d / reach.down };
+    let py = if d < 0.0 {
+        d / reach.up
+    } else {
+        d / reach.down
+    };
     let ex = (w.x - c.x) * reach.sign_x;
-    let qx = if ex < 0.0 { ex / reach.pos_left } else { ex / reach.pos_right };
+    let qx = if ex < 0.0 {
+        ex / reach.pos_left
+    } else {
+        ex / reach.pos_right
+    };
     let ey = (w.y - c.y) * reach.sign_y;
-    let qy = if ey < 0.0 { ey / reach.pos_up } else { ey / reach.pos_down };
+    let qy = if ey < 0.0 {
+        ey / reach.pos_up
+    } else {
+        ey / reach.pos_down
+    };
     // Where the place counts, the two are averaged; where it does not, the
     // pose reading stands alone.
     let dx = (px + reach.place_x * qx) / (1.0 + reach.place_x);
@@ -285,7 +400,10 @@ impl Filter {
     const ALPHA: f32 = 0.4;
 
     pub fn new() -> Filter {
-        Filter { last: Vec::new(), smooth: None }
+        Filter {
+            last: Vec::new(),
+            smooth: None,
+        }
     }
 
     /// yaw, pitch, size, x, y in; the same out, cleaned.
@@ -348,7 +466,11 @@ pub fn zone_of_point(x: f32, y: f32) -> &'static str {
     if x.abs() < 0.5 && y.abs() < 0.5 {
         "centre"
     } else if x.abs() >= y.abs() {
-        if x < 0.0 { "left" } else { "right" }
+        if x < 0.0 {
+            "left"
+        } else {
+            "right"
+        }
     } else if y < 0.0 {
         "up"
     } else {
@@ -409,14 +531,64 @@ pub struct Round {
 }
 
 pub const ROUNDS: [Round; 8] = [
-    Round { kind: "nod", stored_as: "nod", times: 2, seconds: 8.0, prompt: "Look at the camera and nod twice, the way you would to say yes." },
-    Round { kind: "shake", stored_as: "shake", times: 2, seconds: 8.0, prompt: "Look at the camera and shake your head twice, the way you would to say no." },
-    Round { kind: "glance-right", stored_as: "aside", times: 2, seconds: 6.0, prompt: "Something catches your eye to the right. Look at it, then back at the screen. Twice." },
-    Round { kind: "glance-left", stored_as: "aside", times: 2, seconds: 6.0, prompt: "Something catches your eye to the left. Look at it, then back at the screen. Twice." },
-    Round { kind: "keyboard", stored_as: "glance", times: 1, seconds: 8.0, prompt: "Look down at your keyboard and back up at the screen, twice." },
-    Round { kind: "read", stored_as: "read", times: 1, seconds: 12.0, prompt: "Read the text as it appears around the screen." },
-    Round { kind: "talk", stored_as: "talk", times: 1, seconds: 8.0, prompt: "Keep facing the screen and say a sentence or two out loud, as if on a call." },
-    Round { kind: "lean", stored_as: "lean", times: 1, seconds: 8.0, prompt: "Lean in toward the screen and sit back, twice." },
+    Round {
+        kind: "nod",
+        stored_as: "nod",
+        times: 2,
+        seconds: 8.0,
+        prompt: "Look at the camera and nod twice, the way you would to say yes.",
+    },
+    Round {
+        kind: "shake",
+        stored_as: "shake",
+        times: 2,
+        seconds: 8.0,
+        prompt: "Look at the camera and shake your head twice, the way you would to say no.",
+    },
+    Round {
+        kind: "glance-right",
+        stored_as: "aside",
+        times: 2,
+        seconds: 6.0,
+        prompt:
+            "Something catches your eye to the right. Look at it, then back at the screen. Twice.",
+    },
+    Round {
+        kind: "glance-left",
+        stored_as: "aside",
+        times: 2,
+        seconds: 6.0,
+        prompt:
+            "Something catches your eye to the left. Look at it, then back at the screen. Twice.",
+    },
+    Round {
+        kind: "keyboard",
+        stored_as: "glance",
+        times: 1,
+        seconds: 8.0,
+        prompt: "Look down at your keyboard and back up at the screen, twice.",
+    },
+    Round {
+        kind: "read",
+        stored_as: "read",
+        times: 1,
+        seconds: 12.0,
+        prompt: "Read the text as it appears around the screen.",
+    },
+    Round {
+        kind: "talk",
+        stored_as: "talk",
+        times: 1,
+        seconds: 8.0,
+        prompt: "Keep facing the screen and say a sentence or two out loud, as if on a call.",
+    },
+    Round {
+        kind: "lean",
+        stored_as: "lean",
+        times: 1,
+        seconds: 8.0,
+        prompt: "Lean in toward the screen and sit back, twice.",
+    },
 ];
 
 /// The reading round's texts, one per slot; the window places the slots
@@ -578,7 +750,13 @@ fn swing(series: &[(f32, f32, f32)], pick: fn(&(f32, f32, f32)) -> f32) -> f32 {
 /// root-only gestures directory: a header, then one line per frame with
 /// the mesh's angles and the image motion, for designing the detectors.
 #[cfg(feature = "dev-tools")]
-fn save_round_trace(cfg: &crate::config::Config, user: &str, kind: &str, n: usize, lines: &[String]) {
+fn save_round_trace(
+    cfg: &crate::config::Config,
+    user: &str,
+    kind: &str,
+    n: usize,
+    lines: &[String],
+) {
     use std::io::Write as _;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let dir = cfg.store_dir.join("gestures");
@@ -586,7 +764,11 @@ fn save_round_trace(cfg: &crate::config::Config, user: &str, kind: &str, n: usiz
         std::fs::create_dir_all(&dir)?;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         let name = format!("{}-{}-v2-{}-{}.txt", now_secs(), user, kind, n);
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(dir.join(&name))?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.join(&name))?;
         writeln!(f, "v2 t yaw pitch roll pos_x pos_y w cx cy size score")?;
         for l in lines {
             writeln!(f, "{}", l)?;
@@ -606,7 +788,9 @@ pub fn run(a: &mut Authenticator, user: &str, start: &Start) -> Outcome {
         Ok(o) => o,
         Err(e) => {
             end_session(a, user, "failed", &e.to_string());
-            Outcome::Error { message: e.to_string() }
+            Outcome::Error {
+                message: e.to_string(),
+            }
         }
     }
 }
@@ -627,9 +811,15 @@ fn end_session(a: &Authenticator, user: &str, step: &'static str, message: &str)
 }
 
 fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome> {
-    let uid = nix::unistd::User::from_name(user).ok().flatten().map(|u| u.uid.as_raw()).ok_or_else(|| anyhow!("unknown user {}", user))?;
+    let uid = nix::unistd::User::from_name(user)
+        .ok()
+        .flatten()
+        .map(|u| u.uid.as_raw())
+        .ok_or_else(|| anyhow!("unknown user {}", user))?;
     if is_active() {
-        return Ok(Outcome::Error { message: "an enrolment session is already running".into() });
+        return Ok(Outcome::Error {
+            message: "an enrolment session is already running".into(),
+        });
     }
     let existing = match a.store.load(user) {
         Ok(t) => t,
@@ -641,9 +831,15 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
             None => return Err(e),
         },
     };
-    let mut u = existing.unwrap_or_else(|| UserTemplates::new(user, faceauth_engine::embed::AURAFACE_FILE));
+    let mut u =
+        existing.unwrap_or_else(|| UserTemplates::new(user, faceauth_engine::embed::AURAFACE_FILE));
     if u.model != faceauth_engine::embed::AURAFACE_FILE {
-        return Ok(Outcome::Error { message: format!("existing templates are for model {}; delete them first", u.model) });
+        return Ok(Outcome::Error {
+            message: format!(
+                "existing templates are for model {}; delete them first",
+                u.model
+            ),
+        });
     }
     if let Ok(mut act) = ACTIVE.lock() {
         *act = Some((user.to_string(), uid));
@@ -652,11 +848,17 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
         c.clear();
     }
     let payload = serde_json::json!({ "user": user, "start": start.start_at.as_deref().unwrap_or("welcome") }).to_string();
-    if let Err(e) = crate::consent::shell_call(&a.cfg, user, &["shell", "summon", "omarchy.faceauth.enrol", &payload]) {
+    if let Err(e) = crate::consent::shell_call(
+        &a.cfg,
+        user,
+        &["shell", "summon", "omarchy.faceauth.enrol", &payload],
+    ) {
         if let Ok(mut act) = ACTIVE.lock() {
             *act = None;
         }
-        return Ok(Outcome::Error { message: format!("no enrolment window: {}", e) });
+        return Ok(Outcome::Error {
+            message: format!("no enrolment window: {}", e),
+        });
     }
     let mut cap = IrCapture::open(&a.cfg)?;
     if let Some(i) = &cap.illuminator {
@@ -668,10 +870,20 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
     // The person's centre: learned in the centre step from a still, level
     // look at the screen. Until then the stored level stands in.
     if a.pipeline.mesh.is_none() {
-        return Ok(Outcome::Error { message: format!("the face mesh model ({}) is not installed; run `faceauth models fetch`", faceauth_engine::mesh::FACE_MESH_FILE) });
+        return Ok(Outcome::Error {
+            message: format!(
+                "the face mesh model ({}) is not installed; run `faceauth models fetch`",
+                faceauth_engine::mesh::FACE_MESH_FILE
+            ),
+        });
     }
     // The centre pose in degrees, learned in the centre step.
-    let mut centre = Centre { yaw: 0.0, level: 0.0, x: 0.5, y: 0.5 };
+    let mut centre = Centre {
+        yaw: 0.0,
+        level: 0.0,
+        x: 0.5,
+        y: 0.5,
+    };
     let mut centre_samples: Vec<[f32; 4]> = Vec::new();
     let mut still_since: Option<Instant> = None;
     // The person's reach, learned in the range step; the defaults until then.
@@ -701,10 +913,25 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
     let mut round_frames: Vec<crate::consent::CalFrame> = Vec::new();
     let mut added = 0usize;
     let mut filter = Filter::new();
-    let take_template = |u: &mut UserTemplates, a: &mut Authenticator, img: &faceauth_engine::Grey, face: &faceauth_engine::Face, p: &faceauth_engine::pose::Pose, zone: &str| -> Result<()> {
+    let take_template = |u: &mut UserTemplates,
+                         a: &mut Authenticator,
+                         img: &faceauth_engine::Grey,
+                         face: &faceauth_engine::Face,
+                         p: &faceauth_engine::pose::Pose,
+                         zone: &str|
+     -> Result<()> {
         let crop = faceauth_engine::align::align_112(img, &face.landmarks);
         let e = a.pipeline.embedder.embed(&crop)?;
-        u.templates.push(Template { embedding: e, quality: face.score, face_width: face.bbox[2], created: now_secs(), label: format!("{}-{}", start.label, zone), device: Some(device.clone()), yaw: Some(p.yaw), nose_pitch: Some(p.nose_pitch) });
+        u.templates.push(Template {
+            embedding: e,
+            quality: face.score,
+            face_width: face.bbox[2],
+            created: now_secs(),
+            label: format!("{}-{}", start.label, zone),
+            device: Some(device.clone()),
+            yaw: Some(p.yaw),
+            nose_pitch: Some(p.nose_pitch),
+        });
         Ok(())
     };
     loop {
@@ -737,7 +964,9 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
             },
             _ => {}
         }
-        let Some(img) = cap.next(Duration::from_secs(2))? else { continue };
+        let Some(img) = cap.next(Duration::from_secs(2))? else {
+            continue;
+        };
         let dt = last_frame.elapsed().as_secs_f32().min(0.25);
         last_frame = Instant::now();
         let short = (img.width.min(img.height)).max(1) as f32;
@@ -777,7 +1006,12 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
         // 2026-09-23, a chin-up straight at the camera reads -31 and a
         // chin-down +36 where the five-point figures barely moved. Without
         // a mesh on this frame the frame is not read.
-        let Some(m) = a.pipeline.mesh.as_mut().and_then(|mesh| mesh.for_face(&img, &face).ok().flatten()) else {
+        let Some(m) = a
+            .pipeline
+            .mesh
+            .as_mut()
+            .and_then(|mesh| mesh.for_face(&img, &face).ok().flatten())
+        else {
             tick.face = true;
             tick.message = "Hold on, reading the face.".into();
             broadcast(&tick);
@@ -786,7 +1020,12 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
         let hp = faceauth_engine::mesh::head_pose(&m);
         let sm = filter.push([hp.yaw, hp.pitch, size_raw, x_raw, y_raw]);
         let p = raw;
-        let here = Where { yaw: sm[0], pitch: sm[1], x: sm[3], y: sm[4] };
+        let here = Where {
+            yaw: sm[0],
+            pitch: sm[1],
+            x: sm[3],
+            y: sm[4],
+        };
         tick.face = true;
         tick.size = sm[2];
         tick.distance = distance_of(tick.size);
@@ -828,11 +1067,23 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
                 extents[6] = extents[6].max(-ey);
                 extents[7] = extents[7].max(ey);
                 if since.elapsed().as_secs_f32() > RANGE_SECONDS {
-                    let (sx, sy) = (if covar.0 < 0.0 { -1.0 } else { 1.0 }, if covar.1 < 0.0 { -1.0 } else { 1.0 });
+                    let (sx, sy) = (
+                        if covar.0 < 0.0 { -1.0 } else { 1.0 },
+                        if covar.1 < 0.0 { -1.0 } else { 1.0 },
+                    );
                     // With the sign applied, "left" is the side a left turn moved the face to.
-                    let (pl, pr) = if sx > 0.0 { (extents[4], extents[5]) } else { (extents[5], extents[4]) };
-                    let (pu, pd) = if sy > 0.0 { (extents[6], extents[7]) } else { (extents[7], extents[6]) };
-                    reach = Reach::from_extents(extents[0], extents[1], extents[2], extents[3]).with_place(pl, pr, pu, pd, covar.0, covar.1);
+                    let (pl, pr) = if sx > 0.0 {
+                        (extents[4], extents[5])
+                    } else {
+                        (extents[5], extents[4])
+                    };
+                    let (pu, pd) = if sy > 0.0 {
+                        (extents[6], extents[7])
+                    } else {
+                        (extents[7], extents[6])
+                    };
+                    reach = Reach::from_extents(extents[0], extents[1], extents[2], extents[3])
+                        .with_place(pl, pr, pu, pd, covar.0, covar.1);
                     log::info!("enrolment for {}: reach learned, turn left {:.0} right {:.0} chin up {:.0} down {:.0} deg, place left {:.3} right {:.3} up {:.3} down {:.3} (axes {:+.0} {:+.0}, covar {:+.1} {:+.1}, place counts x {} y {}); ring at turn {:.0}/{:.0} chin {:.0}/{:.0} deg", user, extents[0], extents[1], extents[2], extents[3], pl, pr, pu, pd, sx, sy, covar.0, covar.1, reach.place_x, reach.place_y, reach.left, reach.right, reach.up, reach.down);
                     step = Step::Path;
                     path_s = 0.0;
@@ -845,7 +1096,15 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
                 tick.message = message_for(step, tick.distance);
                 tick.on_target = true;
                 if cap.frames % 5 == 0 {
-                    let name = format!("{:06.2}_yaw{:+.3}_pitch{:.3}_dot{:+.2}_{:+.2}_size{:.3}.pgm", t0.elapsed().as_secs_f32(), raw.yaw, raw.nose_pitch, dx, dy, tick.size);
+                    let name = format!(
+                        "{:06.2}_yaw{:+.3}_pitch{:.3}_dot{:+.2}_{:+.2}_size{:.3}.pgm",
+                        t0.elapsed().as_secs_f32(),
+                        raw.yaw,
+                        raw.nose_pitch,
+                        dx,
+                        dy,
+                        tick.size
+                    );
                     if let Err(e) = save_pgm(std::path::Path::new(RECORD_DIR), &name, &img) {
                         log::warn!("recording: cannot save a frame: {}", e);
                     }
@@ -853,7 +1112,13 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
                 if t0.elapsed().as_secs_f32() > RECORD_SECONDS {
                     cap.stop()?;
                     end_session(a, user, "done", "Recorded. Nothing was stored.");
-                    return Ok(Outcome::Enrolled { added: 0, total: u.templates.len(), consistency_min: 1.0, consistency_mean: 1.0, path: String::new() });
+                    return Ok(Outcome::Enrolled {
+                        added: 0,
+                        total: u.templates.len(),
+                        consistency_min: 1.0,
+                        consistency_mean: 1.0,
+                        path: String::new(),
+                    });
                 }
             }
             Step::Welcome => {
@@ -871,8 +1136,17 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
                     let since = *still_since.get_or_insert(Instant::now());
                     let n = centre_samples.len() as f32;
                     let mean = |i: usize| centre_samples.iter().map(|s| s[i]).sum::<f32>() / n;
-                    let running = Centre { yaw: mean(0), level: mean(1), x: mean(2), y: mean(3) };
-                    let spread = centre_samples.iter().map(|s| (s[0] - running.yaw).abs().max((s[1] - running.level).abs())).fold(0.0, f32::max) / 60.0;
+                    let running = Centre {
+                        yaw: mean(0),
+                        level: mean(1),
+                        x: mean(2),
+                        y: mean(3),
+                    };
+                    let spread = centre_samples
+                        .iter()
+                        .map(|s| (s[0] - running.yaw).abs().max((s[1] - running.level).abs()))
+                        .fold(0.0, f32::max)
+                        / 60.0;
                     // The dot is drawn against the running centre so it settles
                     // into the circle as the person does.
                     let (cx, cy) = dot_of(&here, &running, &reach);
@@ -881,7 +1155,10 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
                     tick.centre_yaw = running.yaw;
                     tick.level = running.level;
                     tick.on_target = true;
-                    if since.elapsed() > Duration::from_millis(3000) && centre_samples.len() >= 40 && spread < 0.06 {
+                    if since.elapsed() > Duration::from_millis(3000)
+                        && centre_samples.len() >= 40
+                        && spread < 0.06
+                    {
                         centre = running;
                         log::info!("enrolment for {}: centre learned, yaw {:+.1} pitch {:+.1} deg, place ({:.3}, {:.3})", user, centre.yaw, centre.level, centre.x, centre.y);
                         step = Step::Range;
@@ -905,7 +1182,11 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
                 if tick.on_target {
                     // The target moves only while the dot is with it.
                     path_s += dt / PATH_SECONDS;
-                    let moved = last_taken_pose.map(|(ly, lp)| (here.yaw - ly).abs() >= 5.0 || (here.pitch - lp).abs() >= 4.0).unwrap_or(true);
+                    let moved = last_taken_pose
+                        .map(|(ly, lp)| {
+                            (here.yaw - ly).abs() >= 5.0 || (here.pitch - lp).abs() >= 4.0
+                        })
+                        .unwrap_or(true);
                     if path_taken < PATH_MAX && moved && last_sample.elapsed() >= SAMPLE_SPACING {
                         take_template(&mut u, a, &img, &face, &p, zone_of_point(tx, ty))?;
                         path_taken += 1;
@@ -931,7 +1212,9 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
                 tick.message = message_for(step, tick.distance);
                 if tick.on_target {
                     let since = *on_since.get_or_insert(Instant::now());
-                    if since.elapsed() > Duration::from_millis(400) && last_sample.elapsed() >= SAMPLE_SPACING {
+                    if since.elapsed() > Duration::from_millis(400)
+                        && last_sample.elapsed() >= SAMPLE_SPACING
+                    {
                         take_template(&mut u, a, &img, &face, &p, zone)?;
                         taken += 1;
                         added += 1;
@@ -974,14 +1257,32 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
                         let (lo, mean, _) = u.self_consistency().unwrap_or((1.0, 1.0, 1.0));
                         // The file the templates rest in: the sealed blob when the
                         // store seals, else the plaintext.
-                        let path = if a.store.is_sealed(user) { a.store.sealed_path_for(user) } else { a.store.path_for(user) }.map(|p| p.display().to_string()).unwrap_or_default();
+                        let path = if a.store.is_sealed(user) {
+                            a.store.sealed_path_for(user)
+                        } else {
+                            a.store.path_for(user)
+                        }
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
                         end_session(a, user, "done", "Recognised. Enrolment complete.");
-                        return Ok(Outcome::Enrolled { added, total: u.templates.len(), consistency_min: lo, consistency_mean: mean, path });
+                        return Ok(Outcome::Enrolled {
+                            added,
+                            total: u.templates.len(),
+                            consistency_min: lo,
+                            consistency_mean: mean,
+                            path,
+                        });
                     }
                     step = Step::Bridge;
                 }
-                if verify_since.map(|s| s.elapsed() > Duration::from_secs(20)).unwrap_or(false) {
-                    return Err(anyhow!("the new templates did not recognise you within 20 s ({} added)", added));
+                if verify_since
+                    .map(|s| s.elapsed() > Duration::from_secs(20))
+                    .unwrap_or(false)
+                {
+                    return Err(anyhow!(
+                        "the new templates did not recognise you within 20 s ({} added)",
+                        added
+                    ));
                 }
             }
             Step::Bridge => {
@@ -989,7 +1290,9 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
                 tick.on_target = true;
             }
             Step::Round(i) => {
-                let Some((r, n)) = round_at(i) else { return Err(anyhow!("no round {}", i)) };
+                let Some((r, n)) = round_at(i) else {
+                    return Err(anyhow!("no round {}", i));
+                };
                 tick.round = Some(r.kind);
                 tick.round_no = i + 1;
                 tick.round_of = round_count();
@@ -1014,20 +1317,33 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
                     tick.seconds_left = (r.seconds - t).max(0.0);
                     tick.message = r.prompt.to_string();
                     if r.kind == "read" {
-                        tick.read_slot = Some(((t / READ_SLOT_SECONDS) as usize) % READ_TEXTS.len());
+                        tick.read_slot =
+                            Some(((t / READ_SLOT_SECONDS) as usize) % READ_TEXTS.len());
                     }
                     // Image motion of the face, as the gesture detectors read it.
                     if let Some((pimg, pbox)) = &round_prev {
-                        let region = faceauth_engine::motion::Region::around(*pbox, 0.2, img.width, img.height);
+                        let region = faceauth_engine::motion::Region::around(
+                            *pbox, 0.2, img.width, img.height,
+                        );
                         let (mdx, mdy) = faceauth_engine::motion::shift(pimg, &img, region, 24);
                         round_px += mdx / face.bbox[2].max(1.0);
                         round_py += mdy / face.bbox[2].max(1.0);
                     }
                     round_prev = Some((img.clone(), face.bbox));
-                    let geom = (face.bbox[2], face.bbox[0] + face.bbox[2] / 2.0, face.bbox[1] + face.bbox[3] / 2.0);
+                    let geom = (
+                        face.bbox[2],
+                        face.bbox[0] + face.bbox[2] / 2.0,
+                        face.bbox[1] + face.bbox[3] / 2.0,
+                    );
                     round_series.push((t, round_px, round_py));
                     round_angles.push((t, hp.yaw, hp.pitch));
-                    round_frames.push(crate::consent::CalFrame { t, pos_x: round_px, pos_y: round_py, yaw: p.yaw, geom });
+                    round_frames.push(crate::consent::CalFrame {
+                        t,
+                        pos_x: round_px,
+                        pos_y: round_py,
+                        yaw: p.yaw,
+                        geom,
+                    });
                     if round_lines.len() < 1500 {
                         round_lines.push(format!("{:.2} {:+.1} {:+.1} {:+.1} {:+.3} {:+.3} {:.0} {:.0} {:.0} {:.3} {:.2}", t, hp.yaw, hp.pitch, hp.roll, round_px, round_py, geom.0, geom.1, geom.2, tick.size, m.score));
                     }
@@ -1041,25 +1357,51 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
                         let (amplitude, stored) = match r.stored_as {
                             "nod" => {
                                 let ok = dy >= crate::consent::NodDetector::MIN_DOWN;
-                                if ok { u.gesture.nod.push(dy) }
-                                if dpitch >= crate::consent::NodDetector::MESH_MIN_DEG { u.gesture.nod_deg.push(dpitch) }
+                                if ok {
+                                    u.gesture.nod.push(dy)
+                                }
+                                if dpitch >= crate::consent::NodDetector::MESH_MIN_DEG {
+                                    u.gesture.nod_deg.push(dpitch)
+                                }
                                 (dy, ok)
                             }
                             "shake" => {
                                 let ok = dx >= crate::consent::ShakeDetector::MIN_TURN;
-                                if ok { u.gesture.shake.push(dx) }
-                                if dyaw >= crate::consent::ShakeDetector::MESH_MIN_DEG { u.gesture.shake_deg.push(dyaw) }
+                                if ok {
+                                    u.gesture.shake.push(dx)
+                                }
+                                if dyaw >= crate::consent::ShakeDetector::MESH_MIN_DEG {
+                                    u.gesture.shake_deg.push(dyaw)
+                                }
                                 (dx, ok)
                             }
                             kind => {
-                                u.gesture.everyday.push(crate::store::EverydayRound { kind: kind.to_string(), dy, dx });
-                                u.gesture.everyday_deg.push(crate::store::EverydayDeg { kind: kind.to_string(), dyaw, dpitch });
+                                u.gesture.everyday.push(crate::store::EverydayRound {
+                                    kind: kind.to_string(),
+                                    dy,
+                                    dx,
+                                });
+                                u.gesture.everyday_deg.push(crate::store::EverydayDeg {
+                                    kind: kind.to_string(),
+                                    dyaw,
+                                    dpitch,
+                                });
                                 u.gesture.still_nod.clear();
                                 u.gesture.still_shake.clear();
                                 (dy.max(dx), true)
                             }
                         };
-                        a.cal_rounds.entry(user.to_string()).or_default().push(crate::auth::CalRound { kind: r.stored_as.to_string(), frames: std::mem::take(&mut round_frames), sample: if stored && matches!(r.stored_as, "nod" | "shake") { Some(amplitude) } else { None } });
+                        a.cal_rounds.entry(user.to_string()).or_default().push(
+                            crate::auth::CalRound {
+                                kind: r.stored_as.to_string(),
+                                frames: std::mem::take(&mut round_frames),
+                                sample: if stored && matches!(r.stored_as, "nod" | "shake") {
+                                    Some(amplitude)
+                                } else {
+                                    None
+                                },
+                            },
+                        );
                         log::info!("round {} of {} for {}: {} {} moved {:.3} vertically, {:.3} sideways ({:.0} deg pitch, {:.0} deg yaw){}", i + 1, round_count(), user, r.kind, n, dy, dx, dpitch, dyaw, if stored { "" } else { " (too small to count; not stored)" });
                         #[cfg(feature = "dev-tools")]
                         save_round_trace(&a.cfg, user, r.kind, n, &round_lines);
@@ -1069,13 +1411,31 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
                             Some(s) if step != last => step = s,
                             _ => {
                                 cap.stop()?;
-                                let (nf, sf) = u.gesture.floors(crate::consent::NodDetector::MIN_DOWN, crate::consent::ShakeDetector::MIN_TURN);
-                                let (nd, sd) = u.gesture.floors_deg(crate::consent::NodDetector::MESH_MIN_DEG, crate::consent::ShakeDetector::MESH_MIN_DEG);
+                                let (nf, sf) = u.gesture.floors(
+                                    crate::consent::NodDetector::MIN_DOWN,
+                                    crate::consent::ShakeDetector::MIN_TURN,
+                                );
+                                let (nd, sd) = u.gesture.floors_deg(
+                                    crate::consent::NodDetector::MESH_MIN_DEG,
+                                    crate::consent::ShakeDetector::MESH_MIN_DEG,
+                                );
                                 log::info!("rounds done for {}: floors nod {:.3} shake {:.3} (mesh: nod {:.0} deg, shake {:.0} deg)", user, nf, sf, nd, sd);
                                 let (lo, mean, _) = u.self_consistency().unwrap_or((1.0, 1.0, 1.0));
-                                let path = if a.store.is_sealed(user) { a.store.sealed_path_for(user) } else { a.store.path_for(user) }.map(|p| p.display().to_string()).unwrap_or_default();
+                                let path = if a.store.is_sealed(user) {
+                                    a.store.sealed_path_for(user)
+                                } else {
+                                    a.store.path_for(user)
+                                }
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default();
                                 end_session(a, user, "done", "All done. Your nods, shakes and everyday movements are recorded.");
-                                return Ok(Outcome::Enrolled { added, total: u.templates.len(), consistency_min: lo, consistency_mean: mean, path });
+                                return Ok(Outcome::Enrolled {
+                                    added,
+                                    total: u.templates.len(),
+                                    consistency_min: lo,
+                                    consistency_mean: mean,
+                                    path,
+                                });
                             }
                         }
                     }
@@ -1096,9 +1456,28 @@ mod tests {
         let mut names = vec![s.name().to_string()];
         while let Some(n) = s.next() {
             s = n;
-            names.push(format!("{}{}", s.name(), s.zone().map(|z| format!(":{}", z)).unwrap_or_default()));
+            names.push(format!(
+                "{}{}",
+                s.name(),
+                s.zone().map(|z| format!(":{}", z)).unwrap_or_default()
+            ));
         }
-        assert_eq!(&names[..11], &["welcome", "centre", "range", "path", "hold:centre", "hold:left", "hold:right", "hold:centre", "hold:up", "hold:down", "verify"]);
+        assert_eq!(
+            &names[..11],
+            &[
+                "welcome",
+                "centre",
+                "range",
+                "path",
+                "hold:centre",
+                "hold:left",
+                "hold:right",
+                "hold:centre",
+                "hold:up",
+                "hold:down",
+                "verify"
+            ]
+        );
         assert_eq!(names[11], "bridge");
         assert_eq!(names.len(), 12 + round_count(), "then every round");
         assert_eq!(round_count(), 12);
@@ -1107,17 +1486,41 @@ mod tests {
         assert_eq!(round_at(2).map(|(r, n)| (r.kind, n)), Some(("shake", 1)));
         assert_eq!(round_at(11).map(|(r, n)| (r.kind, n)), Some(("lean", 1)));
         assert!(round_at(12).is_none());
-        assert_eq!(last_step(Some("distance")), Step::Verify, "Add Look ends after verify");
-        assert_eq!(last_step(None), Step::Round(11), "a first enrolment runs every round");
-        assert_eq!(Step::from_start(Some("bridge")), Step::Bridge, "Tune Gestures starts at the bridge");
-        assert_eq!(Step::from_start(Some("distance")), Step::Centre, "Add Look starts at the centre screen");
+        assert_eq!(
+            last_step(Some("distance")),
+            Step::Verify,
+            "Add Look ends after verify"
+        );
+        assert_eq!(
+            last_step(None),
+            Step::Round(11),
+            "a first enrolment runs every round"
+        );
+        assert_eq!(
+            Step::from_start(Some("bridge")),
+            Step::Bridge,
+            "Tune Gestures starts at the bridge"
+        );
+        assert_eq!(
+            Step::from_start(Some("distance")),
+            Step::Centre,
+            "Add Look starts at the centre screen"
+        );
         #[cfg(feature = "dev-tools")]
         {
             assert_eq!(Step::from_start(Some("record")), Step::Record);
-            assert_eq!(Step::Record.next(), None, "a recording stores nothing and leads nowhere");
+            assert_eq!(
+                Step::Record.next(),
+                None,
+                "a recording stores nothing and leads nowhere"
+            );
         }
         #[cfg(not(feature = "dev-tools"))]
-        assert_eq!(Step::from_start(Some("record")), Step::Welcome, "without dev-tools there is no record mode");
+        assert_eq!(
+            Step::from_start(Some("record")),
+            Step::Welcome,
+            "without dev-tools there is no record mode"
+        );
     }
 
     #[test]
@@ -1133,10 +1536,14 @@ mod tests {
     /// top, and comes back; every point on the ring names a look.
     #[test]
     fn the_path_goes_out_round_and_back() {
-        let near = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < 0.02 && (a.1 - b.1).abs() < 0.02;
+        let near =
+            |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < 0.02 && (a.1 - b.1).abs() < 0.02;
         assert!(near(path_point(0.0), (0.0, 0.0)));
         assert!(near(path_point(0.15), (-1.0, 0.0)));
-        assert!(near(path_point(0.15 + 0.70 * 0.25), (0.0, -TOP)), "a quarter of the way round is the top, flattened");
+        assert!(
+            near(path_point(0.15 + 0.70 * 0.25), (0.0, -TOP)),
+            "a quarter of the way round is the top, flattened"
+        );
         assert!(near(path_point(0.15 + 0.70 * 0.5), (1.0, 0.0)));
         assert!(near(path_point(0.15 + 0.70 * 0.75), (0.0, 1.0)));
         assert!(near(path_point(0.85), (-1.0, 0.0)));
@@ -1151,29 +1558,88 @@ mod tests {
     /// where the readings say a look begins.
     #[test]
     fn the_dot_is_relative_to_the_persons_centre_and_reach() {
-        let r = Reach { left: 25.0, right: 20.0, up: 15.0, down: 25.0, pos_left: 0.05, pos_right: 0.05, pos_up: 0.04, pos_down: 0.04, sign_x: 1.0, sign_y: 1.0, place_x: 1.0, place_y: 1.0 };
-        let c = Centre { yaw: 2.0, level: -5.0, x: 0.5, y: 0.5 };
+        let r = Reach {
+            left: 25.0,
+            right: 20.0,
+            up: 15.0,
+            down: 25.0,
+            pos_left: 0.05,
+            pos_right: 0.05,
+            pos_up: 0.04,
+            pos_down: 0.04,
+            sign_x: 1.0,
+            sign_y: 1.0,
+            place_x: 1.0,
+            place_y: 1.0,
+        };
+        let c = Centre {
+            yaw: 2.0,
+            level: -5.0,
+            x: 0.5,
+            y: 0.5,
+        };
         let at = |yaw: f32, pitch: f32, x: f32, y: f32| dot_of(&Where { yaw, pitch, x, y }, &c, &r);
         assert_eq!(at(2.0, -5.0, 0.5, 0.5), (0.0, 0.0));
         // A genuine turn moves both the pose reading and the face's place, and reaches the ring.
         let (x, _) = at(2.0 - 25.0, -5.0, 0.5 - 0.05, 0.5);
-        assert!((x + 1.0).abs() < 0.001, "a left turn of the reach puts the dot on the ring: {}", x);
+        assert!(
+            (x + 1.0).abs() < 0.001,
+            "a left turn of the reach puts the dot on the ring: {}",
+            x
+        );
         let (x, _) = at(2.0 + 20.0, -5.0, 0.5 + 0.05, 0.5);
-        assert!((x - 1.0).abs() < 0.001, "and the right reach, which may differ");
+        assert!(
+            (x - 1.0).abs() < 0.001,
+            "and the right reach, which may differ"
+        );
         let (_, y) = at(2.0, -5.0 - 15.0, 0.5, 0.5 - 0.04);
-        assert!((y + 1.0).abs() < 0.001, "a chin-up of the up reach puts the dot on the top of the ring: {}", y);
+        assert!(
+            (y + 1.0).abs() < 0.001,
+            "a chin-up of the up reach puts the dot on the top of the ring: {}",
+            y
+        );
         // A shift in the chair alone gets half way, not onto the ring.
         let (x, _) = at(2.0, -5.0, 0.5 - 0.05, 0.5);
         assert!((x + 0.5).abs() < 0.001, "{}", x);
-        assert_eq!(at(500.0, 500.0, 5.0, 5.0), (1.6, 1.6), "the dot never leaves the screen");
+        assert_eq!(
+            at(500.0, 500.0, 5.0, 5.0),
+            (1.6, 1.6),
+            "the dot never leaves the screen"
+        );
         // A camera whose axes run the other way is handled by the learned signs.
         let flipped = Reach { sign_x: -1.0, ..r };
-        let (x, _) = dot_of(&Where { yaw: 2.0 - 25.0, pitch: -5.0, x: 0.5 + 0.05, y: 0.5 }, &c, &flipped);
+        let (x, _) = dot_of(
+            &Where {
+                yaw: 2.0 - 25.0,
+                pitch: -5.0,
+                x: 0.5 + 0.05,
+                y: 0.5,
+            },
+            &c,
+            &flipped,
+        );
         assert!((x + 1.0).abs() < 0.001, "{}", x);
         // Where the range step saw no place movement, the pose stands alone.
-        let pose_only = Reach { place_x: 0.0, place_y: 0.0, ..r };
-        let (_, y) = dot_of(&Where { yaw: 2.0, pitch: -5.0 - 15.0, x: 0.5, y: 0.5 + 0.2 }, &c, &pose_only);
-        assert!((y + 1.0).abs() < 0.001, "a place that does not count cannot fight the reading: {}", y);
+        let pose_only = Reach {
+            place_x: 0.0,
+            place_y: 0.0,
+            ..r
+        };
+        let (_, y) = dot_of(
+            &Where {
+                yaw: 2.0,
+                pitch: -5.0 - 15.0,
+                x: 0.5,
+                y: 0.5 + 0.2,
+            },
+            &c,
+            &pose_only,
+        );
+        assert!(
+            (y + 1.0).abs() < 0.001,
+            "a place that does not count cannot fight the reading: {}",
+            y
+        );
     }
 
     /// The ring is set at seventy percent of what the person reached, and
@@ -1185,13 +1651,33 @@ mod tests {
         assert!((r.left - 31.5).abs() < 0.001 && (r.right - 31.5).abs() < 0.001);
         assert!((r.up - 30.1).abs() < 0.001 && (r.down - 31.5).abs() < 0.001);
         let small = Reach::from_extents(2.0, 2.0, 0.0, 1.0);
-        assert_eq!((small.left, small.right, small.up, small.down), (REACH_FLOOR.left, REACH_FLOOR.right, REACH_FLOOR.up, REACH_FLOOR.down), "a person who barely moved still gets a usable ring");
+        assert_eq!(
+            (small.left, small.right, small.up, small.down),
+            (
+                REACH_FLOOR.left,
+                REACH_FLOOR.right,
+                REACH_FLOOR.up,
+                REACH_FLOOR.down
+            ),
+            "a person who barely moved still gets a usable ring"
+        );
         let placed = small.with_place(0.01, 0.2, 0.0, 0.1, -30.0, 5.0);
-        assert_eq!((placed.pos_left, placed.pos_up, placed.sign_x, placed.sign_y), (REACH_FLOOR.pos_left, REACH_FLOOR.pos_up, -1.0, 1.0));
+        assert_eq!(
+            (placed.pos_left, placed.pos_up, placed.sign_x, placed.sign_y),
+            (REACH_FLOOR.pos_left, REACH_FLOOR.pos_up, -1.0, 1.0)
+        );
         assert!((placed.pos_right - 0.14).abs() < 0.001 && (placed.pos_down - 0.07).abs() < 0.001);
-        assert_eq!((placed.place_x, placed.place_y), (1.0, 1.0), "both axes moved plainly");
+        assert_eq!(
+            (placed.place_x, placed.place_y),
+            (1.0, 1.0),
+            "both axes moved plainly"
+        );
         let unmoved = small.with_place(0.043, 0.042, 0.003, 0.032, 50.0, -0.4);
-        assert_eq!((unmoved.place_x, unmoved.place_y), (1.0, 0.0), "sideways counted, vertical did not: it moved 0.03 but with no plain direction");
+        assert_eq!(
+            (unmoved.place_x, unmoved.place_y),
+            (1.0, 0.0),
+            "sideways counted, vertical did not: it moved 0.03 but with no plain direction"
+        );
     }
 
     /// Along the target's axis the dot must be close; across it, where a
@@ -1203,7 +1689,10 @@ mod tests {
         // Left target: x must be near -1; y may drift by more than a third.
         assert!(on_target((-1.0, 0.5), (-1.0, 0.0)));
         assert!(on_target((-0.75, -0.6), (-1.0, 0.0)));
-        assert!(!on_target((-0.5, 0.0), (-1.0, 0.0)), "too far back toward the centre");
+        assert!(
+            !on_target((-0.5, 0.0), (-1.0, 0.0)),
+            "too far back toward the centre"
+        );
         assert!(!on_target((-1.0, 0.8), (-1.0, 0.0)), "too far across");
         // Top target: y must be near -1.
         assert!(on_target((0.5, -1.0), (0.0, -1.0)) && !on_target((0.0, -0.5), (0.0, -1.0)));
@@ -1216,14 +1705,22 @@ mod tests {
         f.push([0.0, 0.0, 0.18, 0.5, 0.5]);
         f.push([0.0, 0.0, 0.18, 0.5, 0.5]);
         let y = f.push([12.0, 0.0, 0.18, 0.5, 0.5])[0];
-        assert!(y.abs() < 0.001, "a single jump of 12 degrees is flicker: {}", y);
+        assert!(
+            y.abs() < 0.001,
+            "a single jump of 12 degrees is flicker: {}",
+            y
+        );
         let y = f.push([0.0, 0.0, 0.18, 0.5, 0.5])[0];
         assert!(y.abs() < 0.001);
         let mut y = 0.0;
         for _ in 0..8 {
             y = f.push([30.0, 0.0, 0.18, 0.5, 0.5])[0];
         }
-        assert!(y > 28.0, "a held turn comes through within a few frames: {}", y);
+        assert!(
+            y > 28.0,
+            "a held turn comes through within a few frames: {}",
+            y
+        );
     }
 
     #[test]
@@ -1237,12 +1734,20 @@ mod tests {
         broadcast(&Tick::blank("welcome", "hi"));
         use std::io::Read as _;
         let mut buf = [0u8; 512];
-        b.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        b.set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
         let n = (&b).read(&mut buf).unwrap();
         let line = String::from_utf8_lossy(&buf[..n]);
-        assert!(line.contains("\"step\":\"welcome\"") && line.ends_with('\n'), "{}", line);
+        assert!(
+            line.contains("\"step\":\"welcome\"") && line.ends_with('\n'),
+            "{}",
+            line
+        );
         drop(b);
         broadcast(&Tick::blank("welcome", "bye"));
-        assert!(WATCHERS.lock().unwrap().is_empty(), "a hung-up watcher is dropped");
+        assert!(
+            WATCHERS.lock().unwrap().is_empty(),
+            "a hung-up watcher is dropped"
+        );
     }
 }

@@ -5,13 +5,24 @@ use crate::image::Grey;
 
 /// The ArcFace reference landmarks for a 112x112 crop:
 /// right eye, left eye, nose, right mouth corner, left mouth corner.
-pub const ARCFACE_112: [[f32; 2]; 5] = [[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366], [41.5493, 92.3655], [70.7299, 92.2041]];
+pub const ARCFACE_112: [[f32; 2]; 5] = [
+    [38.2946, 51.6963],
+    [73.5318, 51.5014],
+    [56.0252, 71.7366],
+    [41.5493, 92.3655],
+    [70.7299, 92.2041],
+];
 
 /// Least-squares similarity (scale, rotation, translation) mapping `src` onto `dst`.
 /// Returns the 2x3 matrix `[a -b tx; b a ty]`.
 pub fn similarity(src: &[[f32; 2]; 5], dst: &[[f32; 2]; 5]) -> [[f32; 3]; 2] {
     let n = 5.0f32;
-    let mean = |p: &[[f32; 2]; 5]| [p.iter().map(|q| q[0]).sum::<f32>() / n, p.iter().map(|q| q[1]).sum::<f32>() / n];
+    let mean = |p: &[[f32; 2]; 5]| {
+        [
+            p.iter().map(|q| q[0]).sum::<f32>() / n,
+            p.iter().map(|q| q[1]).sum::<f32>() / n,
+        ]
+    };
     let ms = mean(src);
     let md = mean(dst);
     // For a similarity with rotation matrix [a -b; b a]:
@@ -24,7 +35,11 @@ pub fn similarity(src: &[[f32; 2]; 5], dst: &[[f32; 2]; 5]) -> [[f32; 3]; 2] {
         num_b += sx * dy - sy * dx;
         den += sx * sx + sy * sy;
     }
-    let (a, b) = if den > 0.0 { (num_a / den, num_b / den) } else { (1.0, 0.0) };
+    let (a, b) = if den > 0.0 {
+        (num_a / den, num_b / den)
+    } else {
+        (1.0, 0.0)
+    };
     let tx = md[0] - (a * ms[0] - b * ms[1]);
     let ty = md[1] - (b * ms[0] + a * ms[1]);
     [[a, -b, tx], [b, a, ty]]
@@ -38,7 +53,10 @@ pub fn invert(m: &[[f32; 3]; 2]) -> [[f32; 3]; 2] {
     let b = -m[0][1] / d;
     let c = -m[1][0] / d;
     let e = m[0][0] / d;
-    [[a, b, -(a * m[0][2] + b * m[1][2])], [c, e, -(c * m[0][2] + e * m[1][2])]]
+    [
+        [a, b, -(a * m[0][2] + b * m[1][2])],
+        [c, e, -(c * m[0][2] + e * m[1][2])],
+    ]
 }
 
 /// The 112x112 aligned crop for a detection's five landmarks, photometrically
@@ -111,7 +129,13 @@ mod tests {
         for (p, q) in src.iter().zip(&ARCFACE_112) {
             let x = m[0][0] * p[0] + m[0][1] * p[1] + m[0][2];
             let y = m[1][0] * p[0] + m[1][1] * p[1] + m[1][2];
-            assert!((x - q[0]).abs() < 1e-2 && (y - q[1]).abs() < 1e-2, "{:?} -> {:?} vs {:?}", p, (x, y), q);
+            assert!(
+                (x - q[0]).abs() < 1e-2 && (y - q[1]).abs() < 1e-2,
+                "{:?} -> {:?} vs {:?}",
+                p,
+                (x, y),
+                q
+            );
         }
         let inv = invert(&m);
         let x = inv[0][0] * ARCFACE_112[2][0] + inv[0][1] * ARCFACE_112[2][1] + inv[0][2];

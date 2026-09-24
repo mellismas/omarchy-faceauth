@@ -32,8 +32,16 @@ pub struct IrCapture {
 /// is the node's device, the USB device its parent.
 fn usb_ids(video: &Path) -> Option<(String, String)> {
     let node = video.file_name()?.to_str()?;
-    let dev = std::path::Path::new("/sys/class/video4linux").join(node).join("device").join("..");
-    let read = |n: &str| std::fs::read_to_string(dev.join(n)).ok().map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty());
+    let dev = std::path::Path::new("/sys/class/video4linux")
+        .join(node)
+        .join("device")
+        .join("..");
+    let read = |n: &str| {
+        std::fs::read_to_string(dev.join(n))
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+    };
     Some((read("idVendor")?, read("idProduct")?))
 }
 
@@ -47,35 +55,70 @@ impl IrCapture {
     /// As `open`, starting from a remembered exposure instead of the default,
     /// so a short look needs no settling time.
     pub fn open_at(cfg: &Config, seed: Option<Exposure>) -> Result<Self> {
-        let (video, subdev, width, height, pixelformat, identity) = match (&cfg.ir_video, &cfg.ir_subdev) {
-            (Some(v), Some(s)) => {
-                // Explicit UVC-style node: take the node's current format.
-                let vd = faceauth_camera::v4l2::VideoDevice::open(v)?;
-                let fmts = vd.formats()?;
-                let pf = fmts.iter().map(|(f, _)| *f).find(|f| faceauth_camera::Decoder::for_pixelformat(*f).is_some()).ok_or_else(|| anyhow!("{}: no decodable format", v.display()))?;
-                let (driver, card, bus) = vd.driver_and_card().unwrap_or_default();
-                // The card string is the device's own claim about itself
-                // (any USB device can present any name), so it is logged
-                // and never part of the identity templates bind to. The
-                // identity is the physical bus path plus the vendor and
-                // product ids from sysfs; a device on the enrolled port that
-                // says it is the enrolled model still cannot prove it, which
-                // the README's "Not defended" list says.
-                let ids = usb_ids(v).map(|(vid, pid)| format!("{}:{}", vid, pid)).unwrap_or_else(|| "no-usb-ids".into());
-                let identity = format!("uvc:{}:{}:{}", driver, bus, ids);
-                log::info!("IR camera {}: driver {} card {:?} bus {} ids {} (identity {})", v.display(), driver, card, bus, ids, identity);
-                (v.clone(), s.clone(), 640, 480, pf, identity)
-            }
-            _ => {
-                let g = faceauth_camera::ipu3::probe()?.ok_or_else(|| anyhow!("no IPU3 camera graph and no ir_video configured"))?;
-                let ir = g.ir_sensor().ok_or_else(|| anyhow!("no front IR sensor on the IPU3 graph"))?;
-                let (w, h) = g.configure(ir, None)?;
-                (ir.video.clone(), ir.subdev.clone(), w, h, ir.pixelformat, format!("ipu3:{}", ir.name))
-            }
+        let (video, subdev, width, height, pixelformat, identity) =
+            match (&cfg.ir_video, &cfg.ir_subdev) {
+                (Some(v), Some(s)) => {
+                    // Explicit UVC-style node: take the node's current format.
+                    let vd = faceauth_camera::v4l2::VideoDevice::open(v)?;
+                    let fmts = vd.formats()?;
+                    let pf = fmts
+                        .iter()
+                        .map(|(f, _)| *f)
+                        .find(|f| faceauth_camera::Decoder::for_pixelformat(*f).is_some())
+                        .ok_or_else(|| anyhow!("{}: no decodable format", v.display()))?;
+                    let (driver, card, bus) = vd.driver_and_card().unwrap_or_default();
+                    // The card string is the device's own claim about itself
+                    // (any USB device can present any name), so it is logged
+                    // and never part of the identity templates bind to. The
+                    // identity is the physical bus path plus the vendor and
+                    // product ids from sysfs; a device on the enrolled port that
+                    // says it is the enrolled model still cannot prove it, which
+                    // the README's "Not defended" list says.
+                    let ids = usb_ids(v)
+                        .map(|(vid, pid)| format!("{}:{}", vid, pid))
+                        .unwrap_or_else(|| "no-usb-ids".into());
+                    let identity = format!("uvc:{}:{}:{}", driver, bus, ids);
+                    log::info!(
+                        "IR camera {}: driver {} card {:?} bus {} ids {} (identity {})",
+                        v.display(),
+                        driver,
+                        card,
+                        bus,
+                        ids,
+                        identity
+                    );
+                    (v.clone(), s.clone(), 640, 480, pf, identity)
+                }
+                _ => {
+                    let g = faceauth_camera::ipu3::probe()?.ok_or_else(|| {
+                        anyhow!("no IPU3 camera graph and no ir_video configured")
+                    })?;
+                    let ir = g
+                        .ir_sensor()
+                        .ok_or_else(|| anyhow!("no front IR sensor on the IPU3 graph"))?;
+                    let (w, h) = g.configure(ir, None)?;
+                    (
+                        ir.video.clone(),
+                        ir.subdev.clone(),
+                        w,
+                        h,
+                        ir.pixelformat,
+                        format!("ipu3:{}", ir.name),
+                    )
+                }
+            };
+        let mut cam = Camera::open(&video, &subdev, width, height, pixelformat, 6)
+            .context("open IR camera")?;
+        let illuminator = if cfg.liveness {
+            Illuminator::open(&subdev)?
+        } else {
+            None
         };
-        let mut cam = Camera::open(&video, &subdev, width, height, pixelformat, 6).context("open IR camera")?;
-        let illuminator = if cfg.liveness { Illuminator::open(&subdev)? } else { None };
-        let start = seed.unwrap_or(Exposure { exposure: 500.min(cam.limits.exposure.1), gain: cam.limits.gain.map(|g| g.0).unwrap_or(0), dgain: 1.0 });
+        let start = seed.unwrap_or(Exposure {
+            exposure: 500.min(cam.limits.exposure.1),
+            gain: cam.limits.gain.map(|g| g.0).unwrap_or(0),
+            dgain: 1.0,
+        });
         cam.set_exposure(start)?;
         cam.start()?;
         Ok(IrCapture {
@@ -107,12 +150,18 @@ impl IrCapture {
         self.frames += 1;
         if self.ae_enabled && self.last_step.elapsed() >= Duration::from_millis(400) {
             self.last_step = Instant::now();
-            let w = self.window.unwrap_or_else(|| Window::centre(self.frame.width, self.frame.height)).clamp(self.frame.width, self.frame.height);
+            let w = self
+                .window
+                .unwrap_or_else(|| Window::centre(self.frame.width, self.frame.height))
+                .clamp(self.frame.width, self.frame.height);
             let mut m = calib::meter(&self.frame.px, self.frame.width, 0, w);
             if m.mean > 0.95 {
                 m.clip = m.clip.max(0.2);
             }
-            let sm = Metering { mean: self.smoother.push(m.mean), clip: m.clip };
+            let sm = Metering {
+                mean: self.smoother.push(m.mean),
+                clip: m.clip,
+            };
             self.metering = sm;
             let f = calib::ae_factor(sm, AE_TARGET);
             if f != 1.0 {
@@ -134,7 +183,12 @@ impl IrCapture {
     pub fn meter_on(&mut self, face: &Face) {
         let (rw, rh) = (self.frame.width as f32, self.frame.height as f32);
         let [bx, by, bw, bh] = face.bbox;
-        let (ox0, oy0, ox1, oy1) = (bx.max(0.0), by.max(0.0), (bx + bw).max(0.0), (by + bh).max(0.0));
+        let (ox0, oy0, ox1, oy1) = (
+            bx.max(0.0),
+            by.max(0.0),
+            (bx + bw).max(0.0),
+            (by + bh).max(0.0),
+        );
         let [t, fx, fy] = self.orientation;
         // Undo the orientation: oriented (ox, oy) came from raw (x, y).
         let back = |ox: f32, oy: f32| -> (f32, f32) {
@@ -156,7 +210,12 @@ impl IrCapture {
         let (bx2, by2) = back(ox1, oy1);
         let (x0, x1) = (ax.min(bx2).max(0.0) as usize, ax.max(bx2).max(0.0) as usize);
         let (y0, y1) = (ay.min(by2).max(0.0) as usize, ay.max(by2).max(0.0) as usize);
-        self.window = Some(Window { x0, y0, x1: x1.max(x0 + 1), y1: y1.max(y0 + 1) });
+        self.window = Some(Window {
+            x0,
+            y0,
+            x1: x1.max(x0 + 1),
+            y1: y1.max(y0 + 1),
+        });
     }
 
     pub fn stop(mut self) -> Result<()> {

@@ -31,7 +31,12 @@ impl Region {
         let y0 = (y - my).max(0.0) as usize;
         let x1 = ((x + w + mx) as usize).min(width);
         let y1 = ((y + h + my) as usize).min(height);
-        Region { x0, y0, x1: x1.max(x0 + 1), y1: y1.max(y0 + 1) }
+        Region {
+            x0,
+            y0,
+            x1: x1.max(x0 + 1),
+            y1: y1.max(y0 + 1),
+        }
     }
 }
 
@@ -45,7 +50,12 @@ pub fn below(bbox: [f32; 4], width: usize, height: usize) -> Region {
     let x1 = ((x + 2.0 * w) as usize).min(width);
     let y0 = ((y + h) as usize).min(height.saturating_sub(1));
     let y1 = ((y + 3.0 * h) as usize).min(height);
-    Region { x0, y0, x1: x1.max(x0 + 1), y1: y1.max(y0 + 1) }
+    Region {
+        x0,
+        y0,
+        x1: x1.max(x0 + 1),
+        y1: y1.max(y0 + 1),
+    }
 }
 
 /// How alike two frames are inside `r`: zero-mean normalised
@@ -135,7 +145,11 @@ fn best_shift(a: &[f32], b: &[f32], max: isize) -> f32 {
                 cnt += 1;
             }
         }
-        if cnt == 0 { -1.0 } else { sum / cnt as f32 }
+        if cnt == 0 {
+            -1.0
+        } else {
+            sum / cnt as f32
+        }
     };
     let scores: Vec<f32> = (-max..=max).map(score).collect();
     let (mut bi, mut bs) = (0usize, f32::MIN);
@@ -188,7 +202,11 @@ mod tests {
             for x in 0..w {
                 let (dx, dy) = (x as f32 - (ox as f32 + 30.0), y as f32 - (oy as f32 + 30.0));
                 let d = (dx * dx + dy * dy).sqrt();
-                let v = if d < 20.0 { 200.0 - d * 4.0 + ((x * 7 + y * 3) % 11) as f32 } else { 40.0 + ((x * 5 + y * 13) % 7) as f32 };
+                let v = if d < 20.0 {
+                    200.0 - d * 4.0 + ((x * 7 + y * 3) % 11) as f32
+                } else {
+                    40.0 + ((x * 5 + y * 13) % 7) as f32
+                };
                 g.data[y * w + x] = v as u8;
             }
         }
@@ -199,7 +217,12 @@ mod tests {
     fn recovers_a_known_shift() {
         let a = scene(120, 120, 20, 20);
         let b = scene(120, 120, 23, 27);
-        let r = Region { x0: 0, y0: 0, x1: 120, y1: 120 };
+        let r = Region {
+            x0: 0,
+            y0: 0,
+            x1: 120,
+            y1: 120,
+        };
         let (dx, dy) = shift(&a, &b, r, 20);
         assert!((dx - 3.0).abs() < 0.6, "dx {}", dx);
         assert!((dy - 7.0).abs() < 0.6, "dy {}", dy);
@@ -214,7 +237,10 @@ mod tests {
             let (w, h) = (g.width as f32, g.height as f32);
             for y in 0..g.height {
                 for x in 0..g.width {
-                    let (dx, dy) = ((x as f32 - w / 2.0) / (w / 2.0), (y as f32 - h / 2.0) / (h / 2.0));
+                    let (dx, dy) = (
+                        (x as f32 - w / 2.0) / (w / 2.0),
+                        (y as f32 - h / 2.0) / (h / 2.0),
+                    );
                     let gain = (1.0 - 0.8 * (dx * dx + dy * dy)).max(0.1);
                     let i = y * g.width + x;
                     g.data[i] = (g.data[i] as f32 * gain) as u8;
@@ -225,7 +251,12 @@ mod tests {
         let mut b = scene(120, 120, 25, 30);
         vignette(&mut a);
         vignette(&mut b);
-        let r = Region { x0: 0, y0: 0, x1: 120, y1: 120 };
+        let r = Region {
+            x0: 0,
+            y0: 0,
+            x1: 120,
+            y1: 120,
+        };
         let (dx, dy) = shift(&a, &b, r, 24);
         assert!(dx.abs() < 1.0, "dx {}", dx);
         assert!((dy - 10.0).abs() < 1.0, "dy {}", dy);
@@ -238,7 +269,12 @@ mod tests {
         for v in b.data.iter_mut() {
             *v = (*v as f32 * 0.7) as u8;
         }
-        let r = Region { x0: 10, y0: 10, x1: 110, y1: 110 };
+        let r = Region {
+            x0: 10,
+            y0: 10,
+            x1: 110,
+            y1: 110,
+        };
         let (dx, dy) = shift(&a, &b, r, 20);
         assert!(dx.abs() < 0.3 && dy.abs() < 0.3, "{} {}", dx, dy);
     }
@@ -255,7 +291,11 @@ mod similarity_tests {
                 data[y * width + x] = f(x, y);
             }
         }
-        Grey { width, height, data }
+        Grey {
+            width,
+            height,
+            data,
+        }
     }
 
     #[test]
@@ -264,13 +304,22 @@ mod similarity_tests {
         let b = frame(160, 120, |x, y| (((x * 7 + y * 3) % 200) / 2 + 20) as u8);
         let r = below([60.0, 10.0, 40.0, 30.0], 160, 120);
         assert!(similarity(&a, &a, r) > 0.999);
-        assert!(similarity(&a, &b, r) > 0.99, "half the brightness is the same scene");
+        assert!(
+            similarity(&a, &b, r) > 0.99,
+            "half the brightness is the same scene"
+        );
     }
 
     #[test]
     fn a_person_who_left_leaves_an_unrelated_region() {
         // A textured torso below the face, then a flat wall with noise.
-        let with = frame(160, 120, |x, y| if y > 40 { ((x * 13 + y * 5) % 180) as u8 } else { 30 });
+        let with = frame(160, 120, |x, y| {
+            if y > 40 {
+                ((x * 13 + y * 5) % 180) as u8
+            } else {
+                30
+            }
+        });
         let without = frame(160, 120, |x, y| (80 + ((x * 31 + y * 17) % 7)) as u8);
         let r = below([60.0, 10.0, 40.0, 30.0], 160, 120);
         assert!(similarity(&with, &without, r) < 0.3);

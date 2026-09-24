@@ -49,12 +49,21 @@ pub fn pose(l: &[[f32; 2]; 5]) -> Pose {
     let pitch = if m[1].abs() > 1.0 { n[1] / m[1] } else { 0.5 };
     let nose_pitch = n[1] / inter_eye;
     let mouth_drop = m[1] / inter_eye;
-    Pose { yaw, pitch, roll, inter_eye, nose_pitch, mouth_drop }
+    Pose {
+        yaw,
+        pitch,
+        roll,
+        inter_eye,
+        nose_pitch,
+        mouth_drop,
+    }
 }
 
 /// Facing the camera closely enough to count as attention.
 pub fn is_attentive(p: &Pose, max_yaw: f32, max_roll_deg: f32) -> bool {
-    p.yaw.abs() <= max_yaw && p.roll.abs().to_degrees() <= max_roll_deg && (0.2..=0.85).contains(&p.pitch)
+    p.yaw.abs() <= max_yaw
+        && p.roll.abs().to_degrees() <= max_roll_deg
+        && (0.2..=0.85).contains(&p.pitch)
 }
 
 #[cfg(test)]
