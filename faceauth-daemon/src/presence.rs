@@ -394,11 +394,14 @@ impl Watch {
         // the chin or a look down at a phone fits no attentive pose and
         // embeds as nobody), so the hold runs for any look that holds
         // nothing, in both modes: the secure mode's first-miss lock is for
-        // a chair whose shape has changed, not for the user's own hand. A
-        // face turned to the screen that fails its check is not hidden, it
-        // is someone else looking at the session, and the shape under it
-        // holds nothing.
-        let hidden = !obs.face || !obs.attentive;
+        // a chair whose shape has changed, not for the user's own hand.
+        // Leaning on a hand or leaning in to read keeps the face turned to
+        // the screen while it scores just under the line, or leaves the
+        // strobe no signal to read; those are hidden too. Only a face turned
+        // to the screen that misses by a wide margin is someone else looking
+        // at the session, and the shape under it holds nothing.
+        let stranger = obs.face && obs.attentive && obs.identity == Some(false) && !obs.near_miss;
+        let hidden = !stranger;
         let held_by_shape = if !seen && hidden && partial_holds(now, self.last_full) {
             let sim = match (self.reference.as_ref(), obs.frame.as_ref()) {
                 (Some(r), Some(f)) => same_shape(r, f),
@@ -649,6 +652,10 @@ pub(crate) struct Observation {
     pub(crate) bbox: Option<[f32; 4]>,
     /// Some(true/false) when an identity check ran.
     pub(crate) identity: Option<bool>,
+    /// A failed check that scored within `NEAR_MISS_SLACK` of the accept
+    /// threshold: the user's own face half covered by a hand or pitched
+    /// over a phone scores there; another person scores far below it.
+    pub(crate) near_miss: bool,
 }
 
 /// Is the machine running on its battery? True when a battery is present
@@ -732,6 +739,7 @@ pub(crate) fn observe_in(
             face: false,
             attentive: false,
             identity: None,
+            near_miss: false,
             frame: None,
             bbox: None,
         });
@@ -748,6 +756,7 @@ pub(crate) fn observe_in(
             face: false,
             attentive: false,
             identity: None,
+            near_miss: false,
             frame: Some(img),
             bbox: None,
         });
@@ -768,7 +777,7 @@ pub(crate) fn observe_in(
         ),
         None => pose::is_attentive(&p, ATTENTIVE_MAX_YAW, ATTENTIVE_MAX_ROLL_DEG),
     };
-    let identity = if identify {
+    let (identity, near_miss) = if identify {
         // Liveness first: one lit/unlit pair under the look's own mask,
         // with exposure frozen for it as the confirm does, since an
         // auto-exposure step inside the pair breaks the phase lock or skews
@@ -785,6 +794,7 @@ pub(crate) fn observe_in(
                     face: true,
                     attentive,
                     identity: Some(false),
+                    near_miss: false,
                     frame: Some(img),
                     bbox: Some(face.bbox),
                 });
@@ -796,6 +806,7 @@ pub(crate) fn observe_in(
                     face: true,
                     attentive,
                     identity: None,
+                    near_miss: false,
                     frame: Some(img),
                     bbox: Some(face.bbox),
                 });
@@ -831,6 +842,7 @@ pub(crate) fn observe_in(
                     face: true,
                     attentive,
                     identity: None,
+                    near_miss: false,
                     frame: Some(img),
                     bbox: Some(face.bbox),
                 });
@@ -848,9 +860,13 @@ pub(crate) fn observe_in(
                 face.score
             );
         }
-        Some(score >= a.cfg.accept_threshold)
+        let passed = score >= a.cfg.accept_threshold;
+        (
+            Some(passed),
+            !passed && score >= a.cfg.accept_threshold - NEAR_MISS_SLACK,
+        )
     } else {
-        None
+        (None, false)
     };
     cap.stop()?;
     log::debug!(
@@ -867,6 +883,7 @@ pub(crate) fn observe_in(
         face: true,
         attentive,
         identity,
+        near_miss,
         frame: Some(img),
         bbox: Some(bbox),
     })
@@ -924,6 +941,15 @@ fn strobe_pair(
 /// 0.95, the face fully covered 0.79, the chair empty -0.34.
 pub const SAME_SHAPE: f32 = 0.60;
 
+/// How far under the accept threshold a failed presence check may score and
+/// still count as the user's own face partly hidden rather than someone
+/// else's (0.45 at the default 0.70). Different people score around 0.1 to
+/// 0.3 against a set on this model; a hand on the chin or a face pitched
+/// over a phone lands between. Reasoned, not measured on a corpus: the
+/// scores are logged at debug so it can be. A near miss holds the clock
+/// only through the shape in the chair, never on its own.
+pub const NEAR_MISS_SLACK: f32 = 0.25;
+
 /// Is the person still in the chair? No face cleared the threshold, but the
 /// shoulders and torso under where the face was look as they did at the
 /// last full sighting. A hand over the face leaves them alone; standing up
@@ -959,6 +985,7 @@ mod watch_tests {
                 None
             },
             identity,
+            near_miss: false,
         }
     }
 
@@ -1208,6 +1235,7 @@ mod watch_tests {
             frame: Some(frame.clone()),
             bbox: Some([20.0, 10.0, 40.0, 40.0]),
             identity: Some(true),
+            near_miss: false,
         };
         let hidden = Observation {
             face: false,
@@ -1215,6 +1243,7 @@ mod watch_tests {
             frame: Some(frame.clone()),
             bbox: None,
             identity: None,
+            near_miss: false,
         };
         let mut looks = vec![seen.clone()];
         looks.extend((0..8).map(|_| hidden.clone()));
@@ -1237,6 +1266,7 @@ mod watch_tests {
         // never becomes the reference.
         let unchecked = Observation {
             identity: None,
+            near_miss: false,
             ..seen.clone()
         };
         let mut looks = vec![unchecked];
@@ -1248,6 +1278,7 @@ mod watch_tests {
         );
         let stranger = Observation {
             identity: Some(false),
+            near_miss: false,
             ..seen.clone()
         };
         let mut looks = vec![seen.clone(), stranger.clone(), stranger];
@@ -1279,6 +1310,7 @@ mod watch_tests {
             frame: Some(frame.clone()),
             bbox: Some([20.0, 10.0, 40.0, 40.0]),
             identity: Some(true),
+            near_miss: false,
         };
         let chin = |identity| Observation {
             face: true,
@@ -1286,6 +1318,7 @@ mod watch_tests {
             frame: Some(frame.clone()),
             bbox: Some([20.0, 10.0, 40.0, 40.0]),
             identity,
+            near_miss: false,
         };
         // Between checks the look carries no verdict; on a check the
         // covered crop fails. Neither holds by itself.
@@ -1345,9 +1378,11 @@ mod watch_tests {
             frame: Some(frame.clone()),
             bbox: Some([20.0, 10.0, 40.0, 40.0]),
             identity: Some(true),
+            near_miss: false,
         };
         let stranger = Observation {
             identity: Some(false),
+            near_miss: false,
             ..seen.clone()
         };
         let mut looks = vec![seen];
@@ -1358,6 +1393,76 @@ mod watch_tests {
             first_lock(&mut w, t0, &looks, PresenceMode::Secure),
             Some(2),
             "secure: the first failed check on a face looking at the screen locks"
+        );
+    }
+
+    /// Secure mode, the user leaning on a hand or leaning in to read: the
+    /// face stays turned to the screen, the check just misses or the strobe
+    /// reads nothing, and the same shape in the chair holds the clock. A
+    /// face that misses by a wide margin is a stranger and locks at once,
+    /// shape or not; a near miss over a changed chair holds nothing.
+    #[test]
+    fn secure_mode_holds_a_near_miss_or_an_unread_face_through_the_shape() {
+        let mut frame = Grey::new(120, 120);
+        frame
+            .data
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, v)| *v = (i % 251) as u8);
+        let seen = Observation {
+            face: true,
+            attentive: true,
+            frame: Some(frame.clone()),
+            bbox: Some([20.0, 10.0, 40.0, 40.0]),
+            identity: Some(true),
+            near_miss: false,
+        };
+        let near = Observation {
+            identity: Some(false),
+            near_miss: true,
+            ..seen.clone()
+        };
+        let unread = Observation {
+            identity: None,
+            ..seen.clone()
+        };
+        let t0 = Instant::now();
+        for (what, look) in [("near miss", &near), ("no signal", &unread)] {
+            let mut looks = vec![seen.clone()];
+            looks.extend((0..8).map(|_| look.clone()));
+            let mut w = Watch::new(cfg());
+            assert_eq!(
+                first_lock(&mut w, t0, &looks, PresenceMode::Secure),
+                None,
+                "secure: a {} with the same shape holds",
+                what
+            );
+        }
+        let far = Observation {
+            identity: Some(false),
+            near_miss: false,
+            ..seen.clone()
+        };
+        let mut looks = vec![seen.clone(), far];
+        looks.extend((0..4).map(|_| unread.clone()));
+        let mut w = Watch::new(cfg());
+        assert_eq!(
+            first_lock(&mut w, t0, &looks, PresenceMode::Secure),
+            Some(2),
+            "secure: a wide miss on a face turned to the screen locks at once"
+        );
+        let mut other = Grey::new(120, 120);
+        other.data.iter_mut().for_each(|v| *v = 200);
+        let mut looks = vec![seen.clone()];
+        looks.extend((0..4).map(|_| Observation {
+            frame: Some(other.clone()),
+            ..near.clone()
+        }));
+        let mut w = Watch::new(cfg());
+        assert_eq!(
+            first_lock(&mut w, t0, &looks, PresenceMode::Secure),
+            Some(2),
+            "secure: a near miss over a changed chair locks"
         );
     }
 

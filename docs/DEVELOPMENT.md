@@ -364,9 +364,10 @@ is about 14 and 7 percent. Detection costs about 14 ms a frame and the
 embedder about 0.35 core-seconds a run, so a watch that identifies every
 tick from a cold exposure is expensive and wrong: ticks start from the
 exposure the last attempt settled on. A hidden face is not absence, in
-either mode: when a look holds nothing (no face, or a face that neither
-matches nor faces the screen, which is what a hand on the chin or a look
-down at a phone gives the mesh), the torso under the last full sighting is
+either mode: when a look holds nothing and is not a stranger (no face, a face turned
+away, a face the strobe read no signal from, or a failed check within
+`NEAR_MISS_SLACK` 0.25 of the threshold, which is what a hand on the chin,
+leaning in or a look down at a phone gives the mesh and the embedder), the torso under the last full sighting is
 compared by normalised cross-correlation, and `SAME_SHAPE` 0.60 holds the
 away clock for up to `PARTIAL_GRACE_S` (120 s) and stays the secure mode's
 first-miss lock. Measured: a hand over part of the face 1.00, a

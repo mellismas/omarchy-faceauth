@@ -33,7 +33,7 @@
 enabled = false               # auto-lock when the enrolled user leaves; opt-in (faceauth presence on|off)
 user = ""                     # whose templates define "present"
 # mode = "default"            # "default": any face turned to the screen holds the lock off, whoever it is; lock once nobody has been there for away_seconds; a hidden face (hand on chin) holds the clock too
-                              # "secure": identity checked on every tick; the first failed check locks at once unless the same shape is still in the chair (the user's own hand over the face, a look down at a phone), an empty chair locks after away_seconds, no other face holds the clock
+                              # "secure": identity checked on every tick; the first clear miss on a face turned to the screen locks at once; a near miss, an unread face or a hidden one holds while the same shape is still in the chair (a hand on the face, leaning in, a look down at a phone), an empty chair locks after away_seconds, no other face holds the clock
                               # the starting mode; the watched user can switch it until the next restart (faceauth presence mode default|secure)
 # tick_seconds = 5.0          # one short look per tick (about 0.45 s of camera; longer on a tick that also strobes for identity and liveness; in the default mode every third tick); 10 s on battery
 # battery_tick_seconds = 10.0 # the tick on battery (0 keeps the mains tick)

@@ -136,9 +136,12 @@ One claim per bullet, each with where the code keeps it.
   holds the lock off: the first look that finds another face locks the
   session at once, an empty chair locks after the away time, and no other
   face holds the clock. Both modes make one allowance, the hidden face: a
-  hand over the face or a look down at a phone reads as no face, or as one
-  that neither matches nor faces the screen, and it holds the clock for up
-  to two minutes while the shape in the chair under it is unchanged. A
+  hand over the face, a head resting on a hand, leaning in to read or a
+  look down at a phone reads as no face, a face turned away, a face the
+  strobe cannot read, or a face that misses the match by a little, and it
+  holds the clock for up to two minutes while the shape in the chair under
+  it is unchanged. Only a face turned to the screen that misses by a wide
+  margin is someone else, and in secure mode it locks at once. A
   print that fails the gate is not the user in either mode.
   Switch modes from the bar's walk-away widget or with Super+Alt+L; the
   switch lasts until the service restarts, and `[presence] mode` sets the

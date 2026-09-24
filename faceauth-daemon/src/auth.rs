@@ -2534,6 +2534,7 @@ mod rearm_tests {
             face,
             attentive,
             identity,
+            near_miss: false,
             frame: None,
             bbox: None,
         }
