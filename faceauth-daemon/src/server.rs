@@ -148,6 +148,17 @@ struct Request {
     /// With `enroll`: keep only frames in this pose (see `auth::POSES`).
     #[serde(default)]
     enroll_pose: Option<String>,
+    /// Root only: the enrolment walk-through (see `enrol`); the reply is
+    /// the outcome when it ends.
+    #[serde(default)]
+    enrol_session: Option<crate::enrol::Start>,
+    /// From the user's window: stream the session's frames on this
+    /// connection until it ends.
+    #[serde(default)]
+    enrol_watch: bool,
+    /// From the user's window: "continue", "redo" or "cancel".
+    #[serde(default)]
+    enrol_control: Option<String>,
     #[serde(default)]
     seconds: Option<f32>,
     #[serde(default)]
@@ -496,6 +507,44 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> R
         };
         return reply(&mut stream, &outcome);
     }
+    if let Some(start) = &req.enrol_session {
+        if cred.uid() != 0 {
+            return reply(&mut stream, &Outcome::Error { message: "not permitted: enrolment requires root".into() });
+        }
+        log::info!("enrolment walk-through for {} (label {:?}, from {:?})", req.user, start.label, start.start_at);
+        // The session holds the camera for as long as the person takes.
+        let outcome = match take() {
+            Some(mut a) => crate::enrol::run(&mut a, &req.user, start),
+            None => Outcome::Error { message: "busy".into() },
+        };
+        log::info!("enrolment walk-through for {}: {:?}", req.user, outcome);
+        if matches!(outcome, Outcome::Enrolled { .. }) {
+            refresh_socket_acl(auth);
+        }
+        return reply(&mut stream, &outcome);
+    }
+    if req.enrol_watch || req.enrol_control.is_some() {
+        // The session's own user (or root) may watch it and steer it.
+        if cred.uid() != 0 && !crate::enrol::active_for(&req.user, cred.uid()) {
+            return reply(&mut stream, &Outcome::Error { message: "no enrolment session for you is running".into() });
+        }
+        if let Some(word) = &req.enrol_control {
+            if matches!(word.as_str(), "continue" | "redo" | "cancel") {
+                crate::enrol::control(word);
+                return reply(&mut stream, &Outcome::Noted);
+            }
+            return reply(&mut stream, &Outcome::Error { message: "unknown control".into() });
+        }
+        // The stream: lines until the session ends. The writer drops this
+        // connection when a write fails, so a closed window costs nothing.
+        stream.set_read_timeout(None)?;
+        crate::enrol::add_watcher(stream.try_clone()?);
+        slot.release();
+        while crate::enrol::is_active() {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        return Ok(());
+    }
     if let Some(label) = &req.enroll {
         log::info!("enrolment for {} (uid {}, label {:?})", req.user, cred.uid(), label);
         let outcome = match take() {
@@ -529,6 +578,11 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> R
         log::debug!("probe for {}: {:?}", req.user, outcome);
         return reply(&mut stream, &outcome);
     }
+    #[cfg(not(feature = "dev-tools"))]
+    if req.sweep_seconds.is_some() {
+        return reply(&mut stream, &Outcome::Error { message: "not built with dev-tools".into() });
+    }
+    #[cfg(feature = "dev-tools")]
     if let Some(seconds) = req.sweep_seconds {
         // Scores per frame: root only, like every other reply that carries them.
         if cred.uid() != 0 {
@@ -1515,7 +1569,8 @@ pub fn probe(socket: &Path, user: &str, timeout: Duration) -> Result<Outcome> {
     request(socket, user, true, timeout)
 }
 
-/// Root: a pose sweep, scored per frame.
+/// Root: a pose sweep, scored per frame (dev-tools builds).
+#[cfg(feature = "dev-tools")]
 pub fn sweep(socket: &Path, user: &str, seconds: f32) -> Result<Outcome> {
     send(socket, serde_json::json!({ "user": user, "sweep_seconds": seconds }), Some(Duration::from_secs_f32(seconds + 15.0)))
 }
@@ -1566,6 +1621,16 @@ pub fn ask_consent(socket: &Path, user: &str) -> Result<Outcome> {
 
 pub fn ping(socket: &Path, user: &str) -> Result<Outcome> {
     send(socket, serde_json::json!({ "user": user, "ping": true }), Some(Duration::from_secs(3)))
+}
+
+/// Root: the enrolment walk-through; returns when it ends.
+pub fn enrol_session(socket: &Path, user: &str, label: &str, start_at: Option<&str>) -> Result<Outcome> {
+    send(socket, serde_json::json!({ "user": user, "enrol_session": { "label": label, "start_at": start_at } }), Some(Duration::from_secs(16 * 60)))
+}
+
+/// From the user's window: steer the running session.
+pub fn enrol_control(socket: &Path, user: &str, word: &str) -> Result<Outcome> {
+    send(socket, serde_json::json!({ "user": user, "enrol_control": word }), Some(Duration::from_secs(3)))
 }
 
 pub fn enroll(socket: &Path, user: &str, label: &str, seconds: f32, count: usize, pose: Option<&str>) -> Result<Outcome> {

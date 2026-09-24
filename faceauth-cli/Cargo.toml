@@ -19,3 +19,8 @@ faceauth-daemon = { version = "0.1.0", path = "../faceauth-daemon" }
 serde_json.workspace = true
 toml.workspace = true
 serde = { workspace = true, features = ["derive"] }
+
+# Development only: the pose sweep and readout, the record mode of the
+# walk-through, and the per-frame gesture recordings. Off in the package.
+[features]
+dev-tools = ["faceauth-daemon/dev-tools"]

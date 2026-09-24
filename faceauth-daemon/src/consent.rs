@@ -408,6 +408,32 @@ fn parent_chain(pid: i32) -> String {
     out.join(" <- ")
 }
 
+/// One `omarchy-shell` invocation inside the user's own systemd manager,
+/// the same route the session lock uses.
+pub fn shell_call(cfg: &Config, user: &str, args: &[&str]) -> Result<()> {
+    let omarchy_path = cfg.omarchy_path.clone().unwrap_or_else(|| {
+        std::fs::read_to_string("/etc/omarchy.conf")
+            .ok()
+            .and_then(|t| t.lines().find_map(|l| l.strip_prefix("OMARCHY_PATH=").map(|v| v.trim_matches('"').to_string())))
+            .unwrap_or_else(|| "/usr/share/omarchy".into())
+    });
+    // The unit's description is what the journal prints on start; the
+    // default is the command line, payload and token included.
+    let status = std::process::Command::new("/usr/bin/timeout")
+        .args(["5", "/usr/bin/systemd-run", "--quiet", "--wait", "--collect", "--user", "--description=omarchy-faceauth window"])
+        .arg(format!("--machine={}@.host", user))
+        .arg(format!("-EOMARCHY_PATH={}", omarchy_path))
+        .arg("/usr/bin/omarchy-shell")
+        .args(args)
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .status()
+        .context("run omarchy-shell in the user's manager")?;
+    if !status.success() {
+        return Err(anyhow!("omarchy-shell {:?} exited {}", args, status));
+    }
+    Ok(())
+}
+
 /// The window on the desktop. Every call is one `omarchy-shell` invocation
 /// inside the user's own systemd manager, the same route the session lock uses.
 pub struct Dialog {
@@ -473,27 +499,7 @@ impl Dialog {
     }
 
     fn shell(&self, args: &[&str]) -> Result<()> {
-        let omarchy_path = self.cfg.omarchy_path.clone().unwrap_or_else(|| {
-            std::fs::read_to_string("/etc/omarchy.conf")
-                .ok()
-                .and_then(|t| t.lines().find_map(|l| l.strip_prefix("OMARCHY_PATH=").map(|v| v.trim_matches('"').to_string())))
-                .unwrap_or_else(|| "/usr/share/omarchy".into())
-        });
-        // The unit's description is what the journal prints on start; the
-        // default is the command line, payload and token included.
-        let status = std::process::Command::new("/usr/bin/timeout")
-            .args(["5", "/usr/bin/systemd-run", "--quiet", "--wait", "--collect", "--user", "--description=omarchy-faceauth window"])
-            .arg(format!("--machine={}@.host", self.user))
-            .arg(format!("-EOMARCHY_PATH={}", omarchy_path))
-            .arg("/usr/bin/omarchy-shell")
-            .args(args)
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-            .status()
-            .context("run omarchy-shell in the user's manager")?;
-        if !status.success() {
-            return Err(anyhow!("omarchy-shell {:?} exited {}", args, status));
-        }
-        Ok(())
+        shell_call(&self.cfg, &self.user, args)
     }
 
     /// Show or update the window. Fails when there is no graphical session to
@@ -1415,7 +1421,9 @@ struct TraceSaver<'a> {
 
 impl Drop for TraceSaver<'_> {
     fn drop(&mut self) {
-        if !self.cfg.gesture_trace {
+        // The recordings exist only in a dev-tools build: the package never
+        // writes them, whatever the config says.
+        if !cfg!(feature = "dev-tools") || !self.cfg.gesture_trace {
             return;
         }
         let trace = self.trace.borrow();

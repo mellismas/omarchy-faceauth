@@ -296,6 +296,7 @@ impl Authenticator {
     /// match falls off with yaw and pitch can be measured, and measured
     /// again after enrolment changes. Root only (the server enforces it):
     /// it returns scores.
+    #[cfg(feature = "dev-tools")]
     pub fn sweep(&mut self, user: &str, seconds: f32) -> Outcome {
         let t0 = Instant::now();
         let templates = match self.store.load(user) {
@@ -1512,7 +1513,7 @@ mod pose_bin_tests {
     use faceauth_engine::pose::Pose;
 
     fn at(yaw: f32, nose_pitch: f32) -> Pose {
-        Pose { yaw, pitch: 0.5, roll: 0.0, nose_pitch, inter_eye: 40.0 }
+        Pose { yaw, pitch: 0.5, roll: 0.0, nose_pitch, mouth_drop: 1.0, inter_eye: 40.0 }
     }
 
     #[test]

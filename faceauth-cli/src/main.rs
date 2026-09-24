@@ -13,7 +13,11 @@ use std::time::{Duration, Instant};
 fn usage() -> ! {
     eprintln!(
         "usage:\n  faceauth cam probe\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth auth [--user NAME] [--socket PATH] [--consent]   (asks a running faceauthd; --consent = window + nod)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there?)
-  faceauth sweep [--user NAME] [--seconds N] [--log FILE] [--threshold T]   (root; scores per frame while you turn your head, binned by yaw and pitch)\n  faceauth enroll [--user NAME] [--label TEXT] [--seconds N] [--count N] [--guided [--poses up,down]]   (through the daemon; --guided asks for five looks: centre, left, right, up, down)\n  faceauth enroll --store DIR ...                   (direct camera access, development)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] [--dismiss|--ack|--passwordless MIN]   (from the consent window; stdin: token line, then password line)\n  faceauth consent-context --action ID --message TEXT [--cookie C]   (from the polkit agent, as a request starts)\n  faceauth calibrate [--user NAME] [--gestures-only]   (root; two nods, two shakes and five everyday movements, stored with the templates)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence                                (current state)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
+  faceauth sweep [--user NAME] [--seconds N] [--log FILE] [--threshold T]   (dev-tools builds; root; scores per frame while you turn your head)
+  faceauth pose [--user NAME] [--rounds N] [--seconds N]   (dev-tools builds; root; a live pose readout)\n  faceauth enroll [--user NAME] [--label TEXT] [--guided [--start distance]]   (root; the walk-through window: distance, path, holds, verify)
+  faceauth enroll [--user NAME] [--label TEXT] [--terminal [--poses up,down]]   (root; the five looks from the terminal, no window)
+  faceauth enroll [--user NAME] [--label TEXT] [--seconds N] [--count N]   (root; one look, as the camera sees it)
+  faceauth enrol-control continue|redo|cancel [--user NAME]   (from the enrolment window)\n  faceauth enroll --store DIR ...                   (direct camera access, development)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] [--dismiss|--ack|--passwordless MIN]   (from the consent window; stdin: token line, then password line)\n  faceauth consent-context --action ID --message TEXT [--cookie C]   (from the polkit agent, as a request starts)\n  faceauth calibrate [--user NAME] [--gestures-only]   (root; two nods, two shakes and five everyday movements, stored with the templates)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence                                (current state)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
     );
     std::process::exit(2)
 }
@@ -31,15 +35,59 @@ fn main() -> Result<()> {
             Ok(())
         }
         ["engine", "test", rest @ ..] => engine_test(rest),
+        ["engine", "mesh", rest @ ..] => {
+            // The dense landmarks and the head pose from them, on a still
+            // frame: detect, mesh, pose, and the five-point pose beside it.
+            let dir = models_dir(rest);
+            let img = faceauth_engine::Grey::read_pgm(rest.iter().find(|a| a.ends_with(".pgm")).ok_or_else(|| anyhow!("IMAGE.pgm"))?)?;
+            let mut p = faceauth_engine::Pipeline::load(&dir)?;
+            let Some(mesh) = p.mesh.as_mut() else { bail!("no {} in {}", faceauth_engine::mesh::FACE_MESH_FILE, dir.display()) };
+            let faces = p.detector.detect(&img, 0.5)?;
+            let Some(face) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else { println!("no face"); return Ok(()) };
+            let five = faceauth_engine::pose::pose(&face.landmarks);
+            let t = Instant::now();
+            let m = mesh.for_face(&img, face)?;
+            let took = t.elapsed();
+            println!("face {:.0}px det {:.2}; five-point yaw {:+.3} nose_pitch {:.3} mouth_drop {:.3} roll {:+.1}", face.bbox[2], face.score, five.yaw, five.nose_pitch, five.mouth_drop, five.roll.to_degrees());
+            match m {
+                Some(m) => {
+                    let hp = faceauth_engine::mesh::head_pose(&m);
+                    println!("mesh score {:.3} in {:.1} ms: yaw {:+.1} pitch {:+.1} roll {:+.1} deg", m.score, took.as_secs_f32() * 1000.0, hp.yaw, hp.pitch, hp.roll);
+                    for (name, i) in [("forehead", faceauth_engine::mesh::FOREHEAD), ("chin", faceauth_engine::mesh::CHIN), ("nose", faceauth_engine::mesh::NOSE_TIP), ("r-eye", faceauth_engine::mesh::RIGHT_EYE_OUTER), ("l-eye", faceauth_engine::mesh::LEFT_EYE_OUTER), ("r-cheek", faceauth_engine::mesh::RIGHT_CHEEK), ("l-cheek", faceauth_engine::mesh::LEFT_CHEEK)] {
+                        let q = m.points[i];
+                        println!("  {:8} ({:.0}, {:.0}, z {:+.0})", name, q[0], q[1], q[2]);
+                    }
+                }
+                None => println!("mesh: no face in the crop"),
+            }
+            Ok(())
+        }
         ["engine", "live", rest @ ..] => engine_live(rest),
         ["enroll", rest @ ..] if !rest.contains(&"--store") => {
             // Production path: the daemon owns the camera and the store.
             let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
             let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
             let label = opt(rest, "--label").unwrap_or("enrol");
-            if rest.contains(&"--guided") {
+            if rest.contains(&"--terminal") {
                 let only: Vec<String> = opt(rest, "--poses").map(|p| p.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default();
                 return enroll_guided(&socket, &user, label, &only);
+            }
+            if rest.contains(&"--guided") {
+                // The walk-through: the daemon opens the window, the person
+                // follows it, and the outcome comes back here.
+                let start_at = opt(rest, "--start");
+                println!("Enrolling {}: follow the window on your screen. This terminal waits for it.", user);
+                let o = faceauth_daemon::server::enrol_session(&socket, &user, label, start_at)?;
+                return match &o {
+                    faceauth_daemon::auth::Outcome::Enrolled { added, total, consistency_min, consistency_mean, path } => {
+                        println!("Saved {} templates ({} new) to {}", total, added, path);
+                        println!("Template self-consistency (pairwise cosine): min {:.3} mean {:.3}", consistency_min, consistency_mean);
+                        println!("{}", at_rest_note(path));
+                        Ok(())
+                    }
+                    faceauth_daemon::auth::Outcome::Error { message } => Err(anyhow!("enrolment failed: {}", message)),
+                    other => Err(anyhow!("enrolment failed: {}", serde_json::to_string(other)?)),
+                };
             }
             let seconds: f32 = opt(rest, "--seconds").unwrap_or("12").parse()?;
             let count: usize = opt(rest, "--count").unwrap_or("10").parse()?;
@@ -65,6 +113,7 @@ fn main() -> Result<()> {
         }
         ["models", "fetch", rest @ ..] => models_fetch(rest),
         ["doctor", rest @ ..] => doctor(rest),
+        #[cfg(feature = "dev-tools")]
         ["sweep", rest @ ..] => {
             // Root: how the match falls off with head pose, against the
             // templates as they are. The user turns slowly left, right, up
@@ -138,6 +187,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        #[cfg(feature = "dev-tools")]
         ["pose", rest @ ..] => {
             // Root: a live readout of the pose measures, a few seconds at a
             // time, so a person can see what a turn or a tilt reads.
@@ -165,6 +215,14 @@ fn main() -> Result<()> {
                 let (plo, phi) = spread(&|f| f.nose_pitch);
                 println!("{:>5} {:>7} {:>+7.2} {:>7} {:>7.2} {:>7} {:>6.2}", r, frames.len(), yaw, format!("{:+.2}..{:+.2}", ylo, yhi), pitch, format!("{:.2}..{:.2}", plo, phi), score);
             }
+            Ok(())
+        }
+        ["enrol-control", word, rest @ ..] => {
+            // From the enrolment window: continue, redo or cancel.
+            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
+            let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
+            let o = faceauth_daemon::server::enrol_control(&socket, &user, word)?;
+            println!("{}", serde_json::to_string(&o)?);
             Ok(())
         }
         ["probe", rest @ ..] => {

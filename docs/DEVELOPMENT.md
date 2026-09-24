@@ -469,6 +469,12 @@ only way every layer agrees; running the checkout shell live is for short tests.
   size/offset-checked against the kernel headers, so the crate needs no libclang or
   bindgen at build time.
 
+## Development builds
+
+`cargo build --features faceauth-cli/dev-tools` (and `cargo test --features faceauth-daemon/dev-tools,faceauth-cli/dev-tools`) compiles the tuning tools in: `faceauth sweep` and `faceauth pose` (root; score and pose per frame while the head moves), the walk-through's record mode (`faceauth enroll --guided --start record`, which stores nothing and saves one IR frame in five under `/var/lib/faceauth/record/`, root only), and the per-frame gesture recordings the `gesture_trace` setting asks for. The package is built without the feature: none of that code is in the shipped binaries, and `gesture_trace` does nothing there. The staging build on the reference machine carries the feature; the PRs are the same tree without it.
+
+The camera feed behind the enrolment window, used to check the dot against the head, is not in any branch: `~/Work/fa-build/enrol-feed-dev.md` says how to apply it while tuning.
+
 ## Build and run
 
 ```

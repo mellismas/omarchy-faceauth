@@ -5,6 +5,7 @@ pub mod auth;
 pub mod capture;
 pub mod config;
 pub mod consent;
+pub mod enrol;
 pub mod pamcheck;
 pub mod presence;
 pub mod server;
