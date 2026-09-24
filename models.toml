@@ -23,3 +23,18 @@ license = "Apache-2.0"
 license_url = "https://huggingface.co/fal/AuraFace-v1/blob/main/LICENSE.md"
 provenance = "fal AuraFace-v1, ResNet100 ArcFace trained on fal's own licensed commercial dataset; only this file from the repository (the bundled detector and landmark models are InsightFace-derived and non-commercial)"
 input = "Nx3x112x112 float, (v - 127.5) / 127.5, aligned to the ArcFace five-point template; output 512-D"
+
+[[model]]
+name = "face_landmark.onnx"
+role = "landmarks"
+# Not yet hosted: converted on 2026-09-23 from Google's canonical file
+# (below) with tf2onnx 1.17.0 on TensorFlow 2.21.0, opset 13; the ONNX is
+# published with the project's releases. Until then setup takes the file
+# from a local models directory.
+url = "https://github.com/mellismas/omarchy-faceauth/releases/download/models/face_landmark.onnx"
+sha256 = "628e17ded45708571b8c6cb9da2438c32844cba8c3a9ed25e929fa9e318c5357"
+size = 2429024
+license = "Apache-2.0"
+license_url = "https://github.com/google-ai-edge/mediapipe/blob/master/LICENSE"
+provenance = "Google MediaPipe face_landmark.tflite (storage.googleapis.com/mediapipe-assets/face_landmark.tflite, sha256 1055cb9d4a9ca8b8c688902a3a5194311138ba256bcc94e336d8373a5f30c814, 1242398 bytes, 2023-02-13), converted to ONNX one-to-one; 468 face mesh points with relative depth"
+input = "1x192x192x3 float NHWC, 0..1, RGB (grey replicated), a square crop 1.5x the detector's box; outputs conv2d_21 1404 floats (468 x, y in crop pixels, z) and conv2d_31 a face-presence logit"

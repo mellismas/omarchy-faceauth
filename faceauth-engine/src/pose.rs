@@ -19,6 +19,13 @@ pub struct Pose {
     /// higher looking down. Steady to a thousandth per frame on a still
     /// face, unmoved by talking; a light nod swings it by 0.03.
     pub nose_pitch: f32,
+    /// The mouth line's drop below the eye line, in inter-eye distances:
+    /// the tilt measure that does not involve the nose. Seen from below (a
+    /// lid camera), a raised chin squares the face to the lens and this
+    /// grows; a lowered chin foreshortens it and this shrinks. The nose
+    /// landmark, by contrast, slides toward the chin when the face is seen
+    /// from underneath, so `nose_pitch` can sit still through a chin-up.
+    pub mouth_drop: f32,
     pub inter_eye: f32,
 }
 
@@ -41,7 +48,8 @@ pub fn pose(l: &[[f32; 2]; 5]) -> Pose {
     let yaw = n[0] / inter_eye;
     let pitch = if m[1].abs() > 1.0 { n[1] / m[1] } else { 0.5 };
     let nose_pitch = n[1] / inter_eye;
-    Pose { yaw, pitch, roll, inter_eye, nose_pitch }
+    let mouth_drop = m[1] / inter_eye;
+    Pose { yaw, pitch, roll, inter_eye, nose_pitch, mouth_drop }
 }
 
 /// Facing the camera closely enough to count as attention.

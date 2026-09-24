@@ -7,6 +7,7 @@
 //! identical channels.
 
 pub mod align;
+pub mod mesh;
 pub mod detect;
 pub mod embed;
 pub mod image;
@@ -15,7 +16,7 @@ pub mod motion;
 pub mod pose;
 pub mod runtime;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 pub use image::Grey;
 use std::path::Path;
 
@@ -32,15 +33,21 @@ pub struct Face {
 pub struct Pipeline {
     pub detector: detect::YuNet,
     pub embedder: embed::ArcFace,
+    /// The dense landmarks, when the model is installed; pose readers
+    /// fall back to the detector's five points without it.
+    pub mesh: Option<mesh::FaceMesh>,
 }
 
 impl Pipeline {
     pub fn load(models_dir: impl AsRef<Path>) -> Result<Self> {
         runtime::init()?;
         let d = models_dir.as_ref();
+        let mesh_path = d.join(mesh::FACE_MESH_FILE);
+        let mesh = if mesh_path.exists() { Some(mesh::FaceMesh::load(&mesh_path).with_context(|| format!("load {}", mesh_path.display()))?) } else { None };
         Ok(Pipeline {
             detector: detect::YuNet::load(d.join(detect::YUNET_FILE))?,
             embedder: embed::ArcFace::load(d.join(embed::AURAFACE_FILE))?,
+            mesh,
         })
     }
 
