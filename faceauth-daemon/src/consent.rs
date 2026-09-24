@@ -650,6 +650,9 @@ pub struct Oscillation {
     pub leg_min_s: f32,
     /// Width change allowed across a gesture (fraction of face width).
     pub width_tol: f32,
+    /// Not moving at all: frame-to-frame change under this, in signal
+    /// units. `REST_STEP` on the image-motion signal; degrees on the mesh.
+    pub rest_step: f32,
     /// Filtered samples that must advance the extreme within a leg: a real
     /// leg is a ramp over several frames; a detector fit switching between
     /// two solutions is one jump (recorded 2026-09-22 on the nose measure:
@@ -760,7 +763,7 @@ impl Oscillation {
     const TAU_S: f32 = 1.5;
 
     pub fn new(name: &'static str, min_thr: f32, max_thr: f32, leg_max_s: f32, shift_tol_x: f32, shift_tol_y: f32, max_amp: f32, both_sides: bool) -> Self {
-        Oscillation { name, min_thr, max_thr, leg_max_s, shift_tol_x, shift_tol_y, max_amp, both_sides, rest_level: 0.0, prior_still: 0.0, span_s: Self::SPAN_S, rest_s: Self::REST_S, rev_frames: Self::REV_FRAMES, leg_min_s: Self::LEG_MIN_S, width_tol: Self::WIDTH_TOL, min_steps: Self::MIN_STEPS, need_ramp: false, co_motion: None, leg_samples: Vec::new(), recent: Vec::new(), regular: None, raw: Vec::new(), settle: Vec::new(), base: None, thr: min_thr, jitter: 0.0, last_p: None, last_step: 0.0, last_t: None, pivot: None, cand: (0.0, 0.0), dir: 0, rev_count: 0, rest_since: None, steps: 0, depart: 0.0, legs: Vec::new(), last_active: None, motion: Vec::new(), gestures: 0 }
+        Oscillation { name, min_thr, max_thr, leg_max_s, shift_tol_x, shift_tol_y, max_amp, both_sides, rest_level: 0.0, prior_still: 0.0, span_s: Self::SPAN_S, rest_s: Self::REST_S, rev_frames: Self::REV_FRAMES, leg_min_s: Self::LEG_MIN_S, width_tol: Self::WIDTH_TOL, rest_step: Self::REST_STEP, min_steps: Self::MIN_STEPS, need_ramp: false, co_motion: None, leg_samples: Vec::new(), recent: Vec::new(), regular: None, raw: Vec::new(), settle: Vec::new(), base: None, thr: min_thr, jitter: 0.0, last_p: None, last_step: 0.0, last_t: None, pivot: None, cand: (0.0, 0.0), dir: 0, rev_count: 0, rest_since: None, steps: 0, depart: 0.0, legs: Vec::new(), last_active: None, motion: Vec::new(), gestures: 0 }
     }
 
     /// True while the head is still or has only just moved: the caller may
@@ -963,7 +966,7 @@ impl Oscillation {
                 // Not moving at all: a step at the still-face noise level, an
                 // absolute of the floor (a still face moves 0.003 of a width
                 // between frames; a slow turnaround moves more).
-                let still = self.last_step < Self::REST_STEP;
+                let still = self.last_step < self.rest_step;
                 if further {
                     self.cand = (p, t);
                     self.steps += 1;
@@ -1215,6 +1218,31 @@ impl NodDetector {
         NodDetector { inner, nods: 0, yaw: Vec::new() }
     }
 
+    /// On the mesh's pitch, in degrees. From the rounds of 2026-09-24
+    /// (`traces/v2`): a nod's legs are 12 to 35 degrees and take 0.23 to
+    /// 0.33 s, reversing at once; a look at the keyboard is 17 to 21
+    /// degrees a leg but takes 0.9 to 2 s and holds at the bottom, a lean
+    /// 18 to 30 over 1.1 to 3.3 s. Size does not separate them; the leg
+    /// time does, so a leg may take at most `MESH_LEG_MAX_S`.
+    pub const MESH_MIN_DEG: f32 = 8.0;
+    pub const MESH_MAX_DEG: f32 = 60.0;
+    pub const MESH_LEG_MAX_S: f32 = 0.6;
+    /// Still, on the mesh: under this many degrees between frames (a still
+    /// head reads 0.7 on average, a turnaround several).
+    pub const MESH_REST_STEP: f32 = 1.5;
+    /// Degrees of mesh yaw per unit of the five-point yaw measure (a 30
+    /// degree turn read about 0.35 on it), so the yaw rules keep their
+    /// numbers whichever signal feeds them.
+    pub const YAW_DEG_PER_UNIT: f32 = 30.0 / 0.35;
+
+    pub fn mesh(floor_deg: f32) -> Self {
+        let floor = floor_deg.max(Self::MESH_MIN_DEG);
+        let mut inner = Oscillation::new("nod", floor, Self::MESH_MAX_DEG.max(floor), Self::MESH_LEG_MAX_S, 0.10, 0.30, Self::MESH_MAX_DEG, false);
+        inner.rest_step = Self::MESH_REST_STEP;
+        inner.co_motion = Some((2, Oscillation::CO_MOTION));
+        NodDetector { inner, nods: 0, yaw: Vec::new() }
+    }
+
     pub fn idle(&self, t: f32) -> bool {
         self.inner.idle(t)
     }
@@ -1304,6 +1332,23 @@ impl ShakeDetector {
         ShakeDetector { inner, shakes: 0 }
     }
 
+    /// On the mesh's yaw, in degrees. From the rounds of 2026-09-24: a
+    /// shake's legs are 33 to 53 degrees and take about 0.3 s; a glance
+    /// aside is as large (32 to 50) but takes 0.8 to 2.2 s and holds at
+    /// the side for half a second or more.
+    pub const MESH_MIN_DEG: f32 = 15.0;
+    pub const MESH_MAX_DEG: f32 = 80.0;
+    pub const MESH_LEG_MAX_S: f32 = 0.6;
+
+    pub fn mesh(floor_deg: f32) -> Self {
+        let floor = floor_deg.max(Self::MESH_MIN_DEG);
+        let mut inner = Oscillation::new("shake", floor, Self::MESH_MAX_DEG.max(floor), Self::MESH_LEG_MAX_S, 0.60, 0.30, Self::MESH_MAX_DEG, false);
+        inner.rest_step = NodDetector::MESH_REST_STEP;
+        inner.width_tol = 0.15;
+        inner.co_motion = Some((1, Oscillation::CO_MOTION));
+        ShakeDetector { inner, shakes: 0 }
+    }
+
     pub fn push(&mut self, yaw: f32, t: f32) -> bool {
         self.push_with(yaw, t, None)
     }
@@ -1342,6 +1387,48 @@ pub struct Measured {
 
 /// Run the live detectors over a recorded round at the given floors, as the
 /// consent loop would: how many nods and shakes it reads.
+/// One frame of a round recorded on the mesh (format v2): angles in
+/// degrees, the image motion in face widths, the box.
+#[derive(Clone, Debug)]
+pub struct CalFrameV2 {
+    pub t: f32,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub roll: f32,
+    pub pos_x: f32,
+    pub pos_y: f32,
+    pub geom: (f32, f32, f32),
+}
+
+/// Parse a v2 recording (a header line, then `t yaw pitch roll pos_x
+/// pos_y w cx cy size score` per line).
+pub fn parse_v2(text: &str) -> Vec<CalFrameV2> {
+    text.lines()
+        .filter(|l| !l.starts_with("v2"))
+        .filter_map(|l| {
+            let f: Vec<f32> = l.split_whitespace().filter_map(|v| v.parse().ok()).collect();
+            if f.len() < 9 {
+                return None;
+            }
+            Some(CalFrameV2 { t: f[0], yaw: f[1], pitch: f[2], roll: f[3], pos_x: f[4], pos_y: f[5], geom: (f[6], f[7], f[8]) })
+        })
+        .collect()
+}
+
+/// Replay a mesh recording through the mesh detectors at these floors
+/// (degrees): nods and shakes counted.
+pub fn replay_round_v2(frames: &[CalFrameV2], floors_deg: (f32, f32)) -> (usize, usize) {
+    let mut det = NodDetector::mesh(floors_deg.0);
+    let mut shake = ShakeDetector::mesh(floors_deg.1);
+    det.inner.prior_still = 1.0;
+    shake.inner.prior_still = 1.0;
+    for f in frames {
+        shake.push_with(f.yaw, f.t, Some(f.geom));
+        det.push_full(f.pitch, Some(f.yaw / NodDetector::YAW_DEG_PER_UNIT), f.t, Some(f.geom));
+    }
+    (det.nods, shake.shakes)
+}
+
 pub fn replay_round(frames: &[CalFrame], floors: (f32, f32)) -> (usize, usize) {
     let mut det = NodDetector::with_floor(floors.0);
     let mut shake = ShakeDetector::with_floor(floors.1);
@@ -1491,13 +1578,20 @@ pub fn track(faces: &[faceauth_engine::Face], tracked: [f32; 4]) -> Track {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, window: Duration, nods_needed: usize, answers: Option<(&Answers, &str)>, lost_after: Option<Duration>, floors: (f32, f32), start: Option<[f32; 4]>, dwell: Duration) -> Result<(Gesture, Option<[f32; 4]>)> {
+pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, window: Duration, nods_needed: usize, answers: Option<(&Answers, &str)>, lost_after: Option<Duration>, floors: (f32, f32), floors_deg: (f32, f32), start: Option<[f32; 4]>, dwell: Duration) -> Result<(Gesture, Option<[f32; 4]>)> {
     let min_detection = cfg.min_detection;
     let user_name = answers.map(|(_, u)| u.to_string()).unwrap_or_else(|| "unknown".into());
     let t0 = Instant::now();
     let mut last_face = Instant::now();
-    let mut det = NodDetector::with_floor(floors.0);
-    let mut shake = ShakeDetector::with_floor(floors.1);
+    // On the mesh when the model is installed: the gestures are read from
+    // the head's angles, which hold up where the image-motion signal and
+    // the five-point pose do not; the image motion still has to carry each
+    // leg (`co_motion`), so a landmark fit cannot nod on its own.
+    let on_mesh = pipeline.mesh.is_some();
+    let fresh_nod = |on_mesh: bool| if on_mesh { NodDetector::mesh(floors_deg.0) } else { NodDetector::with_floor(floors.0) };
+    let fresh_shake = |on_mesh: bool| if on_mesh { ShakeDetector::mesh(floors_deg.1) } else { ShakeDetector::with_floor(floors.1) };
+    let mut det = fresh_nod(on_mesh);
+    let mut shake = fresh_shake(on_mesh);
     // The scan that matched the face just ran with the face steadily in
     // view: that counts as the still second a first leg must follow.
     det.inner.prior_still = 1.0;
@@ -1596,8 +1690,8 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config,
                         log::info!("consent: gesture paused, the matched face is {}", if other == Track::Lost { "not in view" } else { "one of two" });
                         paused_logged = true;
                     }
-                    det = NodDetector::with_floor(floors.0);
-                    shake = ShakeDetector::with_floor(floors.1);
+                    det = fresh_nod(on_mesh);
+                    shake = fresh_shake(on_mesh);
                     prev = None;
                     let since = *lost_since.get_or_insert(Instant::now());
                     if other == Track::Lost && faces.len() == 1 && since.elapsed() > Duration::from_secs(1) {
@@ -1633,7 +1727,16 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config,
         // No flicker filter: on the nose-to-eye measure the calibration
         // battery showed every filter variant costing real gestures and
         // buying no safety (the shape rules carry it).
-        if shake.push_with(pos_x, t, Some(geom)) {
+        // The signals the detectors read: angles on the mesh, image motion
+        // otherwise. A frame the mesh cannot read is skipped on the mesh.
+        let (sig_shake, sig_nod, sig_yaw) = if on_mesh {
+            let Some(m) = pipeline.mesh.as_mut().and_then(|mesh| mesh.for_face(&img, &face).ok().flatten()) else { continue };
+            let hp = faceauth_engine::mesh::head_pose(&m);
+            (hp.yaw, hp.pitch, hp.yaw / NodDetector::YAW_DEG_PER_UNIT)
+        } else {
+            (pos_x, pos_y, pose.yaw)
+        };
+        if shake.push_with(sig_shake, t, Some(geom)) {
             if cfg.gesture_record_only {
                 log::info!("consent: head shake recorded (record-only), {}", summary(&det, &shake, t));
             } else {
@@ -1642,7 +1745,7 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config,
                 return Ok((Gesture::Shaken, tracked));
             }
         }
-        if det.push_full(pos_y, Some(pose.yaw), t, Some(geom)) {
+        if det.push_full(sig_nod, Some(sig_yaw), t, Some(geom)) {
             log::debug!("consent: nod {} at {:.2}s", det.nods, t);
             if det.nods >= nods_needed {
                 if cfg.gesture_record_only {
@@ -2672,5 +2775,45 @@ mod passwordless_tests {
         c.command = "sudo pacman -Syu".into();
         assert!(!is_passwordless_command(&c));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod mesh_battery {
+    use super::*;
+
+    /// The rounds of 2026-09-24 on the mesh: both nod rounds read as two
+    /// nods, both shake rounds as two shakes, and the eight everyday
+    /// rounds (glances each way, the keyboard, reading, talking, leaning)
+    /// read as nothing, at the default floors.
+    #[test]
+    fn mesh_battery_holds() {
+        let dir = format!("{}/traces/v2", env!("CARGO_MANIFEST_DIR"));
+        let floors = (NodDetector::MESH_MIN_DEG, ShakeDetector::MESH_MIN_DEG);
+        let mut bad = Vec::new();
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().map(|e| e == "txt").unwrap_or(false)).collect();
+        files.sort();
+        assert!(files.len() >= 12, "the twelve rounds are in {}", dir);
+        for p in files {
+            let name = p.file_stem().unwrap().to_string_lossy().to_string();
+            let frames = parse_v2(&std::fs::read_to_string(&p).unwrap());
+            let (nods, shakes) = replay_round_v2(&frames, floors);
+            eprintln!("mesh battery {:16} {} frames: {} nods, {} shakes", name, frames.len(), nods, shakes);
+            let want_nod = name.starts_with("nod");
+            let want_shake = name.starts_with("shake");
+            if want_nod && nods < 2 {
+                bad.push(format!("{}: {} nods, wanted 2", name, nods));
+            }
+            if want_shake && shakes < 2 {
+                bad.push(format!("{}: {} shakes, wanted 2", name, shakes));
+            }
+            if !want_nod && nods > 0 {
+                bad.push(format!("{}: {} nods from an everyday movement", name, nods));
+            }
+            if !want_shake && shakes > 0 {
+                bad.push(format!("{}: {} shakes from an everyday movement", name, shakes));
+            }
+        }
+        assert!(bad.is_empty(), "{:#?}", bad);
     }
 }

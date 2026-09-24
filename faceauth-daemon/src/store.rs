@@ -107,12 +107,31 @@ pub struct GestureCal {
     pub nod_floor_min: Option<f32>,
     #[serde(default)]
     pub shake_floor_min: Option<f32>,
+    /// The same rounds on the face mesh, in degrees: each nod's largest
+    /// pitch swing, each shake's largest yaw swing, and every everyday
+    /// round's swing on both axes. The mesh detectors take their floors
+    /// from these; the fields above stay for the image-motion detectors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nod_deg: Vec<f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shake_deg: Vec<f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub everyday_deg: Vec<EverydayDeg>,
     /// From a short-lived earlier format that kept only the numbers; ignored
     /// once `everyday` has rounds, and dropped on the next save.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub still_nod: Vec<f32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub still_shake: Vec<f32>,
+}
+
+/// An everyday round on the mesh: its largest 1.5 s swing in yaw and in
+/// pitch, degrees.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct EverydayDeg {
+    pub kind: String,
+    pub dyaw: f32,
+    pub dpitch: f32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -169,6 +188,17 @@ impl GestureCal {
         if let Some(m) = self.shake_floor_min {
             shake = shake.max(m.min(Self::SHAKE_FLOOR_MAX));
         }
+        (nod, shake)
+    }
+
+    /// The mesh detectors' floors, degrees: 0.4 of this person's typical
+    /// gesture swing, never under the detector's own minimum nor over a
+    /// cap that would lose a light gesture (recorded 2026-09-24: nods 26
+    /// to 35 degrees peak to peak with legs from 12; shakes 49 to 57 with
+    /// legs from 33).
+    pub fn floors_deg(&self, default_nod: f32, default_shake: f32) -> (f32, f32) {
+        let nod = Self::typical(&self.nod_deg).map(|a| (a * 0.4).clamp(default_nod, 16.0)).unwrap_or(default_nod);
+        let shake = Self::typical(&self.shake_deg).map(|a| (a * 0.4).clamp(default_shake, 24.0)).unwrap_or(default_shake);
         (nod, shake)
     }
 
@@ -778,6 +808,19 @@ mod tests {
         let kept: Vec<usize> = u.templates.iter().map(|t| t.embedding.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0).collect();
         assert_eq!(kept, vec![0, 1, 2], "one of each direction survives; the near copies go");
         assert_eq!(u.prune_to(10), 0);
+    }
+
+    #[test]
+    fn mesh_floors_come_from_the_recorded_swings() {
+        let mut g = GestureCal::default();
+        assert_eq!(g.floors_deg(8.0, 15.0), (8.0, 15.0), "nothing recorded: the defaults");
+        g.nod_deg = vec![34.7, 25.7];
+        g.shake_deg = vec![49.2, 56.8];
+        let (n, s) = g.floors_deg(8.0, 15.0);
+        assert!((n - 13.88).abs() < 0.1 && (s - 22.72).abs() < 0.1, "0.4 of the upper median: {} {}", n, s);
+        g.nod_deg = vec![80.0];
+        g.shake_deg = vec![120.0];
+        assert_eq!(g.floors_deg(8.0, 15.0), (16.0, 24.0), "capped so a light gesture still counts");
     }
 
     #[test]

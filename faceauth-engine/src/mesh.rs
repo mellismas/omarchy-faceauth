@@ -132,9 +132,27 @@ pub fn head_pose(m: &Mesh) -> HeadPose {
     HeadPose { yaw, pitch, roll }
 }
 
+/// Facing the camera closely enough to count as attention: within
+/// `max_yaw_deg` of straight on, rolled no more than `max_roll_deg`, and
+/// pitched within the band a person looking at their screen uses (a lid
+/// camera looks up at the face, so level already reads chin-down).
+pub fn is_attentive(hp: &HeadPose, max_yaw_deg: f32, max_roll_deg: f32) -> bool {
+    hp.yaw.abs() <= max_yaw_deg && hp.roll.abs() <= max_roll_deg && (-30.0..=40.0).contains(&hp.pitch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attention_is_a_band_of_yaw_pitch_and_roll() {
+        let level = HeadPose { yaw: 3.0, pitch: 10.0, roll: -2.0 };
+        assert!(is_attentive(&level, 21.0, 25.0));
+        assert!(!is_attentive(&HeadPose { yaw: 30.0, ..level }, 21.0, 25.0), "turned away");
+        assert!(!is_attentive(&HeadPose { roll: 30.0, ..level }, 21.0, 25.0), "tilted over");
+        assert!(!is_attentive(&HeadPose { pitch: -40.0, ..level }, 21.0, 25.0), "chin right up");
+        assert!(is_attentive(&HeadPose { pitch: 35.0, ..level }, 21.0, 25.0), "reading the keyboard still counts");
+    }
 
     fn mesh_with(points: &[(usize, [f32; 3])]) -> Mesh {
         let mut p = vec![[0.0f32; 3]; 468];

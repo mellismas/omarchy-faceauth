@@ -73,11 +73,20 @@ pub struct Tick {
     pub taken: usize,
     pub wanted: usize,
     pub message: String,
+    /// For the gesture and everyday rounds: which round, of how many, the
+    /// kind, the seconds left in it, whether it is still counting down to
+    /// start, and for the reading round which text slot is showing.
+    pub round: Option<&'static str>,
+    pub round_no: usize,
+    pub round_of: usize,
+    pub seconds_left: f32,
+    pub countdown: bool,
+    pub read_slot: Option<usize>,
 }
 
 impl Tick {
     fn blank(step: &'static str, message: &str) -> Tick {
-        Tick { step, zone: None, face: false, size: 0.0, distance: "far", dot_x: 0.0, dot_y: 0.0, target_x: 0.0, target_y: 0.0, on_target: false, yaw: 0.0, pitch: 0.0, roll: 0.0, raw_yaw: 0.0, raw_pitch: 0.0, nose_pitch: 0.0, mesh_yaw: None, mesh_pitch: None, mesh_roll: None, mesh_score: None, x: 0.5, y: 0.5, centre_yaw: 0.0, level: 0.0, taken: 0, wanted: 0, message: message.into() }
+        Tick { step, zone: None, face: false, size: 0.0, distance: "far", dot_x: 0.0, dot_y: 0.0, target_x: 0.0, target_y: 0.0, on_target: false, yaw: 0.0, pitch: 0.0, roll: 0.0, raw_yaw: 0.0, raw_pitch: 0.0, nose_pitch: 0.0, mesh_yaw: None, mesh_pitch: None, mesh_roll: None, mesh_score: None, x: 0.5, y: 0.5, centre_yaw: 0.0, level: 0.0, taken: 0, wanted: 0, message: message.into(), round: None, round_no: 0, round_of: 0, seconds_left: 0.0, countdown: false, read_slot: None }
     }
 }
 
@@ -388,6 +397,58 @@ fn save_pgm(dir: &std::path::Path, name: &str, img: &faceauth_engine::Grey) -> R
 }
 const RANGE_SECONDS: f32 = 14.0;
 
+/// The gesture and everyday rounds after the looks: what is asked, how
+/// many times, for how long, and the kind the store files it under (the
+/// two glances are "aside" rounds, the keyboard look a "glance").
+pub struct Round {
+    pub kind: &'static str,
+    pub stored_as: &'static str,
+    pub times: usize,
+    pub seconds: f32,
+    pub prompt: &'static str,
+}
+
+pub const ROUNDS: [Round; 8] = [
+    Round { kind: "nod", stored_as: "nod", times: 2, seconds: 8.0, prompt: "Look at the camera and nod twice, the way you would to say yes." },
+    Round { kind: "shake", stored_as: "shake", times: 2, seconds: 8.0, prompt: "Look at the camera and shake your head twice, the way you would to say no." },
+    Round { kind: "glance-right", stored_as: "aside", times: 2, seconds: 6.0, prompt: "Something catches your eye to the right. Look at it, then back at the screen. Twice." },
+    Round { kind: "glance-left", stored_as: "aside", times: 2, seconds: 6.0, prompt: "Something catches your eye to the left. Look at it, then back at the screen. Twice." },
+    Round { kind: "keyboard", stored_as: "glance", times: 1, seconds: 8.0, prompt: "Look down at your keyboard and back up at the screen, twice." },
+    Round { kind: "read", stored_as: "read", times: 1, seconds: 12.0, prompt: "Read the text as it appears around the screen." },
+    Round { kind: "talk", stored_as: "talk", times: 1, seconds: 8.0, prompt: "Keep facing the screen and say a sentence or two out loud, as if on a call." },
+    Round { kind: "lean", stored_as: "lean", times: 1, seconds: 8.0, prompt: "Lean in toward the screen and sit back, twice." },
+];
+
+/// The reading round's texts, one per slot; the window places the slots
+/// at the corners and the centre of the screen.
+pub const READ_TEXTS: [&str; 5] = [
+    "The camera reads your head, never your eyes.",
+    "Nothing here is stored as an image.",
+    "A nod approves. A shake refuses.",
+    "Ordinary reading must never count as either.",
+    "That is what this round is for.",
+];
+/// How long each text slot shows.
+pub const READ_SLOT_SECONDS: f32 = 2.4;
+/// The pause before a round starts recording.
+const ROUND_COUNTDOWN: f32 = 2.0;
+
+/// Round `i` in the flat list of (round, repeat) pairs.
+pub fn round_at(i: usize) -> Option<(&'static Round, usize)> {
+    let mut n = 0;
+    for r in &ROUNDS {
+        if i < n + r.times {
+            return Some((r, i - n + 1));
+        }
+        n += r.times;
+    }
+    None
+}
+
+pub fn round_count() -> usize {
+    ROUNDS.iter().map(|r| r.times).sum()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Step {
     /// Nothing stored: the dot alone while the person moves through the
@@ -403,6 +464,10 @@ pub enum Step {
     Path,
     Hold(usize),
     Verify,
+    /// "Next we record how you nod and shake."
+    Bridge,
+    /// One gesture or everyday round, by index into the flat list.
+    Round(usize),
 }
 
 impl Step {
@@ -416,6 +481,8 @@ impl Step {
             Step::Path => "path",
             Step::Hold(_) => "hold",
             Step::Verify => "verify",
+            Step::Bridge => "bridge",
+            Step::Round(_) => "round",
         }
     }
 
@@ -436,7 +503,10 @@ impl Step {
             Step::Path => Step::Hold(0),
             Step::Hold(i) if i + 1 < HOLD_ZONES.len() => Step::Hold(i + 1),
             Step::Hold(_) => Step::Verify,
-            Step::Verify => return None,
+            Step::Verify => Step::Bridge,
+            Step::Bridge => Step::Round(0),
+            Step::Round(i) if i + 1 < round_count() => Step::Round(i + 1),
+            Step::Round(_) => return None,
         })
     }
 
@@ -448,6 +518,7 @@ impl Step {
             "range" => Step::Range,
             "path" => Step::Path,
             "hold" => Step::Hold(0),
+            "bridge" | "gestures" => Step::Bridge,
             _ => Step::Welcome,
         }
     }
@@ -467,6 +538,63 @@ pub fn message_for(step: Step, distance: &str) -> String {
         Step::Path => "Follow the dashed circle with your head and keep the dot inside it. It waits for you.".into(),
         Step::Hold(i) => format!("Hold the dot in the circle: {}.", POSE_HINTS[POSES.iter().position(|p| *p == HOLD_ZONES[i]).unwrap_or(0)]),
         Step::Verify => "Look at the camera.".into(),
+        Step::Bridge => "Next we record how you nod and how you shake your head, and make sure ordinary movement is never mistaken for either. Nothing here is an image.".into(),
+        Step::Round(i) => round_at(i).map(|(r, _)| r.prompt.to_string()).unwrap_or_default(),
+    }
+}
+
+/// Where a session started at decides where it ends: a first enrolment
+/// runs the looks and the rounds, Add Look stops after verify, Tune
+/// Gestures runs the rounds alone.
+fn last_step(start: Option<&str>) -> Step {
+    match start.unwrap_or("welcome") {
+        "distance" | "centre" | "path" | "hold" => Step::Verify,
+        _ => Step::Round(round_count().saturating_sub(1)),
+    }
+}
+
+/// A round's recording: the largest 1.5 s swing on each image-motion
+/// axis, as the terminal calibration measures it, so the stored sizes
+/// and floors are the same numbers either way.
+fn swing(series: &[(f32, f32, f32)], pick: fn(&(f32, f32, f32)) -> f32) -> f32 {
+    let mut best = 0f32;
+    for i in 0..series.len() {
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for s in &series[i..] {
+            if s.0 - series[i].0 > 1.5 {
+                break;
+            }
+            lo = lo.min(pick(s));
+            hi = hi.max(pick(s));
+        }
+        if hi > lo {
+            best = best.max(hi - lo);
+        }
+    }
+    best
+}
+
+/// The per-frame recording of a round, kept in dev-tools builds under the
+/// root-only gestures directory: a header, then one line per frame with
+/// the mesh's angles and the image motion, for designing the detectors.
+#[cfg(feature = "dev-tools")]
+fn save_round_trace(cfg: &crate::config::Config, user: &str, kind: &str, n: usize, lines: &[String]) {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let dir = cfg.store_dir.join("gestures");
+    let res = (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        let name = format!("{}-{}-v2-{}-{}.txt", now_secs(), user, kind, n);
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(dir.join(&name))?;
+        writeln!(f, "v2 t yaw pitch roll pos_x pos_y w cx cy size score")?;
+        for l in lines {
+            writeln!(f, "{}", l)?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = res {
+        log::warn!("round recording for {}: {}", user, e);
     }
 }
 
@@ -561,6 +689,16 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
     let mut on_since: Option<Instant> = None;
     let mut verify_hits = 0usize;
     let mut verify_since: Option<Instant> = None;
+    let last = last_step(start.start_at.as_deref());
+    // A round: when it started counting down, the motion state, the series
+    // for the swing measure, and the recording.
+    let mut round_started: Option<Instant> = None;
+    let mut round_prev: Option<(faceauth_engine::Grey, [f32; 4])> = None;
+    let (mut round_px, mut round_py) = (0f32, 0f32);
+    let mut round_series: Vec<(f32, f32, f32)> = Vec::new();
+    let mut round_angles: Vec<(f32, f32, f32)> = Vec::new(); // t, yaw, pitch in degrees
+    let mut round_lines: Vec<String> = Vec::new();
+    let mut round_frames: Vec<crate::consent::CalFrame> = Vec::new();
     let mut added = 0usize;
     let mut filter = Filter::new();
     let take_template = |u: &mut UserTemplates, a: &mut Authenticator, img: &faceauth_engine::Grey, face: &faceauth_engine::Face, p: &faceauth_engine::pose::Pose, zone: &str| -> Result<()> {
@@ -578,6 +716,9 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
             Some("continue") => {
                 if step == Step::Welcome {
                     step = Step::Centre;
+                } else if step == Step::Bridge {
+                    step = Step::Round(0);
+                    round_started = None;
                 }
             }
             Some("redo") => match step {
@@ -591,6 +732,7 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
                     path_taken = 0;
                 }
                 Step::Hold(_) => taken = 0,
+                Step::Round(_) => round_started = None,
                 _ => {}
             },
             _ => {}
@@ -827,16 +969,116 @@ fn run_inner(a: &mut Authenticator, user: &str, start: &Start) -> Result<Outcome
                     }
                 }
                 if verify_hits >= 2 {
-                    cap.stop()?;
-                    let (lo, mean, _) = u.self_consistency().unwrap_or((1.0, 1.0, 1.0));
-                    // The file the templates rest in: the sealed blob when the
-                    // store seals, else the plaintext.
-                    let path = if a.store.is_sealed(user) { a.store.sealed_path_for(user) } else { a.store.path_for(user) }.map(|p| p.display().to_string()).unwrap_or_default();
-                    end_session(a, user, "done", "Recognised. Enrolment complete.");
-                    return Ok(Outcome::Enrolled { added, total: u.templates.len(), consistency_min: lo, consistency_mean: mean, path });
+                    if last == Step::Verify {
+                        cap.stop()?;
+                        let (lo, mean, _) = u.self_consistency().unwrap_or((1.0, 1.0, 1.0));
+                        // The file the templates rest in: the sealed blob when the
+                        // store seals, else the plaintext.
+                        let path = if a.store.is_sealed(user) { a.store.sealed_path_for(user) } else { a.store.path_for(user) }.map(|p| p.display().to_string()).unwrap_or_default();
+                        end_session(a, user, "done", "Recognised. Enrolment complete.");
+                        return Ok(Outcome::Enrolled { added, total: u.templates.len(), consistency_min: lo, consistency_mean: mean, path });
+                    }
+                    step = Step::Bridge;
                 }
                 if verify_since.map(|s| s.elapsed() > Duration::from_secs(20)).unwrap_or(false) {
                     return Err(anyhow!("the new templates did not recognise you within 20 s ({} added)", added));
+                }
+            }
+            Step::Bridge => {
+                tick.message = message_for(step, tick.distance);
+                tick.on_target = true;
+            }
+            Step::Round(i) => {
+                let Some((r, n)) = round_at(i) else { return Err(anyhow!("no round {}", i)) };
+                tick.round = Some(r.kind);
+                tick.round_no = i + 1;
+                tick.round_of = round_count();
+                tick.on_target = true;
+                let started = *round_started.get_or_insert_with(|| {
+                    round_prev = None;
+                    round_px = 0.0;
+                    round_py = 0.0;
+                    round_series.clear();
+                    round_angles.clear();
+                    round_lines.clear();
+                    round_frames.clear();
+                    Instant::now()
+                });
+                let since = started.elapsed().as_secs_f32();
+                if since < ROUND_COUNTDOWN {
+                    tick.countdown = true;
+                    tick.seconds_left = ROUND_COUNTDOWN - since;
+                    tick.message = format!("Get ready: {}", r.prompt);
+                } else {
+                    let t = since - ROUND_COUNTDOWN;
+                    tick.seconds_left = (r.seconds - t).max(0.0);
+                    tick.message = r.prompt.to_string();
+                    if r.kind == "read" {
+                        tick.read_slot = Some(((t / READ_SLOT_SECONDS) as usize) % READ_TEXTS.len());
+                    }
+                    // Image motion of the face, as the gesture detectors read it.
+                    if let Some((pimg, pbox)) = &round_prev {
+                        let region = faceauth_engine::motion::Region::around(*pbox, 0.2, img.width, img.height);
+                        let (mdx, mdy) = faceauth_engine::motion::shift(pimg, &img, region, 24);
+                        round_px += mdx / face.bbox[2].max(1.0);
+                        round_py += mdy / face.bbox[2].max(1.0);
+                    }
+                    round_prev = Some((img.clone(), face.bbox));
+                    let geom = (face.bbox[2], face.bbox[0] + face.bbox[2] / 2.0, face.bbox[1] + face.bbox[3] / 2.0);
+                    round_series.push((t, round_px, round_py));
+                    round_angles.push((t, hp.yaw, hp.pitch));
+                    round_frames.push(crate::consent::CalFrame { t, pos_x: round_px, pos_y: round_py, yaw: p.yaw, geom });
+                    if round_lines.len() < 1500 {
+                        round_lines.push(format!("{:.2} {:+.1} {:+.1} {:+.1} {:+.3} {:+.3} {:.0} {:.0} {:.0} {:.3} {:.2}", t, hp.yaw, hp.pitch, hp.roll, round_px, round_py, geom.0, geom.1, geom.2, tick.size, m.score));
+                    }
+                    if t >= r.seconds {
+                        // The round is over: measure it the way the terminal
+                        // calibration does and store the same numbers.
+                        let dy = swing(&round_series, |s| s.2);
+                        let dx = swing(&round_series, |s| s.1);
+                        let dpitch = swing(&round_angles, |s| s.2);
+                        let dyaw = swing(&round_angles, |s| s.1);
+                        let (amplitude, stored) = match r.stored_as {
+                            "nod" => {
+                                let ok = dy >= crate::consent::NodDetector::MIN_DOWN;
+                                if ok { u.gesture.nod.push(dy) }
+                                if dpitch >= crate::consent::NodDetector::MESH_MIN_DEG { u.gesture.nod_deg.push(dpitch) }
+                                (dy, ok)
+                            }
+                            "shake" => {
+                                let ok = dx >= crate::consent::ShakeDetector::MIN_TURN;
+                                if ok { u.gesture.shake.push(dx) }
+                                if dyaw >= crate::consent::ShakeDetector::MESH_MIN_DEG { u.gesture.shake_deg.push(dyaw) }
+                                (dx, ok)
+                            }
+                            kind => {
+                                u.gesture.everyday.push(crate::store::EverydayRound { kind: kind.to_string(), dy, dx });
+                                u.gesture.everyday_deg.push(crate::store::EverydayDeg { kind: kind.to_string(), dyaw, dpitch });
+                                u.gesture.still_nod.clear();
+                                u.gesture.still_shake.clear();
+                                (dy.max(dx), true)
+                            }
+                        };
+                        a.cal_rounds.entry(user.to_string()).or_default().push(crate::auth::CalRound { kind: r.stored_as.to_string(), frames: std::mem::take(&mut round_frames), sample: if stored && matches!(r.stored_as, "nod" | "shake") { Some(amplitude) } else { None } });
+                        log::info!("round {} of {} for {}: {} {} moved {:.3} vertically, {:.3} sideways ({:.0} deg pitch, {:.0} deg yaw){}", i + 1, round_count(), user, r.kind, n, dy, dx, dpitch, dyaw, if stored { "" } else { " (too small to count; not stored)" });
+                        #[cfg(feature = "dev-tools")]
+                        save_round_trace(&a.cfg, user, r.kind, n, &round_lines);
+                        a.store.save(&u)?;
+                        round_started = None;
+                        match step.next() {
+                            Some(s) if step != last => step = s,
+                            _ => {
+                                cap.stop()?;
+                                let (nf, sf) = u.gesture.floors(crate::consent::NodDetector::MIN_DOWN, crate::consent::ShakeDetector::MIN_TURN);
+                                let (nd, sd) = u.gesture.floors_deg(crate::consent::NodDetector::MESH_MIN_DEG, crate::consent::ShakeDetector::MESH_MIN_DEG);
+                                log::info!("rounds done for {}: floors nod {:.3} shake {:.3} (mesh: nod {:.0} deg, shake {:.0} deg)", user, nf, sf, nd, sd);
+                                let (lo, mean, _) = u.self_consistency().unwrap_or((1.0, 1.0, 1.0));
+                                let path = if a.store.is_sealed(user) { a.store.sealed_path_for(user) } else { a.store.path_for(user) }.map(|p| p.display().to_string()).unwrap_or_default();
+                                end_session(a, user, "done", "All done. Your nods, shakes and everyday movements are recorded.");
+                                return Ok(Outcome::Enrolled { added, total: u.templates.len(), consistency_min: lo, consistency_mean: mean, path });
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -856,7 +1098,18 @@ mod tests {
             s = n;
             names.push(format!("{}{}", s.name(), s.zone().map(|z| format!(":{}", z)).unwrap_or_default()));
         }
-        assert_eq!(names, vec!["welcome", "centre", "range", "path", "hold:centre", "hold:left", "hold:right", "hold:centre", "hold:up", "hold:down", "verify"]);
+        assert_eq!(&names[..11], &["welcome", "centre", "range", "path", "hold:centre", "hold:left", "hold:right", "hold:centre", "hold:up", "hold:down", "verify"]);
+        assert_eq!(names[11], "bridge");
+        assert_eq!(names.len(), 12 + round_count(), "then every round");
+        assert_eq!(round_count(), 12);
+        assert_eq!(round_at(0).map(|(r, n)| (r.kind, n)), Some(("nod", 1)));
+        assert_eq!(round_at(1).map(|(r, n)| (r.kind, n)), Some(("nod", 2)));
+        assert_eq!(round_at(2).map(|(r, n)| (r.kind, n)), Some(("shake", 1)));
+        assert_eq!(round_at(11).map(|(r, n)| (r.kind, n)), Some(("lean", 1)));
+        assert!(round_at(12).is_none());
+        assert_eq!(last_step(Some("distance")), Step::Verify, "Add Look ends after verify");
+        assert_eq!(last_step(None), Step::Round(11), "a first enrolment runs every round");
+        assert_eq!(Step::from_start(Some("bridge")), Step::Bridge, "Tune Gestures starts at the bridge");
         assert_eq!(Step::from_start(Some("distance")), Step::Centre, "Add Look starts at the centre screen");
         #[cfg(feature = "dev-tools")]
         {

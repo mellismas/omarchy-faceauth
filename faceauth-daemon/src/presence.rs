@@ -330,7 +330,12 @@ pub(crate) fn observe(a: &mut Authenticator, cfg: &PresenceConfig, identify: boo
     // A face was in view at this exposure: the next look starts from it.
     a.last_exposure = Some(cap.exposure);
     let p = pose::pose(&face.landmarks);
-    let attentive = pose::is_attentive(&p, cfg.max_yaw, cfg.max_roll_degrees);
+    // Attention from the mesh when the model is installed: its angles hold
+    // where the five points' do not (a chin-up seen from below).
+    let attentive = match a.pipeline.mesh.as_mut().and_then(|m| m.for_face(&img, &face).ok().flatten()) {
+        Some(m) => faceauth_engine::mesh::is_attentive(&faceauth_engine::mesh::head_pose(&m), cfg.max_yaw * crate::consent::NodDetector::YAW_DEG_PER_UNIT, cfg.max_roll_degrees),
+        None => pose::is_attentive(&p, cfg.max_yaw, cfg.max_roll_degrees),
+    };
     let identity = if identify {
         // Liveness first: one lit/unlit pair under the alternating pattern.
         // A refusal is "not the user"; no signal (a bright room, a face far

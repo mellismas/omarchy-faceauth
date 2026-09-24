@@ -354,8 +354,11 @@ impl Authenticator {
                     let faces = self.pipeline.detector.detect(&img, self.cfg.min_detection)?;
                     match faces.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) {
                         Some(f) => {
-                            let p = faceauth_engine::pose::pose(&f.landmarks);
-                            Outcome::Probe { face: true, attentive: faceauth_engine::pose::is_attentive(&p, 0.25, 25.0), face_px: f.bbox[2], elapsed_ms: 0 }
+                            let attentive = match self.pipeline.mesh.as_mut().and_then(|m| m.for_face(&img, &f).ok().flatten()) {
+                                Some(m) => faceauth_engine::mesh::is_attentive(&faceauth_engine::mesh::head_pose(&m), 0.25 * crate::consent::NodDetector::YAW_DEG_PER_UNIT, 25.0),
+                                None => faceauth_engine::pose::is_attentive(&faceauth_engine::pose::pose(&f.landmarks), 0.25, 25.0),
+                            };
+                            Outcome::Probe { face: true, attentive, face_px: f.bbox[2], elapsed_ms: 0 }
                         }
                         None => Outcome::Probe { face: false, attentive: false, face_px: 0.0, elapsed_ms: 0 },
                     }
@@ -557,6 +560,7 @@ impl Authenticator {
         let lost_after = if cfg.presence.enabled && cfg.presence.user == s.user { Some(Duration::from_secs_f32(cfg.presence.away_seconds)) } else { None };
         let msg = format!("Recognised. Nod {} times to allow this, shake your head to refuse, or type your password.", cfg.consent_nods);
         let floors = s.templates.gesture.floors(crate::consent::NodDetector::MIN_DOWN, crate::consent::ShakeDetector::MIN_TURN);
+        let floors_deg = s.templates.gesture.floors_deg(crate::consent::NodDetector::MESH_MIN_DEG, crate::consent::ShakeDetector::MESH_MIN_DEG);
         let dialog_cell = std::cell::RefCell::new(&mut s.dialog);
         let caller_ref = &s.caller;
         let gesture_cell: std::cell::RefCell<Option<Gesture>> = std::cell::RefCell::new(None);
@@ -597,7 +601,7 @@ impl Authenticator {
                 let left = total - started.elapsed().as_secs_f32();
                 let window = cfg.consent_seconds.clamp(10.0, MAX_BUDGET).min(left).max(1.0);
                 let dwell = dialog_cell.borrow().dwell_left(Instant::now());
-                let (g, followed) = wait_for_nods(cap, pipeline, &cfg, Duration::from_secs_f32(window), cfg.consent_nods, Some((&answers, &user)), lost_after, floors, Some(matched.bbox), dwell)?;
+                let (g, followed) = wait_for_nods(cap, pipeline, &cfg, Duration::from_secs_f32(window), cfg.consent_nods, Some((&answers, &user)), lost_after, floors, floors_deg, Some(matched.bbox), dwell)?;
                 let g = if g == Gesture::Nodded {
                     // The nods came from the followed box; before they count,
                     // that box must be live and enrolled, right now.

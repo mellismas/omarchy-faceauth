@@ -17,7 +17,8 @@ fn usage() -> ! {
   faceauth pose [--user NAME] [--rounds N] [--seconds N]   (dev-tools builds; root; a live pose readout)\n  faceauth enroll [--user NAME] [--label TEXT] [--guided [--start distance]]   (root; the walk-through window: distance, path, holds, verify)
   faceauth enroll [--user NAME] [--label TEXT] [--terminal [--poses up,down]]   (root; the five looks from the terminal, no window)
   faceauth enroll [--user NAME] [--label TEXT] [--seconds N] [--count N]   (root; one look, as the camera sees it)
-  faceauth enrol-control continue|redo|cancel [--user NAME]   (from the enrolment window)\n  faceauth enroll --store DIR ...                   (direct camera access, development)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] [--dismiss|--ack|--passwordless MIN]   (from the consent window; stdin: token line, then password line)\n  faceauth consent-context --action ID --message TEXT [--cookie C]   (from the polkit agent, as a request starts)\n  faceauth calibrate [--user NAME] [--gestures-only]   (root; two nods, two shakes and five everyday movements, stored with the templates)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence                                (current state)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
+  faceauth enrol-control continue|redo|cancel [--user NAME]   (from the enrolment window)\n  faceauth enroll --store DIR ...                   (direct camera access, development)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] [--dismiss|--ack|--passwordless MIN]   (from the consent window; stdin: token line, then password line)\n  faceauth consent-context --action ID --message TEXT [--cookie C]   (from the polkit agent, as a request starts)\n  faceauth calibrate [--user NAME] [--gestures-only]   (root; two nods, two shakes and five everyday movements, stored with the templates)
+  faceauth calibrate [--user NAME] --guided              (root; the same rounds in the walk-through window)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence                                (current state)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
     );
     std::process::exit(2)
 }
@@ -253,6 +254,21 @@ fn main() -> Result<()> {
             let st = std::process::Command::new("systemctl").args(["restart", "faceauth.service"]).status();
             println!("presence watch {} for {} (away after {} s); service restart: {}", mode, user, away, st.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()));
             Ok(())
+        }
+        ["calibrate", rest @ ..] if rest.contains(&"--guided") => {
+            // Root: the gesture and everyday rounds in the walk-through window.
+            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
+            let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
+            println!("Tuning gestures for {}: follow the window on your screen. This terminal waits for it.", user);
+            let o = faceauth_daemon::server::enrol_session(&socket, &user, "tune", Some("bridge"))?;
+            match &o {
+                faceauth_daemon::auth::Outcome::Enrolled { .. } => {
+                    println!("Done. Your nods, shakes and everyday movements are recorded with your templates.");
+                    Ok(())
+                }
+                faceauth_daemon::auth::Outcome::Error { message } => Err(anyhow!("tuning failed: {}", message)),
+                other => Err(anyhow!("tuning failed: {}", serde_json::to_string(other)?)),
+            }
         }
         ["calibrate", rest @ ..] => {
             // Root: two nods, two shakes and three everyday movements, each a
