@@ -495,13 +495,21 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> R
     // the mode at every start. Both forms answer with the state.
     if let Some(mode) = &req.presence_mode {
         let watched = CFG.get().map(|c| c.presence.clone()).unwrap_or_default();
+        // "Watching" is what the bar widget and the key binding show up for,
+        // so it also needs the user enrolled: a watch configured for a user
+        // with no templates never locks for them and offers nothing to switch.
+        let enrolled = auth.lock().map(|a| a.store.enrolled_users().iter().any(|u| u == &req.user)).unwrap_or(false);
         let outcome = match presence_mode_change(cred.uid(), &req.user, &watched, mode) {
+            Ok(Some(m)) if !enrolled => {
+                let _ = m;
+                Outcome::Error { message: format!("{} is not enrolled", req.user) }
+            }
             Ok(Some(m)) => {
                 crate::presence::set_presence_mode(m);
                 log::info!("presence: mode set to {} by uid {} pid {}", m.name(), cred.uid(), cred.pid());
-                presence_state(&watched, &req.user)
+                presence_state(&watched, &req.user, enrolled)
             }
-            Ok(None) => presence_state(&watched, &req.user),
+            Ok(None) => presence_state(&watched, &req.user, enrolled),
             Err(why) => {
                 log::warn!("presence mode request from uid {} for {} refused: {}", cred.uid(), req.user, why);
                 Outcome::Error { message: why }
@@ -831,8 +839,8 @@ fn presence_mode_change(peer_uid: u32, user: &str, watched: &crate::presence::Pr
 
 /// The state a presence mode request answers with: the mode in force and
 /// whether the daemon's watch is on for `user`.
-fn presence_state(watched: &crate::presence::PresenceConfig, user: &str) -> Outcome {
-    Outcome::PresenceMode { mode: crate::presence::presence_mode().name().into(), watching: watched.enabled && watched.user == user }
+fn presence_state(watched: &crate::presence::PresenceConfig, user: &str, enrolled: bool) -> Outcome {
+    Outcome::PresenceMode { mode: crate::presence::presence_mode().name().into(), watching: watched.enabled && watched.user == user && enrolled }
 }
 
 /// Where a request comes from, as far as the daemon can prove it.
@@ -1319,9 +1327,12 @@ mod locality_tests {
         // The read form changes nothing and is answered whether or not the
         // watch is on, with `watching` saying which.
         assert_eq!(presence_mode_change(my_uid + 1, &me, &off, "query"), Ok(None));
-        assert!(matches!(presence_state(&watched, &me), Outcome::PresenceMode { watching: true, .. }));
-        assert!(matches!(presence_state(&off, &me), Outcome::PresenceMode { watching: false, .. }));
-        assert!(matches!(presence_state(&watched, "someone-else"), Outcome::PresenceMode { watching: false, .. }));
+        assert!(matches!(presence_state(&watched, &me, true), Outcome::PresenceMode { watching: true, .. }));
+        assert!(matches!(presence_state(&off, &me, true), Outcome::PresenceMode { watching: false, .. }));
+        assert!(matches!(presence_state(&watched, "someone-else", true), Outcome::PresenceMode { watching: false, .. }));
+        // A watch configured for a user with no templates is not "watching":
+        // the widget and the binding stay away until enrolment.
+        assert!(matches!(presence_state(&watched, &me, false), Outcome::PresenceMode { watching: false, .. }));
     }
 
     /// A process table the check reads instead of /proc and logind.
