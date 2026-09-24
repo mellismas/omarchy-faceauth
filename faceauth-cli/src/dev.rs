@@ -4,8 +4,9 @@
 //! verify loop. None of it ships: the package build has no `dev-tools`
 //! feature, so the shipped CLI is the commands a user or a setup script
 //! runs and nothing a reviewer has to read past (H2). One of these tools,
-//! `enroll --store`, writes templates that match on any camera, which is
-//! why it must not exist in the package.
+//! `enroll --store`, writes into a store of its own from the direct camera,
+//! bound to the IR sensor it probed like the daemon's own enrolment (H5),
+//! and still must not exist in the package.
 
 use super::*;
 use faceauth_camera::calib::{self, Exposure, Window};
@@ -13,7 +14,7 @@ use faceauth_camera::unpack::{bayer_reduce, BayerOrder};
 use faceauth_camera::{Camera, Frame, Illuminator};
 use std::io::Write;
 
-pub(super) const USAGE: &str = "\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only] [--exposure LINES]\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine mesh --models DIR IMAGE.pgm\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth sweep [--user NAME] [--seconds N] [--log FILE] [--threshold T]   (root; scores per frame while you turn your head)\n  faceauth pose [--user NAME] [--rounds N] [--seconds N]   (root; a live pose readout)\n  faceauth enroll --store DIR ...                   (direct camera access; templates match on any camera)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]";
+pub(super) const USAGE: &str = "\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only] [--exposure LINES]\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine mesh --models DIR IMAGE.pgm\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth sweep [--user NAME] [--seconds N] [--log FILE] [--threshold T]   (root; scores per frame while you turn your head)\n  faceauth pose [--user NAME] [--rounds N] [--seconds N]   (root; a live pose readout)\n  faceauth enroll --store DIR ...                   (direct camera access; templates bound to the probed IR sensor)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]";
 
 /// The development commands, or None when `argv` is not one of them.
 pub(super) fn dispatch(argv: &[&str]) -> Option<Result<()>> {
@@ -919,6 +920,16 @@ fn enroll(rest: &[&str]) -> Result<()> {
     let seconds: u64 = opt(rest, "--seconds").unwrap_or("12").parse()?;
     let count: usize = opt(rest, "--count").unwrap_or("10").parse()?;
     let mut p = faceauth_engine::Pipeline::load(&dir)?;
+    // The account and the camera the templates bind to, resolved before
+    // the capture: the store requires both, so this path writes the same
+    // bound set the daemon does (H5).
+    let uid = faceauth_daemon::store::current_uid(&user)
+        .ok_or_else(|| anyhow!("unknown user {}", user))?;
+    let device = {
+        let g = faceauth_camera::ipu3::probe()?.ok_or_else(|| anyhow!("no IPU3 graph"))?;
+        let ir = g.ir_sensor().ok_or_else(|| anyhow!("no IR sensor"))?;
+        faceauth_daemon::capture::ipu3_identity_of(ir)
+    };
     println!(
         "Enrolling {}: look at the camera and move your head a little over the next {} s.",
         user, seconds
@@ -933,7 +944,7 @@ fn enroll(rest: &[&str]) -> Result<()> {
     }
     let mut u = store
         .load(&user)?
-        .unwrap_or_else(|| UserTemplates::new(&user, faceauth_engine::embed::AURAFACE_FILE));
+        .unwrap_or_else(|| UserTemplates::new(&user, uid, faceauth_engine::embed::AURAFACE_FILE));
     if u.model != faceauth_engine::embed::AURAFACE_FILE {
         bail!(
             "existing templates are for model {}, delete them first",
@@ -942,14 +953,13 @@ fn enroll(rest: &[&str]) -> Result<()> {
     }
     let now = now_secs();
     for s in &samples {
-        // Development path (direct camera): unbound templates, usable on any camera.
         u.templates.push(Template {
             embedding: s.embedding.clone(),
             quality: s.score,
             face_width: s.face_width,
             created: now,
             label: label.clone(),
-            device: None,
+            device: device.clone(),
             yaw: None,
             nose_pitch: None,
         });

@@ -1023,8 +1023,8 @@ fn run_inner(
     // The store's one enrolment opener: a set the TPM could not open in
     // time stays where it is and the session fails instead (F2).
     let existing = a.store.open_for_enrolment(user)?;
-    let mut u =
-        existing.unwrap_or_else(|| UserTemplates::new(user, faceauth_engine::embed::AURAFACE_FILE));
+    let mut u = existing
+        .unwrap_or_else(|| UserTemplates::new(user, uid, faceauth_engine::embed::AURAFACE_FILE));
     if u.model != faceauth_engine::embed::AURAFACE_FILE {
         return Ok(Outcome::Error {
             message: format!(
@@ -1117,7 +1117,7 @@ fn run_inner(
             face_width: face.bbox[2],
             created: now_secs(),
             label: format!("{}-{}", start.label, zone),
-            device: Some(device.clone()),
+            device: device.clone(),
             yaw: Some(p.yaw),
             nose_pitch: Some(p.nose_pitch),
         });

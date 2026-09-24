@@ -87,6 +87,14 @@ fn ipu3_identity(sysfs_class: &Path, subdev: &Path, entity_name: &str) -> String
     }
 }
 
+/// The identity templates bind to on `ir`, read from the live sysfs tree:
+/// what `open` records in `IrCapture::identity` for that sensor, for a
+/// caller that has probed the graph but is not streaming (the doctor's
+/// binding check, the development enrolment).
+pub fn ipu3_identity_of(ir: &faceauth_camera::ipu3::Ipu3Sensor) -> String {
+    ipu3_identity(Path::new("/sys/class/video4linux"), &ir.subdev, &ir.name)
+}
+
 impl IrCapture {
     /// Resolve the IR camera (config override, else the IPU3 graph's front IR
     /// sensor), configure it, and start streaming with the illuminator off.
@@ -139,8 +147,7 @@ impl IrCapture {
                         .ir_sensor()
                         .ok_or_else(|| anyhow!("no front IR sensor on the IPU3 graph"))?;
                     let (w, h) = g.configure(ir, None)?;
-                    let identity =
-                        ipu3_identity(Path::new("/sys/class/video4linux"), &ir.subdev, &ir.name);
+                    let identity = ipu3_identity_of(ir);
                     (
                         ir.video.clone(),
                         ir.subdev.clone(),

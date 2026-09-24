@@ -59,6 +59,9 @@ pub struct PresenceConfig {
 /// runs every tick, on mains and on battery). The secure mode checks
 /// identity on every tick.
 pub const IDENTIFY_EVERY: u32 = 3;
+/// Whether the watched user's store failed to load on the last check, so
+/// the warning is logged once per episode rather than every tick.
+static STORE_UNREADABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// A face turned to the screen: yaw within this on the five-point
 /// measure (the mesh's degrees convert through `YAW_DEG_PER_UNIT`) and
 /// roll within this many degrees. What "attentive" means everywhere a
@@ -804,17 +807,33 @@ pub(crate) fn observe_in(
         // store that cannot be read is nobody, not everybody: the check fails
         // closed rather than skipping the tick with identity still assumed.
         let score = match a.store.load(&cfg.user) {
-            Ok(Some(t)) => t
-                .best_match_on(&e, &cap.identity)
-                .map(|(s, _)| s)
-                .unwrap_or(-1.0),
+            Ok(Some(t)) => {
+                STORE_UNREADABLE.store(false, Ordering::Relaxed);
+                t.best_match_on(&e, &cap.identity)
+                    .map(|(s, _)| s)
+                    .unwrap_or(-1.0)
+            }
             Ok(None) => -1.0,
             Err(e) => {
-                log::warn!(
-                    "presence: templates unreadable, identity check fails: {}",
-                    e
-                );
-                -1.0
+                // Not a failed check: there is nothing to check against.
+                // The look decides nothing, so the watch does not run a
+                // check on every tick (the stranger cadence) and hold the
+                // camera against the re-enrolment that fixes it. Warned
+                // once per episode.
+                if !STORE_UNREADABLE.swap(true, Ordering::Relaxed) {
+                    log::warn!(
+                        "presence: templates unreadable, identity is not checked until they are: {}",
+                        e
+                    );
+                }
+                cap.stop()?;
+                return Ok(Observation {
+                    face: true,
+                    attentive,
+                    identity: None,
+                    frame: Some(img),
+                    bbox: Some(face.bbox),
+                });
             }
         };
         if score < a.cfg.accept_threshold {

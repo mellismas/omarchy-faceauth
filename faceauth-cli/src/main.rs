@@ -889,13 +889,50 @@ fn illuminator_check(strobe: bool, liveness_required: bool) -> (&'static str, St
     }
 }
 
+/// The `templates.camera` row: the cameras the templates are bound to
+/// (from the daemon's ping) against the camera in the machine now. The
+/// daemon refuses every attempt when they differ, so that is a failure
+/// naming both and the way out (re-enrol), not a pass on a set that is
+/// merely bound to something. Without a live identity (the doctor could
+/// not probe the camera, which as a user it cannot) the row says the
+/// binding went unchecked and why (H5).
+fn camera_binding_row(
+    bound: &[String],
+    live: std::result::Result<&str, &str>,
+) -> (&'static str, String) {
+    match live {
+        Err(why) => (
+            "info",
+            format!(
+                "bound to {}; not checked against the camera in the machine ({})",
+                bound.join(", "),
+                why
+            ),
+        ),
+        Ok(live) if bound.iter().any(|b| b == live) => (
+            "pass",
+            format!("bound to the camera in the machine ({})", live),
+        ),
+        Ok(live) => (
+            "fail",
+            format!(
+                "bound to {} but the camera in the machine is {}: the daemon refuses every attempt; re-enrol",
+                bound.join(", "),
+                live
+            ),
+        ),
+    }
+}
+
 /// The daemon rows from its answer to a ping: what each reply and each
 /// way of failing to get one means, in one place a table can test (J21,
-/// STORE-14).
+/// STORE-14). `live` is the identity of the camera in the machine, or why
+/// the doctor could not read it.
 fn daemon_checks(
     reply: std::result::Result<faceauth_daemon::auth::Outcome, DaemonErr>,
     user: &str,
     socket: &Path,
+    live: std::result::Result<&str, &str>,
 ) -> Vec<Check> {
     use faceauth_daemon::auth::Outcome;
     let mut out = Vec::new();
@@ -908,7 +945,7 @@ fn daemon_checks(
             model,
             templates,
             sealed,
-            unbound,
+            bound,
             floors,
             load_error,
         }) => {
@@ -918,10 +955,16 @@ fn daemon_checks(
                 format!("faceauthd {} answering on {}", version, socket.display()),
             );
             if let Some(e) = load_error {
+                // The store's own message may already say re-enrol.
+                let advice = if e.contains("re-enrol") {
+                    ""
+                } else {
+                    "; re-enrol"
+                };
                 push(
                     "templates.user",
                     "fail",
-                    format!("templates for {} cannot be read: {}; re-enrol", user, e),
+                    format!("templates for {} cannot be read: {}{}", user, e, advice),
                 );
                 return out;
             }
@@ -954,15 +997,8 @@ fn daemon_checks(
                         }
                     },
                 );
-                push(
-                    "templates.camera",
-                    if unbound == 0 { "pass" } else { "warn" },
-                    if unbound == 0 {
-                        "every template is bound to the camera that enrolled it".into()
-                    } else {
-                        format!("{} of {} template(s) predate camera binding and match on any camera; the next enrolment binds them", unbound, templates)
-                    },
-                );
+                let (st, d) = camera_binding_row(&bound, live);
+                push("templates.camera", st, d);
             }
         }
         // The daemon is up but holds the camera for a request or an
@@ -1041,30 +1077,73 @@ fn doctor(rest: &[&str]) -> Result<()> {
     }
     // camera
     let sysfs_ir = ir_sensor_from_sysfs(Path::new("/sys/class/video4linux"));
+    // The identity templates bind to, for the templates.camera row, or why
+    // the doctor could not read it: the probe opens the sensor's control
+    // node, which is root-only once the udev rule holds.
+    let mut live: std::result::Result<String, String> =
+        Err("the IR camera could not be probed".into());
     match faceauth_camera::ipu3::probe() {
         Ok(Some(g)) => match g.ir_sensor() {
             Some(ir) => {
                 // A read of the control list, never an `Illuminator`, whose
                 // drop would switch the strobe off under the daemon (J22).
                 let strobe = faceauth_camera::has_strobe(&ir.subdev).unwrap_or(false);
-                push("camera.ir", "pass", format!("{} on {} ({}x{})", ir.name, ir.video.display(), ir.width, ir.height));
+                live = Ok(faceauth_daemon::capture::ipu3_identity_of(ir));
+                push(
+                    "camera.ir",
+                    "pass",
+                    format!(
+                        "{} on {} ({}x{})",
+                        ir.name,
+                        ir.video.display(),
+                        ir.width,
+                        ir.height
+                    ),
+                );
                 let (st, d) = illuminator_check(strobe, liveness_required);
                 push("camera.illuminator", st, d);
-                push("camera.rgb", if g.colour_sensor().is_some() { "pass" } else { "warn" }, g.colour_sensor().map(|c| c.name.clone()).unwrap_or_else(|| "no front colour sensor".into()));
+                push(
+                    "camera.rgb",
+                    if g.colour_sensor().is_some() {
+                        "pass"
+                    } else {
+                        "warn"
+                    },
+                    g.colour_sensor()
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| "no front colour sensor".into()),
+                );
             }
-            None => push("camera.ir", "fail", "IPU3 graph found but no front IR sensor".into()),
+            None => push(
+                "camera.ir",
+                "fail",
+                "IPU3 graph found but no front IR sensor".into(),
+            ),
         },
-        Ok(None) => push("camera.ir", "unknown", "no IPU3 graph; UVC IR cameras need ir_video in the config".into()),
+        Ok(None) => {
+            live = Err("no IPU3 graph to read the camera's identity from".into());
+            push(
+                "camera.ir",
+                "unknown",
+                "no IPU3 graph; UVC IR cameras need ir_video in the config".into(),
+            )
+        }
         // The probe opens every sensor's control node and stops at the first
         // it cannot open. Once the udev rule holds, the IR sensor's node is
         // root-only and doctor runs as the user, so that is the expected
         // outcome, not a fault: the sensor is read from sysfs instead, which
         // needs no access to the node.
-        Err(e) if is_permission_denied(&e) => match &sysfs_ir {
-            Some((node, name)) => push("camera.ir", "pass", format!("{} on /dev/{}, owned by root (expected once the udev rule is in place; run as root for the illuminator and RGB checks)", name, node)),
-            None => push("camera.ir", "fail", format!("{} and no ov7251 IR sensor in sysfs", e)),
-        },
-        Err(e) => push("camera.ir", "fail", e.to_string()),
+        Err(e) if is_permission_denied(&e) => {
+            live = Err("the camera's node is root-only; run as root to check the binding".into());
+            match &sysfs_ir {
+                Some((node, name)) => push("camera.ir", "pass", format!("{} on /dev/{}, owned by root (expected once the udev rule is in place; run as root for the illuminator, RGB and template binding checks)", name, node)),
+                None => push("camera.ir", "fail", format!("{} and no ov7251 IR sensor in sysfs", e)),
+            }
+        }
+        Err(e) => {
+            live = Err(format!("the camera probe failed: {}", e));
+            push("camera.ir", "fail", e.to_string())
+        }
     }
     // The node's live state, not the rule file: an access grant made before
     // the rule was installed survives until reboot or `setfacl -b`, so the
@@ -1143,7 +1222,12 @@ fn doctor(rest: &[&str]) -> Result<()> {
             DaemonErr::Other(e.to_string())
         }
     });
-    for c in daemon_checks(reply, &user, &socket) {
+    for c in daemon_checks(
+        reply,
+        &user,
+        &socket,
+        live.as_deref().map_err(|e| e.as_str()),
+    ) {
         push(c.id, c.status, c.detail);
     }
     push(
@@ -1595,12 +1679,13 @@ mod doctor_tests {
             model: "m".into(),
             templates,
             sealed: true,
-            unbound: 0,
+            bound: vec!["ipu3:acpi:\\_SB_.PCI0.I2C3.CAM3".into()],
             floors: None,
             load_error: load_error.map(String::from),
         };
+        let live: std::result::Result<&str, &str> = Ok("ipu3:acpi:\\_SB_.PCI0.I2C3.CAM3");
         assert_eq!(
-            ids(&daemon_checks(Ok(pong(3, None)), "mike", socket)),
+            ids(&daemon_checks(Ok(pong(3, None)), "mike", socket, live)),
             vec![
                 ("daemon.running", "pass"),
                 ("templates.user", "pass"),
@@ -1613,7 +1698,8 @@ mod doctor_tests {
             ids(&daemon_checks(
                 Ok(pong(0, Some("cannot unseal"))),
                 "mike",
-                socket
+                socket,
+                live
             )),
             vec![("daemon.running", "pass"), ("templates.user", "fail")],
             "an unreadable blob is not zero templates"
@@ -1622,7 +1708,8 @@ mod doctor_tests {
             ids(&daemon_checks(
                 Err(DaemonErr::PermissionDenied),
                 "mike",
-                socket
+                socket,
+                live
             )),
             vec![("daemon.running", "pass"), ("templates.user", "warn")],
             "a user who is not enrolled sees a running daemon"
@@ -1633,7 +1720,8 @@ mod doctor_tests {
                     message: "busy".into()
                 }),
                 "mike",
-                socket
+                socket,
+                live
             )),
             vec![("daemon.running", "pass")],
             "a busy daemon is a running daemon"
@@ -1642,12 +1730,13 @@ mod doctor_tests {
             ids(&daemon_checks(
                 Err(DaemonErr::Other("connect: no such file".into())),
                 "mike",
-                socket
+                socket,
+                live
             )),
             vec![("daemon.running", "fail")]
         );
         assert_eq!(
-            ids(&daemon_checks(Ok(Outcome::Noted), "mike", socket)),
+            ids(&daemon_checks(Ok(Outcome::Noted), "mike", socket, live)),
             vec![("daemon.running", "warn")]
         );
         assert_eq!(illuminator_check(true, true).0, "pass");
@@ -1657,6 +1746,41 @@ mod doctor_tests {
             "no strobe under liveness_required refuses every attempt"
         );
         assert_eq!(illuminator_check(false, false).0, "warn");
+    }
+
+    /// H5: the binding row compares the bound identities with the live
+    /// camera's. A match passes; a different camera fails, naming both and
+    /// re-enrolment, since the daemon refuses every attempt; no live
+    /// identity is an unchecked row that says why, never a pass.
+    #[test]
+    fn the_binding_row_compares_bound_and_live_identities() {
+        let old = "ipu3:acpi:\\_SB_.PCI0.I2C3.CAM3".to_string();
+        let new = "ipu3:acpi:\\_SB_.PCI0.I2C2.CAM1";
+        let (st, d) = camera_binding_row(std::slice::from_ref(&old), Ok(&old));
+        assert_eq!(st, "pass", "{}", d);
+        let (st, d) = camera_binding_row(std::slice::from_ref(&old), Ok(new));
+        assert_eq!(st, "fail", "{}", d);
+        assert!(
+            d.contains(&old) && d.contains(new) && d.contains("re-enrol"),
+            "the failure names both identities and the way out: {}",
+            d
+        );
+        let (st, d) = camera_binding_row(&[old.clone(), new.to_string()], Ok(new));
+        assert_eq!(
+            st, "pass",
+            "a set spanning cameras passes on one of them: {}",
+            d
+        );
+        let (st, d) = camera_binding_row(
+            std::slice::from_ref(&old),
+            Err("the camera's node is root-only"),
+        );
+        assert_eq!(st, "info", "{}", d);
+        assert!(
+            d.contains("not checked") && d.contains("root-only") && d.contains(&old),
+            "an unchecked row says so, why, and what the set is bound to: {}",
+            d
+        );
     }
 
     /// E6: only a live `auth required|requisite pam_deny.so` after the face

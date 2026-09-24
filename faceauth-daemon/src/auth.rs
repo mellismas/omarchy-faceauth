@@ -71,9 +71,11 @@ pub enum Outcome {
         /// Whether this user's templates rest sealed to the TPM.
         #[serde(default)]
         sealed: bool,
-        /// Templates from before camera binding, which match on any camera.
+        /// The camera identities this user's templates are bound to
+        /// (`IrCapture::identity`), sorted and deduplicated; `doctor`
+        /// compares them with the live camera's identity.
         #[serde(default)]
-        unbound: usize,
+        bound: Vec<String>,
         /// This user's gesture floors (nod, shake) in degrees, the ones the
         /// consent window runs at, once the walk-through has recorded them.
         #[serde(default)]
@@ -405,10 +407,10 @@ impl Authenticator {
             Err(e) => (None, Some(e.to_string())),
         };
         let templates = loaded.as_ref().map(|t| t.templates.len()).unwrap_or(0);
-        let unbound = loaded
+        let bound = loaded
             .as_ref()
-            .map(|t| t.templates.iter().filter(|x| x.device.is_none()).count())
-            .unwrap_or(0);
+            .map(|t| t.bound_devices())
+            .unwrap_or_default();
         let floors = loaded
             .as_ref()
             .filter(|t| t.gesture.is_calibrated())
@@ -418,7 +420,7 @@ impl Authenticator {
             model: faceauth_engine::embed::AURAFACE_FILE.to_string(),
             templates,
             sealed: self.store.is_sealed(user),
-            unbound,
+            bound,
             floors,
             load_error,
         }
@@ -464,8 +466,11 @@ impl Authenticator {
         // longer open goes aside only on the credential tool's own verdict
         // (F2). Its error becomes the outcome's message.
         let existing = self.store.open_for_enrolment(user)?;
-        let mut u = existing
-            .unwrap_or_else(|| UserTemplates::new(user, faceauth_engine::embed::AURAFACE_FILE));
+        let uid = crate::store::current_uid(user)
+            .ok_or_else(|| anyhow::anyhow!("unknown user {}", user))?;
+        let mut u = existing.unwrap_or_else(|| {
+            UserTemplates::new(user, uid, faceauth_engine::embed::AURAFACE_FILE)
+        });
         if u.model != faceauth_engine::embed::AURAFACE_FILE {
             return Ok(Outcome::Error {
                 message: format!(
@@ -554,22 +559,6 @@ impl Authenticator {
         }
         let now = now_secs();
         let added = samples.len();
-        // Templates from before camera binding match on any camera. They were
-        // enrolled on this machine's IR camera, which the enrolment running
-        // now has just used, so bind them to it rather than leave one unbound
-        // template holding the door open for every camera.
-        let legacy = u.templates.iter().filter(|t| t.device.is_none()).count();
-        if legacy > 0 {
-            for t in u.templates.iter_mut().filter(|t| t.device.is_none()) {
-                t.device = Some(device.clone());
-            }
-            log::info!(
-                "enrolment for {}: {} earlier template(s) bound to {}",
-                user,
-                legacy,
-                device
-            );
-        }
         for (e, q, w, p) in samples {
             u.templates.push(Template {
                 embedding: e,
@@ -577,7 +566,7 @@ impl Authenticator {
                 face_width: w,
                 created: now,
                 label: label.to_string(),
-                device: Some(device.clone()),
+                device: device.clone(),
                 yaw: Some(p.yaw),
                 nose_pitch: Some(p.nose_pitch),
             });
@@ -636,11 +625,18 @@ impl Authenticator {
         }
         let templates = match self.store.load(user) {
             Ok(Some(t)) => t,
-            Ok(None) => return Err(Outcome::NotEnrolled),
+            // The window is already up with this request's token: bring it
+            // down, or it keeps that token as pending and ignores the next
+            // request's summon (seen live when a store failed to load).
+            Ok(None) => {
+                dialog.hide();
+                return Err(Outcome::NotEnrolled);
+            }
             Err(e) => {
+                dialog.hide();
                 return Err(Outcome::Error {
                     message: e.to_string(),
-                })
+                });
             }
         };
         self.last_consent.insert(user.to_string(), Instant::now());
@@ -2420,15 +2416,14 @@ mod nod_frame_tests {
     use crate::store::Template;
 
     fn templates() -> UserTemplates {
-        let mut u = UserTemplates::new("alice", "glintr100");
-        u.uid = None;
+        let mut u = UserTemplates::new("alice", 1000, "glintr100");
         u.templates.push(Template {
             embedding: vec![1.0, 0.0],
             quality: 0.9,
             face_width: 80.0,
             created: 1,
             label: "enrol".into(),
-            device: Some("ipu3:x".into()),
+            device: "ipu3:x".into(),
             yaw: None,
             nose_pitch: None,
         });

@@ -31,6 +31,10 @@ const MODEL_IDLE_TICK: Duration = Duration::from_secs(60);
 const MODEL_IDLE_RELEASE: Duration = Duration::from_secs(600);
 /// How long a request waits for the camera before answering "busy".
 const BUSY_WAIT: Duration = Duration::from_millis(1500);
+/// How long the enrolment walk-through waits: a presence look that
+/// identifies and strobes holds the camera for about two seconds, and the
+/// person has just clicked Enrol, so waiting out one tick beats "busy".
+const ENROL_WAIT: Duration = Duration::from_secs(6);
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 /// Who has templates, kept beside the socket ACL: set at start and again
 /// after every enrolment and deletion, the same moments the ACL changes.
@@ -573,8 +577,8 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> R
     }
     // Take the camera, or say "busy" instead of queueing behind another
     // attempt: the callers (PAM, the lock screen) retry on their own terms.
-    let take = || -> Option<std::sync::MutexGuard<'_, Authenticator>> {
-        let deadline = Instant::now() + BUSY_WAIT;
+    let take_for = |wait: Duration| -> Option<std::sync::MutexGuard<'_, Authenticator>> {
+        let deadline = Instant::now() + wait;
         loop {
             match auth.try_lock() {
                 Ok(g) => return Some(g),
@@ -588,6 +592,7 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> R
             }
         }
     };
+    let take = || take_for(BUSY_WAIT);
     // The polkit agent, before its helper's PAM request arrives, says what
     // the request is. Queued per user in arrival order, single use, only
     // from a local caller (the gate above), and served only to a request
@@ -774,7 +779,7 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> R
             start.start_at
         );
         // The session holds the camera for as long as the person takes.
-        let outcome = match take() {
+        let outcome = match take_for(ENROL_WAIT) {
             Some(mut a) => {
                 // The window and its control calls run as the session user,
                 // who on a first enrolment has no template and so no ACL

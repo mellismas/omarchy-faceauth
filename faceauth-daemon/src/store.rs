@@ -24,10 +24,10 @@
 //! entries and matched by the best score, which is how variants merge into one
 //! identity without averaging away what makes each distinct. Each template
 //! records the camera it was enrolled on and only matches on that camera: a
-//! camera swapped in for the enrolled one gets nothing to match against. A
-//! template with no camera recorded (`device` empty, which only the
-//! development store path writes) matches on any camera, and `doctor`
-//! reports such a set.
+//! camera swapped in for the enrolled one gets nothing to match against.
+//! Every template names its camera and every set names the account's uid;
+//! a file missing either is from before this was required, does not parse,
+//! and reads as unreadable (re-enrol), never as a match.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -60,9 +60,9 @@ pub struct Template {
     /// Free text: "enrol", "glasses", ...
     pub label: String,
     /// The camera this was enrolled on (`IrCapture::identity`); a template
-    /// only matches on that camera. None on templates from before binding.
-    #[serde(default)]
-    pub device: Option<String>,
+    /// only matches on that camera. Required: a file without it does not
+    /// parse, so no template ever matches on every camera.
+    pub device: String,
     /// The head pose the frame was taken at (`pose::Pose` yaw and
     /// nose_pitch), recorded with the template for a later look at which
     /// poses a set covers; nothing reads them yet. None on templates from
@@ -79,8 +79,8 @@ pub struct UserTemplates {
     pub user: String,
     /// The account's uid when enrolled. A recreated account with the same name
     /// is a different person; a mismatch on load is treated as not enrolled.
-    #[serde(default)]
-    pub uid: Option<u32>,
+    /// Required: a file without it does not parse, so the check always runs.
+    pub uid: u32,
     /// Which recognition model produced these; a model change invalidates them.
     pub model: String,
     pub templates: Vec<Template>,
@@ -167,11 +167,13 @@ impl GestureCal {
 }
 
 impl UserTemplates {
-    pub fn new(user: &str, model: &str) -> Self {
+    /// An empty set for `user`, who is `uid` now; the caller resolves the
+    /// account so an unknown name fails there, not as a set with no uid.
+    pub fn new(user: &str, uid: u32, model: &str) -> Self {
         UserTemplates {
             version: FORMAT_VERSION,
             user: user.to_string(),
-            uid: current_uid(user),
+            uid,
             model: model.to_string(),
             templates: Vec::new(),
             gesture: GestureCal::default(),
@@ -207,11 +209,7 @@ impl UserTemplates {
 
     /// The cameras the templates are bound to, for a message.
     pub fn bound_devices(&self) -> Vec<String> {
-        let mut v: Vec<String> = self
-            .templates
-            .iter()
-            .filter_map(|t| t.device.clone())
-            .collect();
+        let mut v: Vec<String> = self.templates.iter().map(|t| t.device.clone()).collect();
         v.sort();
         v.dedup();
         v
@@ -305,7 +303,7 @@ impl UserTemplates {
 
 impl Template {
     fn usable_on(&self, device: &str) -> bool {
-        self.device.as_deref().map(|d| d == device).unwrap_or(true)
+        self.device == device
     }
 }
 
@@ -610,8 +608,16 @@ impl Store {
     }
 
     fn parse(&self, text: &str, p: &Path, user: &str) -> Result<Option<UserTemplates>> {
-        let t: UserTemplates =
-            serde_json::from_str(text).with_context(|| format!("parse {}", p.display()))?;
+        // A file that does not parse is unreadable, whatever it lacks: a
+        // record from before the camera and the uid were required is
+        // re-enrolled, never read with the checks those fields carry
+        // skipped (H5).
+        let t: UserTemplates = serde_json::from_str(text).with_context(|| {
+            format!(
+                "parse {}: not a template set this build reads; re-enrol",
+                p.display()
+            )
+        })?;
         if t.version != FORMAT_VERSION {
             bail!(
                 "{}: template format {} (this build reads {})",
@@ -638,14 +644,16 @@ impl Store {
     /// Is the account these templates were enrolled under still the one
     /// that has the name? A recreated account with the same name is a
     /// different person. Checked on every load, so a cached set for a
-    /// name that changed hands is not enrolled either (F1).
+    /// name that changed hands is not enrolled either (F1). A name the
+    /// password database no longer has cannot log in at all, so it is
+    /// left to the caller rather than refused here.
     fn uid_matches(&self, t: &UserTemplates, p: &Path) -> bool {
-        if let (Some(stored), Some(now)) = (t.uid, (self.uid_of)(&t.user)) {
-            if stored != now {
+        if let Some(now) = (self.uid_of)(&t.user) {
+            if t.uid != now {
                 log::warn!(
                     "{}: templates belong to uid {} but {} is now uid {}; treating as not enrolled",
                     p.display(),
-                    stored,
+                    t.uid,
                     t.user,
                     now
                 );
@@ -1019,14 +1027,17 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    fn tmpl(e: Vec<f32>, created: u64, device: Option<&str>) -> Template {
+    /// The camera every test template is bound to unless a test says otherwise.
+    const CAM: &str = "ipu3:acpi:\\_SB_.PCI0.I2C3.CAM3";
+
+    fn tmpl(e: Vec<f32>, created: u64, device: &str) -> Template {
         Template {
             embedding: e,
             quality: 0.9,
             face_width: 80.0,
             created,
             label: "enrol".into(),
-            device: device.map(String::from),
+            device: device.to_string(),
             yaw: None,
             nose_pitch: None,
         }
@@ -1040,10 +1051,9 @@ mod tests {
     fn roundtrip_and_match_plain() {
         let dir = temp("plain");
         let store = Store::open_with(&dir, Sealing::Plain("test".into())).unwrap();
-        let mut u = UserTemplates::new("alice", "glintr100");
-        u.uid = None;
-        u.templates.push(tmpl(vec![1.0, 0.0], 1, None));
-        u.templates.push(tmpl(vec![0.0, 1.0], 2, None));
+        let mut u = UserTemplates::new("alice", 1000, "glintr100");
+        u.templates.push(tmpl(vec![1.0, 0.0], 1, CAM));
+        u.templates.push(tmpl(vec![0.0, 1.0], 2, CAM));
         let p = store.save(&u).unwrap();
         assert!(p.ends_with("alice.json"));
         assert_eq!(
@@ -1067,39 +1077,105 @@ mod tests {
     fn a_file_for_another_user_is_refused() {
         let dir = temp("other");
         let store = Store::open_with(&dir, Sealing::Plain("test".into())).unwrap();
-        let mut u = UserTemplates::new("alice", "glintr100");
-        u.uid = None;
-        u.templates.push(tmpl(vec![1.0, 0.0], 1, None));
+        let mut u = UserTemplates::new("alice", 1000, "glintr100");
+        u.templates.push(tmpl(vec![1.0, 0.0], 1, CAM));
         store.save(&u).unwrap();
         std::fs::rename(dir.join("alice.json"), dir.join("bob.json")).unwrap();
         assert!(store.load("bob").is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Every template matches only on the camera it names: a set bound to
+    /// one camera has nothing to match on another, whatever the score,
+    /// and a set spanning two cameras matches each embedding only on its
+    /// own (H4, H5).
     #[test]
     fn templates_match_only_on_their_camera() {
-        let mut u = UserTemplates::new("alice", "glintr100");
+        let mut u = UserTemplates::new("alice", 1000, "glintr100");
         u.templates
-            .push(tmpl(vec![1.0, 0.0], 1, Some("ipu3:ov7251 3-0060")));
-        u.templates.push(tmpl(vec![0.0, 1.0], 2, None)); // pre-binding: usable anywhere
-        assert_eq!(u.usable_on("ipu3:ov7251 3-0060"), 2);
-        assert_eq!(u.usable_on("uvc:uvcvideo:Other Cam:usb-1"), 1);
-        assert_eq!(
-            u.best_match_on(&[1.0, 0.0], "uvc:uvcvideo:Other Cam:usb-1")
-                .unwrap(),
-            (0.0, 1)
-        );
+            .push(tmpl(vec![1.0, 0.0], 1, "ipu3:ov7251 3-0060"));
+        u.templates
+            .push(tmpl(vec![0.0, 1.0], 2, "uvc:uvcvideo:1-1:1234:abcd"));
+        assert_eq!(u.usable_on("ipu3:ov7251 3-0060"), 1);
+        assert_eq!(u.usable_on("uvc:uvcvideo:1-1:1234:abcd"), 1);
+        assert_eq!(u.usable_on("uvc:uvcvideo:Other Cam:usb-1"), 0);
         assert_eq!(
             u.best_match_on(&[1.0, 0.0], "ipu3:ov7251 3-0060").unwrap(),
             (1.0, 0)
         );
-        assert_eq!(u.bound_devices(), vec!["ipu3:ov7251 3-0060".to_string()]);
+        assert_eq!(
+            u.best_match_on(&[1.0, 0.0], "uvc:uvcvideo:1-1:1234:abcd")
+                .unwrap(),
+            (0.0, 1),
+            "the other camera's template is the only candidate there"
+        );
+        assert!(
+            u.best_match_on(&[1.0, 0.0], "uvc:uvcvideo:Other Cam:usb-1")
+                .is_none(),
+            "a camera no template names matches nothing"
+        );
+        assert_eq!(
+            u.bound_devices(),
+            vec![
+                "ipu3:ov7251 3-0060".to_string(),
+                "uvc:uvcvideo:1-1:1234:abcd".to_string()
+            ]
+        );
         let only_bound = UserTemplates {
-            templates: vec![tmpl(vec![1.0, 0.0], 1, Some("ipu3:x"))],
+            templates: vec![tmpl(vec![1.0, 0.0], 1, "ipu3:x")],
             ..u.clone()
         };
         assert_eq!(only_bound.usable_on("uvc:y"), 0);
         assert!(only_bound.best_match_on(&[1.0, 0.0], "uvc:y").is_none());
+        assert_eq!(
+            only_bound.best_match_on(&[1.0, 0.0], "ipu3:x").unwrap(),
+            (1.0, 0)
+        );
+    }
+
+    /// A file from before the camera and the uid were required (the
+    /// development laptop's, or one edited to drop them) does not load:
+    /// `load` fails naming re-enrolment, and nothing in it can match on
+    /// any camera (H5). A file with both loads.
+    #[test]
+    fn a_file_without_device_or_uid_does_not_load() {
+        let dir = temp("legacy");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open_with(&dir, Sealing::Plain("test".into())).unwrap();
+        let mut u = UserTemplates::new("alice", 1000, "glintr100");
+        u.templates.push(tmpl(vec![1.0, 0.0], 1, CAM));
+        let full = serde_json::to_string(&u).unwrap();
+        let p = store.path_for("alice").unwrap();
+        let without = |field: &str| -> String {
+            let mut v: serde_json::Value = serde_json::from_str(&full).unwrap();
+            match field {
+                "uid" => {
+                    v.as_object_mut().unwrap().remove("uid");
+                }
+                "device" => {
+                    v["templates"][0].as_object_mut().unwrap().remove("device");
+                }
+                _ => unreachable!(),
+            }
+            serde_json::to_string(&v).unwrap()
+        };
+        for field in ["uid", "device"] {
+            std::fs::write(&p, without(field)).unwrap();
+            let err = match store.load("alice") {
+                Err(e) => format!("{:#}", e),
+                Ok(t) => panic!("a file without {} loaded: {:?}", field, t),
+            };
+            assert!(
+                err.contains("re-enrol") && err.contains(field),
+                "the error names the missing field and re-enrolment: {}",
+                err
+            );
+        }
+        std::fs::write(&p, &full).unwrap();
+        let t = store.load("alice").unwrap().expect("a complete file loads");
+        assert_eq!(t.uid, 1000);
+        assert_eq!(t.best_match_on(&[1.0, 0.0], CAM).unwrap(), (1.0, 0));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A record from before round-4 C3 carries the image-motion fields of
@@ -1131,9 +1207,8 @@ mod tests {
         assert!(cal.is_calibrated());
         let dir = temp("cal");
         let store = Store::open_with(&dir, Sealing::Plain("test".into())).unwrap();
-        let mut u = UserTemplates::new("alice", "glintr100");
-        u.uid = None;
-        u.templates.push(tmpl(vec![1.0, 0.0], 1, None));
+        let mut u = UserTemplates::new("alice", 1000, "glintr100");
+        u.templates.push(tmpl(vec![1.0, 0.0], 1, CAM));
         u.gesture = cal.clone();
         store.save(&u).unwrap();
         assert_eq!(store.load("alice").unwrap().unwrap().gesture, cal);
@@ -1150,10 +1225,10 @@ mod tests {
     /// without glasses, a turned head), as real looks of one face do.
     #[test]
     fn pruning_keeps_the_different_looks() {
-        let mut u = UserTemplates::new("alice", "glintr100");
+        let mut u = UserTemplates::new("alice", 1000, "glintr100");
         let mk = |v: Vec<f32>, label: &str| Template {
             label: label.into(),
-            ..tmpl(unit(v), 1, None)
+            ..tmpl(unit(v), 1, CAM)
         };
         u.templates.push(mk(vec![1.0, 0.0, 0.0], "a"));
         u.templates.push(mk(vec![1.0, 0.05, 0.0], "a-copy"));
@@ -1176,10 +1251,10 @@ mod tests {
     /// They go first now: the outlier, then the poor crop, then duplicates.
     #[test]
     fn pruning_drops_the_impostor_and_the_junk_before_the_person() {
-        let mut u = UserTemplates::new("alice", "glintr100");
+        let mut u = UserTemplates::new("alice", 1000, "glintr100");
         let genuine = |v: Vec<f32>, label: &str| Template {
             label: label.into(),
-            ..tmpl(unit(v), 1, None)
+            ..tmpl(unit(v), 1, CAM)
         };
         u.templates
             .push(genuine(vec![1.0, 0.0, 0.0, 0.0], "look-1"));
@@ -1191,12 +1266,12 @@ mod tests {
             .push(genuine(vec![0.9, 0.0, 0.4, 0.0], "look-3"));
         u.templates.push(Template {
             label: "impostor".into(),
-            ..tmpl(unit(vec![0.0, 0.0, 0.0, 1.0]), 1, None)
+            ..tmpl(unit(vec![0.0, 0.0, 0.0, 1.0]), 1, CAM)
         });
         u.templates.push(Template {
             label: "junk".into(),
             quality: 0.31,
-            ..tmpl(unit(vec![0.95, 0.3, 0.0, 0.0]), 1, None)
+            ..tmpl(unit(vec![0.95, 0.3, 0.0, 0.0]), 1, CAM)
         });
         assert_eq!(u.prune_to(5), 1);
         assert!(
@@ -1224,9 +1299,8 @@ mod tests {
         std::fs::write(dir.join("alice.tmp-1-0"), b"half").unwrap();
         std::fs::write(dir.join("alice.tmp-2-7"), b"half").unwrap();
         std::fs::write(dir.join("alicia.tmp-3-0"), b"hers").unwrap();
-        let mut u = UserTemplates::new("alice", "glintr100");
-        u.uid = None;
-        u.templates.push(tmpl(vec![1.0, 0.0], 1, Some("cam")));
+        let mut u = UserTemplates::new("alice", 1000, "glintr100");
+        u.templates.push(tmpl(vec![1.0, 0.0], 1, "cam"));
         store.save(&u).unwrap();
         assert!(!dir.join("alice.tmp-1-0").exists() && !dir.join("alice.tmp-2-7").exists());
         assert!(
@@ -1236,16 +1310,13 @@ mod tests {
         std::fs::write(dir.join("alice.tmp-9-0"), b"half").unwrap();
         assert!(store.delete("alice").unwrap());
         assert!(!dir.join("alice.tmp-9-0").exists());
-        let mut bad = UserTemplates::new("alice", "glintr100");
-        bad.uid = None;
-        bad.templates
-            .push(tmpl(vec![f32::NAN, 0.0], 1, Some("cam")));
+        let mut bad = UserTemplates::new("alice", 1000, "glintr100");
+        bad.templates.push(tmpl(vec![f32::NAN, 0.0], 1, "cam"));
         let e = store.save(&bad).unwrap_err().to_string();
         assert!(e.contains("not a finite number"), "{}", e);
         assert!(!dir.join("alice.json").exists());
-        let mut bad = UserTemplates::new("alice", "glintr100");
-        bad.uid = None;
-        bad.templates.push(tmpl(vec![1.0, 0.0], 1, Some("cam")));
+        let mut bad = UserTemplates::new("alice", 1000, "glintr100");
+        bad.templates.push(tmpl(vec![1.0, 0.0], 1, "cam"));
         bad.gesture.nod_reads_to_deg = vec![f32::INFINITY];
         assert!(store.save(&bad).is_err());
         let _ = std::fs::remove_dir_all(dir);
@@ -1293,10 +1364,9 @@ mod tests {
     fn too_many_templates_is_a_named_error() {
         let dir = temp("cap");
         let store = Store::open_with(&dir, Sealing::Plain("test".into())).unwrap();
-        let mut u = UserTemplates::new("alice", "glintr100");
-        u.uid = None;
+        let mut u = UserTemplates::new("alice", 1000, "glintr100");
         for i in 0..=MAX_TEMPLATES as u64 {
-            u.templates.push(tmpl(vec![1.0, 0.0], i, None));
+            u.templates.push(tmpl(vec![1.0, 0.0], i, CAM));
         }
         let e = store.save(&u).unwrap_err().to_string();
         assert!(e.contains("limit is 40"), "{}", e);
@@ -1322,9 +1392,8 @@ mod tests {
         .without_creds();
         let sealed = store.sealed_path_for("alice").unwrap();
         std::fs::write(&sealed, b"not a real blob").unwrap();
-        let mut u = UserTemplates::new("alice", "glintr100");
-        u.uid = None;
-        u.templates.push(tmpl(vec![1.0, 0.0], 1, None));
+        let mut u = UserTemplates::new("alice", 1000, "glintr100");
+        u.templates.push(tmpl(vec![1.0, 0.0], 1, CAM));
         let e = store.save(&u).unwrap_err().to_string();
         assert!(e.contains("refusing to write them in plaintext"), "{}", e);
         assert!(sealed.exists(), "the sealed file must survive");
@@ -1356,9 +1425,8 @@ mod tests {
             .unwrap()
             .without_creds()
             .with_uid_resolver(resolver);
-        let mut u = UserTemplates::new("alice", "glintr100");
-        u.uid = Some(1000);
-        u.templates.push(tmpl(vec![1.0, 0.0], 1, None));
+        let mut u = UserTemplates::new("alice", 1000, "glintr100");
+        u.templates.push(tmpl(vec![1.0, 0.0], 1, CAM));
         // The sealed path is the cached one: stage a "sealed" file and seed
         // the cache the way a successful unseal would, with the fingerprint
         // of that file.
@@ -1564,9 +1632,8 @@ mod tests {
         let store = Store::open_with(&dir, Sealing::Plain("test".into()))
             .unwrap()
             .without_creds();
-        let mut u = UserTemplates::new("al", "glintr100");
-        u.uid = None;
-        u.templates.push(tmpl(vec![1.0, 0.0], 1, None));
+        let mut u = UserTemplates::new("al", 1000, "glintr100");
+        u.templates.push(tmpl(vec![1.0, 0.0], 1, CAM));
         store.save(&u).unwrap();
         std::fs::write(dir.join("al.cred.unreadable-1700000000"), b"x").unwrap();
         std::fs::write(dir.join("alice.cred.unreadable-1700000000"), b"x").unwrap();
@@ -1649,9 +1716,8 @@ mod tests {
         };
         let dir = temp("sealed");
         let store = Store::open_with(&dir, Sealing::Tpm).unwrap();
-        let mut u = UserTemplates::new("alice", "glintr100");
-        u.uid = None;
-        u.templates.push(tmpl(vec![1.0, 0.0], 1, Some("ipu3:x")));
+        let mut u = UserTemplates::new("alice", 1000, "glintr100");
+        u.templates.push(tmpl(vec![1.0, 0.0], 1, "ipu3:x"));
         // Plaintext left by an older build is sealed on first load.
         let plain = store.path_for("alice").unwrap();
         std::fs::write(&plain, serde_json::to_string(&u).unwrap()).unwrap();
