@@ -7,6 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use faceauth_camera::calib::{self, Exposure, Metering, Smoother, Window, AE_TARGET};
 use faceauth_camera::{Camera, Frame, Illuminator};
 use faceauth_engine::{Face, Grey};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub struct IrCapture {
@@ -26,6 +27,16 @@ pub struct IrCapture {
     pub identity: String,
 }
 
+/// The USB vendor and product ids of the device behind a video node, from
+/// sysfs (`/sys/class/video4linux/<node>/device/../idVendor`): the interface
+/// is the node's device, the USB device its parent.
+fn usb_ids(video: &Path) -> Option<(String, String)> {
+    let node = video.file_name()?.to_str()?;
+    let dev = std::path::Path::new("/sys/class/video4linux").join(node).join("device").join("..");
+    let read = |n: &str| std::fs::read_to_string(dev.join(n)).ok().map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty());
+    Some((read("idVendor")?, read("idProduct")?))
+}
+
 impl IrCapture {
     /// Resolve the IR camera (config override, else the IPU3 graph's front IR
     /// sensor), configure it, and start streaming with the illuminator off.
@@ -43,7 +54,17 @@ impl IrCapture {
                 let fmts = vd.formats()?;
                 let pf = fmts.iter().map(|(f, _)| *f).find(|f| faceauth_camera::Decoder::for_pixelformat(*f).is_some()).ok_or_else(|| anyhow!("{}: no decodable format", v.display()))?;
                 let (driver, card, bus) = vd.driver_and_card().unwrap_or_default();
-                (v.clone(), s.clone(), 640, 480, pf, format!("uvc:{}:{}:{}", driver, card, bus))
+                // The card string is the device's own claim about itself
+                // (any USB device can present any name), so it is logged
+                // and never part of the identity templates bind to. The
+                // identity is the physical bus path plus the vendor and
+                // product ids from sysfs; a device on the enrolled port that
+                // says it is the enrolled model still cannot prove it, which
+                // the README's "Not defended" list says.
+                let ids = usb_ids(v).map(|(vid, pid)| format!("{}:{}", vid, pid)).unwrap_or_else(|| "no-usb-ids".into());
+                let identity = format!("uvc:{}:{}:{}", driver, bus, ids);
+                log::info!("IR camera {}: driver {} card {:?} bus {} ids {} (identity {})", v.display(), driver, card, bus, ids, identity);
+                (v.clone(), s.clone(), 640, 480, pf, identity)
             }
             _ => {
                 let g = faceauth_camera::ipu3::probe()?.ok_or_else(|| anyhow!("no IPU3 camera graph and no ir_video configured"))?;

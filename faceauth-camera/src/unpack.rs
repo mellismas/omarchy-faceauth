@@ -12,9 +12,17 @@ pub fn ipu3_row_stride(width: usize) -> usize {
     width.div_ceil(50) * 64
 }
 
+/// `width * height` (or `width * height * per`) as a usize, or None when
+/// dimensions a device reports would overflow it: an implausible frame is
+/// refused rather than read through a wrapped size check.
+fn plane(width: usize, height: usize, per: usize) -> Option<usize> {
+    width.checked_mul(height)?.checked_mul(per)
+}
+
 pub fn unpack_ipu3_10(src: &[u8], width: usize, height: usize, dst: &mut [u16]) -> bool {
     let stride = ipu3_row_stride(width);
-    if src.len() < stride * height || dst.len() < width * height {
+    let (Some(packed), Some(pixels)) = (stride.checked_mul(height), plane(width, height, 1)) else { return false };
+    if src.len() < packed || dst.len() < pixels {
         return false;
     }
     for y in 0..height {
@@ -42,7 +50,8 @@ pub fn unpack_ipu3_10(src: &[u8], width: usize, height: usize, dst: &mut [u16]) 
 
 /// 8-bit grey (UVC `GREY`) widened to the 10-bit scale used everywhere else.
 pub fn unpack_grey8(src: &[u8], width: usize, height: usize, dst: &mut [u16]) -> bool {
-    if src.len() < width * height || dst.len() < width * height {
+    let Some(pixels) = plane(width, height, 1) else { return false };
+    if src.len() < pixels || dst.len() < pixels {
         return false;
     }
     for (o, &s) in dst[..width * height].iter_mut().zip(src) {
@@ -53,7 +62,8 @@ pub fn unpack_grey8(src: &[u8], width: usize, height: usize, dst: &mut [u16]) ->
 
 /// `YUYV`: luma only, widened to 10 bits.
 pub fn unpack_yuyv_luma(src: &[u8], width: usize, height: usize, dst: &mut [u16]) -> bool {
-    if src.len() < width * height * 2 || dst.len() < width * height {
+    let (Some(bytes), Some(pixels)) = (plane(width, height, 2), plane(width, height, 1)) else { return false };
+    if src.len() < bytes || dst.len() < pixels {
         return false;
     }
     for i in 0..width * height {
@@ -64,7 +74,8 @@ pub fn unpack_yuyv_luma(src: &[u8], width: usize, height: usize, dst: &mut [u16]
 
 /// 10-bit or 16-bit little-endian grey (`Y10 `, `Y16 `), normalised to 10 bits.
 pub fn unpack_y16(src: &[u8], width: usize, height: usize, shift_down: u32, dst: &mut [u16]) -> bool {
-    if src.len() < width * height * 2 || dst.len() < width * height {
+    let (Some(bytes), Some(pixels)) = (plane(width, height, 2), plane(width, height, 1)) else { return false };
+    if src.len() < bytes || dst.len() < pixels {
         return false;
     }
     for i in 0..width * height {
@@ -90,8 +101,8 @@ pub enum BayerOrder {
 pub fn bayer_reduce(src: &[u16], width: usize, height: usize, order: BayerOrder, black: u16, out: &mut [[f32; 3]]) -> usize {
     let w2 = width / 2;
     let h2 = height / 2;
-    let n = w2 * h2;
-    if src.len() < width * height || out.len() < n {
+    let (Some(n), Some(pixels)) = (w2.checked_mul(h2), plane(width, height, 1)) else { return 0 };
+    if src.len() < pixels || out.len() < n {
         return 0;
     }
     let b = black as f32;
@@ -164,6 +175,23 @@ mod tests {
     fn ipu3_rejects_short_buffers() {
         let mut dst = vec![0u16; 640 * 480];
         assert!(!unpack_ipu3_10(&[0u8; 100], 640, 480, &mut dst));
+    }
+
+    /// Dimensions whose product overflows are refused, not wrapped into a
+    /// size check that passes (F14).
+    #[test]
+    fn absurd_dimensions_are_refused_not_wrapped() {
+        let mut dst = vec![0u16; 16];
+        let src = [0u8; 64];
+        let huge = usize::MAX / 2 + 1;
+        assert!(!unpack_ipu3_10(&src, huge, 2, &mut dst));
+        assert!(!unpack_grey8(&src, huge, 2, &mut dst));
+        assert!(!unpack_yuyv_luma(&src, huge, 2, &mut dst));
+        assert!(!unpack_y16(&src, huge, 2, 0, &mut dst));
+        let src16 = [0u16; 64];
+        let mut out = [[0f32; 3]; 16];
+        assert_eq!(bayer_reduce(&src16, huge, 2, BayerOrder::Bggr, 0, &mut out), 0);
+        assert_eq!(bayer_reduce(&src16, usize::MAX, usize::MAX, BayerOrder::Bggr, 0, &mut out), 0);
     }
 
     #[test]

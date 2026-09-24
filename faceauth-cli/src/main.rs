@@ -7,7 +7,7 @@ use faceauth_camera::ipu3::SensorKind;
 use faceauth_camera::unpack::{bayer_reduce, BayerOrder};
 use faceauth_camera::{Camera, Frame, Illuminator};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn usage() -> ! {
@@ -18,7 +18,7 @@ fn usage() -> ! {
   faceauth enroll [--user NAME] [--label TEXT] [--terminal [--poses up,down]]   (root; the five looks from the terminal, no window)
   faceauth enroll [--user NAME] [--label TEXT] [--seconds N] [--count N]   (root; one look, as the camera sees it)
   faceauth enrol-control continue|redo|cancel [--user NAME]   (from the enrolment window)\n  faceauth enroll --store DIR ...                   (direct camera access, development)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] [--dismiss|--ack|--passwordless MIN]   (from the consent window; stdin: token line, then password line)\n  faceauth consent-context --action ID --message TEXT [--cookie C]   (from the polkit agent, as a request starts)\n  faceauth calibrate [--user NAME] [--gestures-only]   (root; two nods, two shakes and five everyday movements, stored with the templates)
-  faceauth calibrate [--user NAME] --guided              (root; the same rounds in the walk-through window)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence                                (current state)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only]\n"
+  faceauth calibrate [--user NAME] --guided              (root; the same rounds in the walk-through window)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence mode [default|secure] [--user NAME]   (as the watched user; reads or switches the watch's mode until the next restart; prints {{\"presence\":{{\"mode\":..,\"watching\":..}}}})\n  faceauth presence                                (current state)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]\n  faceauth cam graph\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only] [--exposure LINES]\n"
     );
     std::process::exit(2)
 }
@@ -238,8 +238,15 @@ fn main() -> Result<()> {
             let cfg_path = opt(rest, "--config").unwrap_or("/etc/faceauth/config.toml").to_string();
             let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
             let away: f32 = opt(rest, "--away-seconds").unwrap_or("20").parse()?;
-            let text = std::fs::read_to_string(&cfg_path).unwrap_or_default();
-            let mut doc: toml::Table = toml::from_str(&text).unwrap_or_default();
+            // A config that does not parse is not replaced by one that only
+            // holds [presence]: the administrator's other keys would go with
+            // it. A missing file starts empty (F4).
+            let text = match std::fs::read_to_string(&cfg_path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => return Err(e).with_context(|| format!("read {}", cfg_path)),
+            };
+            let mut doc: toml::Table = toml::from_str(&text).with_context(|| format!("{} does not parse; fix it before changing the presence watch", cfg_path))?;
             let mut presence = doc.get("presence").and_then(|v| v.as_table()).cloned().unwrap_or_default();
             presence.insert("enabled".into(), toml::Value::Boolean(*mode == "on"));
             presence.insert("user".into(), toml::Value::String(user.clone()));
@@ -250,7 +257,7 @@ fn main() -> Result<()> {
                 presence.insert("lock_command".into(), toml::Value::Array(vec![toml::Value::String("/usr/bin/faceauth-lock-session".into()), toml::Value::String(user.clone())]));
             }
             doc.insert("presence".into(), toml::Value::Table(presence));
-            std::fs::write(&cfg_path, toml::to_string_pretty(&doc)?).with_context(|| format!("write {} (run as root)", cfg_path))?;
+            write_config_atomically(&cfg_path, &toml::to_string_pretty(&doc)?).with_context(|| format!("write {} (run as root)", cfg_path))?;
             let st = std::process::Command::new("systemctl").args(["restart", "faceauth.service"]).status();
             println!("presence watch {} for {} (away after {} s); service restart: {}", mode, user, away, st.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()));
             Ok(())
@@ -420,6 +427,36 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string(&o)?);
             Ok(())
         }
+        ["presence", "mode", rest @ ..] => {
+            // As the watched user, over the socket: no argument reads the
+            // mode, "default" or "secure" switches it until the next restart.
+            // One JSON line for the shell's toggle; a refusal is one line on
+            // stderr and exit 1.
+            let socket = PathBuf::from(opt(rest, "--socket").unwrap_or("/run/faceauth/sock"));
+            let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
+            let mode = rest.first().filter(|a| !a.starts_with("--")).copied().unwrap_or("query");
+            if !matches!(mode, "query" | "default" | "secure") {
+                bail!("presence mode: \"default\" or \"secure\" (or nothing, to read it)");
+            }
+            match faceauth_daemon::server::presence_mode(&socket, &user, mode) {
+                Ok(faceauth_daemon::auth::Outcome::PresenceMode { mode, watching }) => {
+                    println!("{}", serde_json::json!({ "presence": { "mode": mode, "watching": watching } }));
+                    Ok(())
+                }
+                Ok(faceauth_daemon::auth::Outcome::Error { message }) => {
+                    eprintln!("presence mode: {}", message);
+                    std::process::exit(1);
+                }
+                Ok(other) => {
+                    eprintln!("presence mode: unexpected answer {}", serde_json::to_string(&other)?);
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("presence mode: {:#}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
         ["presence"] => {
             let f = "/run/faceauth/presence.json";
             match std::fs::read_to_string(f) {
@@ -511,13 +548,16 @@ struct Loop {
     exposure: Exposure,
     metering: calib::Metering,
     last_step: Instant,
+    /// Hold the exposure where it started instead of metering: for a frame
+    /// meant to look like the gate's own, which freezes exposure too.
+    fixed: bool,
 }
 
 impl Loop {
     fn new(mut cam: Camera, start: Exposure) -> Result<Self> {
         cam.set_exposure(start)?;
         cam.start()?;
-        Ok(Loop { window: None, cam, frame: Frame::new(0, 0), frames: 0, smoother: Smoother::default(), exposure: start, metering: Default::default(), last_step: Instant::now() })
+        Ok(Loop { window: None, cam, frame: Frame::new(0, 0), frames: 0, smoother: Smoother::default(), exposure: start, metering: Default::default(), last_step: Instant::now(), fixed: false })
     }
 
     /// Capture one frame; every 0.5 s run an exposure step.
@@ -526,7 +566,7 @@ impl Loop {
             return Ok(false);
         }
         self.frames += 1;
-        if self.last_step.elapsed() >= Duration::from_millis(500) {
+        if !self.fixed && self.last_step.elapsed() >= Duration::from_millis(500) {
             self.last_step = Instant::now();
             let w = self.window.unwrap_or_else(|| Window::centre(self.frame.width, self.frame.height)).clamp(self.frame.width, self.frame.height);
             let mut m = calib::meter(&self.frame.px, self.frame.width, black, w);
@@ -552,10 +592,12 @@ fn cam_test(rest: &[&str]) -> Result<()> {
     let mut led = "off";
     let mut snapshot: Option<PathBuf> = None;
     let mut ir_only = false;
+    let mut exposure: Option<i64> = None;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match *a {
             "--seconds" => seconds = it.next().ok_or_else(|| anyhow!("--seconds N"))?.parse()?,
+            "--exposure" => exposure = Some(it.next().ok_or_else(|| anyhow!("--exposure LINES"))?.parse()?),
             "--led" => led = it.next().ok_or_else(|| anyhow!("--led on|off|alt"))?,
             "--snapshot" => snapshot = Some(PathBuf::from(it.next().ok_or_else(|| anyhow!("--snapshot DIR"))?)),
             "--ir-only" => ir_only = true,
@@ -570,7 +612,8 @@ fn cam_test(rest: &[&str]) -> Result<()> {
     let ir_cam = Camera::open(&ir.video, &ir.subdev, iw, ih, ir.pixelformat, 6)?;
     log::info!("IR  {} {}x{} exposure {:?} gain {:?}", ir.name, iw, ih, ir_cam.limits.exposure, ir_cam.limits.gain);
     let illum = Illuminator::open(&ir.subdev)?;
-    let mut ir_loop = Loop::new(ir_cam, Exposure { exposure: 500, gain: 16, dgain: 1.0 })?;
+    let mut ir_loop = Loop::new(ir_cam, Exposure { exposure: exposure.unwrap_or(500), gain: 16, dgain: 1.0 })?;
+    ir_loop.fixed = exposure.is_some();
 
     let mut rgb_loop = match (rgb, ir_only) {
         (Some(r), false) => {
@@ -943,9 +986,9 @@ fn opt<'a>(rest: &'a [&str], key: &str) -> Option<&'a str> {
 }
 
 fn enroll(rest: &[&str]) -> Result<()> {
-    use faceauth_daemon::store::{now_secs, Store, Template, UserTemplates};
+    use faceauth_daemon::store::{now_secs, Template, UserTemplates};
     let dir = models_dir(rest);
-    let store = Store::open(opt(rest, "--store").ok_or_else(|| anyhow!("--store DIR"))?)?;
+    let store = dev_store(opt(rest, "--store").ok_or_else(|| anyhow!("--store DIR"))?)?;
     let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
     let label = opt(rest, "--label").unwrap_or("enrol").to_string();
     let seconds: u64 = opt(rest, "--seconds").unwrap_or("12").parse()?;
@@ -1030,9 +1073,8 @@ fn enroll_guided(socket: &std::path::Path, user: &str, label: &str, only: &[Stri
 }
 
 fn verify(rest: &[&str]) -> Result<()> {
-    use faceauth_daemon::store::Store;
     let dir = models_dir(rest);
-    let store = Store::open(opt(rest, "--store").ok_or_else(|| anyhow!("--store DIR"))?)?;
+    let store = dev_store(opt(rest, "--store").ok_or_else(|| anyhow!("--store DIR"))?)?;
     let user = opt(rest, "--user").map(String::from).unwrap_or_else(target_user);
     let seconds: u64 = opt(rest, "--seconds").unwrap_or("5").parse()?;
     let u = store.load(&user)?.ok_or_else(|| anyhow!("no templates for {}", user))?;
@@ -1338,6 +1380,136 @@ fn sha256_file(p: &std::path::Path) -> Result<String> {
     Ok(text.split_whitespace().next().unwrap_or("").to_string())
 }
 
+/// The IR sensor as sysfs names it, without opening its node: the subdev's
+/// directory name (`v4l-subdev8`) and its `name` attribute (`ov7251 3-0060`).
+/// Matched by name, never by number, like the udev rule.
+fn ir_sensor_from_sysfs(class_dir: &Path) -> Option<(String, String)> {
+    let mut nodes: Vec<_> = std::fs::read_dir(class_dir).ok()?.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    nodes.sort();
+    for p in nodes {
+        let node = p.file_name()?.to_str()?.to_string();
+        if !node.starts_with("v4l-subdev") {
+            continue;
+        }
+        let name = std::fs::read_to_string(p.join("name")).ok()?.trim().to_string();
+        if name.starts_with("ov7251 ") {
+            return Some((node, name));
+        }
+    }
+    None
+}
+
+/// The udev database's current tags for a character device (`Q:` lines in
+/// `/run/udev/data/c<major>:<minor>`). `G:` lines are every tag the device
+/// ever carried and stay after a rule takes one away, so they are not read.
+fn udev_current_tags(db_dir: &Path, rdev: u64) -> Vec<String> {
+    let (major, minor) = (libc_major(rdev), libc_minor(rdev));
+    std::fs::read_to_string(db_dir.join(format!("c{}:{}", major, minor)))
+        .map(|t| t.lines().filter_map(|l| l.strip_prefix("Q:")).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// The kernel's dev_t encoding (glibc's major()/minor() macros).
+fn libc_major(rdev: u64) -> u64 {
+    ((rdev >> 32) & 0xffff_f000) | ((rdev >> 8) & 0xfff)
+}
+
+fn libc_minor(rdev: u64) -> u64 {
+    ((rdev >> 12) & 0xffff_ff00) | (rdev & 0xff)
+}
+
+/// Whether this process could open the node for writing: the ACL as the
+/// kernel applies it, which is the grant that matters.
+fn user_can_write(dev: &Path) -> bool {
+    std::fs::OpenOptions::new().write(true).open(dev).is_ok()
+}
+
+/// The verdict on the IR sensor's control node. Right is root:root 0600 with
+/// no uaccess tag and no write access for the caller; anything looser lets a
+/// process running as the user change the sensor under the daemon.
+fn ir_node_verdict(mode: u32, uid: u32, gid: u32, current_tags: &[String], user_can_write: bool) -> (&'static str, String) {
+    let root_only = uid == 0 && gid == 0 && mode & 0o077 == 0;
+    let uaccess = current_tags.iter().any(|t| t == "uaccess");
+    let running_as_root = unsafe { libc_geteuid() } == 0;
+    let mut notes = Vec::new();
+    if !root_only {
+        notes.push(format!("mode {:04o} uid {} gid {} (want root:root 0600: the udev rule 72-faceauth-ir.rules is missing or not applied)", mode, uid, gid));
+    }
+    if uaccess {
+        notes.push("tagged uaccess, so the seat user is granted access on every login".to_string());
+    }
+    if user_can_write && !running_as_root {
+        notes.push("this user can write the sensor's controls (an ACL granted before the rule survives until reboot or `setfacl -b` on the node)".to_string());
+    }
+    if notes.is_empty() {
+        ("pass", if running_as_root { "root-only, no uaccess tag (the ACL was not checked: run doctor as the user for that)".to_string() } else { "root-only, no uaccess tag, no write access for this user".to_string() })
+    } else {
+        ("warn", notes.join("; "))
+    }
+}
+
+extern "C" {
+    #[link_name = "geteuid"]
+    fn libc_geteuid() -> u32;
+}
+
+/// Whether an error from the camera probe is the node refusing to open.
+fn is_permission_denied(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<std::io::Error>().map(|io| io.kind() == std::io::ErrorKind::PermissionDenied).unwrap_or(false))
+}
+
+/// A PAM line that counts: not blank, not a comment.
+fn pam_active_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'))
+}
+
+/// The verdict on one PAM service file. `pam.lock` must be closed by a live
+/// `auth required|requisite pam_deny.so` AFTER the face line: a commented-out
+/// pam_deny closes nothing, and one above the face line runs before it. On
+/// the elevation services `timeout=` on a consent line is flagged, because
+/// the module ignores it and an administrator reading the file would take it
+/// for a bound.
+fn pam_stack_verdict(id: &str, text: &str) -> (&'static str, String) {
+    let want_deny = id == "pam.lock";
+    let elevation = id == "pam.sudo" || id == "pam.polkit";
+    let face_lines: Vec<&str> = pam_active_lines(text).filter(|l| l.contains("pam_faceauth.so")).collect();
+    let has = !face_lines.is_empty();
+    let deny_after_face = {
+        let mut seen_face = false;
+        let mut closed = false;
+        for l in pam_active_lines(text) {
+            if l.contains("pam_faceauth.so") {
+                seen_face = true;
+            } else if seen_face && l.contains("pam_deny.so") {
+                let mut words = l.split_whitespace();
+                let control = (words.next(), words.next());
+                if matches!(control, (Some("auth"), Some("required")) | (Some("auth"), Some("requisite"))) {
+                    closed = true;
+                }
+            }
+        }
+        closed
+    };
+    let prompt = face_lines.iter().any(|l| l.split_whitespace().any(|w| w == "prompt" || w.starts_with("prompt=")));
+    let consent = face_lines.iter().any(|l| l.split_whitespace().any(|w| w == "consent"));
+    let consent_timeout = face_lines.iter().any(|l| l.split_whitespace().any(|w| w == "consent") && l.split_whitespace().any(|w| w.starts_with("timeout=")));
+    let mut st = if !has { if id == "pam.greeter" { "info" } else { "warn" } } else if want_deny && !deny_after_face { "fail" } else { "pass" };
+    let mut d = if has { "wired".to_string() } else { "not wired".to_string() };
+    if has && elevation {
+        d += if consent { ", consent (window + nod)" } else if prompt { ", prompt (Enter to scan)" } else { ", NO consent or prompt: scans on presence" };
+    }
+    if has && want_deny {
+        d += if deny_after_face { ", closed by pam_deny" } else { ", NOT closed by a live 'auth required pam_deny.so' after the face line: an ignored module would read as success" };
+    }
+    if consent_timeout {
+        d += ", timeout= on a consent line is ignored (the window waits until answered): remove it";
+        if st == "pass" {
+            st = "warn";
+        }
+    }
+    (st, d)
+}
+
 #[derive(serde::Serialize)]
 struct Check {
     id: &'static str,
@@ -1353,6 +1525,7 @@ fn doctor(rest: &[&str]) -> Result<()> {
     let mut push = |id: &'static str, status: &'static str, detail: String| checks.push(Check { id, status, detail });
 
     // camera
+    let sysfs_ir = ir_sensor_from_sysfs(Path::new("/sys/class/video4linux"));
     match faceauth_camera::ipu3::probe() {
         Ok(Some(g)) => match g.ir_sensor() {
             Some(ir) => {
@@ -1364,7 +1537,32 @@ fn doctor(rest: &[&str]) -> Result<()> {
             None => push("camera.ir", "fail", "IPU3 graph found but no front IR sensor".into()),
         },
         Ok(None) => push("camera.ir", "unknown", "no IPU3 graph; UVC IR cameras need ir_video in the config".into()),
+        // The probe opens every sensor's control node and stops at the first
+        // it cannot open. Once the udev rule holds, the IR sensor's node is
+        // root-only and doctor runs as the user, so that is the expected
+        // outcome, not a fault: the sensor is read from sysfs instead, which
+        // needs no access to the node.
+        Err(e) if is_permission_denied(&e) => match &sysfs_ir {
+            Some((node, name)) => push("camera.ir", "pass", format!("{} on /dev/{}, owned by root (expected once the udev rule is in place; run as root for the illuminator and RGB checks)", name, node)),
+            None => push("camera.ir", "fail", format!("{} and no ov7251 IR sensor in sysfs", e)),
+        },
         Err(e) => push("camera.ir", "fail", e.to_string()),
+    }
+    // The node's live state, not the rule file: an access grant made before
+    // the rule was installed survives until reboot or `setfacl -b`, so the
+    // ACL and the udev database's current tags are what count.
+    if let Some((node, _)) = &sysfs_ir {
+        let dev = PathBuf::from("/dev").join(node);
+        let (st, d) = match std::fs::metadata(&dev) {
+            Ok(m) => {
+                use std::os::unix::fs::MetadataExt;
+                let tags = udev_current_tags(Path::new("/run/udev/data"), m.rdev());
+                let (st, d) = ir_node_verdict(m.mode() & 0o777, m.uid(), m.gid(), &tags, user_can_write(&dev));
+                (st, format!("/dev/{}: {}", node, d))
+            }
+            Err(e) => ("unknown", format!("/dev/{}: {}", node, e)),
+        };
+        push("camera.ir_access", st, d);
     }
     // models
     let manifest = PathBuf::from("/usr/share/faceauth/models.toml");
@@ -1406,18 +1604,10 @@ fn doctor(rest: &[&str]) -> Result<()> {
         None => push("liveness.policy", "unknown", "config not readable".into()),
     }
     // PAM wiring
-    for (id, path, want_deny) in [("pam.sudo", "/etc/pam.d/sudo", false), ("pam.polkit", "/etc/pam.d/polkit-1", false), ("pam.lock", "/etc/pam.d/omarchy-lock-face", true), ("pam.greeter", "/etc/pam.d/sddm", false)] {
+    for (id, path) in [("pam.sudo", "/etc/pam.d/sudo"), ("pam.polkit", "/etc/pam.d/polkit-1"), ("pam.lock", "/etc/pam.d/omarchy-lock-face"), ("pam.greeter", "/etc/pam.d/sddm")] {
         match std::fs::read_to_string(path) {
             Ok(t) => {
-                let has = t.lines().any(|l| l.contains("pam_faceauth.so") && !l.trim_start().starts_with('#'));
-                let deny = t.lines().any(|l| l.contains("pam_deny.so"));
-                let prompt = t.lines().any(|l| l.contains("pam_faceauth.so") && l.contains("prompt"));
-                let consent = t.lines().any(|l| l.contains("pam_faceauth.so") && l.contains("consent"));
-                let elevation = id == "pam.sudo" || id == "pam.polkit";
-                let st = if !has { if id == "pam.greeter" { "info" } else { "warn" } } else if want_deny && !deny { "fail" } else { "pass" };
-                let mut d = if has { "wired".to_string() } else { "not wired".to_string() };
-                if has && elevation { d += if consent { ", consent (window + nod)" } else if prompt { ", prompt (Enter to scan)" } else { ", NO consent or prompt: scans on presence" }; }
-                if has && want_deny { d += if deny { ", closed by pam_deny" } else { ", NOT closed by pam_deny: an ignored module would read as success" }; }
+                let (st, d) = pam_stack_verdict(id, &t);
                 push(id, st, d);
             }
             Err(_) => push(id, "warn", "no file (not wired)".into()),
@@ -1442,4 +1632,145 @@ fn doctor(rest: &[&str]) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod doctor_tests {
+    use super::*;
+
+    /// E6: only a live `auth required|requisite pam_deny.so` after the face
+    /// line closes the lock stack.
+    #[test]
+    fn a_commented_out_pam_deny_does_not_close_the_lock_stack() {
+        let open = "#%PAM-1.0\nauth sufficient pam_faceauth.so socket=/run/faceauth/sock timeout=8\n#auth required pam_deny.so\naccount include system-local-login\n";
+        let (st, d) = pam_stack_verdict("pam.lock", open);
+        assert_eq!(st, "fail", "{}", d);
+        assert!(d.contains("NOT closed"), "{}", d);
+        let closed = open.replace("#auth required pam_deny.so", "auth required pam_deny.so");
+        assert_eq!(pam_stack_verdict("pam.lock", &closed), ("pass", "wired, closed by pam_deny".to_string()));
+        let requisite = open.replace("#auth required pam_deny.so", "auth   requisite   pam_deny.so");
+        assert_eq!(pam_stack_verdict("pam.lock", &requisite).0, "pass");
+        // A pam_deny above the face line runs first and never lets the face line answer.
+        let above = "auth required pam_deny.so\nauth sufficient pam_faceauth.so\n";
+        assert_eq!(pam_stack_verdict("pam.lock", above).0, "fail");
+        // The wrong control word or a different module type does not close the stack.
+        let optional = open.replace("#auth required pam_deny.so", "auth optional pam_deny.so");
+        assert_eq!(pam_stack_verdict("pam.lock", &optional).0, "fail");
+        let account = open.replace("#auth required pam_deny.so", "account required pam_deny.so");
+        assert_eq!(pam_stack_verdict("pam.lock", &account).0, "fail");
+    }
+
+    /// F11: `timeout=` on a consent line is ignored by the module and doctor says so.
+    #[test]
+    fn timeout_on_a_consent_line_is_flagged() {
+        let stale = "auth sufficient pam_faceauth.so socket=/run/faceauth/sock timeout=60 consent\nauth include system-auth\n";
+        let (st, d) = pam_stack_verdict("pam.sudo", stale);
+        assert_eq!(st, "warn", "{}", d);
+        assert!(d.contains("consent (window + nod)") && d.contains("timeout= on a consent line is ignored"), "{}", d);
+        let clean = "auth sufficient pam_faceauth.so socket=/run/faceauth/sock consent\nauth include system-auth\n";
+        assert_eq!(pam_stack_verdict("pam.sudo", clean), ("pass", "wired, consent (window + nod)".to_string()));
+        // A plain look keeps its timeout without comment.
+        let lock = "auth sufficient pam_faceauth.so timeout=8\nauth required pam_deny.so\n";
+        assert!(!pam_stack_verdict("pam.lock", lock).1.contains("timeout="));
+        // A commented-out face line is not wired.
+        assert_eq!(pam_stack_verdict("pam.sudo", "#auth sufficient pam_faceauth.so consent\n").0, "warn");
+    }
+
+    /// D3: the IR sensor is found by name in sysfs without opening its node,
+    /// so doctor keeps going once the node is root-only.
+    #[test]
+    fn the_ir_sensor_is_found_by_name_in_sysfs() {
+        let dir = std::env::temp_dir().join(format!("faceauth-doctor-sysfs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (node, name) in [("v4l-subdev2", "ipu3-csi2 0"), ("v4l-subdev6", "ov8865 3-0010"), ("v4l-subdev8", "ov7251 3-0060"), ("v4l-subdev9", "dw9719 3-000c"), ("video0", "ipu3-cio2 0")] {
+            std::fs::create_dir_all(dir.join(node)).unwrap();
+            std::fs::write(dir.join(node).join("name"), format!("{}\n", name)).unwrap();
+        }
+        assert_eq!(ir_sensor_from_sysfs(&dir), Some(("v4l-subdev8".to_string(), "ov7251 3-0060".to_string())));
+        std::fs::remove_dir_all(dir.join("v4l-subdev8")).unwrap();
+        assert_eq!(ir_sensor_from_sysfs(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D3: the verdict reads the node's live state. Right is root:root 0600,
+    /// no uaccess in the current tags and no write access for the caller.
+    #[test]
+    fn the_ir_node_verdict_reads_the_live_state() {
+        let none: Vec<String> = vec![];
+        let seat = vec!["seat".to_string()];
+        let uaccess = vec!["seat".to_string(), "uaccess".to_string()];
+        assert_eq!(ir_node_verdict(0o600, 0, 0, &seat, false).0, "pass");
+        assert_eq!(ir_node_verdict(0o600, 0, 0, &none, false).0, "pass");
+        // Before the rule: video group, rw, uaccess tag, and the user holds an ACL.
+        let (st, d) = ir_node_verdict(0o660, 0, 983, &uaccess, true);
+        assert_eq!(st, "warn");
+        assert!(d.contains("want root:root 0600") && d.contains("tagged uaccess"), "{}", d);
+        // The rule applied to the udev database but the earlier ACL still stands.
+        let (st, d) = ir_node_verdict(0o600, 0, 0, &seat, true);
+        assert_eq!(st, "warn");
+        assert!(d.contains("setfacl -b"), "{}", d);
+        // Right mode, stale tag: the next login grants access again.
+        assert_eq!(ir_node_verdict(0o600, 0, 0, &uaccess, false).0, "warn");
+    }
+
+    /// D3: the probe's error for a root-only node is recognised through the
+    /// context anyhow wraps around it, and anything else is still a fault.
+    #[test]
+    fn a_root_only_node_is_permission_denied_not_a_fault() {
+        let denied = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied)).context("open /dev/v4l-subdev8").context("IPU3 probe");
+        assert!(is_permission_denied(&denied));
+        let missing = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::NotFound)).context("open /dev/media0");
+        assert!(!is_permission_denied(&missing));
+        assert!(!is_permission_denied(&anyhow!("no subdev node")));
+    }
+
+    /// D3: the udev database's Q: lines are the current tags; G: lines are history.
+    #[test]
+    fn udev_current_tags_come_from_q_lines() {
+        let dir = std::env::temp_dir().join(format!("faceauth-doctor-udev-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 81:22 as the kernel encodes it: major in bits 8..20, minor low byte plus bits 20..32.
+        let rdev: u64 = (81 << 8) | 22;
+        assert_eq!((libc_major(rdev), libc_minor(rdev)), (81, 22));
+        std::fs::write(dir.join("c81:22"), "I:1\nE:ID_PATH=x\nG:seat\nG:uaccess\nQ:seat\nV:1\n").unwrap();
+        assert_eq!(udev_current_tags(&dir, rdev), vec!["seat".to_string()]);
+        assert!(udev_current_tags(&dir, (81 << 8) | 23).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The development `--store DIR` store: plaintext unless running as root.
+/// As a user, probing the TPM makes PID 1 ask polkit, which puts a real
+/// "decrypt a system credential" window on the desktop during a dev run or
+/// a test (F13); root probes as the daemon does.
+fn dev_store(dir: &str) -> Result<faceauth_daemon::store::Store> {
+    use faceauth_daemon::store::{Sealing, Store};
+    if unsafe { libc_geteuid() } == 0 {
+        Store::open(dir)
+    } else {
+        Store::open_with(dir, Sealing::Plain("development store, not root".into()))
+    }
+}
+
+/// Write the config through a temporary file in the same directory and a
+/// rename, so a failure part-way leaves the old file whole (F4).
+fn write_config_atomically(path: &str, text: &str) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let p = std::path::Path::new(path);
+    let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(".{}.tmp-{}", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "config.toml".into()), std::process::id()));
+    let mode = std::fs::metadata(p).map(|m| m.permissions().mode()).unwrap_or(0o644);
+    let r = (|| -> Result<()> {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, p)?;
+        Ok(())
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
 }

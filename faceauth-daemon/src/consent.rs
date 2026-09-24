@@ -19,11 +19,58 @@ use serde::Serialize;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+/// A typed password on its way to the PAM check: wiped when dropped, so a
+/// copy left in a map or a gesture does not stay readable in freed memory
+/// (and from there in swap or a hibernation image) after the check (F12).
+/// Copies made before it is wrapped (the request line, the JSON field)
+/// are wiped by the server as it builds one.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(s: String) -> Secret {
+        Secret(s)
+    }
+}
+
+impl std::ops::Deref for Secret {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        wipe_string(&mut self.0);
+    }
+}
+
+/// Overwrite a string's bytes with zeros before they are freed. A volatile
+/// write, so the optimiser cannot drop it as a dead store; the string is
+/// left empty, which is valid UTF-8.
+pub fn wipe_string(s: &mut String) {
+    // SAFETY: zero bytes are valid UTF-8, and the vector is cleared before
+    // the borrow ends, so no partial sequence is left behind.
+    let v = unsafe { s.as_mut_vec() };
+    for b in v.iter_mut() {
+        // SAFETY: `b` is a valid, aligned, exclusively borrowed byte.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    v.clear();
+}
+
 /// What the window (or the CLI) can send while a request is pending.
 #[derive(Clone, Debug)]
 pub enum Answer {
     /// The user typed their password into the window.
-    Password(String),
+    Password(Secret),
     /// The requester hung up its socket: nobody is waiting for the verdict.
     Gone,
     /// The user dismissed, killed or blocked: refuse now.
@@ -52,6 +99,10 @@ pub struct CallerInfo {
     /// process of the user's can send that, so the window labels it.
     pub command: String,
     pub verified: bool,
+    /// `command` was cut at `COMMAND_CLIP`: the card says so rather
+    /// than pass the tail off as the whole (A6). The nod path stays open.
+    #[serde(default)]
+    pub clipped: bool,
     /// Who asked: the requesting process and pid, then its parents
     /// ("sudo (pid 3011002)  from  bash (2990241) <- foot (13950)"), or the
     /// polkit helper's pid with a note that the asking process was not found.
@@ -93,14 +144,48 @@ fn read_proc(pid: i32, what: &str) -> Option<String> {
     std::fs::read(format!("/proc/{}/{}", pid, what)).ok().map(|b| String::from_utf8_lossy(&b).replace('\0', " ").trim().to_string())
 }
 
-/// Text for the window: no control characters (a newline or a bidi override
-/// in a command line would let the requester write its own description) and
-/// a cap that only a pathological command line reaches; the window wraps
-/// and never elides, so what is shown is the whole thing. Applied to
-/// everything read from /proc or sent by the polkit agent before it reaches
-/// the window or the log.
+/// Longest command text shown, in characters. Wider than any real command
+/// line (a kernel's argument limit is far larger, but a shown command past
+/// this is not read by a person); what is cut is flagged, never hidden (A6).
+pub const COMMAND_CLIP: usize = 16_384;
+
+/// Text for the window: nothing that formats or steers the text (a newline
+/// or a bidi override in a command line would let the requester write its
+/// own description). Characters are kept or dropped by Unicode general
+/// category: Cc (controls), Cf (format: zero-width, bidi, joiners), Zl and
+/// Zp (line and paragraph separators) go; a tab becomes a space; every
+/// other category stays. Cut at `COMMAND_CLIP`; `clip_command` says
+/// whether it was. Applied to everything read from /proc or sent by the
+/// polkit agent before it reaches the window or the log.
 pub fn clip(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control() && !matches!(*c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')).take(2000).collect()
+    clip_command(s).0
+}
+
+/// `clip`, and whether the text was cut.
+pub fn clip_command(s: &str) -> (String, bool) {
+    let kept: String = s.chars().filter_map(|c| if c == '\t' { Some(' ') } else if is_dropped_category(c) { None } else { Some(c) }).take(COMMAND_CLIP + 1).collect();
+    if kept.chars().count() > COMMAND_CLIP {
+        log::info!("consent: a command line of over {} characters is shown cut", COMMAND_CLIP);
+        (kept.chars().take(COMMAND_CLIP).collect(), true)
+    } else {
+        (kept, false)
+    }
+}
+
+/// Unicode general categories Cc, Cf, Zl and Zp (Unicode 15). The Cf
+/// table is the standard's, listed in full so nothing new that formats or
+/// reorders text slips through as "not on the hand list".
+fn is_dropped_category(c: char) -> bool {
+    if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+        return true;
+    }
+    const CF: [(u32, u32); 21] = [
+        (0x00AD, 0x00AD), (0x0600, 0x0605), (0x061C, 0x061C), (0x06DD, 0x06DD), (0x070F, 0x070F), (0x0890, 0x0891), (0x08E2, 0x08E2), (0x180E, 0x180E),
+        (0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x2064), (0x2066, 0x206F), (0xFEFF, 0xFEFF), (0xFFF9, 0xFFFB), (0x110BD, 0x110BD), (0x110CD, 0x110CD),
+        (0x13430, 0x1343F), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A), (0xE0001, 0xE0001), (0xE0020, 0xE007F),
+    ];
+    let u = c as u32;
+    CF.iter().any(|&(lo, hi)| lo <= u && u <= hi)
 }
 
 fn exe_of(pid: i32) -> String {
@@ -313,7 +398,9 @@ impl CallerInfo {
         // The helper is setuid, so its exe link is unreadable without ptrace
         // rights (this daemon has none); comm is readable but truncated to 15 bytes.
         let comm = comm_of(pid);
-        let base = Path::new(&exe).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| comm.clone());
+        // The base name is the requester's own (a process may name its
+        // executable anything): clipped like the command it labels.
+        let base = Path::new(&exe).file_name().map(|s| clip(&s.to_string_lossy())).unwrap_or_else(|| comm.clone());
         if base == "polkit-agent-helper-1" || comm.starts_with("polkit-agent-he") {
             let agent_comm = agent.map(|a| comm_of(a.pid)).unwrap_or_default();
             let context = agent.and_then(take_polkit_context);
@@ -322,7 +409,8 @@ impl CallerInfo {
             info.cmdline = cmdline;
             return info;
         }
-        CallerInfo { pid, exe: exe.clone(), cmdline: cmdline.clone(), kill_pid: pid, via: base.clone(), command: clip(&cmdline), verified: true, parents: parent_chain(pid), who: format!("{} (pid {})  from  {}", base, pid, parent_chain(pid)), requester: None }
+        let (command, clipped) = clip_command(&cmdline);
+        CallerInfo { pid, exe: exe.clone(), cmdline: cmdline.clone(), kill_pid: pid, via: base.clone(), command, clipped, verified: true, parents: parent_chain(pid), who: format!("{} (pid {})  from  {}", base, pid, parent_chain(pid)), requester: None }
     }
 
     /// A request through polkit's helper. The helper carries nothing that
@@ -362,14 +450,14 @@ impl CallerInfo {
                 log::warn!("consent: polkit named requester pid {} with uid {}, not uid {}; not shown as verified", rp, uid, user_uid);
                 return None;
             }
-            let cl = clip(&read_proc(rp, "cmdline").unwrap_or_default());
+            let (cl, clipped) = clip_command(&read_proc(rp, "cmdline").unwrap_or_default());
             if cl.is_empty() {
                 return None;
             }
-            Some((rp, cl))
+            Some((rp, cl, clipped))
         });
         match named {
-            Some((rp, cl)) => {
+            Some((rp, cl, clipped)) => {
                 let name = comm_of(rp);
                 let parents = parent_chain(rp);
                 let asked = match (c.caller_pid, c.subject_pid) {
@@ -378,6 +466,7 @@ impl CallerInfo {
                 };
                 log::info!("consent: polkit helper pid {}: requester {} (pid {}) named by polkitd; the agent relayed: {}", pid, name, rp, relayed);
                 info.command = cl;
+                info.clipped = clipped;
                 info.verified = true;
                 info.kill_pid = rp;
                 info.requester = Some(rp);
@@ -411,12 +500,7 @@ fn parent_chain(pid: i32) -> String {
 /// One `omarchy-shell` invocation inside the user's own systemd manager,
 /// the same route the session lock uses.
 pub fn shell_call(cfg: &Config, user: &str, args: &[&str]) -> Result<()> {
-    let omarchy_path = cfg.omarchy_path.clone().unwrap_or_else(|| {
-        std::fs::read_to_string("/etc/omarchy.conf")
-            .ok()
-            .and_then(|t| t.lines().find_map(|l| l.strip_prefix("OMARCHY_PATH=").map(|v| v.trim_matches('"').to_string())))
-            .unwrap_or_else(|| "/usr/share/omarchy".into())
-    });
+    let omarchy_path = omarchy_path(cfg);
     // The unit's description is what the journal prints on start; the
     // default is the command line, payload and token included.
     let status = std::process::Command::new("/usr/bin/timeout")
@@ -574,8 +658,32 @@ pub fn session_locked(user: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The Omarchy tree the running shell was launched from: the config's
+/// `omarchy_path`, else `/etc/omarchy.conf` (written by `omarchy-dev-link`
+/// as `export OMARCHY_PATH="..."`, and by hand as a bare assignment), else
+/// the package. One resolver for the window, the notices and the lock
+/// helper, so a dev-linked desktop is reached the same way by all three.
+pub fn omarchy_path(cfg: &Config) -> String {
+    cfg.omarchy_path
+        .clone()
+        .or_else(|| std::fs::read_to_string("/etc/omarchy.conf").ok().and_then(|t| omarchy_path_from_conf(&t)))
+        .unwrap_or_else(|| "/usr/share/omarchy".into())
+}
+
+/// The `OMARCHY_PATH` value in an omarchy.conf text, with or without an
+/// `export` prefix and with or without quotes; `None` when the file names
+/// nothing usable, so the caller falls through to the package.
+pub fn omarchy_path_from_conf(text: &str) -> Option<String> {
+    text.lines().find_map(|l| {
+        let l = l.trim();
+        let l = l.strip_prefix("export ").map(str::trim_start).unwrap_or(l);
+        let v = l.strip_prefix("OMARCHY_PATH=")?.trim().trim_matches('"').trim_matches('\'');
+        (!v.is_empty() && v.starts_with('/')).then(|| v.to_string())
+    })
+}
+
 pub fn notify(cfg: &Config, user: &str, title: &str, body: &str) {
-    let omarchy_path = cfg.omarchy_path.clone().unwrap_or_else(|| "/usr/share/omarchy".into());
+    let omarchy_path = omarchy_path(cfg);
     let _ = std::process::Command::new("/usr/bin/timeout")
         .args(["5", "/usr/bin/systemd-run", "--quiet", "--collect", "--user", "--description=omarchy-faceauth notice"])
         .arg(format!("--machine={}@.host", user))
@@ -598,7 +706,7 @@ pub enum Gesture {
     /// Two head shakes: a refusal.
     Shaken,
     /// The window supplied a password (verified by the caller).
-    Password(String),
+    Password(Secret),
     Dismissed,
     /// The requester went away; the window comes down with it.
     Gone,
@@ -1577,8 +1685,19 @@ pub fn track(faces: &[faceauth_engine::Face], tracked: [f32; 4]) -> Track {
     }
 }
 
+/// The most recent frames kept from a nod's legs for the identity check
+/// after the confirm (D4): two per gesture and a few to spare.
+pub const NOD_FRAMES_KEPT: usize = 8;
+
+/// `nod_frames` receives the frame and face at the end of each counted
+/// nod leg, and at each counted nod, newest last, capped at
+/// `NOD_FRAMES_KEPT`. The caller embeds them after the confirm and
+/// requires each to match the templates: the nods must have come from
+/// the enrolled face, not merely from the box the confirm later finds
+/// live (D4). Nothing about identity is read here; the detectors and
+/// their floors are untouched.
 #[allow(clippy::too_many_arguments)]
-pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, window: Duration, nods_needed: usize, answers: Option<(&Answers, &str)>, lost_after: Option<Duration>, floors: (f32, f32), floors_deg: (f32, f32), start: Option<[f32; 4]>, dwell: Duration) -> Result<(Gesture, Option<[f32; 4]>)> {
+pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, window: Duration, nods_needed: usize, answers: Option<(&Answers, &str)>, lost_after: Option<Duration>, floors: (f32, f32), floors_deg: (f32, f32), start: Option<[f32; 4]>, dwell: Duration, nod_frames: &mut Vec<(Grey, faceauth_engine::Face)>) -> Result<(Gesture, Option<[f32; 4]>)> {
     let min_detection = cfg.min_detection;
     let user_name = answers.map(|(_, u)| u.to_string()).unwrap_or_else(|| "unknown".into());
     let t0 = Instant::now();
@@ -1684,8 +1803,11 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config,
                     // another: nothing counts meanwhile, and a nod begun
                     // before is forgotten. A single face back for a second
                     // is adopted (the user moved); the confirm at the end
-                    // still has to match it.
-                    last_face = Instant::now();
+                    // still has to match it. A face that is not the followed
+                    // one does not hold the request open: the away clock
+                    // runs from the last sight of the followed face, so a
+                    // stranger at the desk cannot keep a request pending
+                    // past the presence away time (C1, consent lane).
                     if !paused_logged {
                         log::info!("consent: gesture paused, the matched face is {}", if other == Track::Lost { "not in view" } else { "one of two" });
                         paused_logged = true;
@@ -1745,7 +1867,15 @@ pub fn wait_for_nods(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config,
                 return Ok((Gesture::Shaken, tracked));
             }
         }
-        if det.push_full(sig_nod, Some(sig_yaw), t, Some(geom)) {
+        let legs_before = det.inner.legs.len();
+        let counted = det.push_full(sig_nod, Some(sig_yaw), t, Some(geom));
+        if counted || det.inner.legs.len() > legs_before {
+            nod_frames.push((img.clone(), face.clone()));
+            if nod_frames.len() > NOD_FRAMES_KEPT {
+                nod_frames.remove(0);
+            }
+        }
+        if counted {
             log::debug!("consent: nod {} at {:.2}s", det.nods, t);
             if det.nods >= nods_needed {
                 if cfg.gesture_record_only {
@@ -1835,12 +1965,55 @@ mod window_text_tests {
     use super::{clip, Dialog, TOKENS};
 
     #[test]
+    fn the_omarchy_path_is_read_in_every_form_the_conf_takes() {
+        use super::omarchy_path_from_conf as f;
+        assert_eq!(f("export OMARCHY_PATH=\"/home/x/omarchy\"\n").as_deref(), Some("/home/x/omarchy"));
+        assert_eq!(f("OMARCHY_PATH=/usr/share/omarchy\n").as_deref(), Some("/usr/share/omarchy"));
+        assert_eq!(f("# comment\n  export  OMARCHY_PATH='/opt/o'\n").as_deref(), Some("/opt/o"));
+        assert_eq!(f("OMARCHY_PATH=\n"), None);
+        assert_eq!(f("OMARCHY_PATH=relative\n"), None);
+        assert_eq!(f(""), None);
+    }
+
+    #[test]
     fn clip_drops_line_breaks_and_direction_overrides() {
+        use super::{clip_command, COMMAND_CLIP};
         assert_eq!(clip("sudo /bin/sh -c true\nRoutine update\nNo action needed"), "sudo /bin/sh -c trueRoutine updateNo action needed");
         assert_eq!(clip("ls \u{202E}txt.sh"), "ls txt.sh");
-        assert_eq!(clip("a\u{200B}b\u{2066}c\tD"), "abcD");
-        assert_eq!(clip(&"x".repeat(2500)).chars().count(), 2000);
+        assert_eq!(clip("a\u{200B}b\u{2066}c\tD"), "abc D", "a tab is a space; format characters go");
+        // Line and paragraph separators, next line, and the Arabic letter
+        // mark: every category that breaks or steers a line, not a hand list.
+        assert_eq!(clip("a\u{2028}b\u{2029}c\u{0085}d\u{061C}e\u{FEFF}f\u{00AD}g\u{E0041}h"), "abcdefgh");
         assert_eq!(clip("plain command --flag"), "plain command --flag");
+        assert_eq!(clip("caf\u{E9} \u{00A0}x \u{4E2D}\u{6587} \u{1F600}"), "caf\u{E9} \u{00A0}x \u{4E2D}\u{6587} \u{1F600}", "letters, symbols and other spaces stay");
+        // A 2,500-character command is shown whole and unflagged (the old
+        // 2,000 cut is gone); a command past the limit is cut and flagged,
+        // and neither changes what the request may do (A6, ruling D5).
+        let (c, clipped) = clip_command(&"x".repeat(2500));
+        assert_eq!((c.chars().count(), clipped), (2500, false));
+        let (c, clipped) = clip_command(&"y".repeat(COMMAND_CLIP + 500));
+        assert_eq!((c.chars().count(), clipped), (COMMAND_CLIP, true));
+        let (c, clipped) = clip_command(&"z".repeat(COMMAND_CLIP));
+        assert_eq!((c.chars().count(), clipped), (COMMAND_CLIP, false));
+        let (c, clipped) = clip_command(&"w".repeat(20_000));
+        assert_eq!((c.chars().count(), clipped), (COMMAND_CLIP, true), "a 20,000-character command is cut and flagged");
+    }
+
+    /// The window payload carries the flag with the caller, so the card can
+    /// say the command is cut; the caller is otherwise the same request.
+    #[test]
+    fn a_clipped_command_is_flagged_in_the_payload() {
+        use super::{clip_command, CallerInfo, COMMAND_CLIP};
+        let (command, clipped) = clip_command(&"x".repeat(20_000));
+        let info = CallerInfo { command, clipped, verified: true, ..Default::default() };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["clipped"], serde_json::Value::Bool(true));
+        // The flag is a label for the card only: the nod path reads
+        // nothing from it, so consent proceeds on a cut command as on any.
+        assert!(info.verified && info.kill_pid == 0);
+        assert_eq!(json["command"].as_str().unwrap().chars().count(), COMMAND_CLIP);
+        let plain = CallerInfo { command: "sudo ls".into(), verified: true, ..Default::default() };
+        assert_eq!(serde_json::to_value(&plain).unwrap()["clipped"], serde_json::Value::Bool(false));
     }
 
     #[test]

@@ -4,6 +4,12 @@
 # copied here under their item names. Needs root twice (turning recording on,
 # restoring the config); the windows themselves grant nothing.
 #
+# The root steps take every path as a positional argument rather than
+# splicing it into the script text, so a directory name with a quote or a
+# space cannot change what runs as root. Root never writes into a directory
+# this user owns: the recordings are copied into a root-owned temporary
+# directory, handed over with chown, and moved into place by the user.
+#
 #   tools/battery.sh [USER] [OUTDIR]      default: $USER, faceauth-daemon/traces/cal-$(date +%Y%m%d)
 #
 # For each window: once it says "Recognised", do what the label says; otherwise stay as you are.
@@ -36,7 +42,18 @@ items=(
 mkdir -p "$out"
 slugs=$(mktemp); for it in "${items[@]}"; do echo "${it%%:*}" >> "$slugs"; done
 # The keys go above the first table, or they would land inside it and be ignored.
-pkexec sh -c "echo 'FACEAUTH BATTERY: turn on recording (record-only) and restart'; set -e; cp $cfg $cfg.pre-battery; sed -i '/^gesture_trace *=/d; /^gesture_record_only *=/d' $cfg; sed -i '0,/^\\[/s//gesture_trace = true\\ngesture_record_only = true\\n\\n[/' $cfg; grep -q '^gesture_trace = true' $cfg; systemctl restart faceauth.service; sleep 5; systemctl is-active faceauth.service" || exit 1
+pkexec sh -c '
+  echo "FACEAUTH BATTERY: turn on recording (record-only) and restart"
+  set -e
+  cfg=$1
+  cp "$cfg" "$cfg.pre-battery"
+  sed -i "/^gesture_trace *=/d; /^gesture_record_only *=/d" "$cfg"
+  sed -i "0,/^\\[/s//gesture_trace = true\\ngesture_record_only = true\\n\\n[/" "$cfg"
+  grep -q "^gesture_trace = true" "$cfg"
+  systemctl restart faceauth.service
+  sleep 5
+  systemctl is-active faceauth.service
+' sh "$cfg" || exit 1
 sleep 4
 start=$(date +%s)
 n=0; total=${#items[@]}
@@ -46,6 +63,27 @@ for it in "${items[@]}"; do
   echo "$n ${it%%:*} recorded"
   sleep 2
 done
-pkexec sh -c "echo 'FACEAUTH BATTERY: restore the config and collect the recordings'; set -e; mv $cfg.pre-battery $cfg; systemctl restart faceauth.service; cd /var/lib/faceauth/gestures; i=0; for f in \$(ls -1 | awk -F- '\$1 >= $start' | sort); do i=\$((i+1)); slug=\$(sed -n \"\${i}p\" $slugs); [ -z \"\$slug\" ] && slug=extra; cp \"\$f\" \"$out/\$(printf %02d \$i)-\$slug.txt\"; done; chown -R $user \"$out\"; ls \"$out\" | wc -l"
+# Root copies into a directory only root can reach, then hands it over; the
+# user does the move. Root never follows a path into a user-owned directory.
+staging=$(pkexec sh -c '
+  echo "FACEAUTH BATTERY: restore the config and collect the recordings" >&2
+  set -e
+  cfg=$1; start=$2; slugs=$3; user=$4
+  mv "$cfg.pre-battery" "$cfg"
+  systemctl restart faceauth.service
+  staging=$(mktemp -d /tmp/faceauth-battery.XXXXXX)
+  cd /var/lib/faceauth/gestures
+  i=0
+  for f in $(ls -1 | awk -F- -v s="$start" "\$1 >= s" | sort); do
+    i=$((i+1))
+    slug=$(sed -n "${i}p" "$slugs")
+    [ -z "$slug" ] && slug=extra
+    cp "$f" "$staging/$(printf %02d "$i")-$slug.txt"
+  done
+  chown -R "$user" "$staging"
+  echo "$staging"
+' sh "$cfg" "$start" "$slugs" "$user") || exit 1
+mv "$staging"/* "$out"/ && rmdir "$staging"
 rm -f "$slugs"
+ls "$out" | wc -l
 echo "recordings in $out; replay them with: cargo test --release -p faceauth-daemon cal_report -- --ignored --nocapture"

@@ -69,36 +69,48 @@ impl YuNet {
                 Ok(data.to_vec())
             };
             let (cls, obj, bbox, kps) = (get("cls")?, get("obj")?, get("bbox")?, get("kps")?);
-            for r in 0..rows {
-                for c in 0..cols {
-                    let idx = r * cols + c;
-                    if idx >= cls.len() || idx >= obj.len() {
-                        break;
-                    }
-                    let score = (cls[idx].clamp(0.0, 1.0) * obj[idx].clamp(0.0, 1.0)).sqrt();
-                    if score < threshold {
-                        continue;
-                    }
-                    let s = stride as f32;
-                    let cx = (c as f32 + bbox[idx * 4]) * s;
-                    let cy = (r as f32 + bbox[idx * 4 + 1]) * s;
-                    let bw = bbox[idx * 4 + 2].exp() * s;
-                    let bh = bbox[idx * 4 + 3].exp() * s;
-                    let mut landmarks = [[0f32; 2]; 5];
-                    for (n, lm) in landmarks.iter_mut().enumerate() {
-                        *lm = [(kps[idx * 10 + 2 * n] + c as f32) * s / scale, (kps[idx * 10 + 2 * n + 1] + r as f32) * s / scale];
-                    }
-                    boxes.push(Face {
-                        bbox: [(cx - bw / 2.0) / scale, (cy - bh / 2.0) / scale, bw / scale, bh / scale],
-                        score,
-                        landmarks,
-                        embedding: None,
-                    });
-                }
-            }
+            boxes.extend(decode_stride(&cls, &obj, &bbox, &kps, stride, cols, rows, threshold, scale)?);
         }
         Ok(nms(boxes, NMS_IOU))
     }
+}
+
+/// Decode one stride's outputs into faces. The four tensors must agree on
+/// the cell count: a model whose box or landmark output is shorter than its
+/// score output is refused rather than read past its end (a panic here
+/// would take the request thread with it).
+#[allow(clippy::too_many_arguments)]
+fn decode_stride(cls: &[f32], obj: &[f32], bbox: &[f32], kps: &[f32], stride: usize, cols: usize, rows: usize, threshold: f32, scale: f32) -> Result<Vec<Face>> {
+    let cells = cols * rows;
+    if cls.len() < cells || obj.len() < cells || bbox.len() < cells * 4 || kps.len() < cells * 10 {
+        anyhow::bail!("YuNet: stride {} outputs are short for {}x{} cells (cls {}, obj {}, bbox {}, kps {})", stride, cols, rows, cls.len(), obj.len(), bbox.len(), kps.len());
+    }
+    let mut boxes = Vec::new();
+    for r in 0..rows {
+        for c in 0..cols {
+            let idx = r * cols + c;
+            let score = (cls[idx].clamp(0.0, 1.0) * obj[idx].clamp(0.0, 1.0)).sqrt();
+            if score < threshold {
+                continue;
+            }
+            let s = stride as f32;
+            let cx = (c as f32 + bbox[idx * 4]) * s;
+            let cy = (r as f32 + bbox[idx * 4 + 1]) * s;
+            let bw = bbox[idx * 4 + 2].exp() * s;
+            let bh = bbox[idx * 4 + 3].exp() * s;
+            let mut landmarks = [[0f32; 2]; 5];
+            for (n, lm) in landmarks.iter_mut().enumerate() {
+                *lm = [(kps[idx * 10 + 2 * n] + c as f32) * s / scale, (kps[idx * 10 + 2 * n + 1] + r as f32) * s / scale];
+            }
+            boxes.push(Face {
+                bbox: [(cx - bw / 2.0) / scale, (cy - bh / 2.0) / scale, bw / scale, bh / scale],
+                score,
+                landmarks,
+                embedding: None,
+            });
+        }
+    }
+    Ok(boxes)
 }
 
 fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
@@ -129,6 +141,26 @@ fn nms(mut faces: Vec<Face>, iou_threshold: f32) -> Vec<Face> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A model whose box or landmark output is shorter than its score
+    /// output is an error, not a panic (F9).
+    #[test]
+    fn short_model_outputs_are_an_error_not_a_panic() {
+        let (cols, rows) = (4usize, 2usize);
+        let cells = cols * rows;
+        let cls = vec![1.0f32; cells];
+        let obj = vec![1.0f32; cells];
+        let bbox = vec![0.0f32; cells * 4];
+        let kps = vec![0.0f32; cells * 10];
+        assert_eq!(decode_stride(&cls, &obj, &bbox, &kps, 8, cols, rows, 0.5, 1.0).unwrap().len(), cells);
+        let short_bbox = vec![0.0f32; cells * 4 - 1];
+        let e = decode_stride(&cls, &obj, &short_bbox, &kps, 8, cols, rows, 0.5, 1.0).unwrap_err().to_string();
+        assert!(e.contains("short"), "{}", e);
+        let short_kps = vec![0.0f32; 3];
+        assert!(decode_stride(&cls, &obj, &bbox, &short_kps, 8, cols, rows, 0.5, 1.0).is_err());
+        let short_cls = vec![1.0f32; cells - 1];
+        assert!(decode_stride(&short_cls, &obj, &bbox, &kps, 8, cols, rows, 0.5, 1.0).is_err());
+    }
 
     #[test]
     fn nms_drops_overlaps_keeps_best() {

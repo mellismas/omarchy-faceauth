@@ -10,7 +10,7 @@ use crate::consent::{notify, take_answer, wait_for_nods, Answer, Answers, Dialog
 use crate::config::Config;
 use crate::store::{Store, UserTemplates};
 use anyhow::Result;
-use faceauth_engine::liveness::{FlashResponse, Verdict};
+use faceauth_engine::liveness::{FlashResponse, StrobePhase, Verdict};
 use faceauth_engine::{Grey, Pipeline};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -68,6 +68,8 @@ pub enum Outcome {
     Deleted,
     /// A polkit context was noted for the request the agent is serving.
     Noted,
+    /// The presence watch's mode, and whether the daemon watches this user.
+    PresenceMode { mode: String, watching: bool },
     /// A calibration round's measurement.
     Calibrated {
         gesture: String,
@@ -399,11 +401,18 @@ impl Authenticator {
                 return Ok(Outcome::Error { message: format!("unknown pose {:?}; one of {}", p, POSES.join(", ")) });
             }
         }
+        // A store that cannot seal does not replace sealed templates: that
+        // would write the next set in plaintext (F2).
+        if let Err(e) = self.store.check_can_replace(user) {
+            return Ok(Outcome::Error { message: e.to_string() });
+        }
         // Enrolment is the recovery path for a blob this machine can no longer
         // open (a cleared TPM, a firmware reset): set it aside and start fresh.
+        // Only on the credential tool's own verdict; a TPM that was busy or
+        // unreachable is an error to report, not a reason to discard a set.
         let existing = match self.store.load(user) {
             Ok(t) => t,
-            Err(e) => match self.store.set_aside_unreadable(user)? {
+            Err(e) => match self.store.set_aside_if_unreadable(user, &e)? {
                 Some(aside) => {
                     log::warn!("enrolment for {}: existing templates unreadable ({}); set aside as {} and starting fresh", user, e, aside.display());
                     None
@@ -601,13 +610,20 @@ impl Authenticator {
                 let left = total - started.elapsed().as_secs_f32();
                 let window = cfg.consent_seconds.clamp(10.0, MAX_BUDGET).min(left).max(1.0);
                 let dwell = dialog_cell.borrow().dwell_left(Instant::now());
-                let (g, followed) = wait_for_nods(cap, pipeline, &cfg, Duration::from_secs_f32(window), cfg.consent_nods, Some((&answers, &user)), lost_after, floors, floors_deg, Some(matched.bbox), dwell)?;
+                let mut nod_frames = Vec::new();
+                let (g, followed) = wait_for_nods(cap, pipeline, &cfg, Duration::from_secs_f32(window), cfg.consent_nods, Some((&answers, &user)), lost_after, floors, floors_deg, Some(matched.bbox), dwell, &mut nod_frames)?;
                 let g = if g == Gesture::Nodded {
                     // The nods came from the followed box; before they count,
-                    // that box must be live and enrolled, right now.
+                    // that box must be live and enrolled, right now, and the
+                    // frames kept from the nods themselves must be the
+                    // enrolled face too (D4): a face swapped in for the
+                    // gesture and out again before the confirm is refused.
                     let _ = dialog_cell.borrow_mut().show("confirming", "Confirming.", caller_ref, 0.0);
                     match confirm(cap, pipeline, &cfg, templates_ref, followed.unwrap_or(matched.bbox))? {
-                        Confirm::Live => Gesture::Nodded,
+                        Confirm::Live => match nod_frames_match(pipeline, templates_ref, &nod_frames, &cap.identity, cfg.accept_threshold)? {
+                            Ok(()) => Gesture::Nodded,
+                            Err(why) => Gesture::ConfirmFailed(why),
+                        },
                         Confirm::NoSignal => Gesture::ConfirmUnclear,
                         Confirm::Refused(why) => Gesture::ConfirmFailed(why),
                     }
@@ -887,6 +903,14 @@ impl Authenticator {
         let look = crate::presence::PresenceConfig { user: user.to_string(), ..Default::default() };
         let mut unseen_since = Instant::now();
         let mut looks = 0u32;
+        // The same stranger rule as the presence watch (C1): a face that
+        // fails the identity check does not hold the request open, and the
+        // user's away time runs from the last look that was the user. The
+        // check runs every third look (it costs the strobe and the embedder);
+        // between checks a face counts, with the mode's tolerance.
+        let mode = crate::presence::presence_mode();
+        let strikes = if mode == crate::presence::PresenceMode::Secure { 1 } else { 2 };
+        let mut identity_fails = 0u32;
         loop {
             for _ in 0..10 {
                 std::thread::sleep(Duration::from_millis(200));
@@ -895,20 +919,23 @@ impl Authenticator {
                 }
             }
             looks += 1;
-            match crate::presence::observe(self, &look, false) {
-                Ok(o) if o.face && o.attentive => {
+            match crate::presence::observe(self, &look, looks.is_multiple_of(3)) {
+                Ok(o) if o.face && o.attentive && o.identity != Some(false) => {
                     log::info!("consent: a face turned to the camera after {} looks; scanning", looks);
                     return None;
                 }
                 Ok(o) => {
-                    if o.face {
+                    match o.identity {
+                        Some(true) => identity_fails = 0,
+                        Some(false) => identity_fails += 1,
+                        None => {}
+                    }
+                    if o.face && identity_fails < strikes {
                         unseen_since = Instant::now();
                     } else if let Some(l) = lost_after {
-                        {
-                            if unseen_since.elapsed() > l {
-                                log::info!("consent: nobody for {:.0}s while waiting; the user left", l.as_secs_f32());
-                                return Some(Round::FaceLost);
-                            }
+                        if unseen_since.elapsed() > l {
+                            log::info!("consent: {} for {:.0}s while waiting; the user left", if o.face { "not the user" } else { "nobody" }, l.as_secs_f32());
+                            return Some(Round::FaceLost);
                         }
                     }
                 }
@@ -1103,7 +1130,9 @@ impl Authenticator {
         }
         // Phase 1: find the face and let the exposure settle on it (steady light).
         let mut settled = false;
-        let mut prev: Option<(Grey, f64)> = None;
+        let mut prev: Option<Grey> = None;
+        // The strobe mask for this attempt, drawn fresh (D5).
+        let mut phase = StrobePhase::random();
         let (mut best, mut matches, mut scored) = (-1f32, 0usize, 0usize);
         let mut face_seen = false;
         let mut alternating_since: Option<Instant> = None;
@@ -1158,23 +1187,26 @@ impl Authenticator {
                     settle_info = format!("settled at {:.2}s exp {} gain {} meter {:.2} frame mean {:.0}", t0.elapsed().as_secs_f32(), cap.exposure.exposure, cap.exposure.gain, cap.metering.mean, mean);
                     cap.freeze_exposure(true);
                     if strobe {
-                        cap.illuminator.as_ref().unwrap().set_pattern(0xaa)?;
+                        cap.illuminator.as_ref().unwrap().set_pattern(phase.pattern())?;
                         alternating_since = Some(Instant::now());
                     }
                 }
                 continue;
             }
 
-            // Phase 2: score frames. With the strobe alternating, only lit frames
-            // (brighter than their predecessor by a margin) are scored, each with
-            // its unlit predecessor through the gate.
+            // Phase 2: score frames. With the strobe on its mask, only lit
+            // frames after an unlit one are scored, each with that unlit
+            // predecessor through the gate, and only once the frames have
+            // followed the mask: a stream that brightens on its own schedule
+            // is never a pair (D5).
             let pair = if strobe {
-                let Some((p_img, p_mean)) = prev.replace((img.clone(), mean)) else { continue };
+                let in_phase = phase.push(mean);
+                let Some(p_img) = prev.replace(img.clone()) else { continue };
                 // Give the pattern a few frames to take effect after switching.
                 if alternating_since.map(|t| t.elapsed() < Duration::from_millis(150)).unwrap_or(false) {
                     continue;
                 }
-                if mean < p_mean * 1.15 {
+                if !in_phase {
                     continue;
                 }
                 n_lit += 1;
@@ -1197,7 +1229,11 @@ impl Authenticator {
                         continue;
                     }
                     v => {
-                        log::warn!("liveness denied: {:?} {:?}", v, fr);
+                        // The verdict only: the measurements behind it are
+                        // the cues a print would be tuned against, and the
+                        // journal is readable by wheel (D6).
+                        log::warn!("liveness denied: {:?}", v);
+                        log::debug!("liveness denied: {:?} {:?}", v, fr);
                         cap.stop()?;
                         return Ok(Outcome::Denied { reason: format!("{:?}", v), elapsed_ms: ms(t0) });
                     }
@@ -1249,8 +1285,10 @@ impl Authenticator {
                 return Ok(Outcome::Match { score: Some(best), frames: scored, elapsed_ms: ms(t0) });
             }
         }
-        log::info!("attempt detail: frames {} lit {} faces {} nosignal {} scored {} matches {}{}", n_frames, n_lit, n_faces, n_nosignal, scored, matches, if settle_info.is_empty() { " (never settled)" } else { "" });
-        log::debug!("attempt scores: {} | {}", settle_info, score_trail.join(" "));
+        // How many frames matched is logged only on success: on a failure
+        // it says how close the presentation came (D6).
+        log::info!("attempt detail: frames {} lit {} faces {} nosignal {} scored {}{}", n_frames, n_lit, n_faces, n_nosignal, scored, if settle_info.is_empty() { " (never settled)" } else { "" });
+        log::debug!("attempt scores: matches {} | {} | {}", matches, settle_info, score_trail.join(" "));
         cap.stop()?;
         if scored == 0 {
             Ok(Outcome::NoFace { elapsed_ms: ms(t0) })
@@ -1308,10 +1346,12 @@ pub fn confirm(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, templ
         return Ok(if cfg.liveness_required { Confirm::Refused("no strobe control".into()) } else { Confirm::Live });
     }
     cap.freeze_exposure(true);
-    cap.illuminator.as_ref().unwrap().set_pattern(0xaa)?;
+    // A fresh mask for the confirm, and pairs only once the frames follow it (D5).
+    let mut phase = StrobePhase::random();
+    cap.illuminator.as_ref().unwrap().set_pattern(phase.pattern())?;
     let t0 = Instant::now();
     let device = cap.identity.clone();
-    let mut prev: Option<(Grey, f64)> = None;
+    let mut prev: Option<Grey> = None;
     let mut tracked = followed;
     let (mut passed, mut failed, mut nosignal, mut pairs) = (0usize, 0usize, 0usize, 0usize);
     let verdict = loop {
@@ -1320,8 +1360,9 @@ pub fn confirm(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, templ
         }
         let Some(img) = cap.next(Duration::from_secs(1))? else { continue };
         let mean = img.data.iter().map(|&v| v as f64).sum::<f64>() / img.data.len() as f64;
-        let Some((p_img, p_mean)) = prev.replace((img.clone(), mean)) else { continue };
-        if t0.elapsed() < Duration::from_millis(150) || mean < p_mean * 1.15 {
+        let in_phase = phase.push(mean);
+        let Some(p_img) = prev.replace(img.clone()) else { continue };
+        if t0.elapsed() < Duration::from_millis(150) || !in_phase {
             continue;
         }
         let faces = pipeline.analyse(&img, cfg.min_detection, 1)?;
@@ -1344,7 +1385,8 @@ pub fn confirm(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, templ
                 continue;
             }
             v => {
-                log::warn!("confirm: liveness denied: {:?} {:?}", v, fr);
+                log::warn!("confirm: liveness denied: {:?}", v);
+                log::debug!("confirm: liveness denied: {:?} {:?}", v, fr);
                 break Confirm::Refused(format!("{:?}", v));
             }
         }
@@ -1370,8 +1412,78 @@ pub fn confirm(cap: &mut IrCapture, pipeline: &mut Pipeline, cfg: &Config, templ
         }
     };
     cap.illuminator.as_ref().unwrap().set(true)?;
-    log::info!("confirm: {} in {:.2}s ({} pairs, {} no signal, {} matched, {} under)", match &verdict { Confirm::Live => "live".to_string(), Confirm::NoSignal => "no signal".to_string(), Confirm::Refused(w) => format!("refused: {}", w) }, t0.elapsed().as_secs_f32(), pairs, nosignal, passed, failed);
+    // The pair counts go to the journal on a pass only; on a refusal they
+    // would say how close it came (D6).
+    match &verdict {
+        Confirm::Live => log::info!("confirm: live in {:.2}s ({} pairs, {} no signal, {} matched)", t0.elapsed().as_secs_f32(), pairs, nosignal, passed),
+        Confirm::NoSignal => log::info!("confirm: no signal in {:.2}s", t0.elapsed().as_secs_f32()),
+        Confirm::Refused(w) => log::info!("confirm: refused: {} ({:.2}s)", w, t0.elapsed().as_secs_f32()),
+    }
+    log::debug!("confirm detail: {} pairs, {} no signal, {} matched, {} under", pairs, nosignal, passed, failed);
     Ok(verdict)
+}
+
+/// After a live confirm: embed the frames kept from the nod legs and require
+/// each to be the enrolled face at the accept threshold (D4). The check runs
+/// after the nods, on frames already captured, so the live nod detectors
+/// and their floors are untouched. The inner result is the refusal reason.
+pub fn nod_frames_match(pipeline: &mut Pipeline, templates: &UserTemplates, frames: &[(Grey, faceauth_engine::Face)], device: &str, threshold: f32) -> Result<std::result::Result<(), String>> {
+    let mut embeddings = Vec::with_capacity(frames.len());
+    for (img, face) in frames {
+        let crop = faceauth_engine::align::align_112(img, &face.landmarks);
+        embeddings.push(pipeline.embedder.embed(&crop)?);
+    }
+    let r = check_nod_embeddings(&embeddings, templates, device, threshold);
+    match &r {
+        Ok(()) => log::info!("confirm: the {} nod frames are the enrolled face", embeddings.len()),
+        Err(why) => log::warn!("confirm: {}", why),
+    }
+    Ok(r)
+}
+
+/// The rule behind `nod_frames_match`, on embeddings: every kept frame must
+/// score at or above `threshold` against a template usable on `device`, and
+/// there must be at least one.
+pub fn check_nod_embeddings(embeddings: &[Vec<f32>], templates: &UserTemplates, device: &str, threshold: f32) -> std::result::Result<(), String> {
+    if embeddings.is_empty() {
+        return Err("no frames were kept from the nods".into());
+    }
+    for (i, e) in embeddings.iter().enumerate() {
+        match templates.best_match_on(e, device) {
+            Some((score, _)) if score >= threshold => {}
+            Some(_) => return Err(format!("nod frame {} of {} is not the enrolled face", i + 1, embeddings.len())),
+            None => return Err("no template for this camera".into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod nod_frame_tests {
+    use super::*;
+    use crate::store::Template;
+
+    fn templates() -> UserTemplates {
+        let mut u = UserTemplates::new("alice", "glintr100");
+        u.uid = None;
+        u.templates.push(Template { embedding: vec![1.0, 0.0], quality: 0.9, face_width: 80.0, created: 1, label: "enrol".into(), device: Some("ipu3:x".into()), yaw: None, nose_pitch: None });
+        u
+    }
+
+    /// A confirm whose nod frames embed to another identity refuses, even
+    /// though the face present at the confirm matched (D4).
+    #[test]
+    fn nod_frames_of_another_face_refuse() {
+        let u = templates();
+        let me = vec![0.95, 0.31];
+        let other = vec![0.0, 1.0];
+        assert_eq!(check_nod_embeddings(&[me.clone(), me.clone()], &u, "ipu3:x", 0.70), Ok(()));
+        let e = check_nod_embeddings(&[me.clone(), other.clone(), me.clone()], &u, "ipu3:x", 0.70).unwrap_err();
+        assert!(e.contains("nod frame 2 of 3"), "{}", e);
+        assert!(check_nod_embeddings(&[other], &u, "ipu3:x", 0.70).is_err());
+        assert!(check_nod_embeddings(&[], &u, "ipu3:x", 0.70).is_err(), "no frames is not a pass");
+        assert!(check_nod_embeddings(&[me], &u, "uvc:other", 0.70).unwrap_err().contains("no template"));
+    }
 }
 
 /// What the window asks for in a calibration round, and the prompt once

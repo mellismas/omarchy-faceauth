@@ -1,4 +1,9 @@
 # /etc/faceauth/config.toml : every key optional; these are the defaults.
+# Keys the daemon does not know are named in the journal at start (a value
+# meant for the top level but written under [presence] lands there). A value
+# that would switch a check off (required_matches = 0, accept_threshold
+# outside (0, 1], consent_nods = 0, an empty lock_command) stops the daemon
+# from starting, and every stack it sits in falls to the password.
 models_dir = "/usr/share/faceauth/models"
 store_dir = "/var/lib/faceauth"
 socket = "/run/faceauth/sock"
@@ -20,6 +25,9 @@ gesture_record_only = false # recognise gestures but never act on them (for reco
 [presence]
 enabled = false             # auto-lock when the enrolled user leaves; opt-in
 user = ""                   # whose templates define "present"
+mode = "default"            # "default": a stranger in view never holds the lock off past away_seconds; a hidden face (hand on chin) and one flaky identity check are tolerated
+                            # "secure": lock whenever the enrolled user is not positively in frame for away_seconds; one failed identity check counts, nothing else holds the clock
+                            # the starting mode; the watched user can switch it until the next restart (faceauth presence mode default|secure)
 tick_seconds = 5.0          # one short look (about 0.45 s of camera, 0.8 s when it also checks identity and liveness) per tick; 10 s on battery
 identify_every = 3          # identity and liveness check every N ticks; detection every tick
 battery_tick_seconds = 10.0 # the tick on battery (0 keeps the mains tick)

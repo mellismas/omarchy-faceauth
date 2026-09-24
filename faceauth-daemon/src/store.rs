@@ -379,14 +379,71 @@ fn creds(bin: &Path, args: &[&str], stdin_bytes: &[u8]) -> Result<Vec<u8>> {
     let out = child.wait_with_output()?;
     if let Err(e) = write {
         if !out.status.success() {
-            bail!("systemd-creds {}: {} {}", args.first().copied().unwrap_or(""), out.status, String::from_utf8_lossy(&out.stderr).trim());
+            return Err(creds_failure(args, &out));
         }
         return Err(e).context("write to systemd-creds");
     }
     if !out.status.success() {
-        bail!("systemd-creds {}: {} {}", args.first().copied().unwrap_or(""), out.status, String::from_utf8_lossy(&out.stderr).trim());
+        return Err(creds_failure(args, &out));
     }
     Ok(out.stdout)
+}
+
+/// The error for a credential tool that ran and failed, carrying whether
+/// the failure is the tool's verdict on the blob or a passing condition.
+fn creds_failure(args: &[&str], out: &std::process::Output) -> anyhow::Error {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let kind = classify_creds_failure(out.status.code(), &stderr);
+    anyhow::anyhow!("systemd-creds {}: {} {}", args.first().copied().unwrap_or(""), out.status, stderr.trim()).context(kind)
+}
+
+/// Whether a failed unseal says anything about the blob. Enrolment sets a
+/// blob aside and starts fresh only on a definitive failure; a passing
+/// condition (the TPM busy or unreachable, the tool timed out or could not
+/// start, the sandbox refusing the device) must not discard a good set of
+/// templates and the calibration in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnsealFailure {
+    /// The tool ran, read the blob, and refused it: corrupt, sealed under
+    /// another key, or bound to another name.
+    Definitive,
+    /// The tool did not get as far as a verdict.
+    Transient,
+}
+
+impl std::fmt::Display for UnsealFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self { UnsealFailure::Definitive => "the credential cannot be decrypted", UnsealFailure::Transient => "the credential service could not be reached" })
+    }
+}
+
+/// `timeout` exits 124 when it killed the tool and 137 when SIGKILL did;
+/// 125 to 127 are its own failures to run the command.
+pub fn classify_creds_failure(code: Option<i32>, stderr: &str) -> UnsealFailure {
+    match code {
+        None | Some(124..=127) | Some(137) => return UnsealFailure::Transient,
+        _ => {}
+    }
+    let s = stderr.to_ascii_lowercase();
+    const PASSING: [&str; 12] = ["timed out", "connect", "temporarily unavailable", "no such file", "no such device", "not available", "resource busy", "operation not permitted", "input/output error", "out of memory", "permission denied", "not supported"];
+    if PASSING.iter().any(|m| s.contains(m)) {
+        UnsealFailure::Transient
+    } else {
+        UnsealFailure::Definitive
+    }
+}
+
+/// Does this load error say the blob itself is unreadable? The credential
+/// tool's own verdict and a parse failure of decrypted bytes are; an I/O or
+/// service failure is not.
+pub fn is_definitive(e: &anyhow::Error) -> bool {
+    if let Some(k) = e.downcast_ref::<UnsealFailure>() {
+        return *k == UnsealFailure::Definitive;
+    }
+    if e.downcast_ref::<std::io::Error>().is_some() {
+        return false;
+    }
+    true
 }
 
 /// Seal `plain` to the TPM under credential name `name`, scoped to root; the blob is text.
@@ -435,6 +492,10 @@ pub struct Store {
     /// user against the file they came from, so an attempt pays it only when
     /// the file changed.
     cache: Mutex<HashMap<String, (Fingerprint, UserTemplates)>>,
+    /// The account's uid by name (getpwnam for the daemon; tests inject one
+    /// they can change). Read on every load, cache hits included: a name
+    /// that now belongs to another uid is not enrolled, whatever is cached.
+    uid_of: fn(&str) -> Option<u32>,
 }
 
 impl Store {
@@ -450,7 +511,15 @@ impl Store {
     pub fn open_with_probe(dir: impl AsRef<Path>, sealing: Sealing, probe: fn() -> Sealing) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        Ok(Store { dir, sealing: Mutex::new(sealing), probe, creds_bin: PathBuf::from(SYSTEMD_CREDS), cache: Mutex::new(HashMap::new()) })
+        Ok(Store { dir, sealing: Mutex::new(sealing), probe, creds_bin: PathBuf::from(SYSTEMD_CREDS), cache: Mutex::new(HashMap::new()), uid_of: current_uid })
+    }
+
+    /// A store that resolves account names through `f` instead of the
+    /// password database.
+    #[cfg(test)]
+    fn with_uid_resolver(mut self, f: fn(&str) -> Option<u32>) -> Self {
+        self.uid_of = f;
+        self
     }
 
     /// A store whose credential tool always fails: for tests that must
@@ -489,7 +558,7 @@ impl Store {
         self.sealed_path_for(user).map(|p| p.exists()).unwrap_or(false)
     }
 
-    fn parse(text: &str, p: &Path, user: &str) -> Result<Option<UserTemplates>> {
+    fn parse(&self, text: &str, p: &Path, user: &str) -> Result<Option<UserTemplates>> {
         let t: UserTemplates = serde_json::from_str(text).with_context(|| format!("parse {}", p.display()))?;
         if t.version != FORMAT_VERSION {
             bail!("{}: template format {} (this build reads {})", p.display(), t.version, FORMAT_VERSION);
@@ -497,13 +566,21 @@ impl Store {
         if t.user != user {
             bail!("{}: templates are for {:?}, not {:?}", p.display(), t.user, user);
         }
-        if let (Some(stored), Some(now)) = (t.uid, current_uid(user)) {
+        Ok(if self.uid_matches(&t, p) { Some(t) } else { None })
+    }
+
+    /// Is the account these templates were enrolled under still the one
+    /// that has the name? A recreated account with the same name is a
+    /// different person. Checked on every load, so a cached set for a
+    /// name that changed hands is not enrolled either (F1).
+    fn uid_matches(&self, t: &UserTemplates, p: &Path) -> bool {
+        if let (Some(stored), Some(now)) = (t.uid, (self.uid_of)(&t.user)) {
             if stored != now {
-                log::warn!("{}: templates belong to uid {} but {} is now uid {}; treating as not enrolled", p.display(), stored, user, now);
-                return Ok(None);
+                log::warn!("{}: templates belong to uid {} but {} is now uid {}; treating as not enrolled", p.display(), stored, t.user, now);
+                return false;
             }
         }
-        Ok(Some(t))
+        true
     }
 
     pub fn load(&self, user: &str) -> Result<Option<UserTemplates>> {
@@ -511,16 +588,13 @@ impl Store {
         let plain = self.path_for(user)?;
         if sealed.exists() {
             let fp = fingerprint(&sealed)?;
-            if let Ok(c) = self.cache.lock() {
-                if let Some((have, t)) = c.get(user) {
-                    if *have == fp {
-                        return Ok(Some(t.clone()));
-                    }
-                }
+            let cached = self.cache.lock().ok().and_then(|c| c.get(user).filter(|(have, _)| *have == fp).map(|(_, t)| t.clone()));
+            if let Some(t) = cached {
+                return Ok(if self.uid_matches(&t, &sealed) { Some(t) } else { None });
             }
             let blob = std::fs::read(&sealed).with_context(|| format!("read {}", sealed.display()))?;
             let (text, old_kind) = unseal(&self.creds_bin, &cred_name(user), &blob).with_context(|| format!("unseal {}", sealed.display()))?;
-            let t = Self::parse(&String::from_utf8_lossy(&text), &sealed, user)?;
+            let t = self.parse(&String::from_utf8_lossy(&text), &sealed, user)?;
             if let Some(t) = &t {
                 if old_kind && self.sealing() == Sealing::Tpm {
                     // A system-scoped blob from the first cut: any local user
@@ -541,7 +615,7 @@ impl Store {
             return Ok(None);
         }
         let text = std::fs::read_to_string(&plain).with_context(|| format!("read {}", plain.display()))?;
-        let t = Self::parse(&text, &plain, user)?;
+        let t = self.parse(&text, &plain, user)?;
         if let (Some(t), Sealing::Tpm) = (&t, &self.sealing()) {
             // Found in the clear on a machine that can seal: seal it now.
             match self.save(t) {
@@ -633,12 +707,35 @@ impl Store {
         if !sealed.exists() {
             return Ok(None);
         }
+        self.check_can_replace(user)?;
         let aside = self.dir.join(format!("{}.cred.unreadable-{}", user, now_secs()));
         std::fs::rename(&sealed, &aside).with_context(|| format!("set aside {}", sealed.display()))?;
         if let Ok(mut c) = self.cache.lock() {
             c.remove(user);
         }
         Ok(Some(aside))
+    }
+
+    /// Enrolment's recovery, narrowed to what it is for: the blob goes aside
+    /// only when `e` is the credential tool's verdict on it (or a parse
+    /// failure of what it decrypted). A TPM that is busy, missing from the
+    /// sandbox, or slow is not a reason to discard a good set (F2).
+    pub fn set_aside_if_unreadable(&self, user: &str, e: &anyhow::Error) -> Result<Option<PathBuf>> {
+        if !is_definitive(e) {
+            return Ok(None);
+        }
+        self.set_aside_unreadable(user)
+    }
+
+    /// May a fresh set be written for this user? Not when sealed templates
+    /// exist and this store cannot seal: writing plaintext beside them, or
+    /// after setting them aside, would be the downgrade sticky sealing
+    /// refuses. Delete the templates first, deliberately (F2).
+    pub fn check_can_replace(&self, user: &str) -> Result<()> {
+        if let (Sealing::Plain(why), true) = (self.sealing(), self.is_sealed(user)) {
+            bail!("templates for {} are sealed and this daemon cannot seal ({}); enrolment refused rather than downgrade them to plaintext. Delete them first if that is intended", user, why);
+        }
+        Ok(())
     }
 
     /// Users with templates on disk (sealed or plain): the accounts allowed
@@ -652,13 +749,40 @@ impl Store {
         v
     }
 
+    /// Remove everything the store holds about a user: the templates, sealed
+    /// or plain, any set-aside blob (`<user>.cred.unreadable-*`), the gesture
+    /// recordings (`gestures/<secs>-<user>-*.txt`) and the walk-through's
+    /// frame recordings (`record/<user>/`). True when templates were there.
     pub fn delete(&self, user: &str) -> Result<bool> {
+        Self::check_user(user)?;
         let mut any = false;
         for p in [self.sealed_path_for(user)?, self.path_for(user)?] {
             if p.exists() {
                 std::fs::remove_file(&p)?;
                 any = true;
             }
+        }
+        let aside_prefix = format!("{}.cred.unreadable-", user);
+        for e in std::fs::read_dir(&self.dir).into_iter().flatten().flatten() {
+            let name = e.file_name();
+            let Some(n) = name.to_str() else { continue };
+            if n.starts_with(&aside_prefix) {
+                std::fs::remove_file(e.path()).with_context(|| format!("remove {}", e.path().display()))?;
+            }
+        }
+        for e in std::fs::read_dir(self.dir.join("gestures")).into_iter().flatten().flatten() {
+            let name = e.file_name();
+            let Some(n) = name.to_str() else { continue };
+            // `<unix seconds>-<user>-<how it ended>.txt`, the user matched
+            // as a whole component so "al" does not take "alice"'s files.
+            let is_users = n.strip_suffix(".txt").and_then(|stem| stem.split_once('-')).map(|(secs, rest)| secs.chars().all(|c| c.is_ascii_digit()) && rest.strip_prefix(user).map(|r| r.starts_with('-')).unwrap_or(false)).unwrap_or(false);
+            if is_users {
+                std::fs::remove_file(e.path()).with_context(|| format!("remove {}", e.path().display()))?;
+            }
+        }
+        let record = self.dir.join("record").join(user);
+        if record.is_dir() {
+            std::fs::remove_dir_all(&record).with_context(|| format!("remove {}", record.display()))?;
         }
         if let Ok(mut c) = self.cache.lock() {
             c.remove(user);
@@ -854,13 +978,134 @@ mod tests {
         assert!(e.contains("refusing to write them in plaintext"), "{}", e);
         assert!(sealed.exists(), "the sealed file must survive");
         assert!(!store.path_for("alice").unwrap().exists());
-        // Loading it fails (it is not a blob), and enrolment's recovery sets it aside.
+        // Loading it fails (it is not a blob), and enrolment's recovery does
+        // not set it aside either: on a store that cannot seal, that would be
+        // the same downgrade by another route (F2).
         assert!(store.load("alice").is_err());
-        let aside = store.set_aside_unreadable("alice").unwrap().unwrap();
-        assert!(aside.file_name().unwrap().to_string_lossy().starts_with("alice.cred.unreadable-"));
-        assert!(!sealed.exists());
-        assert!(store.load("alice").unwrap().is_none());
+        let e = store.set_aside_unreadable("alice").unwrap_err().to_string();
+        assert!(e.contains("enrolment refused"), "{}", e);
+        assert!(sealed.exists(), "the sealed file must survive the recovery path too");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A cached set is re-checked against the account on every hit: the
+    /// name changing hands reads as not enrolled without a restart (F1).
+    #[test]
+    fn a_cache_hit_still_checks_the_uid() {
+        static UID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1000);
+        fn resolver(_: &str) -> Option<u32> {
+            Some(UID.load(std::sync::atomic::Ordering::SeqCst))
+        }
+        let dir = temp("cacheuid");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open_with(&dir, Sealing::Plain("test".into())).unwrap().without_creds().with_uid_resolver(resolver);
+        let mut u = UserTemplates::new("alice", "glintr100");
+        u.uid = Some(1000);
+        u.templates.push(tmpl(vec![1.0, 0.0], 1, None));
+        // The sealed path is the cached one: stage a "sealed" file and seed
+        // the cache the way a successful unseal would, with the fingerprint
+        // of that file.
+        let sealed = store.sealed_path_for("alice").unwrap();
+        std::fs::write(&sealed, b"blob").unwrap();
+        let fp = fingerprint(&sealed).unwrap();
+        store.cache.lock().unwrap().insert("alice".into(), (fp, u.clone()));
+        assert!(store.load("alice").unwrap().is_some(), "the cached set serves while the uid holds");
+        UID.store(1001, std::sync::atomic::Ordering::SeqCst);
+        assert!(store.load("alice").unwrap().is_none(), "the same name on another uid is not enrolled, cache or no cache");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A failed unseal sets a blob aside only when the tool refused the
+    /// blob itself; a service that could not be reached leaves it be, and a
+    /// store that cannot seal never sets a sealed blob aside at all (F2).
+    #[test]
+    fn only_a_definitive_unseal_failure_sets_a_blob_aside() {
+        assert_eq!(classify_creds_failure(Some(1), "Failed to decrypt credential: Bad message"), UnsealFailure::Definitive);
+        assert_eq!(classify_creds_failure(Some(1), "Embedded credential name 'faceauth-bob' does not match filename"), UnsealFailure::Definitive);
+        assert_eq!(classify_creds_failure(Some(124), ""), UnsealFailure::Transient, "timeout killed it");
+        assert_eq!(classify_creds_failure(None, ""), UnsealFailure::Transient, "a signal");
+        assert_eq!(classify_creds_failure(Some(1), "Failed to connect to TPM: Connection refused"), UnsealFailure::Transient);
+        assert_eq!(classify_creds_failure(Some(1), "Failed to open /dev/tpmrm0: Operation not permitted"), UnsealFailure::Transient);
+        let transient = anyhow::anyhow!("systemd-creds decrypt: exit status: 1 busy").context(UnsealFailure::Transient).context("unseal /x/alice.cred");
+        let definitive = anyhow::anyhow!("systemd-creds decrypt: exit status: 1 bad").context(UnsealFailure::Definitive).context("unseal /x/alice.cred");
+        assert!(!is_definitive(&transient) && is_definitive(&definitive));
+        assert!(!is_definitive(&anyhow::Error::from(std::io::Error::other("read"))), "an I/O failure says nothing about the blob");
+
+        // A store that can seal, and a sealed blob it could not open.
+        let dir = temp("aside");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open_with_probe(&dir, Sealing::Tpm, || Sealing::Tpm).unwrap().without_creds();
+        let sealed = store.sealed_path_for("alice").unwrap();
+        std::fs::write(&sealed, b"blob").unwrap();
+        assert!(store.set_aside_if_unreadable("alice", &transient).unwrap().is_none());
+        assert!(sealed.exists(), "a transient failure keeps the blob");
+        assert!(store.set_aside_if_unreadable("alice", &definitive).unwrap().is_some());
+        assert!(!sealed.exists(), "a definitive failure sets it aside");
+
+        // A store that cannot seal refuses to replace a sealed set, so the
+        // recovery cannot downgrade it (the round-3 PoC, inverted).
+        let dir2 = temp("noaside");
+        let _ = std::fs::remove_dir_all(&dir2);
+        let plain = Store::open_with_probe(&dir2, Sealing::Plain("TPM probe failed: timeout".into()), || Sealing::Plain("still failing".into())).unwrap().without_creds();
+        let sealed2 = plain.sealed_path_for("alice").unwrap();
+        std::fs::write(&sealed2, b"blob").unwrap();
+        let e = plain.check_can_replace("alice").unwrap_err().to_string();
+        assert!(e.contains("enrolment refused"), "{}", e);
+        assert!(plain.set_aside_if_unreadable("alice", &definitive).is_err(), "no set-aside on a store that would then write plaintext");
+        assert!(sealed2.exists());
+        assert!(plain.check_can_replace("bob").is_ok(), "a user without sealed templates may enrol plain");
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir2);
+    }
+
+    /// Deleting a user takes the set-aside blobs, the gesture recordings
+    /// and the walk-through recordings with the templates, and nobody
+    /// else's (F5).
+    #[test]
+    fn delete_removes_every_trace_of_the_user_and_only_theirs() {
+        let dir = temp("deleteall");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open_with(&dir, Sealing::Plain("test".into())).unwrap().without_creds();
+        let mut u = UserTemplates::new("al", "glintr100");
+        u.uid = None;
+        u.templates.push(tmpl(vec![1.0, 0.0], 1, None));
+        store.save(&u).unwrap();
+        std::fs::write(dir.join("al.cred.unreadable-1700000000"), b"x").unwrap();
+        std::fs::write(dir.join("alice.cred.unreadable-1700000000"), b"x").unwrap();
+        std::fs::create_dir_all(dir.join("gestures")).unwrap();
+        std::fs::write(dir.join("gestures/1700000001-al-nodded.txt"), b"x").unwrap();
+        std::fs::write(dir.join("gestures/1700000002-alice-nodded.txt"), b"x").unwrap();
+        std::fs::write(dir.join("gestures/1700000003-al-with-dash-al-x.txt"), b"x").unwrap();
+        std::fs::create_dir_all(dir.join("record/al")).unwrap();
+        std::fs::write(dir.join("record/al/frame.pgm"), b"x").unwrap();
+        std::fs::create_dir_all(dir.join("record/alice")).unwrap();
+        assert!(store.delete("al").unwrap());
+        let left: Vec<String> = walk(&dir);
+        assert_eq!(left, vec!["alice.cred.unreadable-1700000000", "gestures/1700000002-alice-nodded.txt", "record/alice"], "{:?}", left);
+        assert!(!store.delete("al").unwrap(), "nothing left to delete");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn walk(dir: &Path) -> Vec<String> {
+        let mut v = Vec::new();
+        fn go(root: &Path, d: &Path, v: &mut Vec<String>) {
+            for e in std::fs::read_dir(d).unwrap().flatten() {
+                let p = e.path();
+                let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                if p.is_dir() {
+                    let before = v.len();
+                    go(root, &p, v);
+                    if v.len() == before {
+                        v.push(rel);
+                    }
+                } else {
+                    v.push(rel);
+                }
+            }
+        }
+        go(dir, dir, &mut v);
+        v.sort();
+        v
     }
 
     /// Runs the real thing when it can (root, TPM). Otherwise it is skipped,

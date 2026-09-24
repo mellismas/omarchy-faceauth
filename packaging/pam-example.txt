@@ -1,9 +1,10 @@
 # pam_faceauth returns PAM_IGNORE for every failure (no daemon, timeout, no match,
 # malformed reply, panic). That is what makes it safe in a stack that has a
-# password behind it. It also means a stack with NOTHING behind it must be closed
-# with pam_deny: an ignored module leaves the stack without a verdict, and PAM
-# reads no verdict as success (measured by the author of omarchy PR 7935 against
-# a stopped backend: without pam_deny the stack authenticated anyone in 0.1 s).
+# password behind it. A stack with NOTHING behind it is still closed with
+# pam_deny, as belt and braces: on Linux-PAM 1.7.2 an auth stack whose only
+# module returned PAM_IGNORE answers PAM_PERM_DENIED (measured against a stopped
+# backend), so an ignore-only stack fails closed on its own, but that is a
+# library behaviour and not a promise, and `doctor` checks for the pam_deny line.
 
 # /etc/pam.d/omarchy-lock-face   (the lock screen's third stack, beside -password and -fingerprint;
 #                                 the password is a separate service on its own lane, so this one

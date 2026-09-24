@@ -1,0 +1,39 @@
+# Keep the IR sensor's control node root-only.
+#
+# logind's uaccess tag hands the seat user read-write access to every camera
+# node, which is right for the RGB webcam and wrong for the sensor that
+# authenticates. With write access, a process running as the user can change
+# exposure or gain under the daemon mid-capture, force session locks, and take
+# genuine IR frames of the user. Only faceauthd (root) needs this node.
+#
+# The file name is the ordering. 70-uaccess.rules adds the tag and
+# 73-seat-late.rules turns the tag into the ACL, so this file must sort between
+# them: a 70- name sorts before 70-uaccess and the tag comes straight back.
+#
+# The sensor is matched by its sysfs name, never by node number: v4l-subdevN
+# moves between boots and module reloads. The media controller node
+# (/dev/media0) and the CIO2 capture nodes are left alone because the RGB
+# webcam needs them for video calls. GROUP and MODE are set as well as the tag
+# removed, so a user in the video group does not keep write access through the
+# group bits.
+#
+# An access grant made before this rule was installed survives until reboot or
+# `setfacl -b` on the node, so doctor reads the node's live ACL and the udev
+# database's current tags, not this file.
+#
+# A UVC IR camera (a USB module rather than an IPU3 sensor) has no v4l-subdev
+# node; its control path is the capture node itself, so it cannot be locked
+# down without also taking the stream away from the user, and matching by name
+# alone would be wrong because two identical modules (front and rear, or a
+# dock) would share a name. Setup would identify the sensor it detected by
+# ENV{ID_PATH} (the bus position, stable across boots) and ATTR{index} (the
+# node's index within the device), and write one extra rule of this shape:
+#
+#   SUBSYSTEM=="video4linux", ENV{ID_PATH}=="pci-0000:00:14.0-usb-0:5:1.0", ATTR{index}=="2", TAG-="uaccess", GROUP="root", MODE="0600"
+#
+# That writer is not built: the UVC path is not wired yet (see doctor's
+# camera.ir check), and a wrong rule would silently take a webcam away.
+
+ACTION=="remove", GOTO="faceauth_ir_end"
+SUBSYSTEM=="video4linux", KERNEL=="v4l-subdev*", ATTR{name}=="ov7251 *", TAG-="uaccess", GROUP="root", MODE="0600"
+LABEL="faceauth_ir_end"

@@ -211,6 +211,10 @@ struct Request {
     context_caller_pid: Option<i32>,
     #[serde(default)]
     context_subject_pid: Option<i32>,
+    /// From the watched user: switch the presence watch to "default" or
+    /// "secure" until the next restart.
+    #[serde(default)]
+    presence_mode: Option<String>,
 }
 
 /// Who may connect: root, and the enrolled users, by ACL on the socket
@@ -355,14 +359,25 @@ fn read_request(stream: &mut UnixStream) -> Result<Option<String>> {
 fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> Result<()> {
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let cred = getsockopt(&stream, PeerCredentials).context("peer credentials")?;
+    // A face line on a stack the daemon itself runs (system-auth, through
+    // the password check) would have it ask itself and wait forever: any
+    // request from this daemon's own pid is answered "error" before a byte
+    // is read, so that stack falls through (B6).
+    if is_own_pid(cred.pid(), std::process::id()) {
+        log::warn!("request from this daemon's own pid {}: refused; a face line is on a stack the daemon runs itself", cred.pid());
+        return reply(&mut stream, &Outcome::Error { message: "the daemon does not ask itself".into() });
+    }
     // Bounded read before anything else: a peer that never sends a newline
     // cannot grow this, one that dribbles cannot stretch it, and the error
     // never echoes the peer's bytes back.
-    let Some(line) = read_request(&mut stream)? else {
+    let Some(mut line) = read_request(&mut stream)? else {
         return reply(&mut stream, &Outcome::Error { message: "bad request".into() });
     };
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    let req: Request = match serde_json::from_str(line.trim()) {
+    let parsed: std::result::Result<Request, _> = serde_json::from_str(line.trim());
+    // The line may carry a password; its bytes are not left in freed memory (F12).
+    crate::consent::wipe_string(&mut line);
+    let mut req: Request = match parsed {
         Ok(r) => r,
         Err(_) => return reply(&mut stream, &Outcome::Error { message: "bad request".into() }),
     };
@@ -467,12 +482,32 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> R
             let o = if armed { Outcome::Noted } else { Outcome::Error { message: "minutes out of range".into() } };
             return reply(&mut stream, &o);
         }
-        let answer = if req.consent_dismiss { crate::consent::Answer::Dismiss } else { crate::consent::Answer::Password(req.consent_password.clone().unwrap_or_default()) };
+        let answer = if req.consent_dismiss { crate::consent::Answer::Dismiss } else { crate::consent::Answer::Password(crate::consent::Secret::new(req.consent_password.take().unwrap_or_default())) };
         if let Ok(mut m) = answers.lock() {
             m.insert(req.user.clone(), answer);
         }
         log::info!("consent answer for {} from uid {}: {}", req.user, cred.uid(), if req.consent_dismiss { "dismiss" } else { "password" });
         return reply(&mut stream, &Outcome::Pong { version: env!("CARGO_PKG_VERSION").into(), model: String::new(), templates: 0, sealed: false, unbound: 0, floors: None });
+    }
+    // The watched user reads ("query") or switches the presence watch's
+    // mode for this run of the daemon: local (the gate above), and only
+    // that user, for their own watch. It does not persist; the config sets
+    // the mode at every start. Both forms answer with the state.
+    if let Some(mode) = &req.presence_mode {
+        let watched = CFG.get().map(|c| c.presence.clone()).unwrap_or_default();
+        let outcome = match presence_mode_change(cred.uid(), &req.user, &watched, mode) {
+            Ok(Some(m)) => {
+                crate::presence::set_presence_mode(m);
+                log::info!("presence: mode set to {} by uid {} pid {}", m.name(), cred.uid(), cred.pid());
+                presence_state(&watched, &req.user)
+            }
+            Ok(None) => presence_state(&watched, &req.user),
+            Err(why) => {
+                log::warn!("presence mode request from uid {} for {} refused: {}", cred.uid(), req.user, why);
+                Outcome::Error { message: why }
+            }
+        };
+        return reply(&mut stream, &outcome);
     }
     if req.ping {
         let outcome = match take() {
@@ -599,12 +634,6 @@ fn handle(mut stream: UnixStream, auth: &Mutex<Authenticator>, slot: &Slot) -> R
     log::info!("attempt for {} (uid {}, pid {}{})", req.user, cred.uid(), cred.pid(), if req.consent { ", consent" } else { "" });
     let outcome = if req.consent {
         let uid = user_uid(&req.user).unwrap_or(cred.uid());
-        // A face line on a stack the daemon itself runs (system-auth, through
-        // the password check) would have it ask itself and wait forever (B6).
-        if cred.pid() == std::process::id() as i32 {
-            log::warn!("consent: the request comes from this daemon's own pid; a face line is on a stack the daemon runs itself");
-            return reply(&mut stream, &Outcome::Error { message: "the daemon does not ask itself".into() });
-        }
         // The window goes to the user's graphical session. If that session
         // is not the one in the foreground on its seat (sudo on a text
         // console while the desktop runs on another VT), nobody can see it
@@ -774,6 +803,36 @@ fn lid_closed_in(dir: &std::path::Path) -> bool {
         }
     }
     seen
+}
+
+/// Is the peer this very process? Its own PAM stack, if a face line is on
+/// it, connects back with the daemon's pid (B6).
+fn is_own_pid(peer_pid: i32, own: u32) -> bool {
+    peer_pid == own as i32
+}
+
+/// May `peer_uid`, asking about `user`, switch the watch on `watched` to
+/// `mode`? Only the watched user, for their own watch, while one runs.
+/// `"query"` asks without switching: Ok(None), allowed for any user asking
+/// about themselves (the uid check above the call already holds).
+fn presence_mode_change(peer_uid: u32, user: &str, watched: &crate::presence::PresenceConfig, mode: &str) -> std::result::Result<Option<crate::presence::PresenceMode>, String> {
+    if mode == "query" {
+        return Ok(None);
+    }
+    let Some(m) = crate::presence::PresenceMode::parse(mode) else { return Err(format!("unknown presence mode {:?}; \"default\", \"secure\" or \"query\"", mode)) };
+    if !watched.enabled || watched.user.is_empty() {
+        return Err("the presence watch is off".into());
+    }
+    if user != watched.user || user_uid(&watched.user) != Some(peer_uid) {
+        return Err("only the watched user may set the presence mode".into());
+    }
+    Ok(Some(m))
+}
+
+/// The state a presence mode request answers with: the mode in force and
+/// whether the daemon's watch is on for `user`.
+fn presence_state(watched: &crate::presence::PresenceConfig, user: &str) -> Outcome {
+    Outcome::PresenceMode { mode: crate::presence::presence_mode().name().into(), watching: watched.enabled && watched.user == user }
 }
 
 /// Where a request comes from, as far as the daemon can prove it.
@@ -1071,20 +1130,24 @@ fn is_ssh_comm(comm: &str) -> bool {
 }
 
 /// The logind session id from a cgroup listing (`session-3.scope`,
-/// `session-c1.scope`), if the process is in one.
+/// `session-c1.scope`), if the process is directly in one. Only the
+/// canonical position counts: `/user.slice/user-<uid>.slice/session-<id>.scope`
+/// and nothing below it. The user's own manager (`user@<uid>.service`) is
+/// delegated, so a component of that name anywhere under it is the user's
+/// to create; it names nothing (F8).
 fn session_id_from_cgroup(cgroup: &str) -> Option<String> {
-    for line in cgroup.lines() {
-        for part in line.split('/') {
-            if let Some(rest) = part.strip_prefix("session-") {
-                if let Some(id) = rest.strip_suffix(".scope") {
-                    if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric()) {
-                        return Some(id.to_string());
-                    }
-                }
-            }
-        }
+    let path = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    let parts: Vec<&str> = path.split('/').collect();
+    let ["", "user.slice", slice, scope] = parts.as_slice() else { return None };
+    let uid = slice.strip_prefix("user-")?.strip_suffix(".slice")?;
+    if uid.is_empty() || !uid.chars().all(|c| c.is_ascii_digit()) {
+        return None;
     }
-    None
+    let id = scope.strip_prefix("session-")?.strip_suffix(".scope")?;
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(id.to_string())
 }
 
 #[cfg(test)]
@@ -1213,6 +1276,52 @@ mod locality_tests {
         assert_eq!(session_id_from_cgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/run-p193148-i205978.service"), None);
         assert_eq!(session_id_from_cgroup("0::/system.slice/faceauth.service"), None);
         assert_eq!(session_id_from_cgroup("0::/user.slice/session-.scope"), None);
+    }
+
+    /// A session-shaped component the user made inside their delegated
+    /// manager names no session; only the canonical position does (F8,
+    /// poc_authz_2 inverted).
+    #[test]
+    fn a_forged_session_component_under_the_user_manager_names_nothing() {
+        assert_eq!(session_id_from_cgroup("0::/user.slice/user-1000.slice/user@1000.service/session-c1.scope/evil\n"), None);
+        assert_eq!(session_id_from_cgroup("0::/user.slice/user-1000.slice/user@1000.service/session-c1.scope\n"), None);
+        assert_eq!(session_id_from_cgroup("0::/user.slice/user-1000.slice/session-3.scope/sub\n"), None, "nothing below the scope either");
+        assert_eq!(session_id_from_cgroup("0::/user.slice/session-3.scope\n"), None);
+        assert_eq!(session_id_from_cgroup("0::/user.slice/user-x.slice/session-3.scope\n"), None);
+        assert_eq!(session_id_from_cgroup("1:name=systemd:/user.slice/user-1000.slice/session-3.scope\n"), None, "only the unified hierarchy line");
+        assert_eq!(session_id_from_cgroup("0::/user.slice/user-1000.slice/session-3.scope\n"), Some("3".into()));
+    }
+
+    /// A request from the daemon's own pid is refused whatever it asks (B6).
+    #[test]
+    fn the_daemon_refuses_its_own_pid() {
+        let me = std::process::id();
+        assert!(is_own_pid(me as i32, me));
+        assert!(!is_own_pid(me as i32 + 1, me));
+        assert!(!is_own_pid(1, me));
+    }
+
+    /// The presence mode switch is the watched user's alone, for their own
+    /// watch, while a watch runs.
+    #[test]
+    fn only_the_watched_user_switches_the_presence_mode() {
+        use crate::presence::{PresenceConfig, PresenceMode};
+        let me = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        let my_uid = user_uid(&me).unwrap_or(0);
+        let watched = PresenceConfig { enabled: true, user: me.clone(), ..Default::default() };
+        assert_eq!(presence_mode_change(my_uid, &me, &watched, "secure"), Ok(Some(PresenceMode::Secure)));
+        assert_eq!(presence_mode_change(my_uid, &me, &watched, "default"), Ok(Some(PresenceMode::Default)));
+        assert!(presence_mode_change(my_uid, &me, &watched, "paranoid").unwrap_err().contains("unknown"));
+        assert!(presence_mode_change(my_uid + 1, &me, &watched, "secure").unwrap_err().contains("only the watched user"));
+        assert!(presence_mode_change(my_uid, "someone-else", &watched, "secure").is_err());
+        let off = PresenceConfig { enabled: false, ..watched.clone() };
+        assert!(presence_mode_change(my_uid, &me, &off, "secure").unwrap_err().contains("off"));
+        // The read form changes nothing and is answered whether or not the
+        // watch is on, with `watching` saying which.
+        assert_eq!(presence_mode_change(my_uid + 1, &me, &off, "query"), Ok(None));
+        assert!(matches!(presence_state(&watched, &me), Outcome::PresenceMode { watching: true, .. }));
+        assert!(matches!(presence_state(&off, &me), Outcome::PresenceMode { watching: false, .. }));
+        assert!(matches!(presence_state(&watched, "someone-else"), Outcome::PresenceMode { watching: false, .. }));
     }
 
     /// A process table the check reads instead of /proc and logind.
@@ -1617,6 +1726,13 @@ pub fn consent_context(socket: &Path, user: &str, action: &str, message: &str, c
 /// never (the daemon ends it only if this socket hangs up). No deadline.
 pub fn ask_consent(socket: &Path, user: &str) -> Result<Outcome> {
     send(socket, serde_json::json!({ "user": user, "consent": true }), None)
+}
+
+/// From the watched user: switch the presence watch to "default" or
+/// "secure" until the daemon restarts, or "query" to read it. Answered
+/// with `Outcome::PresenceMode`.
+pub fn presence_mode(socket: &Path, user: &str, mode: &str) -> Result<Outcome> {
+    send(socket, serde_json::json!({ "user": user, "presence_mode": mode }), Some(Duration::from_secs(3)))
 }
 
 pub fn ping(socket: &Path, user: &str) -> Result<Outcome> {

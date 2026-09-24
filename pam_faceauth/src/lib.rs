@@ -17,13 +17,29 @@
 //! ends the stack on it: the window had the password box, so closing it
 //! without a password or a nod is the answer no, and no other prompt follows.
 //!
-//! Module arguments (in the PAM line): `socket=/run/faceauth/sock`,
-//! `timeout=8` (seconds to wait for the daemon's reply), and `prompt`, which
-//! makes the scan a deliberate act: the module asks through the PAM
-//! conversation, Enter on an empty line runs the face scan, anything typed is
-//! handed on as the password (PAM_AUTHTOK, for the `try_first_pass` module
-//! behind us) and no scan runs. Elevation (sudo, polkit) should use `prompt`;
-//! the lock screen, where looking at the machine is the act, should not.
+//! Module arguments (in the PAM line):
+//!
+//! - `socket=/run/faceauth/sock`: where the daemon listens.
+//! - `consent`: the elevation argument, for sudo and polkit. The daemon opens
+//!   a window naming the command and the requester, and the request is
+//!   approved by two nods or by the password typed into that window; sitting
+//!   in front of the machine never elevates anything by itself. The window
+//!   waits until it is answered, so `timeout=` is ignored on a consent line
+//!   (the module logs that it was) and `prompt` is not consulted.
+//! - `timeout=8`: seconds to wait for the daemon's reply on a plain look (the
+//!   lock screen, where looking at the machine is the act).
+//! - `prompt`: the older deliberate act for a caller that has a conversation:
+//!   Enter on an empty line runs the face scan, anything typed is handed on
+//!   as the password (PAM_AUTHTOK, for the `try_first_pass` module behind us,
+//!   byte for byte) and no scan runs. `consent` is preferred for elevation
+//!   because the caller relaying the conversation is the process asking to be
+//!   elevated.
+//!
+//! The daemon trusts an effective-uid-0 peer with its root-only requests
+//! (enrolment, deletion, calibration), and under sudo and polkit this module
+//! runs as root. It therefore builds exactly two request shapes, the plain
+//! look and the consent request, in one place (`request_line`), and a test
+//! pins that no other field can ever leave this module.
 
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -98,14 +114,18 @@ fn log(msg: &str) {
     }
 }
 
-/// Overwrite a CString's bytes before it is freed.
-fn wipe(c: std::ffi::CString) {
-    let mut bytes = c.into_bytes();
+/// Overwrite a buffer that may hold a password before it is freed.
+fn wipe_bytes(mut bytes: Vec<u8>) {
     for b in bytes.iter_mut() {
-        // SAFETY-adjacent: volatile so the compiler keeps the stores.
+        // Volatile so the compiler keeps the stores to a buffer it is about to free.
         unsafe { std::ptr::write_volatile(b, 0) };
     }
     drop(bytes);
+}
+
+/// Overwrite a CString's bytes before it is freed.
+fn wipe(c: std::ffi::CString) {
+    wipe_bytes(c.into_bytes());
 }
 
 /// Names go into the auth log; strip anything that could forge a line.
@@ -115,10 +135,12 @@ fn sanitise(s: &str) -> String {
 
 const DEFAULT_PROMPT: &str = "Press Enter to authenticate by face, or type your password: ";
 
-/// Ask through the application's conversation. `Ok(Some(text))` is what the
-/// user typed (empty for a bare Enter); `Ok(None)` means no conversation is
-/// available, `Err` that the application refused.
-fn converse(pamh: *mut pam_handle_t, text: &str) -> Result<Option<String>, ()> {
+/// Ask through the application's conversation. `Ok(Some(bytes))` is what the
+/// user typed (empty for a bare Enter), kept as the bytes the application
+/// handed over because a password is not text: rewriting it into UTF-8 would
+/// hand the module behind us a password that can never match. `Ok(None)`
+/// means no conversation is available, `Err` that the application refused.
+fn converse(pamh: *mut pam_handle_t, text: &str) -> Result<Option<Vec<u8>>, ()> {
     let mut item: *const c_void = std::ptr::null();
     // SAFETY: pamh is PAM's handle; item is a valid out-pointer.
     let rc = unsafe { pam_get_item(pamh, PAM_CONV, &mut item) };
@@ -139,15 +161,15 @@ fn converse(pamh: *mut pam_handle_t, text: &str) -> Result<Option<String>, ()> {
     }
     let out = unsafe {
         let r = &*resp;
-        let text = if r.resp.is_null() { String::new() } else { CStr::from_ptr(r.resp).to_string_lossy().into_owned() };
+        let bytes = if r.resp.is_null() { Vec::new() } else { CStr::from_ptr(r.resp).to_bytes().to_vec() };
         if !r.resp.is_null() {
             // Wipe before freeing: it may be a password.
-            let len = CStr::from_ptr(r.resp).to_bytes().len();
+            let len = bytes.len();
             std::ptr::write_bytes(r.resp, 0, len);
             free(r.resp as *mut c_void);
         }
         free(resp as *mut c_void);
-        text
+        bytes
     };
     Ok(Some(out))
 }
@@ -209,7 +231,23 @@ enum Said {
     Other,
 }
 
+/// The only place a request to the daemon is built. Two shapes exist: the
+/// plain look and the consent request. The name goes in verbatim, so a name
+/// that would need escaping (a quote, a backslash, a control character) is
+/// refused here rather than rewritten into a different name: the daemon must
+/// be asked about PAM_USER or about nobody.
+fn request_line(user: &str, consent: bool) -> Option<String> {
+    if user.is_empty() || user.len() > 256 || user.chars().any(|c| c == '"' || c == '\\' || c.is_control()) {
+        return None;
+    }
+    Some(if consent { format!("{{\"user\":\"{}\",\"consent\":true}}\n", user) } else { format!("{{\"user\":\"{}\"}}\n", user) })
+}
+
 fn daemon_says(socket: &Path, user: &str, timeout: Duration, consent: bool) -> Said {
+    let Some(req) = request_line(user, consent) else {
+        log("user name would need escaping; not asking the daemon");
+        return Said::Other;
+    };
     let Ok(mut stream) = UnixStream::connect(socket) else { return Said::Other };
     // The socket lives under a root-owned runtime directory, so nobody else
     // can put a listener there; this check is the belt to that suspender. A
@@ -223,14 +261,6 @@ fn daemon_says(socket: &Path, user: &str, timeout: Duration, consent: bool) -> S
     if stream.set_read_timeout(read_timeout).is_err() || stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
         return Said::Other;
     }
-    // A tiny hand-built JSON object: the user name is escaped for quotes and backslashes.
-    let escaped: String = user.chars().flat_map(|c| match c {
-        '"' => vec!['\\', '"'],
-        '\\' => vec!['\\', '\\'],
-        c if c.is_control() => vec![],
-        c => vec![c],
-    }).collect();
-    let req = if consent { format!("{{\"user\":\"{}\",\"consent\":true}}\n", escaped) } else { format!("{{\"user\":\"{}\"}}\n", escaped) };
     if stream.write_all(req.as_bytes()).is_err() {
         return Said::Other;
     }
@@ -265,7 +295,12 @@ fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char
     if rc != PAM_SUCCESS || user_ptr.is_null() {
         return PAM_IGNORE;
     }
-    let user = unsafe { CStr::from_ptr(user_ptr) }.to_string_lossy().into_owned();
+    // A name that is not UTF-8 is refused, not rewritten: a rewritten name
+    // would ask the daemon about a different user than PAM_USER.
+    let Ok(user) = unsafe { CStr::from_ptr(user_ptr) }.to_str().map(str::to_owned) else {
+        log("user name is not UTF-8, ignoring");
+        return PAM_IGNORE;
+    };
     if user.is_empty() || user.len() > 256 {
         return PAM_IGNORE;
     }
@@ -285,16 +320,16 @@ fn authenticate(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char
     let t0 = std::time::Instant::now();
     if let (Some(text), false) = (&args.prompt, args.consent) {
         match converse(pamh, text) {
-            // Typed something: that is the password for the module behind us; no scan.
-            Ok(Some(mut typed)) if !typed.is_empty() => {
-                if let Ok(tok) = std::ffi::CString::new(typed.clone()) {
+            // Typed something: that is the password for the module behind us,
+            // handed on as the bytes typed; no scan.
+            Ok(Some(typed)) if !typed.is_empty() => {
+                // The bytes came from a C string, so they hold no NUL and this cannot fail.
+                if let Ok(tok) = std::ffi::CString::new(typed) {
                     // SAFETY: PAM copies the item.
                     unsafe { pam_set_item(pamh, PAM_AUTHTOK, tok.as_ptr() as *const c_void) };
+                    // The password must not linger in freed heap.
                     wipe(tok);
                 }
-                // The password must not linger in freed heap.
-                unsafe { std::ptr::write_bytes(typed.as_mut_vec().as_mut_ptr(), 0, typed.len()) };
-                drop(typed);
                 log(&format!("user {}: password typed at the prompt, no scan", sanitise(&user)));
                 return PAM_IGNORE;
             }
@@ -359,6 +394,73 @@ mod tests {
     #[test]
     fn no_daemon_is_not_a_match() {
         assert_eq!(daemon_says(Path::new("/nonexistent/faceauth.sock"), "alice", Duration::from_secs(1), false), Said::Other);
+    }
+
+    /// F7: a typed password reaches PAM_AUTHTOK as the bytes typed. The
+    /// conversion the module applies is CStr bytes to CString, with no text
+    /// decoding in between, so a Latin-1 byte survives.
+    #[test]
+    fn a_typed_password_keeps_its_bytes() {
+        let typed: &[u8] = b"caf\xe9-pass\0";
+        let c = CStr::from_bytes_with_nul(typed).unwrap();
+        let as_module_keeps_it = c.to_bytes().to_vec();
+        let handed_on = std::ffi::CString::new(as_module_keeps_it).unwrap();
+        assert_eq!(handed_on.as_bytes(), &typed[..typed.len() - 1], "the bytes handed to PAM_AUTHTOK are the bytes typed");
+        assert_ne!(handed_on.as_bytes(), "caf\u{FFFD}-pass".as_bytes(), "no replacement character was introduced");
+    }
+
+    /// F7: a name the escaper would have altered is refused, not rewritten.
+    #[test]
+    fn a_name_that_needs_escaping_is_refused() {
+        assert_eq!(request_line("alice", false).as_deref(), Some("{\"user\":\"alice\"}\n"));
+        assert_eq!(request_line("alice", true).as_deref(), Some("{\"user\":\"alice\",\"consent\":true}\n"));
+        for bad in ["ali\u{7}ce", "ali\"ce", "ali\\ce", "alice\n", "", "alice\u{7f}"] {
+            assert!(request_line(bad, false).is_none(), "{:?} was sent", bad);
+            assert!(request_line(bad, true).is_none(), "{:?} was sent", bad);
+        }
+        assert!(request_line(&"a".repeat(257), false).is_none());
+    }
+
+    /// F7: with such a name the daemon is never even connected to.
+    #[test]
+    fn a_control_character_in_the_name_never_reaches_the_socket() {
+        let dir = std::env::temp_dir().join(format!("pam_faceauth-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(daemon_says(&path, "ali\u{7}ce", Duration::from_secs(1), true), Said::Other);
+        assert_eq!(listener.accept().map(|_| ()).unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "a connection was made for a refused name");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F10: the daemon trusts a root peer with enrolment, deletion and
+    /// calibration, and this module runs as root under sudo and polkit. The
+    /// request builder is the one place a request is made, and the only keys
+    /// it can write are `user` and `consent`.
+    #[test]
+    fn the_module_can_only_emit_a_look_or_a_consent_request() {
+        let src = include_str!("lib.rs");
+        let start = src.find("fn request_line(").expect("the request builder exists");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("the builder ends")];
+        // Every JSON key the builder writes is a `\"name\":` fragment in a format string.
+        let mut keys = std::collections::BTreeSet::new();
+        for (i, _) in body.match_indices("\\\"") {
+            let after = &body[i + 2..];
+            let ident: String = after.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            if !ident.is_empty() && after[ident.len()..].starts_with("\\\":") {
+                keys.insert(ident);
+            }
+        }
+        assert_eq!(keys.into_iter().collect::<Vec<_>>(), ["consent", "user"], "the builder emits exactly these request keys");
+        // The rest of the module builds no request at all: no other format string opens a JSON object.
+        let non_test = &src[..src.find("#[cfg(test)]").unwrap()];
+        let object_openers = non_test.matches("format!(\"{{").count();
+        assert_eq!(object_openers, 2, "the two shapes in request_line are the only JSON objects the module formats");
+        for root_only in [["en", "rol"].concat(), ["del", "ete"].concat(), ["cali", "brate"].concat()] {
+            assert!(!body.contains(&root_only), "the builder names {}", root_only);
+        }
     }
 
     #[test]

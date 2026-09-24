@@ -70,7 +70,9 @@ pub fn check(service: &str, user: &str, password: &str) -> bool {
         }
         let rc = pam_authenticate(h, 0);
         pam_end(h, rc);
-        // Wipe the password copy.
+        // Wipe this function's own copy (the CString). PAM's strdup copies
+        // from the conversation are freed by PAM; the daemon's other copies
+        // are wiped by `consent::Secret` and the server as they go (F12).
         let bytes = pw.into_bytes();
         let mut bytes = bytes;
         for b in bytes.iter_mut() {

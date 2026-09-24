@@ -447,8 +447,9 @@ only way every layer agrees; running the checkout shell live is for short tests.
   installs log in automatically; `doctor` reports it as info.
 - **Templates are bound to the uid** they were enrolled under; a recreated
   account with the same name reads as not enrolled.
-- **faillock**: decided and documented: a face match does not reset the
-  password's failure counter; `doctor` warns.
+- **faillock**: reversed on 2026-09-22 (see "faillock, 2026-09-22 late"
+  below): a face match clears the bad-password lockout; `doctor` reports
+  it as info.
 - **Package**: `makepkg` builds `omarchy-faceauth 0.1.0-1` (5.5 MiB) from a
   tarball of `src/` with the tests in `check()`; contents listed in
   `design/pr-omarchy-pkgs.md`. PR drafts for both repositories in `design/`.
@@ -885,7 +886,7 @@ against recorded cgroup strings and the running test process.
 
 **Templates are bound to the camera that enrolled them.** Each template
 records `IrCapture::identity` (`ipu3:<sensor entity>` on IPU3 machines,
-`uvc:<driver>:<card>:<bus>` elsewhere) and only matches on that camera, in
+`uvc:<driver>:<bus path>:<idVendor>:<idProduct>` elsewhere; the card string is logged, never trusted) and only matches on that camera, in
 attempts and in the presence watch; an attempt on a camera with nothing
 usable is an error, logged with both names, so a camera swapped in for the
 enrolled one has nothing to match against. Templates from before this carry
@@ -1407,3 +1408,23 @@ module returned ignore in 0 ms, and sudo fell to its password path with no
 window. Repeated from a separate machine over Tailscale with the same
 result. The positive fail-closed check, installed that morning with unit
 coverage only, now has its live remote test.
+
+## 2026-09-23, night: round-3 review closed
+
+Seven review streams plus a Codex pass (design/security-review-20260923-round3-worklist.html) ran against 75049ff. Sections A and B landed during the day; the rest landed tonight by five fixer agents working disjoint files, then a package (staging 0.1.1-23) and the live tests below.
+
+**Walk-away lock, two modes (C1, C2, ruling D2).** `[presence] mode = "default" | "secure"`, switchable for the session over the socket (`faceauth presence mode`, and the bar widget `omarchy.faceauth.presence`, left click cycles). Default: the away timer decides before the stranger state, so a stranger never holds the lock past `away_seconds`; the same-shape reference is taken only from ticks where identity passed. Secure: one failed identity check and nothing but the user's face holds the clock. While locked, the watch resumes on a face match or, every three ticks, when the session reads unlocked, so a password unlock with the camera covered no longer leaves the watch suspended. The lock helper resolves the Omarchy tree from the config, then `/etc/omarchy.conf` in either form (`export OMARCHY_PATH=...` is what dev-link writes), then the package, never fatally, and exits 1 unless the compositor reports a session lock (C3); the daemon shares the resolver for the window and notices.
+
+**Gate hardening (D4, D5, D6).** The frame at each counted nod leg is kept and embedded after the confirm; each must match the templates or the request refuses (`nod frame N of M is not the enrolled face`). The strobe mask is drawn per gate (balanced eight bits, never the idle 0xaa) and a pair is scored only when the last eight frames' brightness follows a rotation of it; presence's strobe window widened to 600 ms for the eight frames. Denials log a cue-free verdict; the flash measurements are debug.
+
+**IR sensor access (D3).** `packaging/72-faceauth-ir.rules` drops the `uaccess` tag from the ov7251 subdev and makes it root 0600 (after 70-uaccess adds the tag, before 73-seat-late applies the ACL). The media node and the RGB sensor keep their grants. Doctor reports the root-owned node and a `camera.ir_access` row; the Face menu's camera list recognises the sensor by entity name since the pad format is unreadable to the user. On the reference machine the rule took effect on the package's udev reload without a reboot.
+
+**Command text (A6, A7, ruling D5).** Clip at `COMMAND_CLIP` = 16,384 characters, flagged `clipped` in the payload and marked on the card; the card grows with the command to 40% of the panel and then scrolls; nothing is elided and the nod path is unchanged. `clip()` drops Cc, Cf, Zl and Zp by category.
+
+**Setup, removal, package (E1, E2, E6, E7, E8, E9).** Setup keeps a byte copy of the polkit-1 it writes; removal deletes the file only while it still matches, otherwise strips the face line (a fingerprint line added later survives). Removal deletes templates, set-asides and gesture traces directly when the daemon is stopped. Doctor requires a live `pam_deny` after the face line and flags `timeout=` on consent lines. The restart moved from the install scriptlet to `90-omarchy-faceauth-restart.hook` (after systemd's reload hook). check() states that packaged CI cannot test sealing.
+
+**Hardening batch (B6, F1 to F14).** Own-pid requests refused before a read; uid checked on template cache hits; set-aside only on a definitive unseal failure and enrolment refused on a Plain store beside a `.cred`; unknown config keys named with their table, disabling values refuse to start; `presence on|off` bails on an unparseable config and writes atomically; `templates delete` removes every trace of the user; session id only from the canonical scope path; YuNet decode bounds-checked; passwords in a wiping `Secret`; PAM module keeps the typed bytes and returns ignore on a non-UTF-8 user; UVC identity from bus path and USB ids, the card string logged and never trusted; checked arithmetic in unpack.
+
+**Live tests.** LT3: sudo on tty3 got a password prompt, no window. LT5: lock, password unlock with the camera covered, second lock 23 s after leaving, face unlock. LT7: the helper by hand locked and returned 0. Nod on the new build: two nods at 11.7/22.5 degrees, confirm live in 0.63 s, four nod frames matched. LT4 (D2, the enlarged print): a 1.5x life-size print of a fixed-exposure IR frame (`faceauth cam test --exposure 120 --led on`, dev-tools), tiled over four sheets and cut out, held at the lock screen for twelve minutes of attempts: DenySurround three times, NoMatch on every frame that passed the gate, and three attempts where exposure never settled on the blown-out paper. No unlock. Mike's ruling: **D2 refuted**. The distance-normalised reflectance check stays on the list as hardening, not a blocker. LT6 (a second person) waits for one.
+
+**Not yet.** The two-factor mode designed tonight (design/plan-two-factor-20260923.html) is next, after the YubiKey arrives.

@@ -11,14 +11,52 @@
 # few seconds: the owner may be a few feet away and wants to see the screen
 # waiting for them. `lock lockPresence` sets that before locking; the system
 # lock command then runs its usual extras (password manager, screensaver).
-set -euo pipefail
+#
+# The exit code is the daemon's only evidence. 0 means the compositor holds a
+# session lock; 1 means it does not, whatever the lock command said, so the
+# daemon keeps its away state and tries again on the next tick instead of
+# believing a lock that never happened.
+set -uo pipefail
+
 user=${1:?user}
-omarchy_path=${2:-$(sed -n 's/^OMARCHY_PATH=//p' /etc/omarchy.conf 2>/dev/null | tr -d '"' | head -1)}
+
+# The Omarchy tree. Never fatal: a missing /etc/omarchy.conf (no package or
+# installer creates it) means the packaged tree, and omarchy-dev-link writes
+# the export form, which a bare `OMARCHY_PATH=` match would miss.
+omarchy_path_from_conf() {
+  local conf=${1:-/etc/omarchy.conf} line v
+  [[ -r $conf ]] || return 0
+  while IFS= read -r line; do
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line#export }
+    line=${line#"${line%%[![:space:]]*}"}
+    [[ $line == OMARCHY_PATH=* ]] || continue
+    v=${line#OMARCHY_PATH=}
+    v=${v%%[[:space:]]*}
+    v=${v#\"}; v=${v%\"}; v=${v#\'}; v=${v%\'}
+    [[ $v == /* ]] && { printf '%s\n' "$v"; return 0; }
+  done < "$conf"
+  return 0
+}
+omarchy_path=${2:-$(omarchy_path_from_conf "${FACEAUTH_OMARCHY_CONF:-/etc/omarchy.conf}")}
 omarchy_path=${omarchy_path:-/usr/share/omarchy}
+
 run_as_user() {
   /usr/bin/timeout 15 /usr/bin/systemd-run --machine="$user@.host" --user --wait --collect --quiet \
     -E "OMARCHY_PATH=$omarchy_path" "$@"
 }
+
 run_as_user /usr/bin/omarchy-shell lock lockPresence || true
-exec /usr/bin/timeout 15 /usr/bin/systemd-run --machine="$user@.host" --user --wait --collect --quiet \
-  -E "OMARCHY_PATH=$omarchy_path" /usr/bin/omarchy-system-lock
+run_as_user /usr/bin/omarchy-system-lock || echo "faceauth-lock-session: the lock command failed" >&2
+
+# The lock command can return before the lock is up, or return 0 without
+# locking at all (a dev-linked shell answering an IPC it does not serve). Ask
+# the compositor, for up to three seconds, and answer with what it says.
+for _ in 1 2 3 4 5 6; do
+  if run_as_user /usr/bin/omarchy-hyprland-session-locked; then
+    exit 0
+  fi
+  sleep 0.5
+done
+echo "faceauth-lock-session: the session is not locked" >&2
+exit 1

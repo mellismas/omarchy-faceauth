@@ -27,26 +27,34 @@ on its own: the PAM stacks are written only by `omarchy setup security face`.
   helper is polkit's and polkit does not say who asked), so the first line
   is polkit's own description as the agent relayed it, labelled
   "Unverified:", and the second says the asking process was not found.
-  Nothing is elided. Nothing elevates until the face matches, the daemon
-  sees two nods from that same face, and a strobed confirm shows it live
-  and enrolled; two head shakes refuse; the password typed into the window
-  approves. Buttons dismiss, or deny and kill the requester when the daemon
-  could name it. The request has no deadline: nods are read for
+  Control and direction-override characters are stripped from both lines
+  and nothing else is cut: a long command scrolls in the card rather than
+  being elided, up to the daemon's limit on the line. Nothing elevates
+  until the window has acknowledged the request to the daemon, the face
+  matches, the daemon sees two nods from that same face, and a strobed
+  confirm shows it live and enrolled; two head shakes refuse; the password
+  typed into the window approves. Buttons dismiss, or deny and kill the
+  requester when the daemon could name it. The request has no deadline: nods are read for
   `consent_seconds` (90 by default) after a match, then the camera drops to
   the presence rhythm and an attentive face re-arms it, the lock screen's
-  cycle; if you walk away the session locks and the request resumes when
-  your face unlocks it. Requests queue and get the window in turn, and a
+  cycle. With the walk-away lock on, walking away locks the session and
+  the request resumes when your face unlocks it; with it off the window
+  waits. Requests queue and get the window in turn, and a
   waiting one is announced by a desktop notice. Every approval and every
   refusal posts a notice.
-- **Gestures.** Both are read from real image motion of the face between
-  frames (how far its pixels shifted, vertically for the nod, sideways for
-  the shake), not from landmark angles, because a face detector's fit can
-  flip between two solutions and fake an angle while moving no pixels. A
-  gesture is four alternating legs done together, from a head that was still
-  just before; a glance, a look down, reading, talking and leaning in are all
-  rejected by shape (see Measured, below). Setup records two nods and two
-  shakes and sets the person's floors from them: the nod's only ever rises
-  above the default, the shake's only ever falls below it.
+- **Gestures.** With the face mesh model installed, both are read from the
+  head's angles in degrees (pitch for the nod, yaw for the shake), taken
+  from MediaPipe's dense landmarks on the matched face; without it, from
+  real image motion of the face between frames. Either way the face box
+  must move along the gesture's axis during each leg: that catches a
+  frozen box and a landmark fit that flipped between two solutions, not
+  ordinary jitter, so a fit cannot nod on its own. A gesture is four
+  alternating legs done together, from a head that was still just before;
+  a glance, a look down, reading, talking and leaning in are all rejected
+  by shape (see Measured, below). The enrolment walk-through records two
+  nods, two shakes and the everyday movements and sets the person's floors
+  from them: the nod's only ever rises above the default, the shake's only
+  ever falls below it.
 - **Walk-away lock** (opt-in, `sudo faceauth presence on`): one short look
   every five seconds (ten on battery), and on every third look a strobed
   pair through the flash gate and an identity check; lock when the camera
@@ -56,8 +64,12 @@ on its own: the PAM stacks are written only by `omarchy setup security face`.
   face was are compared with the last full sighting, and while that shape
   is still in the chair (a hand over the chin while reading) the clock is
   held, for up to two minutes after the last full sighting. Standing up
-  replaces the shape with the wall. A face that is not the enrolled user
-  neither counts as present nor locks.
+  replaces the shape with the wall. Two modes. In the default mode the
+  away timer wins: a face that is not the enrolled user never counts as
+  present, so a stranger in the chair, or a photo propped there, never
+  holds the lock off past the away time. In secure mode the session locks
+  as soon as the enrolled user is not in frame. A tray toggle for the mode
+  is to come.
 - **Every failure falls back to the password**, from a covered camera to a
   stopped service: the module returns `PAM_IGNORE` for everything but a
   match and one other thing. On a polkit consent line the answer no (a head
@@ -78,10 +90,13 @@ on its own: the PAM stacks are written only by `omarchy setup security face`.
   head's background stays dark.
 - **Elevation is never passive.** A face in front of the camera approves
   nothing; the nod is measured by the daemon on its own camera, and no key,
-  click or socket message stands in for it. The nod is read from the face
-  that matched: the daemon follows that box through the gesture and ignores
-  other faces, a nod whose box does not move with it is not a nod (image
-  motion inside a still box is not a head), and after the second nod the
+  click or socket message stands in for it. The daemon reads no nods until
+  the window has acknowledged the request over the socket, and none in a
+  short dwell after that, so a request swapped in mid-nod needs fresh nods.
+  The nod is read from the face that matched: the daemon follows that box
+  through the gesture and ignores other faces, the box must move with each
+  leg (a frozen box, or a landmark fit that flipped, is not a head
+  moving), and after the second nod the
   illuminator strobes again and two lit/unlit pairs must pass the flash
   gate and match the templates on that box before anything is approved. A
   print held up and waggled passes the detector and fails the confirm.
@@ -96,9 +111,26 @@ on its own: the PAM stacks are written only by `omarchy setup security face`.
   faillock's own reset module runs, so the daemon does it.
 - **Remote callers.** A request whose caller the daemon cannot show to be
   local (an `sshd` in its ancestry, a logind session marked remote, or any
-  shape it cannot verify) is refused before any window or camera. A same-uid
-  process inside your own desktop session counts as local; what stands
-  between that and root is the window naming the request, and the nod.
+  shape it cannot verify) is refused before any window or camera. On the
+  polkit lane the process judged is not polkit's root helper but the agent
+  that connected it, read from the helper's systemd unit instance and
+  pinned by pidfd, and the requesting process polkitd names must be local
+  too. A same-uid process inside your own desktop session counts as local,
+  and so does one that your own session services spawned for a remote
+  shell (`systemd-run --user` from an SSH login, D-Bus activation, a user
+  timer): provenance cannot tell those apart, so such a process can raise
+  a window. What stands between that and root is the window naming the
+  request, and the nod, which a remote shell cannot produce.
+- **Root peers are trusted.** A socket peer with effective uid 0 may ask
+  about any user, and enrol, delete and calibrate. The PAM module never
+  sends those request shapes, and root itself is never authenticated by
+  face.
+- **The sandbox limits accidents, not a compromised daemon.** The unit's
+  hardening narrows what a bug in the root daemon can reach by mistake. A
+  daemon under an attacker's control still runs as root, and `/run` is
+  writable in its mount namespace (that is how the faillock reset works).
+  The structural answer, a dedicated user plus a small root helper, is not
+  built.
 - **Lid closed.** The camera is in the lid, so a consent request with it
   closed is answered before the camera is taken and the stack falls through
   to the password at once, as the fingerprint stack does through its PAM
@@ -124,10 +156,23 @@ on its own: the PAM stacks are written only by `omarchy setup security face`.
   so the password box is there and the scan resumes when the hold is over.
 - **Not defended**: a look-alike, a 3D mask, malware already running as you
   with your password, a video rendered on a display the IR camera can see
-  (not measured; not claimed), and anything a setuid-root binary you can run
-  does as uid 0 (on a stock system those are sudo, pkexec and polkit's
-  helper, each of which authenticates first). A face match does not reset
-  `pam_faillock`'s counter.
+  (not measured; not claimed), a substituted or replaying camera that feeds
+  the daemon recorded IR frames (the strobe pattern is fixed today; a
+  per-request random pattern is being built and will narrow this, not
+  close it), and anything a setuid-root binary you can run does as uid 0
+  (on a stock system those are sudo, pkexec and polkit's helper, each of
+  which authenticates first).
+- **The false-accept rate is unmeasured.** The 0.70 threshold was set on
+  one subject's face and one print; no other person's face has been scored
+  against it, so how often a stranger would match is not known. Data is to
+  be collected. `required_matches` is a spike filter over correlated
+  frames, not a false-accept control.
+- **No trusted-path marker.** A process running as you can draw a window
+  that imitates the card and collect a password typed into it, and the
+  real card carries nothing that such a window could not copy. An
+  unprompted password window is only as trustworthy as the session it
+  appears in: type a password into it only for a request you just made,
+  and prefer the nod, which a fake window gains nothing from.
 
 ## Setup
 
@@ -136,17 +181,44 @@ on its own: the PAM stacks are written only by `omarchy setup security face`.
 ```
 sudo faceauth models fetch                 # ~260 MB, checksummed, once
 sudo systemctl enable --now faceauth.service
-sudo faceauth enroll --user $USER          # 12 s at the camera; --label for another look
+sudo faceauth enroll --user $USER --guided # the walk-through window; --label for another look
 faceauth auth --user $USER                 # {"result":"match",...} means it works
-sudo faceauth calibrate --user $USER       # two nods, two shakes
+sudo faceauth calibrate --user $USER --guided   # the gesture rounds again (Tune Gestures)
 faceauth doctor                            # every part, one row each
 ```
+
+`enroll --guided` opens the enrolment walk-through: a full-screen window
+on the laptop's own panel that draws a dot for where your head points and
+a ring for the target, fed by the daemon with one line per analysed
+frame (position, size, yaw, pitch, roll and whether the step is
+satisfied); no image leaves the daemon. The steps are welcome, centre (sit
+normally and look at the centre; the dot's size says too close or too
+far), range (turn the head all the way round once so the ring is set from
+your reach), path (follow the ring from the centre out to the edge and
+round), hold (centre, left, right, centre, up, down, each held while
+templates are taken), verify (look at the camera), then twelve gesture and
+everyday rounds: two nods, two shakes, two glances right, two glances
+left, a look at the keyboard, reading text placed around the screen,
+talking while facing the screen, and leaning in. Each round's head swing
+is recorded in degrees from the face mesh and the floors come from the
+nods and shakes. Add Look starts at the centre step and stops after
+verify; `calibrate --guided` (Tune Gestures in the menu) runs the rounds
+alone. `enroll --terminal` is the older path, five looks prompted in the
+terminal with no window; `calibrate` without `--guided` does the same for
+the rounds.
 
 Then the PAM lines from `packaging/pam-example.txt`: `omarchy-lock-face` for
 the lock screen (closed by `pam_deny`), and one `consent` line at the top of
 `sudo` and `polkit-1`. Removal is `omarchy remove security face`, which
 restores the original PAM files and deletes the templates unless told to
 keep them.
+
+Development builds: `cargo build --features faceauth-cli/dev-tools`
+compiles the tuning tools in (`faceauth sweep`, `faceauth pose`, the
+walk-through's record mode and the per-frame gesture recordings); the
+package is built without the feature and none of that code is in the
+shipped binaries. See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md),
+"Development builds".
 
 `doctor` rows: `camera.ir`, `camera.rgb`, `camera.illuminator`,
 `models.manifest`, `models.file`, `daemon.running`, `templates.user`,
@@ -171,8 +243,9 @@ the `[presence]` table for the walk-away lock.
 
 ```
 faceauth doctor [--json]
-faceauth enroll [--user NAME] [--label TEXT]
-faceauth calibrate [--user NAME] [--rounds N]
+faceauth enroll [--user NAME] [--label TEXT] --guided [--start distance]
+faceauth enroll [--user NAME] [--label TEXT] --terminal [--poses up,down]
+faceauth calibrate [--user NAME] [--guided]
 faceauth auth [--user NAME] [--consent]
 faceauth templates delete [--user NAME]
 faceauth presence on|off [--user NAME] [--away-seconds N]
@@ -198,14 +271,19 @@ every threshold are in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 | Crate | What it is |
 | --- | --- |
 | `faceauth-camera` | V4L2 and media-controller capture, Intel IPU3 pipeline setup and 10-bit unpack, UVC greyscale decoders, exposure control, the IR illuminator as a V4L2 control. |
-| `faceauth-engine` | Detect (YuNet), align, embed (glintr100, 512-D), cosine match, head pose, image motion; ONNX Runtime loaded at run time from `/usr/lib/libonnxruntime.so`. |
+| `faceauth-engine` | Detect (YuNet), align, embed (glintr100, 512-D), cosine match, dense face mesh (MediaPipe face landmark, 468 points) and head pose from it, image motion; ONNX Runtime loaded at run time from `/usr/lib/libonnxruntime.so`. |
 | `faceauth-daemon` | `faceauthd`: authentication (settle, strobe, liveness gate, two matching frames), consent (window, gesture detectors, password check against `system-auth`), presence, the sealed template store, the socket. |
 | `faceauth-cli` | `faceauth`. |
 | `pam_faceauth` | The PAM module; links only libc and libpam. |
 | `packaging/` | Service unit, default config, lock helper, PAM example. |
 
 Models are not in the repository or the package: `models.toml` names them
-with checksums and `faceauth models fetch` verifies them.
+with checksums, sizes and licences, and `faceauth models fetch` verifies
+them. The face mesh is Google's MediaPipe face landmark model
+(Apache-2.0), converted one-to-one to ONNX and hosted on this project's
+GitHub releases; its head pose drives the gestures, the attention check
+that wakes a request, and the off-axis looks that enrolment takes so the
+match holds when the head is turned.
 
 ## Build
 
