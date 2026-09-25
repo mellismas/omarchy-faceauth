@@ -1,7 +1,7 @@
 //! Helpers the watch and lock tests share: observations, a config, and a
 //! driver that runs the watch until it asks for the lock.
 
-use super::config::{PresenceConfig, PresenceMode};
+use super::config::{AwayTime, PresenceConfig, PresenceMode};
 use super::observe::Observation;
 use super::watch::Watch;
 use std::time::{Duration, Instant};
@@ -28,7 +28,8 @@ pub(super) fn obs_at(face: bool, attentive: bool, identity: Option<bool>) -> Obs
 pub(super) fn cfg() -> PresenceConfig {
     PresenceConfig {
         user: "alice".into(),
-        away_seconds: 20.0,
+        away_seconds: AwayTime::Seconds(20.0),
+        secure_away_seconds: 20.0,
         ..Default::default()
     }
 }

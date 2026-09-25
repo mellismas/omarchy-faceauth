@@ -4,8 +4,8 @@
 # sets nothing: the daemon runs on its built-in defaults, which are the
 # values shown, and a default that changes in a later package reaches an
 # install that never edited the file. Uncomment a line to change it. The
-# three [presence] keys left explicit are the ones `faceauth presence on|off`
-# rewrites in place; they are at their defaults too.
+# two [presence] keys left explicit are the ones `faceauth presence on|off`
+# always rewrites in place; they are at their defaults too.
 #
 # Keys the daemon does not know are named in the journal at start (a value
 # meant for the top level but written under [presence] lands there). A value
@@ -33,10 +33,11 @@
 enabled = false               # auto-lock when the enrolled user leaves; opt-in (faceauth presence on|off)
 user = ""                     # whose templates define "present"
 # mode = "default"            # "default": any face turned to the screen holds the lock off, whoever it is; lock once nobody has been there for away_seconds; a hidden face (hand on chin) holds the clock too
-                              # "secure": identity checked on every tick; the first clear miss on a face turned to the screen locks at once; a near miss, an unread face or a hidden one holds while the same shape is still in the chair (a hand on the face, leaning in, a look down at a phone), an empty chair locks after away_seconds, no other face holds the clock
+                              # "secure": identity checked on every tick; the first clear miss on a face turned to the screen locks at once; a near miss, an unread face or a hidden one holds while the same shape is still in the chair (a hand on the face, leaning in, a look down at a phone), an empty chair locks after secure_away_seconds, no other face holds the clock
                               # the starting mode; the watched user can switch it until the next restart (faceauth presence mode default|secure)
 # tick_seconds = 5.0          # the secure mode's tick; the default mode looks every 10 s at the most often; one short look per tick (about 0.45 s of camera; longer on a tick that also strobes for identity and liveness; in the default mode every third tick); 10 s on battery
 # battery_tick_seconds = 10.0 # the tick on battery (0 keeps the mains tick)
-# away_seconds = 20.0         # unseen for this long -> lock the session
+# away_seconds = 20.0         # default mode, the away time: unseen for this long -> lock the session; or "never": the default mode never locks the session by time; `faceauth presence away-time --default` sets it, and `faceauth presence on` keeps it unless given --away-seconds
+# secure_away_seconds = 20.0  # secure mode: the same in seconds, no "never" (secure mode keeps the session open only for a verified face); `--secure` sets it
 # obscured_face_lock = "never"  # default mode, the obscured face lock time: how long a face that is partly covered or turned away (hand on the chin, a look down) keeps the session open since the last clear sighting, while the same shape is in the chair; "never" = until the chair changes (a coat on the chair can hold it too), or minutes, 1 or more; `faceauth presence obscured-lock --default` sets it
 # secure_obscured_face_lock = 2 # secure mode: the same in minutes, 1 to 10 (clamped); after it an unverified face counts as gone; `--secure` sets it

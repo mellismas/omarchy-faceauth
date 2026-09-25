@@ -375,6 +375,13 @@ mode, "never" as shipped) or `secure_obscured_face_lock` (secure mode, 2
 minutes, clamped to 1 to 10) and stays the secure mode's
 first-miss lock. Measured: a hand over part of the face 1.00, a
 sheet over it 0.95, the face fully covered 0.79, the chair empty -0.34.
+The away time is per mode and is read for the mode in force, by the watch
+and by the consent round's away clock alike: `away_seconds` in the default
+mode (seconds, or "never", when the default mode never locks by time) and
+`secure_away_seconds` in the secure mode (seconds only), 20 s each as
+shipped (`PresenceConfig::away_for`). `faceauth presence away-time` writes
+them; `faceauth presence on` leaves them alone unless given
+`--away-seconds`.
 
 **Timing.** The exposure loop settles on a face in about 1.2 s; a lock
 screen attempt matches in under two seconds from the panel becoming secure;

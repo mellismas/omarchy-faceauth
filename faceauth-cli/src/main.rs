@@ -7,7 +7,10 @@ use cam::{cam_graph, cam_probe};
 use doctor::doctor;
 use enroll::{at_rest_note, enroll_guided};
 use models::models_fetch;
-use presence::{away_for, obscured_edit, obscured_keys, presence_edit, write_config_atomically};
+use presence::{
+    away_flag, away_keys, away_summary, lock_time_edit, obscured_keys, presence_edit,
+    write_config_atomically,
+};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -28,7 +31,7 @@ fn usage() -> ! {
   faceauth enroll [--user NAME] [--label TEXT] [--start distance]   (root; the walk-through window, the same one Setup > Security > Face opens; --guided is accepted)
   faceauth enroll [--user NAME] [--label TEXT] --terminal [--poses up,down]   (root; the five looks from the terminal, no window)
   faceauth enroll [--user NAME] [--label TEXT] --look [--seconds N] [--count N]   (root; one look, as the camera sees it, no walk-through)
-  faceauth enrol-control continue|redo|cancel [--user NAME]   (from the enrolment window)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]   (development: the omarchy-faceauth-models package ships the files)\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] [--dismiss|--ack|--rearm|--passwordless MIN]   (from the consent window; stdin: token line, then password line)\n  faceauth calibrate [--user NAME] --guided              (root; the gesture and everyday rounds in the walk-through window, stored with the templates)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence obscured-lock [--default never|MIN] [--secure MIN]   (root; saves the obscured face lock times, the walk-away lock stays as it is)\n  faceauth presence mode [default|secure] [--user NAME]   (as the watched user; reads or switches the watch's mode until the next restart; prints {{\"presence\":{{\"mode\":..,\"watching\":..}}}})\n  faceauth presence [--user NAME]                  (the watch's mode and, for the watched user, its state){}",
+  faceauth enrol-control continue|redo|cancel [--user NAME]   (from the enrolment window)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]   (development: the omarchy-faceauth-models package ships the files)\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] [--dismiss|--ack|--rearm|--passwordless MIN]   (from the consent window; stdin: token line, then password line)\n  faceauth calibrate [--user NAME] --guided              (root; the gesture and everyday rounds in the walk-through window, stored with the templates)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service; on keeps the saved away times unless --away-seconds is given)\n  faceauth presence away-time [--default never|SECONDS] [--secure SECONDS]   (root; saves the away times, the walk-away lock stays as it is)\n  faceauth presence obscured-lock [--default never|MIN] [--secure MIN]   (root; saves the obscured face lock times, the walk-away lock stays as it is)\n  faceauth presence mode [default|secure] [--user NAME]   (as the watched user; reads or switches the watch's mode until the next restart; prints {{\"presence\":{{\"mode\":..,\"watching\":..}}}})\n  faceauth presence [--user NAME]                  (the watch's mode and, for the watched user, its state){}",
         dev_usage()
     );
     std::process::exit(2)
@@ -175,8 +178,9 @@ fn main() -> Result<()> {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
                 Err(e) => return Err(e).with_context(|| format!("read {}", cfg_path)),
             };
-            // Without --away-seconds the configured away time stays.
-            let away = away_for(opt(rest, "--away-seconds"), &text, &cfg_path)?;
+            // Without --away-seconds the saved away times stay, "never"
+            // included.
+            let away = away_flag(opt(rest, "--away-seconds"))?;
             let edited = presence_edit(&text, &cfg_path, *mode == "on", &user, away)?;
             write_config_atomically(&cfg_path, &edited)
                 .with_context(|| format!("write {} (run as root)", cfg_path))?;
@@ -193,9 +197,13 @@ fn main() -> Result<()> {
                 );
             }
             if *mode == "on" {
+                // Already validated by the edit; read again only to report
+                // the saved away times, without repeating its warnings.
+                let presence = toml::from_str::<faceauth_daemon::config::Config>(&edited)?.presence;
                 println!(
-                    "presence watch on for {} (away after {} s); service restarted",
-                    user, away
+                    "presence watch on for {} ({}); service restarted",
+                    user,
+                    away_summary(&presence)
                 );
             } else {
                 println!("presence watch off; service restarted");
@@ -294,7 +302,7 @@ fn main() -> Result<()> {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
                 Err(e) => return Err(e).with_context(|| format!("read {}", cfg_path)),
             };
-            let edited = obscured_edit(&text, &cfg_path, &keys)?;
+            let edited = lock_time_edit(&text, &cfg_path, &keys)?;
             write_config_atomically(&cfg_path, &edited)
                 .with_context(|| format!("write {} (run as root)", cfg_path))?;
             let on = faceauth_daemon::config::Config::from_text(&edited, &cfg_path)
@@ -315,6 +323,43 @@ fn main() -> Result<()> {
                 println!("obscured face lock time saved; service restarted");
             } else {
                 println!("obscured face lock time saved; the walk-away lock stays off");
+            }
+            Ok(())
+        }
+        ["presence", "away-time", rest @ ..] => {
+            // Root: save the away times without touching whether the
+            // walk-away lock is on. The running daemon reads its config at
+            // start, so it restarts only when the watch is on.
+            let cfg_path = opt(rest, "--config")
+                .unwrap_or("/etc/faceauth/config.toml")
+                .to_string();
+            let keys = away_keys(opt(rest, "--default"), opt(rest, "--secure"))?;
+            let text = match std::fs::read_to_string(&cfg_path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => return Err(e).with_context(|| format!("read {}", cfg_path)),
+            };
+            let edited = lock_time_edit(&text, &cfg_path, &keys)?;
+            write_config_atomically(&cfg_path, &edited)
+                .with_context(|| format!("write {} (run as root)", cfg_path))?;
+            let on = faceauth_daemon::config::Config::from_text(&edited, &cfg_path)
+                .map(|c| c.presence.enabled)
+                .unwrap_or(false);
+            if on {
+                let st = std::process::Command::new("/usr/bin/systemctl")
+                    .args(["restart", "faceauth.service"])
+                    .status()
+                    .context("run /usr/bin/systemctl")?;
+                if !st.success() {
+                    bail!(
+                        "away time written to {}, but the service did not restart ({}); see `systemctl status faceauth.service`",
+                        cfg_path,
+                        st
+                    );
+                }
+                println!("away time saved; service restarted");
+            } else {
+                println!("away time saved; the walk-away lock stays off");
             }
             Ok(())
         }

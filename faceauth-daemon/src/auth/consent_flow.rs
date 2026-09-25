@@ -11,6 +11,7 @@ use super::rearm::{attention_wait, hold_wait, RearmGate};
 use super::scan::Scan;
 use crate::capture::IrCapture;
 use crate::consent::{notify, wait_for_nods, Answer, ConsentState, Dialog, Gesture, CONSENT};
+use crate::presence::{presence_mode, PresenceConfig, PresenceMode};
 use crate::store::UserTemplates;
 use anyhow::Result;
 use faceauth_engine::Pipeline;
@@ -117,11 +118,7 @@ impl Authenticator {
         let state = &CONSENT;
         let user = s.user.clone();
         let started = s.started;
-        let lost_after = if cfg.presence.enabled && cfg.presence.user == s.user {
-            Some(Duration::from_secs_f32(cfg.presence.away_seconds))
-        } else {
-            None
-        };
+        let lost_after = lost_after_for(&cfg.presence, &s.user, presence_mode());
         let msg = format!("Recognised. Nod {} times to allow this, shake your head to refuse, or type your password.", NODS_NEEDED);
         let floors_deg = consent_floors(&s.templates.gesture);
         let seen = &s.user_seen_at;
@@ -743,5 +740,55 @@ fn elapsed_of(o: &Outcome) -> u64 {
         | Outcome::ConsentDenied { elapsed_ms, .. }
         | Outcome::Refused { elapsed_ms, .. } => *elapsed_ms,
         _ => 0,
+    }
+}
+
+/// The consent round's away clock for `user`: the walk-away lock's away
+/// time in `mode`, the mode in force, while the watch is on for this user.
+/// None (no watch for them, or the default mode set to "never") means the
+/// round never ends with the user gone.
+fn lost_after_for(presence: &PresenceConfig, user: &str, mode: PresenceMode) -> Option<Duration> {
+    if presence.enabled && presence.user == user {
+        presence.away_for(mode)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod lost_after_tests {
+    use super::*;
+    use crate::presence::{AwayTime, LockWord};
+
+    /// The consent round's clock is the walk-away lock's away time for the
+    /// mode in force, and runs only while the watch is on for this user.
+    #[test]
+    fn the_consent_away_clock_follows_the_mode_in_force() {
+        let mut p = PresenceConfig {
+            enabled: true,
+            user: "alice".into(),
+            away_seconds: AwayTime::Seconds(45.0),
+            secure_away_seconds: 30.0,
+            ..Default::default()
+        };
+        let default = PresenceMode::Default;
+        let secure = PresenceMode::Secure;
+        assert_eq!(
+            lost_after_for(&p, "alice", default),
+            Some(Duration::from_secs(45))
+        );
+        assert_eq!(
+            lost_after_for(&p, "alice", secure),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(lost_after_for(&p, "bob", secure), None);
+        p.away_seconds = AwayTime::Word(LockWord::Never);
+        assert_eq!(lost_after_for(&p, "alice", default), None);
+        assert_eq!(
+            lost_after_for(&p, "alice", secure),
+            Some(Duration::from_secs(30))
+        );
+        p.enabled = false;
+        assert_eq!(lost_after_for(&p, "alice", secure), None);
     }
 }

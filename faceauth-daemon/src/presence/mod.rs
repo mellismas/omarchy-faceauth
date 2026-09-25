@@ -11,17 +11,19 @@
 //! Two modes (`[presence] mode`), ruled in the round-4 review (Q9). In the
 //! `default` mode any face turned to the screen holds the lock off: a
 //! laptop handed to someone stays open while they look at it, and the
-//! session locks only once the chair has been empty for `away_seconds`.
+//! session locks only once the chair has been empty for `away_seconds`
+//! (never by time, when that is "never").
 //! Identity is checked every `IDENTIFY_EVERY` ticks there, but only to tell
 //! the shell who is holding the clock and to take the shape reference for a
 //! hidden face; it never decides the lock. In the `secure` mode identity is
 //! checked on every tick, only a face that passes holds the clock, the first
 //! failed check locks the session at once, and an empty chair locks after
-//! `away_seconds`.
+//! `secure_away_seconds`. Each mode reads its own away time, the one of the
+//! mode in force, so a switch at run time takes the other time.
 //!
 //! State: `Present` (someone the mode accepts is holding the clock),
 //! `Stranger` (default mode only: a face whose identity check failed is
-//! holding it), `Away` (nobody has held it for `away_seconds`, or in the
+//! holding it), `Away` (nobody has held it for the mode's away time, or in the
 //! secure mode a check failed; the session is locked once on the
 //! transition). In the default mode a face the detector only half sees (a
 //! hand over the chin while reading) is not absence: while no face is found,
@@ -41,8 +43,8 @@ mod test_support;
 mod watch;
 
 pub use config::{
-    presence_mode, set_presence_mode, LockWord, ObscuredFaceLock, PresenceConfig, PresenceMode,
-    SECURE_OBSCURED_LOCK_MINUTES, SECURE_OBSCURED_LOCK_RANGE,
+    presence_mode, set_presence_mode, AwayTime, LockWord, ObscuredFaceLock, PresenceConfig,
+    PresenceMode, SECURE_OBSCURED_LOCK_MINUTES, SECURE_OBSCURED_LOCK_RANGE,
 };
 pub use lock::{SessionLock, LOCK_CHECK_TICKS, LOCK_HELPER, SESSION_LOCK};
 pub(crate) use observe::{observe_in, Observation};

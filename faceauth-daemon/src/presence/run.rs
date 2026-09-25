@@ -2,7 +2,9 @@
 //! each tick, and the snapshot it publishes for the socket's presence
 //! query.
 
-use super::config::{presence_mode, set_presence_mode, PresenceConfig, PresenceMode};
+use super::config::{
+    presence_mode, set_presence_mode, AwayTime, LockWord, PresenceConfig, PresenceMode,
+};
 use super::lock::{LOCK_CHECK_TICKS, SESSION_LOCK};
 use super::observe::observe_in;
 use super::watch::{identify_this_tick, tick_for, State, Watch, IDENTIFY_EVERY};
@@ -36,11 +38,15 @@ pub fn run(auth: Arc<Mutex<Authenticator>>, cfg: PresenceConfig) {
     let mut w = Watch::new(cfg.clone());
     let mut tick: u32 = 0;
     log::info!(
-        "presence watch on for {} (mode {}, tick {}s, away after {}s, obscured face lock {})",
+        "presence watch on for {} (mode {}, tick {}s, away {} (secure {}s), obscured face lock {})",
         cfg.user,
         cfg.mode.name(),
         tick_for(&cfg, cfg.mode, false),
-        cfg.away_seconds,
+        match cfg.away_seconds {
+            AwayTime::Seconds(s) => format!("after {}s", s),
+            AwayTime::Word(LockWord::Never) => "never".into(),
+        },
+        cfg.secure_away_seconds,
         match cfg.obscured_lock_for(cfg.mode) {
             Some(d) => format!("after {} min", d.as_secs() / 60),
             None => "never".into(),

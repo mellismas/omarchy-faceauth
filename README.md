@@ -69,8 +69,9 @@ One claim per bullet, each with where the code keeps it.
   back and attentive, when you press Ready to nod, or when your face unlocks
   the screen; a face that merely stays in view does not re-arm them. A
   screen lock under the card parks the request until the unlock; with the
-  walk-away lock on, walking away locks the session and the request resumes
-  when your face unlocks it. The daemon re-sends the card every minute, and
+  walk-away lock on, walking away for the away time of the mode in force
+  locks the session and the request resumes when your face unlocks it (with
+  the default mode's away time set to never, the request just waits). The daemon re-sends the card every minute, and
   a card the daemon has gone quiet on hides itself without answering.
   Requests queue one at a time; approvals, refusals and waiting requests
   post a notice (`auth::run_with_answers`, `auth::consent_round`).
@@ -132,12 +133,20 @@ One claim per bullet, each with where the code keeps it.
   two seconds before it counts as unseen. In the default mode any face turned
   to the screen holds the lock off, whoever it belongs to (a laptop handed
   to someone stays unlocked while they look at it), and the session locks
-  once nobody has been in front of it for the away time; identity is
-  checked on every third look only to report who is holding it. In secure
+  once nobody has been in front of it for the default mode's away time
+  (`away_seconds`, 20 seconds as shipped, or never, in which case the
+  default mode does not lock by time); identity is checked on every third
+  look only to report who is holding it. In secure
   mode identity is checked on every look and only the enrolled user's face
   holds the lock off: the first look that finds another face locks the
-  session at once, an empty chair locks after the away time, and no other
-  face holds the clock. Both modes make one allowance, the hidden face: a
+  session at once, an empty chair locks after the secure mode's own away
+  time (`secure_away_seconds`, 20 seconds as shipped), and no other face
+  holds the clock. The secure mode's away time is always a number of
+  seconds: secure mode promises that only a verified face keeps the session
+  open. Each mode reads its own away time, so a mode switch takes the other
+  time at once. `sudo faceauth presence away-time` changes the away times
+  without switching the walk-away lock on, and `presence on` keeps the
+  saved times unless it is given `--away-seconds`. Both modes make one allowance, the hidden face: a
   hand over the face, a head resting on a hand, leaning in to read or a
   look down at a phone reads as no face, a face turned away, a face the
   strobe cannot read, or a face that misses the match by a little, and it
@@ -267,6 +276,7 @@ faceauth auth [--user NAME] [--socket PATH] [--consent]
 faceauth probe [--user NAME]                   one short look: is a face there?
 faceauth templates delete [--user NAME]
 faceauth presence on|off [--user NAME] [--away-seconds N]
+faceauth presence away-time [--default never|SECONDS] [--secure SECONDS]
 faceauth presence mode [default|secure]        read or switch the walk-away mode until the next restart
 faceauth presence                              the watch's current state
 faceauth cam probe | cam graph | cam test | engine inspect|test|live | liveness capture | verify

@@ -1,28 +1,31 @@
 //! The config edits behind `faceauth presence`: the watch switched on or
-//! off and the obscured face lock times. Only the keys asked for change,
+//! off, the away times, and the obscured face lock times. Only the keys
+//! asked for change,
 //! the result is validated as the daemon would read it, and the file is
 //! replaced atomically, so the administrator's comments and other keys
 //! survive.
 
 use anyhow::{bail, Context, Result};
+use faceauth_daemon::presence::{AwayTime, PresenceConfig};
 
-/// The config text with the presence watch switched: `on` sets the user
-/// and the away time (and a lock command if none is set), `off` sets only
-/// `enabled`, so the administrator's other keys and every comment stay as
-/// they are. The result is parsed and validated as the daemon would parse
-/// it before anything is written, so a value the daemon would refuse to
-/// start on (a zero or negative away time) is refused here instead (E3).
-/// The away time for `presence on`: the flag's value, or without it the
-/// one the config already has (20 s when it has none).
-pub(super) fn away_for(arg: Option<&str>, text: &str, origin: &str) -> Result<f32> {
-    match arg {
-        Some(a) => a
-            .parse()
-            .with_context(|| format!("--away-seconds {}: not a number", a)),
-        None => Ok(faceauth_daemon::config::Config::from_text(text, origin)
-            .map(|c| c.presence.away_seconds)
-            .unwrap_or(20.0)),
-    }
+/// The `--away-seconds` value for `presence on`, if one was given. Without
+/// it `on` writes no away time, so the saved ones ("never" included) stay.
+pub(super) fn away_flag(arg: Option<&str>) -> Result<Option<f32>> {
+    arg.map(|a| {
+        a.parse()
+            .with_context(|| format!("--away-seconds {}: not a number", a))
+    })
+    .transpose()
+}
+
+/// The away times, as the `presence on` and `presence away-time` messages
+/// report them.
+pub(super) fn away_summary(p: &PresenceConfig) -> String {
+    let default = match p.away_seconds {
+        AwayTime::Seconds(s) => format!("after {} s", s),
+        AwayTime::Word(_) => "never".into(),
+    };
+    format!("away {}, secure {} s", default, p.secure_away_seconds)
 }
 
 /// The obscured face lock time keys from `presence obscured-lock`, checked
@@ -61,10 +64,50 @@ pub(super) fn obscured_keys(
     Ok(keys)
 }
 
-/// The config text with the obscured face lock times set and nothing else:
-/// `enabled`, the user and the away time stay as they are, so saving a time
-/// never switches the walk-away lock on. Validated as the daemon parses it.
-pub(super) fn obscured_edit(text: &str, origin: &str, keys: &[(&str, String)]) -> Result<String> {
+/// The away time keys from `presence away-time`, checked as the daemon reads
+/// them: `--default never` or a number of seconds above 0, `--secure` a
+/// number of seconds above 0. The secure mode has no "never": it promises
+/// that only a verified face keeps the session open. Written as the file
+/// already writes seconds (`30.0`), so the menu's checks read them back.
+pub(super) fn away_keys(
+    default: Option<&str>,
+    secure: Option<&str>,
+) -> Result<Vec<(&'static str, String)>> {
+    let seconds = |v: &str| -> Option<String> {
+        let s: f64 = v.parse().ok()?;
+        (s > 0.0 && (s as f32).is_finite()).then(|| format!("{:?}", s))
+    };
+    let mut keys = Vec::new();
+    if let Some(d) = default {
+        if d == "never" {
+            keys.push(("away_seconds", "\"never\"".to_string()));
+        } else {
+            match seconds(d) {
+                Some(s) => keys.push(("away_seconds", s)),
+                None => bail!("--default {}: \"never\" or a number of seconds above 0", d),
+            }
+        }
+    }
+    if let Some(v) = secure {
+        match seconds(v) {
+            Some(s) => keys.push(("secure_away_seconds", s)),
+            None => bail!(
+                "--secure {}: a number of seconds above 0 (the secure mode has no \"never\")",
+                v
+            ),
+        }
+    }
+    if keys.is_empty() {
+        bail!("give --default never|SECONDS, --secure SECONDS, or both");
+    }
+    Ok(keys)
+}
+
+/// The config text with lock times set and nothing else, the obscured face
+/// lock times or the away times: `enabled` and the user stay as they are, so
+/// saving a time never switches the walk-away lock on or off. Validated as
+/// the daemon parses it.
+pub(super) fn lock_time_edit(text: &str, origin: &str, keys: &[(&str, String)]) -> Result<String> {
     let edited = set_presence_keys(text, keys);
     let before = faceauth_daemon::config::Config::from_text(text, origin).ok();
     let cfg = faceauth_daemon::config::Config::from_text(&edited, origin).with_context(|| {
@@ -81,23 +124,34 @@ pub(super) fn obscured_edit(text: &str, origin: &str, keys: &[(&str, String)]) -
     Ok(edited)
 }
 
+/// The config text with the presence watch switched: `on` sets the user,
+/// and the default mode's away time only when `--away-seconds` gave one;
+/// `off` sets only `enabled`. The administrator's other keys, the saved
+/// away times and every comment stay as they are. The result is parsed and
+/// validated as the daemon would parse it before anything is written, so a
+/// value the daemon would refuse to start on (a zero or negative away time)
+/// is refused here instead (E3).
 pub(super) fn presence_edit(
     text: &str,
     origin: &str,
     on: bool,
     user: &str,
-    away: f32,
+    away: Option<f32>,
 ) -> Result<String> {
-    if on && (!away.is_finite() || away <= 0.0) {
-        bail!(
-            "--away-seconds {}: the away time must be a positive number of seconds",
-            away
-        );
+    if let (true, Some(away)) = (on, away) {
+        if !away.is_finite() || away <= 0.0 {
+            bail!(
+                "--away-seconds {}: the away time must be a positive number of seconds",
+                away
+            );
+        }
     }
     let mut keys: Vec<(&str, String)> = vec![("enabled", on.to_string())];
     if on {
         keys.push(("user", toml::Value::String(user.to_string()).to_string()));
-        keys.push(("away_seconds", format!("{:?}", away as f64)));
+        if let Some(away) = away {
+            keys.push(("away_seconds", format!("{:?}", away as f64)));
+        }
     }
     let edited = set_presence_keys(text, &keys);
     let cfg = faceauth_daemon::config::Config::from_text(&edited, origin).with_context(|| {
@@ -106,8 +160,10 @@ pub(super) fn presence_edit(
             origin
         )
     })?;
+    let away_took =
+        |a: f32| matches!(cfg.presence.away_seconds, AwayTime::Seconds(s) if (s - a).abs() < 1e-3);
     let took = cfg.presence.enabled == on
-        && (!on || (cfg.presence.user == user && (cfg.presence.away_seconds - away).abs() < 1e-3));
+        && (!on || (cfg.presence.user == user && away.map(away_took).unwrap_or(true)));
     if !took {
         bail!(
             "the [presence] keys in {} did not take the new values (set elsewhere in the file?); nothing was written",
@@ -255,14 +311,98 @@ mod arg_tests {
 
     /// J27: the exit status follows the daemon's answer for every scripted
     /// subcommand.
-    /// A command that sets only the hold keeps the configured away time.
+    /// `presence on` writes an away time only when `--away-seconds` gives
+    /// one: without it the saved times stay, a default of "never" included,
+    /// which is what the menu's Enable row relies on.
     #[test]
     fn the_away_time_stays_unless_given() {
-        let text = "[presence]\nenabled = true\nuser = \"mike\"\naway_seconds = 45.0\n";
-        assert_eq!(away_for(None, text, "test").unwrap(), 45.0);
-        assert_eq!(away_for(Some("30"), text, "test").unwrap(), 30.0);
-        assert_eq!(away_for(None, "", "test").unwrap(), 20.0);
-        assert!(away_for(Some("soon"), text, "test").is_err());
+        assert_eq!(away_flag(None).unwrap(), None);
+        assert_eq!(away_flag(Some("30")).unwrap(), Some(30.0));
+        assert!(away_flag(Some("soon")).is_err());
+        let off = "[presence]\nenabled = false\nuser = \"mike\"\naway_seconds = \"never\"\nsecure_away_seconds = 45.0\n";
+        let on = presence_edit(off, "test", true, "mike", None).unwrap();
+        assert_eq!(on, off.replace("enabled = false", "enabled = true"));
+        let cfg = faceauth_daemon::config::Config::from_text(&on, "test").unwrap();
+        assert!(cfg.presence.enabled);
+        assert_eq!(
+            cfg.presence.away_seconds,
+            AwayTime::Word(faceauth_daemon::presence::LockWord::Never)
+        );
+        assert_eq!(cfg.presence.secure_away_seconds, 45.0);
+        let on = presence_edit(off, "test", true, "mike", Some(30.0)).unwrap();
+        assert!(on.contains("\naway_seconds = 30.0\n"), "{}", on);
+        assert!(on.contains("\nsecure_away_seconds = 45.0\n"), "{}", on);
+    }
+
+    /// The away time flags take what the daemon reads and nothing else: the
+    /// default mode a number of seconds or "never", the secure mode seconds
+    /// only. Saving them writes only their keys, in the forms the menu's
+    /// checks read back, and never switches the walk-away lock on or off.
+    #[test]
+    fn away_times_save_only_their_keys_without_switching_the_lock() {
+        assert!(away_keys(None, None).is_err());
+        assert_eq!(
+            away_keys(Some("never"), Some("30")).unwrap(),
+            vec![
+                ("away_seconds", "\"never\"".to_string()),
+                ("secure_away_seconds", "30.0".to_string())
+            ]
+        );
+        assert_eq!(
+            away_keys(Some("60"), None).unwrap(),
+            vec![("away_seconds", "60.0".to_string())]
+        );
+        assert_eq!(
+            away_keys(None, Some("20")).unwrap(),
+            vec![("secure_away_seconds", "20.0".to_string())]
+        );
+        for bad in ["0", "-5", "soon", "NaN", "inf", "1e300", "Never", ""] {
+            assert!(away_keys(Some(bad), None).is_err(), "--default {:?}", bad);
+        }
+        for bad in ["never", "0", "-20", "soon", "NaN", "inf"] {
+            assert!(away_keys(None, Some(bad)).is_err(), "--secure {:?}", bad);
+        }
+        for enabled in ["false", "true"] {
+            let text = format!(
+                "[presence]\nenabled = {}\nuser = \"mike\"\naway_seconds = 45.0 # mine\nobscured_face_lock = 30\n",
+                enabled
+            );
+            let out =
+                lock_time_edit(&text, "test", &away_keys(Some("30"), Some("60")).unwrap()).unwrap();
+            assert_eq!(
+                out,
+                text.replace("away_seconds = 45.0 # mine", "away_seconds = 30.0 # mine")
+                    + "secure_away_seconds = 60.0\n",
+                "only the away keys change"
+            );
+            let cfg = faceauth_daemon::config::Config::from_text(&out, "test").unwrap();
+            assert_eq!(cfg.presence.enabled, enabled == "true");
+            assert_eq!(cfg.presence.away_seconds, AwayTime::Seconds(30.0));
+            assert_eq!(cfg.presence.secure_away_seconds, 60.0);
+            let out =
+                lock_time_edit(&text, "test", &away_keys(Some("never"), None).unwrap()).unwrap();
+            assert!(
+                out.contains("\naway_seconds = \"never\" # mine\n"),
+                "{}",
+                out
+            );
+            let cfg = faceauth_daemon::config::Config::from_text(&out, "test").unwrap();
+            assert_eq!(cfg.presence.enabled, enabled == "true");
+            assert_eq!(cfg.presence.secure_away_seconds, 20.0);
+        }
+        let out =
+            lock_time_edit("", "test", &away_keys(Some("never"), Some("30")).unwrap()).unwrap();
+        assert_eq!(
+            out,
+            "[presence]\naway_seconds = \"never\"\nsecure_away_seconds = 30.0\n"
+        );
+        let cfg = faceauth_daemon::config::Config::from_text(&out, "test").unwrap();
+        assert!(!cfg.presence.enabled, "saving a time leaves the lock off");
+        assert_eq!(
+            cfg.presence
+                .away_for(faceauth_daemon::presence::PresenceMode::Default),
+            None
+        );
     }
 
     /// The lock time flags take what the menu and setup offer and nothing
@@ -287,16 +427,16 @@ mod arg_tests {
         assert!(obscured_keys(None, Some("0")).is_err());
         let off = "[presence]\nenabled = false\nuser = \"mike\"\naway_seconds = 45.0\n";
         let out =
-            obscured_edit(off, "test", &obscured_keys(Some("30"), Some("5")).unwrap()).unwrap();
+            lock_time_edit(off, "test", &obscured_keys(Some("30"), Some("5")).unwrap()).unwrap();
         let cfg = faceauth_daemon::config::Config::from_text(&out, "test").unwrap();
         assert!(!cfg.presence.enabled, "saving a time leaves the lock off");
-        assert_eq!(cfg.presence.away_seconds, 45.0);
+        assert_eq!(cfg.presence.away_seconds, AwayTime::Seconds(45.0));
         assert_eq!(
             cfg.presence.obscured_face_lock,
             faceauth_daemon::presence::ObscuredFaceLock::Minutes(30)
         );
         assert_eq!(cfg.presence.secure_obscured_face_lock, 5);
-        let out = obscured_edit("", "test", &obscured_keys(Some("never"), None).unwrap()).unwrap();
+        let out = lock_time_edit("", "test", &obscured_keys(Some("never"), None).unwrap()).unwrap();
         let cfg = faceauth_daemon::config::Config::from_text(&out, "test").unwrap();
         assert!(!cfg.presence.enabled);
         assert_eq!(
@@ -309,7 +449,7 @@ mod arg_tests {
 
 #[cfg(test)]
 mod presence_edit_tests {
-    use super::{presence_edit, set_presence_keys, toml_content};
+    use super::{presence_edit, set_presence_keys, toml_content, AwayTime};
 
     const SHIPPED: &str = include_str!("../../packaging/config.toml");
 
@@ -318,17 +458,17 @@ mod presence_edit_tests {
     #[test]
     fn a_zero_or_negative_away_time_is_refused_before_any_write() {
         for away in [0.0f32, -5.0, f32::NAN, f32::INFINITY] {
-            let r = presence_edit(SHIPPED, "test", true, "mike", away);
+            let r = presence_edit(SHIPPED, "test", true, "mike", Some(away));
             assert!(r.is_err(), "away {} accepted", away);
         }
-        assert!(presence_edit(SHIPPED, "test", true, "mike", 20.0).is_ok());
+        assert!(presence_edit(SHIPPED, "test", true, "mike", Some(20.0)).is_ok());
     }
 
     /// E3: the shipped, commented config keeps every comment and every
     /// other key; only the three presence keys change.
     #[test]
     fn a_commented_config_keeps_its_comments() {
-        let out = presence_edit(SHIPPED, "test", true, "mike", 30.0).unwrap();
+        let out = presence_edit(SHIPPED, "test", true, "mike", Some(30.0)).unwrap();
         for line in SHIPPED.lines() {
             let comment = line.find('#').map(|i| &line[i..]);
             if let Some(c) = comment {
@@ -350,18 +490,36 @@ mod presence_edit_tests {
         let cfg = faceauth_daemon::config::Config::from_text(&out, "test").unwrap();
         assert!(cfg.presence.enabled);
         assert_eq!(cfg.presence.user, "mike");
-        assert_eq!(cfg.presence.away_seconds, 30.0);
+        assert_eq!(cfg.presence.away_seconds, AwayTime::Seconds(30.0));
+    }
+
+    /// `on` without `--away-seconds` writes only `enabled` and the user: the
+    /// shipped file's away times stay commented out, at their defaults.
+    #[test]
+    fn on_without_a_flag_writes_no_away_time() {
+        let out = presence_edit(SHIPPED, "test", true, "mike", None).unwrap();
+        assert!(
+            !out.lines()
+                .any(|l| l.starts_with("away_seconds") || l.starts_with("secure_away_seconds")),
+            "{}",
+            out
+        );
+        assert_eq!(out.lines().count(), SHIPPED.lines().count());
+        let cfg = faceauth_daemon::config::Config::from_text(&out, "test").unwrap();
+        assert!(cfg.presence.enabled);
+        assert_eq!(cfg.presence.away_seconds, AwayTime::Seconds(20.0));
+        assert_eq!(cfg.presence.secure_away_seconds, 20.0);
     }
 
     /// E3: `off` sets only `enabled`; the user and the away time stay.
     #[test]
     fn off_sets_only_enabled() {
-        let on = presence_edit(SHIPPED, "test", true, "mike", 45.0).unwrap();
-        let off = presence_edit(&on, "test", false, "somebody-else", 5.0).unwrap();
+        let on = presence_edit(SHIPPED, "test", true, "mike", Some(45.0)).unwrap();
+        let off = presence_edit(&on, "test", false, "somebody-else", Some(5.0)).unwrap();
         let cfg = faceauth_daemon::config::Config::from_text(&off, "test").unwrap();
         assert!(!cfg.presence.enabled);
         assert_eq!(cfg.presence.user, "mike");
-        assert_eq!(cfg.presence.away_seconds, 45.0);
+        assert_eq!(cfg.presence.away_seconds, AwayTime::Seconds(45.0));
         assert_eq!(off.replace("enabled = false", "enabled = true"), on);
     }
 
@@ -369,7 +527,7 @@ mod presence_edit_tests {
     /// keeps the new keys inside it.
     #[test]
     fn missing_keys_and_tables_are_added_in_place() {
-        let out = presence_edit("", "test", true, "mike", 20.0).unwrap();
+        let out = presence_edit("", "test", true, "mike", None).unwrap();
         let cfg = faceauth_daemon::config::Config::from_text(&out, "test").unwrap();
         assert!(cfg.presence.enabled);
         assert_eq!(cfg.presence.user, "mike");

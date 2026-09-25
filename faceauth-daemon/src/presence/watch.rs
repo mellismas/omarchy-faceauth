@@ -205,7 +205,8 @@ impl Watch {
         {
             log::info!("presence: nobody holds the clock this look (face {}, identity {:?}, frame {}, last full sighting {})", obs.face, obs.identity, obs.frame.is_some(), self.last_full.map(|t| format!("{:.0}s ago", now.duration_since(t).as_secs_f32())).unwrap_or_else(|| "never".into()));
         }
-        let away_for = self.last_seen.map(|t| now.duration_since(t).as_secs_f32());
+        let unseen = self.last_seen.map(|t| now.duration_since(t));
+        let away_for = unseen.map(|d| d.as_secs_f32());
         // A face holding the clock whose check failed is reported as a
         // stranger (default mode only; the secure mode has locked by now),
         // so the shell can say who is keeping the session open.
@@ -217,7 +218,13 @@ impl Watch {
             } else {
                 State::Stranger
             }
-        } else if away_for.map(|s| s >= cfg.away_seconds).unwrap_or(false) {
+        } else if unseen
+            .zip(cfg.away_for(mode))
+            .map(|(u, limit)| u >= limit)
+            .unwrap_or(false)
+        {
+            // The away time of the mode in force. The default mode set to
+            // "never" has none: an empty chair there never goes away by time.
             State::Away
         } else if held_by_shape {
             self.state // the user, face hidden: what the shell shows stays
@@ -307,6 +314,7 @@ pub fn partial_holds(now: Instant, last_full: Option<Instant>, limit: Option<Dur
 #[cfg(test)]
 mod watch_tests {
     use super::*;
+    use crate::presence::{AwayTime, LockWord};
 
     /// The live cadence, as `run` computes it: the user passes identity
     /// checks for three ticks and leaves; from tick 4 on a stranger (an
@@ -379,27 +387,104 @@ mod watch_tests {
         assert_eq!(live_cadence(PresenceMode::Default, true, 10.0), None);
     }
 
-    /// An empty chair locks after away_seconds in both modes, from the
-    /// user's last sighting: with the live cadence that is the away time to
-    /// the second, on mains and on battery.
+    /// An empty chair locks after the away time of the mode in force, from
+    /// the user's last sighting: `away_seconds` in the default mode and
+    /// `secure_away_seconds` in the secure mode. With the live cadence that
+    /// is the away time to the second, on mains and on battery.
     #[test]
-    fn an_empty_chair_locks_after_away_seconds_in_both_modes() {
-        for mode in [PresenceMode::Default, PresenceMode::Secure] {
-            let mut w = Watch::new(cfg());
+    fn an_empty_chair_locks_after_each_modes_away_time() {
+        for (mode, lock_tick) in [(PresenceMode::Default, 5), (PresenceMode::Secure, 7)] {
+            let mut w = Watch::new(PresenceConfig {
+                secure_away_seconds: 30.0,
+                ..cfg()
+            });
             let t0 = Instant::now();
             let mut looks = vec![obs(true, Some(true))];
-            looks.extend((0..8).map(|_| obs(false, None)));
-            // Seen at tick 1 (5 s); the clock runs out at 25 s, tick 5.
+            looks.extend((0..10).map(|_| obs(false, None)));
+            // Seen at tick 1 (5 s); the default clock (20 s) runs out at
+            // 25 s, tick 5, and the secure one (30 s) at 35 s, tick 7.
             assert_eq!(
                 first_lock(&mut w, t0, &looks, mode),
-                Some(5),
-                "{:?}: an empty chair locks at away_seconds",
+                Some(lock_tick),
+                "{:?}: an empty chair locks at its mode's away time",
                 mode
             );
             assert_eq!(w.state, State::Away);
             assert_eq!(live_cadence(mode, false, 5.0), Some(20.0), "{:?}", mode);
             assert_eq!(live_cadence(mode, false, 10.0), Some(20.0), "{:?}", mode);
         }
+    }
+
+    /// Mike, 2026-09-25: the default mode's away time may be "never". An
+    /// empty chair then never locks, however long it stays empty; the
+    /// secure mode, which has no "never", still locks it on its own time.
+    #[test]
+    fn default_mode_set_to_never_leaves_an_empty_chair_unlocked() {
+        let never = PresenceConfig {
+            away_seconds: AwayTime::Word(LockWord::Never),
+            ..cfg()
+        };
+        let t0 = Instant::now();
+        let mut looks = vec![obs(true, Some(true))];
+        looks.extend((0..2000).map(|_| obs(false, None)));
+        let mut w = Watch::new(never.clone());
+        assert_eq!(
+            first_lock(&mut w, t0, &looks, PresenceMode::Default),
+            None,
+            "default, never: nearly three hours of an empty chair and no lock"
+        );
+        assert_ne!(w.state, State::Away);
+        assert!(!w.locked_by_presence);
+        let mut w = Watch::new(never);
+        assert_eq!(
+            first_lock(&mut w, t0, &looks, PresenceMode::Secure),
+            Some(5),
+            "secure: the empty chair locks at secure_away_seconds"
+        );
+    }
+
+    /// The away time is read for the mode in force on every tick, so a
+    /// switch at run time takes the other mode's time at once, measured
+    /// from the same last sighting.
+    #[test]
+    fn a_mode_switch_at_run_time_takes_the_other_away_time() {
+        let t0 = Instant::now();
+        let at = |tick: u64| t0 + Duration::from_secs(5 * tick);
+        // Default 60 s, secure 20 s: unseen for 20 s is not away in the
+        // default mode, and the switch to secure locks on the next tick.
+        let mut w = Watch::new(PresenceConfig {
+            away_seconds: AwayTime::Seconds(60.0),
+            secure_away_seconds: 20.0,
+            ..cfg()
+        });
+        assert!(
+            !w.step(&obs(true, Some(true)), at(1), PresenceMode::Default)
+                .lock
+        );
+        for tick in 2..=5 {
+            let step = w.step(&obs(false, None), at(tick), PresenceMode::Default);
+            assert!(!step.lock, "default, tick {}", tick);
+        }
+        assert!(w.step(&obs(false, None), at(6), PresenceMode::Secure).lock);
+        // Default "never": no lock for as long as the default mode is in
+        // force; switched to secure, a chair empty past the secure time
+        // locks at once.
+        let mut w = Watch::new(PresenceConfig {
+            away_seconds: AwayTime::Word(LockWord::Never),
+            ..cfg()
+        });
+        assert!(
+            !w.step(&obs(true, Some(true)), at(1), PresenceMode::Default)
+                .lock
+        );
+        for tick in 2..=100 {
+            let step = w.step(&obs(false, None), at(tick), PresenceMode::Default);
+            assert!(!step.lock, "default, never, tick {}", tick);
+        }
+        assert!(
+            w.step(&obs(false, None), at(101), PresenceMode::Secure)
+                .lock
+        );
     }
 
     /// The secure mode identifies on every tick; the default mode on its

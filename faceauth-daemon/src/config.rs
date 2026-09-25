@@ -142,8 +142,12 @@ impl Config {
             bail!("consent_scan_seconds and consent_seconds must be positive");
         }
         let pr = &self.presence;
-        if !positive(pr.tick_seconds) || !positive(pr.away_seconds) {
-            bail!("[presence] tick_seconds and away_seconds must be positive");
+        let away_ok = match pr.away_seconds {
+            crate::presence::AwayTime::Seconds(s) => positive(s),
+            crate::presence::AwayTime::Word(_) => true,
+        };
+        if !positive(pr.tick_seconds) || !away_ok || !positive(pr.secure_away_seconds) {
+            bail!("[presence] tick_seconds, away_seconds and secure_away_seconds must be positive (away_seconds may also be \"never\")");
         }
         if pr.enabled && pr.user.is_empty() {
             bail!("[presence] enabled = true needs a user");
@@ -314,6 +318,8 @@ mod tests {
             "accept_threshold = 1.5",
             "min_detection = 0",
             "[presence]\naway_seconds = 0",
+            "[presence]\naway_seconds = -1.0",
+            "[presence]\nsecure_away_seconds = 0",
             "[presence]\nenabled = true\nuser = \"\"",
         ] {
             let e = Config::from_text(bad, "test")
@@ -333,6 +339,7 @@ mod tests {
             "accept_threshold = 1.0",
             "[presence]\nmode = \"secure\"",
             "[presence]\nmode = \"default\"",
+            "[presence]\naway_seconds = \"never\"\nsecure_away_seconds = 30.0",
             // Keys the daemon no longer has (the lock command and the
             // state file, H16 and H17; the fixed paths, the gate switch,
             // the nod count and the watch's tuning knobs, H15): a config
