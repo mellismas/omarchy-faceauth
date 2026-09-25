@@ -142,9 +142,11 @@ One claim per bullet, each with where the code keeps it.
   look down at a phone reads as no face, a face turned away, a face the
   strobe cannot read, or a face that misses the match by a little, and it
   holds the clock while the shape in the chair under it is unchanged. How
-  long it holds is a setting: in the default mode there is no limit as
-  shipped (`hidden_hold = "none"`, or minutes), in secure mode two minutes
-  (`secure_hidden_hold`, 1 to 10). Only a face turned to the screen that
+  long it holds is the obscured face lock time, a setting per mode: never as
+  shipped in the default mode (`obscured_face_lock = "never"`, or minutes),
+  two minutes in secure mode (`secure_obscured_face_lock`, 1 to 10). Setup
+  asks for both, and `sudo faceauth presence obscured-lock` changes them
+  without switching the walk-away lock on. Only a face turned to the screen that
   misses by a wide margin is someone else, and in secure mode it locks at
   once. A print that fails the gate is not the user in either mode.
   Switch modes from the bar's walk-away widget or with Super+Alt+L; the

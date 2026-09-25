@@ -370,8 +370,9 @@ away, a face the strobe read no signal from, or a failed check within
 `NEAR_MISS_SLACK` 0.25 of the threshold, which is what a hand on the chin,
 leaning in or a look down at a phone gives the mesh and the embedder), the torso under the last full sighting is
 compared by normalised cross-correlation, and `SAME_SHAPE` 0.60 holds the
-away clock for `hidden_hold` (default mode, no limit as shipped) or
-`secure_hidden_hold` (secure mode, 2 minutes, clamped to 1 to 10) and stays the secure mode's
+away clock for the obscured face lock time: `obscured_face_lock` (default
+mode, "never" as shipped) or `secure_obscured_face_lock` (secure mode, 2
+minutes, clamped to 1 to 10) and stays the secure mode's
 first-miss lock. Measured: a hand over part of the face 1.00, a
 sheet over it 0.95, the face fully covered 0.79, the chair empty -0.34.
 

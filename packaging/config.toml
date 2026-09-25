@@ -38,5 +38,5 @@ user = ""                     # whose templates define "present"
 # tick_seconds = 5.0          # the secure mode's tick; the default mode looks every 10 s at the most often; one short look per tick (about 0.45 s of camera; longer on a tick that also strobes for identity and liveness; in the default mode every third tick); 10 s on battery
 # battery_tick_seconds = 10.0 # the tick on battery (0 keeps the mains tick)
 # away_seconds = 20.0         # unseen for this long -> lock the session
-# hidden_hold = "none"        # default mode: how long a hidden face (hand on the chin, a look down) holds the lock off since the last clear sighting, while the same shape is in the chair; "none" = until the chair changes (a coat on the chair can hold it too), or minutes, 1 or more
-# secure_hidden_hold = 2      # secure mode: the same in minutes, 1 to 10 (clamped); after it an unverified face counts as gone
+# obscured_face_lock = "never"  # default mode, the obscured face lock time: how long a face that is partly covered or turned away (hand on the chin, a look down) keeps the session open since the last clear sighting, while the same shape is in the chair; "never" = until the chair changes (a coat on the chair can hold it too), or minutes, 1 or more; `faceauth presence obscured-lock --default` sets it
+# secure_obscured_face_lock = 2 # secure mode: the same in minutes, 1 to 10 (clamped); after it an unverified face counts as gone; `--secure` sets it

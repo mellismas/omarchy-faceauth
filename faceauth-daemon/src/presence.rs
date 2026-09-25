@@ -26,9 +26,9 @@
 //! transition). In the default mode a face the detector only half sees (a
 //! hand over the chin while reading) is not absence: while no face is found,
 //! the away clock is held after the last full sighting while the shape
-//! under the last face box is unchanged, for `hidden_hold` (no limit as
-//! shipped) in the default mode and `secure_hidden_hold` (2 minutes) in the
-//! secure mode. The state
+//! under the last face box is unchanged, for the obscured face lock time:
+//! `obscured_face_lock` ("never" as shipped) in the default mode and
+//! `secure_obscured_face_lock` (2 minutes) in the secure mode. The state
 //! is answered over the socket (the `presence_mode` query) to root and the
 //! watched user.
 
@@ -55,69 +55,69 @@ pub struct PresenceConfig {
     pub battery_tick_seconds: f32,
     /// Seconds without the user before the session is locked.
     pub away_seconds: f32,
-    /// Default mode: how long a hidden face (a hand on the chin, a look
-    /// down, the same shape in the chair) holds the lock off since the last
-    /// clear sighting. "none", the shipped value, holds until the chair
-    /// changes; a number is minutes, at least 1.
-    pub hidden_hold: HiddenHold,
+    /// Default mode: the obscured face lock time, how long a face that is
+    /// partly covered or turned away (a hand on the chin, a look down) keeps
+    /// the session open after the last clear sighting while the same shape
+    /// stays in the chair. "never", the shipped value, locks only when the
+    /// chair changes; a number is minutes, at least 1.
+    pub obscured_face_lock: ObscuredFaceLock,
     /// Secure mode: the same, in minutes, 1 to 10. Secure mode promises that
-    /// only a verified face keeps the session open, so the unverified hold
-    /// is bounded.
-    pub secure_hidden_hold: u32,
+    /// only a verified face keeps the session open, so this is bounded.
+    pub secure_obscured_face_lock: u32,
 }
 
-/// The default mode's hidden-face hold: a number of minutes, or the word
-/// "none" for no limit.
+/// The default mode's obscured face lock time: a number of minutes, or the
+/// word "never".
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum HiddenHold {
+pub enum ObscuredFaceLock {
     Minutes(u32),
-    Word(HoldWord),
+    Word(LockWord),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum HoldWord {
-    None,
+pub enum LockWord {
+    Never,
 }
 
-/// Secure mode's hidden-face hold, in minutes: the shipped value and the
+/// Secure mode's obscured face lock time, in minutes: the shipped value and the
 /// range a config may set (outside it the value is clamped, with a warning).
-pub const SECURE_HIDDEN_HOLD_MINUTES: u32 = 2;
-pub const SECURE_HIDDEN_HOLD_RANGE: (u32, u32) = (1, 10);
+pub const SECURE_OBSCURED_LOCK_MINUTES: u32 = 2;
+pub const SECURE_OBSCURED_LOCK_RANGE: (u32, u32) = (1, 10);
 
 impl PresenceConfig {
-    /// How long a hidden face holds the lock off in `mode`, from the last
-    /// clear sighting; None is no limit.
-    pub fn hidden_hold_for(&self, mode: PresenceMode) -> Option<Duration> {
+    /// The obscured face lock time in `mode`, from the last clear sighting;
+    /// None is never.
+    pub fn obscured_lock_for(&self, mode: PresenceMode) -> Option<Duration> {
         let minutes = |m: u32| Duration::from_secs(u64::from(m) * 60);
         match mode {
             PresenceMode::Secure => Some(minutes(
-                self.secure_hidden_hold
-                    .clamp(SECURE_HIDDEN_HOLD_RANGE.0, SECURE_HIDDEN_HOLD_RANGE.1),
+                self.secure_obscured_face_lock
+                    .clamp(SECURE_OBSCURED_LOCK_RANGE.0, SECURE_OBSCURED_LOCK_RANGE.1),
             )),
-            PresenceMode::Default => match self.hidden_hold {
-                HiddenHold::Word(HoldWord::None) => None,
-                HiddenHold::Minutes(m) => Some(minutes(m.max(1))),
+            PresenceMode::Default => match self.obscured_face_lock {
+                ObscuredFaceLock::Word(LockWord::Never) => None,
+                ObscuredFaceLock::Minutes(m) => Some(minutes(m.max(1))),
             },
         }
     }
 
-    /// Warnings for hold values the watch clamps, for the start-up log.
-    pub fn hold_warnings(&self) -> Vec<String> {
+    /// Warnings for lock times the watch clamps, for the start-up log.
+    pub fn obscured_lock_warnings(&self) -> Vec<String> {
         let mut w = Vec::new();
-        let (lo, hi) = SECURE_HIDDEN_HOLD_RANGE;
-        if !(lo..=hi).contains(&self.secure_hidden_hold) {
+        let (lo, hi) = SECURE_OBSCURED_LOCK_RANGE;
+        if !(lo..=hi).contains(&self.secure_obscured_face_lock) {
             w.push(format!(
-                "secure_hidden_hold = {} is outside {} to {} minutes; using {}",
-                self.secure_hidden_hold,
+                "secure_obscured_face_lock = {} is outside {} to {} minutes; using {}",
+                self.secure_obscured_face_lock,
                 lo,
                 hi,
-                self.secure_hidden_hold.clamp(lo, hi)
+                self.secure_obscured_face_lock.clamp(lo, hi)
             ));
         }
-        if self.hidden_hold == HiddenHold::Minutes(0) {
-            w.push("hidden_hold = 0 is under 1 minute; using 1".into());
+        if self.obscured_face_lock == ObscuredFaceLock::Minutes(0) {
+            w.push("obscured_face_lock = 0 is under 1 minute; using 1".into());
         }
         w
     }
@@ -166,8 +166,8 @@ impl Default for PresenceConfig {
             tick_seconds: 5.0,
             battery_tick_seconds: 10.0,
             away_seconds: 20.0,
-            hidden_hold: HiddenHold::Word(HoldWord::None),
-            secure_hidden_hold: SECURE_HIDDEN_HOLD_MINUTES,
+            obscured_face_lock: ObscuredFaceLock::Word(LockWord::Never),
+            secure_obscured_face_lock: SECURE_OBSCURED_LOCK_MINUTES,
         }
     }
 }
@@ -494,7 +494,7 @@ impl Watch {
         let hidden = !stranger;
         let held_by_shape = if !seen
             && hidden
-            && partial_holds(now, self.last_full, cfg.hidden_hold_for(mode))
+            && partial_holds(now, self.last_full, cfg.obscured_lock_for(mode))
         {
             let sim = match (self.reference.as_ref(), obs.frame.as_ref()) {
                 (Some(r), Some(f)) => same_shape(r, f),
@@ -626,17 +626,17 @@ pub fn run(auth: Arc<Mutex<Authenticator>>, cfg: PresenceConfig) {
     let mut w = Watch::new(cfg.clone());
     let mut tick: u32 = 0;
     log::info!(
-        "presence watch on for {} (mode {}, tick {}s, away after {}s, hidden face held {})",
+        "presence watch on for {} (mode {}, tick {}s, away after {}s, obscured face lock {})",
         cfg.user,
         cfg.mode.name(),
         tick_for(&cfg, cfg.mode, false),
         cfg.away_seconds,
-        match cfg.hidden_hold_for(cfg.mode) {
-            Some(d) => format!("{} min", d.as_secs() / 60),
-            None => "without limit".into(),
+        match cfg.obscured_lock_for(cfg.mode) {
+            Some(d) => format!("after {} min", d.as_secs() / 60),
+            None => "never".into(),
         }
     );
-    for w in cfg.hold_warnings() {
+    for w in cfg.obscured_lock_warnings() {
         log::warn!("presence: {}", w);
     }
     let mut on_battery = false;
@@ -1874,40 +1874,40 @@ mod partial_tests {
         );
     }
 
-    /// Mike, 2026-09-24: the default mode ships with no limit, the secure
+    /// Mike, 2026-09-24: the default mode ships with "never", the secure
     /// mode with two minutes; secure is bounded 1 to 10 minutes, the default
-    /// takes "none" or minutes from 1.
+    /// takes "never" or minutes from 1.
     #[test]
-    fn hidden_hold_defaults_parse_and_clamp() {
+    fn obscured_face_lock_defaults_parse_and_clamp() {
         let c = PresenceConfig::default();
-        assert_eq!(c.hidden_hold_for(PresenceMode::Default), None);
+        assert_eq!(c.obscured_lock_for(PresenceMode::Default), None);
         assert_eq!(
-            c.hidden_hold_for(PresenceMode::Secure),
+            c.obscured_lock_for(PresenceMode::Secure),
             Some(Duration::from_secs(120))
         );
-        assert!(c.hold_warnings().is_empty());
+        assert!(c.obscured_lock_warnings().is_empty());
         let parse = |t: &str| -> PresenceConfig { toml::from_str(t).unwrap() };
-        let c = parse("hidden_hold = 30\nsecure_hidden_hold = 5");
+        let c = parse("obscured_face_lock = 30\nsecure_obscured_face_lock = 5");
         assert_eq!(
-            c.hidden_hold_for(PresenceMode::Default),
+            c.obscured_lock_for(PresenceMode::Default),
             Some(Duration::from_secs(1800))
         );
         assert_eq!(
-            c.hidden_hold_for(PresenceMode::Secure),
+            c.obscured_lock_for(PresenceMode::Secure),
             Some(Duration::from_secs(300))
         );
-        let c = parse("hidden_hold = \"none\"");
-        assert_eq!(c.hidden_hold_for(PresenceMode::Default), None);
-        let c = parse("hidden_hold = 0\nsecure_hidden_hold = 60");
+        let c = parse("obscured_face_lock = \"never\"");
+        assert_eq!(c.obscured_lock_for(PresenceMode::Default), None);
+        let c = parse("obscured_face_lock = 0\nsecure_obscured_face_lock = 60");
         assert_eq!(
-            c.hidden_hold_for(PresenceMode::Default),
+            c.obscured_lock_for(PresenceMode::Default),
             Some(Duration::from_secs(60))
         );
         assert_eq!(
-            c.hidden_hold_for(PresenceMode::Secure),
+            c.obscured_lock_for(PresenceMode::Secure),
             Some(Duration::from_secs(600))
         );
-        assert_eq!(c.hold_warnings().len(), 2);
-        assert!(toml::from_str::<PresenceConfig>("hidden_hold = \"forever\"").is_err());
+        assert_eq!(c.obscured_lock_warnings().len(), 2);
+        assert!(toml::from_str::<PresenceConfig>("obscured_face_lock = \"forever\"").is_err());
     }
 }
