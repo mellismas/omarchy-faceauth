@@ -105,6 +105,24 @@ impl Grey {
         v
     }
 
+    /// Mean pixel value inside `bbox` (`[x, y, w, h]`, clamped to the
+    /// frame); the whole-frame mean when the box misses the frame.
+    pub fn region_mean(&self, bbox: [f32; 4]) -> f64 {
+        let x0 = bbox[0].max(0.0) as usize;
+        let y0 = bbox[1].max(0.0) as usize;
+        let x1 = ((bbox[0] + bbox[2]).max(0.0) as usize).min(self.width);
+        let y1 = ((bbox[1] + bbox[3]).max(0.0) as usize).min(self.height);
+        if x1 <= x0 || y1 <= y0 {
+            return self.mean();
+        }
+        let mut sum: u64 = 0;
+        for y in y0..y1 {
+            let row = &self.data[y * self.width + x0..y * self.width + x1];
+            sum += row.iter().map(|&v| v as u64).sum::<u64>();
+        }
+        sum as f64 / ((x1 - x0) * (y1 - y0)) as f64
+    }
+
     /// Mean pixel value. The sum is taken in integers: a frame's total is
     /// far below 2^53, so this equals the floating-point running sum to the
     /// last bit and costs a fraction of it.
@@ -235,6 +253,26 @@ fn orient_u10<const TRANSPOSE: bool, const FLIP_X: bool>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The region mean follows the box, clamps it to the frame, and falls
+    /// back to the frame mean when the box misses the frame.
+    #[test]
+    fn region_mean_averages_the_box_only() {
+        let mut g = Grey::new(10, 10);
+        for y in 0..10 {
+            for x in 0..10 {
+                g.data[y * 10 + x] = if (2..6).contains(&x) && (3..7).contains(&y) {
+                    200
+                } else {
+                    0
+                };
+            }
+        }
+        assert_eq!(g.region_mean([2.0, 3.0, 4.0, 4.0]), 200.0);
+        assert_eq!(g.region_mean([2.0, 3.0, 8.0, 4.0]), 100.0);
+        assert_eq!(g.region_mean([-5.0, -5.0, 3.0, 3.0]), g.mean());
+        assert_eq!(g.region_mean([20.0, 20.0, 5.0, 5.0]), g.mean());
+    }
 
     #[test]
     fn orientation_matches_the_viewer_mapping() {

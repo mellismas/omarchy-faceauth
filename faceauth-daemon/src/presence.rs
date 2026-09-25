@@ -25,8 +25,10 @@
 //! secure mode a check failed; the session is locked once on the
 //! transition). In the default mode a face the detector only half sees (a
 //! hand over the chin while reading) is not absence: while no face is found,
-//! the away clock is held for up to `PARTIAL_GRACE_S` after the last full
-//! sighting when the shape under the last face box is unchanged. The state
+//! the away clock is held after the last full sighting while the shape
+//! under the last face box is unchanged, for `hidden_hold` (no limit as
+//! shipped) in the default mode and `secure_hidden_hold` (2 minutes) in the
+//! secure mode. The state
 //! is answered over the socket (the `presence_mode` query) to root and the
 //! watched user.
 
@@ -53,15 +55,101 @@ pub struct PresenceConfig {
     pub battery_tick_seconds: f32,
     /// Seconds without the user before the session is locked.
     pub away_seconds: f32,
+    /// Default mode: how long a hidden face (a hand on the chin, a look
+    /// down, the same shape in the chair) holds the lock off since the last
+    /// clear sighting. "none", the shipped value, holds until the chair
+    /// changes; a number is minutes, at least 1.
+    pub hidden_hold: HiddenHold,
+    /// Secure mode: the same, in minutes, 1 to 10. Secure mode promises that
+    /// only a verified face keeps the session open, so the unverified hold
+    /// is bounded.
+    pub secure_hidden_hold: u32,
+}
+
+/// The default mode's hidden-face hold: a number of minutes, or the word
+/// "none" for no limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum HiddenHold {
+    Minutes(u32),
+    Word(HoldWord),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HoldWord {
+    None,
+}
+
+/// Secure mode's hidden-face hold, in minutes: the shipped value and the
+/// range a config may set (outside it the value is clamped, with a warning).
+pub const SECURE_HIDDEN_HOLD_MINUTES: u32 = 2;
+pub const SECURE_HIDDEN_HOLD_RANGE: (u32, u32) = (1, 10);
+
+impl PresenceConfig {
+    /// How long a hidden face holds the lock off in `mode`, from the last
+    /// clear sighting; None is no limit.
+    pub fn hidden_hold_for(&self, mode: PresenceMode) -> Option<Duration> {
+        let minutes = |m: u32| Duration::from_secs(u64::from(m) * 60);
+        match mode {
+            PresenceMode::Secure => Some(minutes(
+                self.secure_hidden_hold
+                    .clamp(SECURE_HIDDEN_HOLD_RANGE.0, SECURE_HIDDEN_HOLD_RANGE.1),
+            )),
+            PresenceMode::Default => match self.hidden_hold {
+                HiddenHold::Word(HoldWord::None) => None,
+                HiddenHold::Minutes(m) => Some(minutes(m.max(1))),
+            },
+        }
+    }
+
+    /// Warnings for hold values the watch clamps, for the start-up log.
+    pub fn hold_warnings(&self) -> Vec<String> {
+        let mut w = Vec::new();
+        let (lo, hi) = SECURE_HIDDEN_HOLD_RANGE;
+        if !(lo..=hi).contains(&self.secure_hidden_hold) {
+            w.push(format!(
+                "secure_hidden_hold = {} is outside {} to {} minutes; using {}",
+                self.secure_hidden_hold,
+                lo,
+                hi,
+                self.secure_hidden_hold.clamp(lo, hi)
+            ));
+        }
+        if self.hidden_hold == HiddenHold::Minutes(0) {
+            w.push("hidden_hold = 0 is under 1 minute; using 1".into());
+        }
+        w
+    }
 }
 
 /// Ticks between identity checks in the default mode (detection alone
 /// runs every tick, on mains and on battery). The secure mode checks
 /// identity on every tick.
 pub const IDENTIFY_EVERY: u32 = 3;
+
+/// How long a look keeps trying to find the face when someone was there at
+/// the last look: a hand passing over the face (a scratch, a sip) or a turn
+/// away for a moment is not an empty chair, so the look waits it out instead
+/// of recording a miss. A look at an empty chair stops after the exposure
+/// settles, so the camera and the illuminator are not held for nobody.
+pub const LOOK_SEE_BUDGET: Duration = Duration::from_secs(2);
+
+/// The default mode's tick. Mike, 2026-09-24: secure mode looks every five
+/// seconds, the default mode less often; the default mode only needs to see
+/// that someone is there within the away time.
+pub const DEFAULT_MODE_TICK_SECONDS: f32 = 10.0;
+
+/// The longest a look spends settling the exposure on the face before its
+/// flash reading: a few frames usually, bounded because auto-exposure can
+/// hold where a metered face clips a few percent.
+pub const FACE_SETTLE_MAX: Duration = Duration::from_millis(500);
 /// Whether the watched user's store failed to load on the last check, so
 /// the warning is logged once per episode rather than every tick.
 static STORE_UNREADABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether the last look found the face beyond the line, so the note is
+/// logged once per episode.
+static BEYOND_LINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// A face turned to the screen: yaw within this on the five-point
 /// measure (the mesh's degrees convert through `YAW_DEG_PER_UNIT`) and
 /// roll within this many degrees. What "attentive" means everywhere a
@@ -78,6 +166,8 @@ impl Default for PresenceConfig {
             tick_seconds: 5.0,
             battery_tick_seconds: 10.0,
             away_seconds: 20.0,
+            hidden_hold: HiddenHold::Word(HoldWord::None),
+            secure_hidden_hold: SECURE_HIDDEN_HOLD_MINUTES,
         }
     }
 }
@@ -402,7 +492,10 @@ impl Watch {
         // at the session, and the shape under it holds nothing.
         let stranger = obs.face && obs.attentive && obs.identity == Some(false) && !obs.near_miss;
         let hidden = !stranger;
-        let held_by_shape = if !seen && hidden && partial_holds(now, self.last_full) {
+        let held_by_shape = if !seen
+            && hidden
+            && partial_holds(now, self.last_full, cfg.hidden_hold_for(mode))
+        {
             let sim = match (self.reference.as_ref(), obs.frame.as_ref()) {
                 (Some(r), Some(f)) => same_shape(r, f),
                 _ => 0.0,
@@ -512,25 +605,44 @@ pub(crate) fn identify_this_tick(mode: PresenceMode, tick: u32, every: u32, stat
         || (state != State::Present && tick.is_multiple_of(2))
 }
 
+/// Seconds between looks: the configured tick (the battery tick on
+/// battery), and in the default mode never under
+/// `DEFAULT_MODE_TICK_SECONDS`.
+pub fn tick_for(cfg: &PresenceConfig, mode: PresenceMode, on_battery: bool) -> f32 {
+    let base = if on_battery && cfg.battery_tick_seconds > 0.0 {
+        cfg.battery_tick_seconds
+    } else {
+        cfg.tick_seconds
+    };
+    if mode == PresenceMode::Default {
+        base.max(DEFAULT_MODE_TICK_SECONDS)
+    } else {
+        base
+    }
+}
+
 pub fn run(auth: Arc<Mutex<Authenticator>>, cfg: PresenceConfig) {
     set_presence_mode(cfg.mode);
     let mut w = Watch::new(cfg.clone());
     let mut tick: u32 = 0;
     log::info!(
-        "presence watch on for {} (mode {}, tick {}s, away after {}s)",
+        "presence watch on for {} (mode {}, tick {}s, away after {}s, hidden face held {})",
         cfg.user,
         cfg.mode.name(),
-        cfg.tick_seconds,
-        cfg.away_seconds
+        tick_for(&cfg, cfg.mode, false),
+        cfg.away_seconds,
+        match cfg.hidden_hold_for(cfg.mode) {
+            Some(d) => format!("{} min", d.as_secs() / 60),
+            None => "without limit".into(),
+        }
     );
+    for w in cfg.hold_warnings() {
+        log::warn!("presence: {}", w);
+    }
     let mut on_battery = false;
     let mut mode = presence_mode();
     loop {
-        let tick_s = if on_battery && cfg.battery_tick_seconds > 0.0 {
-            cfg.battery_tick_seconds
-        } else {
-            cfg.tick_seconds
-        };
+        let tick_s = tick_for(&cfg, mode, on_battery);
         std::thread::sleep(Duration::from_secs_f32(tick_s));
         tick = tick.wrapping_add(1);
         let battery = on_battery_now();
@@ -592,7 +704,14 @@ pub fn run(auth: Arc<Mutex<Authenticator>>, cfg: PresenceConfig) {
             if let Some(r) = recent {
                 w.note_recent(r);
             }
-            match observe_in(&mut a, &cfg, identify, mode == PresenceMode::Secure) {
+            let persist = matches!(w.state, State::Present | State::Stranger);
+            match observe_in(
+                &mut a,
+                &cfg,
+                identify,
+                mode == PresenceMode::Secure,
+                persist,
+            ) {
                 Ok(o) => o,
                 Err(e) => {
                     log::warn!("presence tick: {}", e);
@@ -719,6 +838,7 @@ pub(crate) fn observe_in(
     cfg: &PresenceConfig,
     identify: bool,
     strict: bool,
+    persist: bool,
 ) -> Result<Observation> {
     use crate::capture::IrCapture;
     let mut cap = IrCapture::open_at(&a.cfg, a.last_exposure)?;
@@ -733,7 +853,7 @@ pub(crate) fn observe_in(
             img = Some(g);
         }
     }
-    let Some(img) = img else {
+    let Some(mut img) = img else {
         cap.stop()?;
         return Ok(Observation {
             face: false,
@@ -744,7 +864,19 @@ pub(crate) fn observe_in(
             bbox: None,
         });
     };
-    let faces = a.pipeline.detector.detect(&img, a.cfg.min_detection)?;
+    let mut faces = a.pipeline.detector.detect(&img, a.cfg.min_detection)?;
+    // With someone there at the last look, keep looking for up to
+    // `LOOK_SEE_BUDGET` before calling it no face (a hand over the face for
+    // a moment is not an empty chair).
+    if persist && faces.is_empty() {
+        let until = Instant::now() + LOOK_SEE_BUDGET;
+        while faces.is_empty() && Instant::now() < until {
+            if let Some(g) = cap.next(Duration::from_millis(200))? {
+                faces = a.pipeline.detector.detect(&g, a.cfg.min_detection)?;
+                img = g;
+            }
+        }
+    }
     // The next look starts from where this one's exposure ended, face or
     // no face: a seed that saturates after the light changes is escaped one
     // step per look this way, where saving it only behind a found face left
@@ -777,6 +909,43 @@ pub(crate) fn observe_in(
         ),
         None => pose::is_attentive(&p, ATTENTIVE_MAX_YAW, ATTENTIVE_MAX_ROLL_DEG),
     };
+    // Beyond the line an unlock attempt would not judge, the look does not
+    // flash or check identity either: it cannot read the face there, and
+    // flashing at someone out of range every tick is what the user saw as
+    // being read over and over. The look still reports the face; the
+    // default mode holds on it, the secure mode treats it as hidden.
+    let near_enough = crate::auth::scannable(face.bbox[2], img.width, img.height);
+    if identify && !near_enough {
+        if !BEYOND_LINE.swap(true, Ordering::Relaxed) {
+            log::info!(
+                "presence: face {:.0} px wide, beyond the line; no flash and no identity check until it is nearer",
+                face.bbox[2]
+            );
+        }
+    } else if near_enough {
+        BEYOND_LINE.store(false, Ordering::Relaxed);
+    }
+    let identify = identify && near_enough;
+    if identify && cap.illuminator.is_some() {
+        // Settle the exposure on the face before the flash, as an unlock
+        // attempt does (C10). The look's exposure came from the whole frame,
+        // and a face near the screen then clips under the strobe: 20 to 23
+        // percent of the face blown out, read as no signal, measured live
+        // on 2026-09-24 at an ordinary seated distance. Bounded, since
+        // auto-exposure can hold where a face clips a few percent.
+        cap.meter_on(&face);
+        let until = Instant::now() + FACE_SETTLE_MAX;
+        let mut steps = 0;
+        while Instant::now() < until {
+            if cap.next(Duration::from_millis(200))?.is_some() {
+                steps += 1;
+                if steps >= 3 && cap.metering.clip < 0.05 {
+                    break;
+                }
+            }
+        }
+        a.last_exposure = Some(cap.exposure);
+    }
     let (identity, near_miss) = if identify {
         // Liveness first: one lit/unlit pair under the look's own mask,
         // with exposure frozen for it as the confirm does, since an
@@ -785,7 +954,12 @@ pub(crate) fn observe_in(
         // "not the user"; no signal decides nothing in the default mode and
         // ends the look unchecked in the secure mode.
         let gate_ran = cap.illuminator.is_some();
-        let verdict = strobe_pair(&mut cap, &face)?;
+        let verdict = strobe_pair(
+            &mut cap,
+            &mut a.pipeline.detector,
+            a.cfg.min_detection,
+            &face,
+        )?;
         match after_gate(gate_ran, verdict, strict) {
             AfterGate::Embed => {}
             AfterGate::Refused => {
@@ -889,19 +1063,27 @@ pub(crate) fn observe_in(
     })
 }
 
-/// How long a partly hidden face holds off the away clock, measured from
-/// the last full sighting of the user. Long enough to read with a hand on
-/// the chin; short enough that a coat on the chair does not keep the
-/// machine open all evening.
-pub const PARTIAL_GRACE_S: f32 = 120.0;
+/// How long a presence look may strobe for its one reading. The phase lock
+/// alone takes about half a second (the settle, then eight frames that
+/// follow the mask), so the 0.6 s the look used to allow left room for one
+/// pair at best, and many looks at a user sitting in front of the screen
+/// read nothing. Two seconds, so a hand or a turn in the middle of a look
+/// does not end it unread (Mike, 2026-09-24: "keeps looking until it sees or
+/// for 2 sec"). The look returns at the first verdict, so an ordinary look
+/// still strobes for about half a second.
+pub const PRESENCE_STROBE_WINDOW: Duration = Duration::from_millis(2000);
 
-/// One strobed lit/unlit pair on the open camera, gated at `face`'s box:
+/// One strobed lit/unlit pair on the open camera, gated at the face:
 /// `Some(true)` passed, `Some(false)` refused, `None` no usable pair within
-/// the window (no signal, or the pattern never took). The gate's numbers
-/// are logged at debug either way, so real faces and prints build up a
-/// distribution for the thresholds.
+/// the window. The flash is judged where the face is in each lit frame, as
+/// an unlock attempt does; the box from before the strobe misses a head
+/// that moved. A look that ends without a verdict says why at info (frames,
+/// pairs, pairs too faint, whether the frames ever followed the mask); the
+/// gate's numbers stay at debug.
 fn strobe_pair(
     cap: &mut crate::capture::IrCapture,
+    detector: &mut faceauth_engine::detect::YuNet,
+    min_detection: f32,
     face: &faceauth_engine::Face,
 ) -> Result<Option<bool>> {
     use crate::strobe::{Gate, StrobeGate};
@@ -912,17 +1094,32 @@ fn strobe_pair(
     // frames have followed it (D5), the settle after the mask is written
     // (E4) and steady light back when the look ends, whichever way.
     let mut gate = StrobeGate::start(cap, true)?;
+    gate.focus_on(face.bbox);
     let t0 = Instant::now();
-    while t0.elapsed() < Duration::from_millis(600) {
+    let mut tracked = face.clone();
+    let (mut pairs, mut faint) = (0usize, 0usize);
+    while t0.elapsed() < PRESENCE_STROBE_WINDOW {
         let Some(pair) = gate.next_frame(Duration::from_millis(200))? else {
             continue;
         };
-        match gate.judge(&pair, face)? {
+        let faces = detector.detect(&pair.lit, min_detection)?;
+        if let crate::consent::Track::Found(i) = crate::consent::track(&faces, tracked.bbox) {
+            tracked = faces[i].clone();
+            gate.focus_on(tracked.bbox);
+        }
+        pairs += 1;
+        match gate.judge(&pair, &tracked)? {
             Gate::Pass(fr) => {
-                log::debug!("presence liveness: pass {:?}", fr);
+                log::debug!(
+                    "presence liveness: pass after {} ms, pair {} {:?}",
+                    t0.elapsed().as_millis(),
+                    pairs,
+                    fr
+                );
                 return Ok(Some(true));
             }
             Gate::NoSignal(fr) => {
+                faint += 1;
                 log::debug!("presence liveness: no signal {:?}", fr);
             }
             Gate::Denied(why, fr) => {
@@ -932,6 +1129,14 @@ fn strobe_pair(
             }
         }
     }
+    log::info!(
+        "presence liveness: no reading in {} ms: {} frames, {} pairs, {} too faint, the frames {} the mask",
+        t0.elapsed().as_millis(),
+        gate.frames(),
+        pairs,
+        faint,
+        if gate.locked() { "followed" } else { "never followed" }
+    );
     Ok(None)
 }
 
@@ -959,10 +1164,11 @@ pub fn same_shape(reference: &(Grey, [f32; 4]), frame: &Grey) -> f32 {
     faceauth_engine::motion::similarity(&reference.0, frame, r)
 }
 
-/// Does a hidden-face sighting at `now` hold off the away clock?
-pub fn partial_holds(now: Instant, last_full: Option<Instant>) -> bool {
+/// Does a hidden-face sighting at `now` hold off the away clock? Only after
+/// a clear sighting, and within `limit` of it (None: no limit).
+pub fn partial_holds(now: Instant, last_full: Option<Instant>, limit: Option<Duration>) -> bool {
     last_full
-        .map(|t| now.duration_since(t).as_secs_f32() < PARTIAL_GRACE_S)
+        .map(|t| limit.is_none_or(|l| now.duration_since(t) < l))
         .unwrap_or(false)
 }
 
@@ -1466,6 +1672,17 @@ mod watch_tests {
         );
     }
 
+    /// Secure mode looks every tick (5 s, 10 s on battery); the default mode
+    /// looks every 10 s.
+    #[test]
+    fn the_default_mode_looks_less_often_than_the_secure_mode() {
+        let c = PresenceConfig::default();
+        assert_eq!(tick_for(&c, PresenceMode::Secure, false), 5.0);
+        assert_eq!(tick_for(&c, PresenceMode::Secure, true), 10.0);
+        assert_eq!(tick_for(&c, PresenceMode::Default, false), 10.0);
+        assert_eq!(tick_for(&c, PresenceMode::Default, true), 10.0);
+    }
+
     /// While locked, the watch resumes on a face match, or on the session
     /// reading as unlocked by other means, checked every few ticks, with a
     /// fresh absence clock: an empty chair after a password unlock locks
@@ -1637,16 +1854,60 @@ mod partial_tests {
     use super::*;
 
     #[test]
-    fn a_partial_face_holds_the_clock_only_after_a_full_sighting_and_only_for_the_grace() {
+    fn a_partial_face_holds_the_clock_only_after_a_full_sighting_and_only_for_the_hold() {
         let now = Instant::now();
+        let two = Some(Duration::from_secs(120));
         assert!(
-            !partial_holds(now, None),
+            !partial_holds(now, None, two),
             "never seen in full: a weak blob is not the user"
         );
-        assert!(partial_holds(now, Some(now - Duration::from_secs(30))));
+        assert!(!partial_holds(now, None, None));
+        assert!(partial_holds(now, Some(now - Duration::from_secs(30)), two));
         assert!(!partial_holds(
             now,
-            Some(now - Duration::from_secs_f32(PARTIAL_GRACE_S + 1.0))
+            Some(now - Duration::from_secs(121)),
+            two
         ));
+        assert!(
+            partial_holds(now, Some(now - Duration::from_secs(4 * 3600)), None),
+            "no limit holds as long as the shape does"
+        );
+    }
+
+    /// Mike, 2026-09-24: the default mode ships with no limit, the secure
+    /// mode with two minutes; secure is bounded 1 to 10 minutes, the default
+    /// takes "none" or minutes from 1.
+    #[test]
+    fn hidden_hold_defaults_parse_and_clamp() {
+        let c = PresenceConfig::default();
+        assert_eq!(c.hidden_hold_for(PresenceMode::Default), None);
+        assert_eq!(
+            c.hidden_hold_for(PresenceMode::Secure),
+            Some(Duration::from_secs(120))
+        );
+        assert!(c.hold_warnings().is_empty());
+        let parse = |t: &str| -> PresenceConfig { toml::from_str(t).unwrap() };
+        let c = parse("hidden_hold = 30\nsecure_hidden_hold = 5");
+        assert_eq!(
+            c.hidden_hold_for(PresenceMode::Default),
+            Some(Duration::from_secs(1800))
+        );
+        assert_eq!(
+            c.hidden_hold_for(PresenceMode::Secure),
+            Some(Duration::from_secs(300))
+        );
+        let c = parse("hidden_hold = \"none\"");
+        assert_eq!(c.hidden_hold_for(PresenceMode::Default), None);
+        let c = parse("hidden_hold = 0\nsecure_hidden_hold = 60");
+        assert_eq!(
+            c.hidden_hold_for(PresenceMode::Default),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            c.hidden_hold_for(PresenceMode::Secure),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(c.hold_warnings().len(), 2);
+        assert!(toml::from_str::<PresenceConfig>("hidden_hold = \"forever\"").is_err());
     }
 }

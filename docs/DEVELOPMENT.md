@@ -292,12 +292,13 @@ CLI's engine tools load a pipeline without it.
 ## The kernel dependency
 
 The IR illuminator is driven through a V4L2 strobe control that the stock
-ov7251 driver does not have. Kernel patch 0002 (`media: i2c: ov7251: expose
+ov7251 driver does not have. Kernel patch 0010 (`media: i2c: ov7251: expose
 the strobe output as a flash control`) adds `strobe_output_enable` and a
 frame-pattern bitmask; without it `cam probe` reports no illuminator, the
-liveness gate cannot run, and the daemon refuses. Patch 0001 (`media:
-ipu3-cio2: support concurrent streams`) gives each CIO2 queue its own DMA
-channel so the RGB camera can stream while the IR camera does, which is
+liveness gate cannot run, and the daemon refuses. Patch 0009 (`media:
+ipu3-cio2: support concurrent streams on multiple CSI-2 ports`), after
+seven CIO2 bug fixes and a bounds check in 0001-0008, gives each CIO2 queue
+its own DMA channel so the RGB camera can stream while the IR camera does, which is
 what keeps a consent window from killing a video call's camera. Neither is
 in a shipped kernel yet; both are kept with their measurements and review
 history in the project's kernel pack, outside this source tree. The daemon
@@ -369,7 +370,8 @@ away, a face the strobe read no signal from, or a failed check within
 `NEAR_MISS_SLACK` 0.25 of the threshold, which is what a hand on the chin,
 leaning in or a look down at a phone gives the mesh and the embedder), the torso under the last full sighting is
 compared by normalised cross-correlation, and `SAME_SHAPE` 0.60 holds the
-away clock for up to `PARTIAL_GRACE_S` (120 s) and stays the secure mode's
+away clock for `hidden_hold` (default mode, no limit as shipped) or
+`secure_hidden_hold` (secure mode, 2 minutes, clamped to 1 to 10) and stays the secure mode's
 first-miss lock. Measured: a hand over part of the face 1.00, a
 sheet over it 0.95, the face fully covered 0.79, the chair empty -0.34.
 

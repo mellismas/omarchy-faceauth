@@ -35,6 +35,8 @@ user = ""                     # whose templates define "present"
 # mode = "default"            # "default": any face turned to the screen holds the lock off, whoever it is; lock once nobody has been there for away_seconds; a hidden face (hand on chin) holds the clock too
                               # "secure": identity checked on every tick; the first clear miss on a face turned to the screen locks at once; a near miss, an unread face or a hidden one holds while the same shape is still in the chair (a hand on the face, leaning in, a look down at a phone), an empty chair locks after away_seconds, no other face holds the clock
                               # the starting mode; the watched user can switch it until the next restart (faceauth presence mode default|secure)
-# tick_seconds = 5.0          # one short look per tick (about 0.45 s of camera; longer on a tick that also strobes for identity and liveness; in the default mode every third tick); 10 s on battery
+# tick_seconds = 5.0          # the secure mode's tick; the default mode looks every 10 s at the most often; one short look per tick (about 0.45 s of camera; longer on a tick that also strobes for identity and liveness; in the default mode every third tick); 10 s on battery
 # battery_tick_seconds = 10.0 # the tick on battery (0 keeps the mains tick)
 # away_seconds = 20.0         # unseen for this long -> lock the session
+# hidden_hold = "none"        # default mode: how long a hidden face (hand on the chin, a look down) holds the lock off since the last clear sighting, while the same shape is in the chair; "none" = until the chair changes (a coat on the chair can hold it too), or minutes, 1 or more
+# secure_hidden_hold = 2      # secure mode: the same in minutes, 1 to 10 (clamped); after it an unverified face counts as gone

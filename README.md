@@ -10,7 +10,7 @@ depends on libc, libpam, systemd (`systemd-creds`, `systemd-run`), Arch's
 `tpm2-tss` and `acl`, all used at run time.
 
 Tested on one machine: a Surface Book 2 (Intel IPU3, ov7251 IR sensor)
-running a kernel with the two patches described under "Hardware" below.
+running a kernel with the patches described under "Hardware" below.
 UVC IR modules, the kind most Windows Hello laptops use, are not supported:
 their emitter is not a V4L2 control, so the liveness gate cannot run and the
 daemon refuses.
@@ -127,7 +127,9 @@ One claim per bullet, each with where the code keeps it.
   the control and replays a face in step is not caught
   (`liveness::StrobePhase`).
 - **Walk-away lock** (opt-in, `sudo faceauth presence on`): one short look
-  every five seconds (ten on battery). In the default mode any face turned
+  every five seconds in secure mode (ten on battery) and every ten in the
+  default mode, and a look at someone who was there keeps trying for up to
+  two seconds before it counts as unseen. In the default mode any face turned
   to the screen holds the lock off, whoever it belongs to (a laptop handed
   to someone stays unlocked while they look at it), and the session locks
   once nobody has been in front of it for the away time; identity is
@@ -139,10 +141,12 @@ One claim per bullet, each with where the code keeps it.
   hand over the face, a head resting on a hand, leaning in to read or a
   look down at a phone reads as no face, a face turned away, a face the
   strobe cannot read, or a face that misses the match by a little, and it
-  holds the clock for up to two minutes while the shape in the chair under
-  it is unchanged. Only a face turned to the screen that misses by a wide
-  margin is someone else, and in secure mode it locks at once. A
-  print that fails the gate is not the user in either mode.
+  holds the clock while the shape in the chair under it is unchanged. How
+  long it holds is a setting: in the default mode there is no limit as
+  shipped (`hidden_hold = "none"`, or minutes), in secure mode two minutes
+  (`secure_hidden_hold`, 1 to 10). Only a face turned to the screen that
+  misses by a wide margin is someone else, and in secure mode it locks at
+  once. A print that fails the gate is not the user in either mode.
   Switch modes from the bar's walk-away widget or with Super+Alt+L; the
   switch lasts until the service restarts, and `[presence] mode` sets the
   starting mode (`presence::run`, `presence::PresenceMode`).
@@ -281,13 +285,14 @@ them.
 ## Hardware and Measurements
 
 The IR illuminator is driven through a V4L2 strobe control that the stock
-ov7251 driver does not have; kernel patch 0002 (`media: i2c: ov7251: expose
-the strobe output as a flash control`, on its way to linux-media) adds it
-and is not yet in `linux-omarchy` or any other shipped kernel. Without it
-face authentication refuses and the password is used. Patch 0001 (`media:
-ipu3-cio2: support concurrent streams`) lets the RGB camera stream at the
-same time, so a consent window during a video call does not kill the call's
-camera. Setup checks for the strobe control (`faceauth doctor`, row
+ov7251 driver does not have; the last patch of a ten-patch series for
+linux-media (`media: i2c: ov7251: expose the strobe output as a flash
+control`) adds it, and it is not yet in `linux-omarchy` or any other shipped
+kernel. Without it face authentication refuses and the password is used.
+The ipu3-cio2 patches before it fix seven bugs in the CIO2 driver and then
+let the RGB camera stream at the same time (`media: ipu3-cio2: support
+concurrent streams on multiple CSI-2 ports`), so a consent window during a
+video call does not kill the call's camera. Setup checks for the strobe control (`faceauth doctor`, row
 `camera.illuminator`) before it changes anything.
 
 Models are not in the repository: the `omarchy-faceauth-models` package

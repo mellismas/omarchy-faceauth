@@ -391,7 +391,7 @@ impl Authenticator {
     pub fn probe(&mut self) -> Outcome {
         let t0 = Instant::now();
         let look = crate::presence::PresenceConfig::default();
-        match crate::presence::observe_in(self, &look, false, false) {
+        match crate::presence::observe_in(self, &look, false, false, false) {
             Ok(o) => Outcome::Probe {
                 face: o.face,
                 attentive: o.attentive,
@@ -1018,7 +1018,7 @@ impl Authenticator {
         };
         let strict = crate::presence::presence_mode() == crate::presence::PresenceMode::Secure;
         let mut look =
-            |identify: bool| crate::presence::observe_in(self, &look_cfg, identify, strict);
+            |identify: bool| crate::presence::observe_in(self, &look_cfg, identify, strict, false);
         hold_wait(
             &mut look,
             state,
@@ -1054,7 +1054,7 @@ impl Authenticator {
         let mode = crate::presence::presence_mode();
         let strict = mode == crate::presence::PresenceMode::Secure;
         let mut look =
-            |identify: bool| crate::presence::observe_in(self, &look_cfg, identify, strict);
+            |identify: bool| crate::presence::observe_in(self, &look_cfg, identify, strict, false);
         let locked = || crate::consent::session_locked(user);
         attention_wait(
             &mut look,
@@ -1329,6 +1329,13 @@ impl Authenticator {
 
     /// Record a failure where a face was seen; the hold it starts, if any.
     fn charge(&mut self, user: &str) -> Option<Duration> {
+        // A development build measuring distance limits runs many failing
+        // attempts on purpose; FACEAUTH_DEV_NO_COOLDOWN keeps them from
+        // starting holds. Release builds have no such switch.
+        #[cfg(feature = "dev-tools")]
+        if std::env::var_os("FACEAUTH_DEV_NO_COOLDOWN").is_some() {
+            return None;
+        }
         let now = Instant::now();
         let s = self.failures.entry(user.to_string()).or_default();
         s.charge(now);
@@ -1407,6 +1414,7 @@ impl Authenticator {
         }
         // Phase 1: find the face and let the exposure settle on it (steady light).
         let mut face_seen = false;
+        let mut last_face: Option<[f32; 4]> = None;
         let mut settle_info = String::new();
         let mut n_frames = 0usize;
         let cap_after = scoring_cap(self.cfg.attempt_timeout);
@@ -1436,6 +1444,7 @@ impl Authenticator {
                 .detect(&img, self.cfg.min_detection)?;
             if let Some(f) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) {
                 face_seen = true;
+                last_face = Some(f.bbox);
                 cap.meter_on(f);
             }
             // Settled: a face has been metered on for a few steps, or a second has
@@ -1476,6 +1485,9 @@ impl Authenticator {
         let mut score_trail: Vec<String> = Vec::new();
         let mut scoring_since: Option<Instant> = None;
         let mut gate = crate::strobe::StrobeGate::start(&mut cap, strobe)?;
+        if let Some(b) = last_face {
+            gate.focus_on(b);
+        }
         let matched: Option<faceauth_engine::Face> = loop {
             if t0.elapsed() > deadline {
                 break None;
@@ -1531,6 +1543,7 @@ impl Authenticator {
                 }
                 Gated::Pass(face) => {
                     n_faces += 1;
+                    gate.focus_on(face.bbox);
                     face
                 }
             };
@@ -1668,18 +1681,38 @@ pub(crate) enum Gated {
 }
 
 /// The narrowest face, as a fraction of the frame's shorter side, that an
-/// attempt scores (60 px on a 480 px side). Enrolment's right distance
-/// starts at 0.14 (`enrol::SIZE_RIGHT`); sitting back from the reference
-/// machine measured 45 px, where the strobe cannot be read and the crop
-/// does not match. A face under this is treated as no face: never scored,
-/// so never a match and never charged against the five-a-minute rule, and
-/// the lock screen's probe does not wake the panel for it.
-pub const SCAN_MIN_FACE_FRAC: f32 = 0.125;
+/// attempt scores (40 px on a 480 px side). Measured on the reference
+/// laptop on 2026-09-24 with the cutoff off, moving back and forth: every
+/// attempt matched at 40 px and nearer (0.75 to 0.95), 35 to 39 px was
+/// marginal (0.65 to 0.73), 30 to 34 px missed although the flash still
+/// read, and under 30 px the gate refused. The limit is the face's detail,
+/// not light: exposure was at its maximum from about 50 px out. The line
+/// sits a little inside the measured limit (distance-20260924.txt in the
+/// development tree's fa-build). 60 px was tried first and discarded most
+/// frames at an ordinary sitting-back distance, so consent never matched
+/// and nods never armed. A face under this is treated as no face: never scored, so never a
+/// match and never charged against the five-a-minute rule, and the lock
+/// screen's probe does not wake the panel for it.
+pub const SCAN_MIN_FACE_FRAC: f32 = 0.084;
+
+/// The cutoff in force: `SCAN_MIN_FACE_FRAC`, or in a development build
+/// `FACEAUTH_DEV_SCAN_MIN_FRAC` from the environment, for measuring where
+/// the camera stops reading a face.
+pub fn scan_min_frac() -> f32 {
+    #[cfg(feature = "dev-tools")]
+    if let Some(v) = std::env::var("FACEAUTH_DEV_SCAN_MIN_FRAC")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+    {
+        return v;
+    }
+    SCAN_MIN_FACE_FRAC
+}
 
 /// Is a face `face_w` pixels wide, in a `w` by `h` frame, near enough to
 /// judge?
 pub fn scannable(face_w: f32, w: usize, h: usize) -> bool {
-    face_w >= SCAN_MIN_FACE_FRAC * w.min(h) as f32
+    face_w >= scan_min_frac() * w.min(h) as f32
 }
 
 /// Detect the face in a pair's lit frame (the best one, or, with `follow`,
@@ -2187,6 +2220,7 @@ pub fn confirm(
     // A fresh mask for the confirm, and pairs only once the frames follow it (D5).
     let mut gate = crate::strobe::StrobeGate::start(cap, true)?;
     let mut tracked = followed;
+    gate.focus_on(tracked);
     let (mut passed, mut failed, mut nosignal, mut pairs) = (0usize, 0usize, 0usize, 0usize);
     let verdict = loop {
         if t0.elapsed().as_secs_f32() > CONFIRM_SECONDS {
@@ -2213,6 +2247,7 @@ pub fn confirm(
             }
         };
         tracked = face.bbox;
+        gate.focus_on(tracked);
         let Some(e) = &face.embedding else { continue };
         match templates.best_match_on(e, &device) {
             Some((score, _)) if score >= cfg.accept_threshold => {
@@ -2293,14 +2328,16 @@ pub fn nod_frames_match(
 }
 
 /// How far under the accept threshold a nod frame may score and still count
-/// as the user's own face pitched mid-nod. The frames are kept at the ends
+/// as the user's own face pitched mid-nod (0.40 at the default 0.70; 0.20
+/// refused the reference user's own nod on 2026-09-24 at a frame scoring
+/// 0.49 with the head pitched down). The frames are kept at the ends
 /// of the nod legs, chin down or chin up, which is where the embedder is
 /// weakest on an enrolled face; another person's face scores far below
 /// this against the user's templates, since different identities sit
 /// around 0.1 to 0.3 on this model, and the live confirm just before the
 /// nods matched at the full threshold. Set by reasoning, not measured on
 /// a corpus; the refusal log carries the scores so it can be.
-pub const NOD_FRAME_SLACK: f32 = 0.20;
+pub const NOD_FRAME_SLACK: f32 = 0.30;
 
 /// The rule behind `nod_frames_match`, on embeddings: there must be at
 /// least one kept frame, every frame must score within `NOD_FRAME_SLACK`
@@ -2447,16 +2484,17 @@ mod scannable_tests {
     use super::*;
 
     /// On the reference camera's 640x480 frames: ordinary sitting (78 to
-    /// 96 px) is judged, sitting back (45 px, measured) is not; the rule
-    /// follows the frame's shorter side.
+    /// 96 px) and the measured reliable range down to 40 px are judged; the
+    /// marginal 35 to 39 px and beyond are not; the rule follows the
+    /// frame's shorter side.
     #[test]
     fn a_face_too_far_to_judge_is_not_scanned() {
         assert!(scannable(78.0, 640, 480));
-        assert!(scannable(60.0, 640, 480));
-        assert!(!scannable(45.0, 640, 480));
-        assert!(!scannable(59.0, 640, 480));
-        assert!(scannable(120.0, 1280, 960));
-        assert!(!scannable(100.0, 1280, 960));
+        assert!(scannable(40.4, 640, 480));
+        assert!(!scannable(39.0, 640, 480));
+        assert!(!scannable(35.0, 640, 480));
+        assert!(scannable(81.0, 1280, 960));
+        assert!(!scannable(80.0, 1280, 960));
     }
 }
 
@@ -2525,7 +2563,7 @@ mod nod_frame_tests {
         )
         .unwrap_err();
         assert!(e.contains("only 1 of 3"), "{}", e);
-        let far = vec![0.4, 0.917];
+        let far = vec![0.3, 0.954];
         let e =
             check_nod_embeddings(&[me.clone(), far, me.clone()], &u, "ipu3:x", 0.70).unwrap_err();
         assert!(e.contains("nod frame 2 of 3"), "{}", e);

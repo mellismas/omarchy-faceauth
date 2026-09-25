@@ -15,7 +15,7 @@ fn usage() -> ! {
   faceauth enroll [--user NAME] [--label TEXT] [--start distance]   (root; the walk-through window, the same one Setup > Security > Face opens; --guided is accepted)
   faceauth enroll [--user NAME] [--label TEXT] --terminal [--poses up,down]   (root; the five looks from the terminal, no window)
   faceauth enroll [--user NAME] [--label TEXT] --look [--seconds N] [--count N]   (root; one look, as the camera sees it, no walk-through)
-  faceauth enrol-control continue|redo|cancel [--user NAME]   (from the enrolment window)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]   (development: the omarchy-faceauth-models package ships the files)\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] [--dismiss|--ack|--rearm|--passwordless MIN]   (from the consent window; stdin: token line, then password line)\n  faceauth calibrate [--user NAME] --guided              (root; the gesture and everyday rounds in the walk-through window, stored with the templates)\n  faceauth presence on|off [--user NAME] [--away-seconds N]   (root; rewrites the config, restarts the service)\n  faceauth presence mode [default|secure] [--user NAME]   (as the watched user; reads or switches the watch's mode until the next restart; prints {{\"presence\":{{\"mode\":..,\"watching\":..}}}})\n  faceauth presence [--user NAME]                  (the watch's mode and, for the watched user, its state){}",
+  faceauth enrol-control continue|redo|cancel [--user NAME]   (from the enrolment window)\n  faceauth templates delete [--user NAME]\n  faceauth models fetch [--manifest FILE] [--dir DIR]   (development: the omarchy-faceauth-models package ships the files)\n  faceauth doctor [--json]\n  faceauth consent-answer [--user NAME] [--dismiss|--ack|--rearm|--passwordless MIN]   (from the consent window; stdin: token line, then password line)\n  faceauth calibrate [--user NAME] --guided              (root; the gesture and everyday rounds in the walk-through window, stored with the templates)\n  faceauth presence on|off [--user NAME] [--away-seconds N] [--hidden-hold none|MIN] [--secure-hidden-hold MIN]   (root; rewrites the config, restarts the service)\n  faceauth presence mode [default|secure] [--user NAME]   (as the watched user; reads or switches the watch's mode until the next restart; prints {{\"presence\":{{\"mode\":..,\"watching\":..}}}})\n  faceauth presence [--user NAME]                  (the watch's mode and, for the watched user, its state){}",
         dev_usage()
     );
     std::process::exit(2)
@@ -154,10 +154,6 @@ fn main() -> Result<()> {
                 .unwrap_or("/etc/faceauth/config.toml")
                 .to_string();
             let user = user_arg(rest)?;
-            let away_arg = opt(rest, "--away-seconds").unwrap_or("20");
-            let away: f32 = away_arg
-                .parse()
-                .with_context(|| format!("--away-seconds {}: not a number", away_arg))?;
             // A config that does not parse is not replaced by one that only
             // holds [presence]: the administrator's other keys would go with
             // it. A missing file starts empty (F4).
@@ -166,7 +162,14 @@ fn main() -> Result<()> {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
                 Err(e) => return Err(e).with_context(|| format!("read {}", cfg_path)),
             };
-            let edited = presence_edit(&text, &cfg_path, *mode == "on", &user, away)?;
+            // Without --away-seconds the configured away time stays: a menu
+            // row that sets only the hidden-face hold must not reset it.
+            let away = away_for(opt(rest, "--away-seconds"), &text, &cfg_path)?;
+            let holds = hold_keys(
+                opt(rest, "--hidden-hold"),
+                opt(rest, "--secure-hidden-hold"),
+            )?;
+            let edited = presence_edit(&text, &cfg_path, *mode == "on", &user, away, &holds)?;
             write_config_atomically(&cfg_path, &edited)
                 .with_context(|| format!("write {} (run as root)", cfg_path))?;
             let st = std::process::Command::new("/usr/bin/systemctl")
@@ -1302,7 +1305,55 @@ fn doctor(rest: &[&str]) -> Result<()> {
 /// they are. The result is parsed and validated as the daemon would parse
 /// it before anything is written, so a value the daemon would refuse to
 /// start on (a zero or negative away time) is refused here instead (E3).
-fn presence_edit(text: &str, origin: &str, on: bool, user: &str, away: f32) -> Result<String> {
+/// The away time for `presence on`: the flag's value, or without it the
+/// one the config already has (20 s when it has none).
+fn away_for(arg: Option<&str>, text: &str, origin: &str) -> Result<f32> {
+    match arg {
+        Some(a) => a
+            .parse()
+            .with_context(|| format!("--away-seconds {}: not a number", a)),
+        None => Ok(faceauth_daemon::config::Config::from_text(text, origin)
+            .map(|c| c.presence.away_seconds)
+            .unwrap_or(20.0)),
+    }
+}
+
+/// The hidden-face hold keys from the `presence on` flags, checked against
+/// the ranges the menu offers: `--hidden-hold none` or minutes from 1,
+/// `--secure-hidden-hold` minutes from 1 to 10.
+fn hold_keys(hidden: Option<&str>, secure: Option<&str>) -> Result<Vec<(&'static str, String)>> {
+    let mut keys = Vec::new();
+    if let Some(h) = hidden {
+        if h == "none" {
+            keys.push(("hidden_hold", "\"none\"".to_string()));
+        } else {
+            match h.parse::<u32>() {
+                Ok(m) if m >= 1 => keys.push(("hidden_hold", m.to_string())),
+                _ => bail!(
+                    "--hidden-hold {}: \"none\" or a number of minutes, 1 or more",
+                    h
+                ),
+            }
+        }
+    }
+    if let Some(v) = secure {
+        let (lo, hi) = faceauth_daemon::presence::SECURE_HIDDEN_HOLD_RANGE;
+        match v.parse::<u32>() {
+            Ok(m) if (lo..=hi).contains(&m) => keys.push(("secure_hidden_hold", m.to_string())),
+            _ => bail!("--secure-hidden-hold {}: minutes from {} to {}", v, lo, hi),
+        }
+    }
+    Ok(keys)
+}
+
+fn presence_edit(
+    text: &str,
+    origin: &str,
+    on: bool,
+    user: &str,
+    away: f32,
+    holds: &[(&str, String)],
+) -> Result<String> {
     if on && (!away.is_finite() || away <= 0.0) {
         bail!(
             "--away-seconds {}: the away time must be a positive number of seconds",
@@ -1313,6 +1364,7 @@ fn presence_edit(text: &str, origin: &str, on: bool, user: &str, away: f32) -> R
     if on {
         keys.push(("user", toml::Value::String(user.to_string()).to_string()));
         keys.push(("away_seconds", format!("{:?}", away as f64)));
+        keys.extend(holds.iter().map(|(k, v)| (*k, v.clone())));
     }
     let edited = set_presence_keys(text, &keys);
     let cfg = faceauth_daemon::config::Config::from_text(&edited, origin).with_context(|| {
@@ -1516,6 +1568,52 @@ mod arg_tests {
 
     /// J27: the exit status follows the daemon's answer for every scripted
     /// subcommand.
+    /// A command that sets only the hold keeps the configured away time.
+    #[test]
+    fn the_away_time_stays_unless_given() {
+        let text = "[presence]\nenabled = true\nuser = \"mike\"\naway_seconds = 45.0\n";
+        assert_eq!(away_for(None, text, "test").unwrap(), 45.0);
+        assert_eq!(away_for(Some("30"), text, "test").unwrap(), 30.0);
+        assert_eq!(away_for(None, "", "test").unwrap(), 20.0);
+        assert!(away_for(Some("soon"), text, "test").is_err());
+    }
+
+    /// The hold flags take what the menu offers and nothing else.
+    #[test]
+    fn hold_flags_take_the_menu_ranges() {
+        assert!(hold_keys(None, None).unwrap().is_empty());
+        assert_eq!(
+            hold_keys(Some("none"), Some("2")).unwrap(),
+            vec![
+                ("hidden_hold", "\"none\"".to_string()),
+                ("secure_hidden_hold", "2".to_string())
+            ]
+        );
+        assert_eq!(
+            hold_keys(Some("240"), None).unwrap(),
+            vec![("hidden_hold", "240".to_string())]
+        );
+        assert!(hold_keys(Some("0"), None).is_err());
+        assert!(hold_keys(Some("forever"), None).is_err());
+        assert!(hold_keys(None, Some("11")).is_err());
+        assert!(hold_keys(None, Some("0")).is_err());
+        let out = presence_edit(
+            "",
+            "test",
+            true,
+            "mike",
+            20.0,
+            &hold_keys(Some("30"), Some("5")).unwrap(),
+        )
+        .unwrap();
+        let cfg = faceauth_daemon::config::Config::from_text(&out, "test").unwrap();
+        assert_eq!(
+            cfg.presence.hidden_hold,
+            faceauth_daemon::presence::HiddenHold::Minutes(30)
+        );
+        assert_eq!(cfg.presence.secure_hidden_hold, 5);
+    }
+
     #[test]
     fn the_exit_status_follows_the_answer() {
         assert_eq!(exit_for(&Outcome::Noted), 0);
@@ -1568,17 +1666,17 @@ mod presence_edit_tests {
     #[test]
     fn a_zero_or_negative_away_time_is_refused_before_any_write() {
         for away in [0.0f32, -5.0, f32::NAN, f32::INFINITY] {
-            let r = presence_edit(SHIPPED, "test", true, "mike", away);
+            let r = presence_edit(SHIPPED, "test", true, "mike", away, &[]);
             assert!(r.is_err(), "away {} accepted", away);
         }
-        assert!(presence_edit(SHIPPED, "test", true, "mike", 20.0).is_ok());
+        assert!(presence_edit(SHIPPED, "test", true, "mike", 20.0, &[]).is_ok());
     }
 
     /// E3: the shipped, commented config keeps every comment and every
     /// other key; only the three presence keys change.
     #[test]
     fn a_commented_config_keeps_its_comments() {
-        let out = presence_edit(SHIPPED, "test", true, "mike", 30.0).unwrap();
+        let out = presence_edit(SHIPPED, "test", true, "mike", 30.0, &[]).unwrap();
         for line in SHIPPED.lines() {
             let comment = line.find('#').map(|i| &line[i..]);
             if let Some(c) = comment {
@@ -1606,8 +1704,8 @@ mod presence_edit_tests {
     /// E3: `off` sets only `enabled`; the user and the away time stay.
     #[test]
     fn off_sets_only_enabled() {
-        let on = presence_edit(SHIPPED, "test", true, "mike", 45.0).unwrap();
-        let off = presence_edit(&on, "test", false, "somebody-else", 5.0).unwrap();
+        let on = presence_edit(SHIPPED, "test", true, "mike", 45.0, &[]).unwrap();
+        let off = presence_edit(&on, "test", false, "somebody-else", 5.0, &[]).unwrap();
         let cfg = faceauth_daemon::config::Config::from_text(&off, "test").unwrap();
         assert!(!cfg.presence.enabled);
         assert_eq!(cfg.presence.user, "mike");
@@ -1619,7 +1717,7 @@ mod presence_edit_tests {
     /// keeps the new keys inside it.
     #[test]
     fn missing_keys_and_tables_are_added_in_place() {
-        let out = presence_edit("", "test", true, "mike", 20.0).unwrap();
+        let out = presence_edit("", "test", true, "mike", 20.0, &[]).unwrap();
         let cfg = faceauth_daemon::config::Config::from_text(&out, "test").unwrap();
         assert!(cfg.presence.enabled);
         assert_eq!(cfg.presence.user, "mike");

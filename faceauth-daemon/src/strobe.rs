@@ -49,6 +49,9 @@ pub struct StrobeGate<'a> {
     /// The exposure and gain the sensor reported once the spell began;
     /// a pair measured after they moved is refused (J19).
     baseline: Option<(i32, i32)>,
+    /// Where the face is, widened a little: the phase follows the mean over
+    /// this box instead of the whole frame once a caller names it.
+    focus: Option<[f32; 4]>,
 }
 
 impl<'a> StrobeGate<'a> {
@@ -74,6 +77,7 @@ impl<'a> StrobeGate<'a> {
             started: Instant::now(),
             frames: 0,
             baseline,
+            focus: None,
         })
     }
 
@@ -102,6 +106,27 @@ impl<'a> StrobeGate<'a> {
         self.phase.as_ref().map(|p| p.draws()).unwrap_or(0)
     }
 
+    /// Follow the mask on the face at `bbox` rather than on the whole
+    /// frame. The illuminator lights the face far more than the room, so a
+    /// face that fills little of the frame (sitting back: about 50 px of a
+    /// 480 px frame) still steps clearly with the mask where the frame mean
+    /// barely moves, and the phase locks there too; the face itself has to
+    /// follow the random mask, which a replay has to match as well. The
+    /// first call restarts the phase lock, since the measure changes;
+    /// later calls move the box with the face.
+    pub fn focus_on(&mut self, bbox: [f32; 4]) {
+        let (cx, cy) = (bbox[0] + bbox[2] / 2.0, bbox[1] + bbox[3] / 2.0);
+        let (w, h) = (bbox[2] * 1.2, bbox[3] * 1.2);
+        let widened = [cx - w / 2.0, cy - h / 2.0, w, h];
+        if self.focus.is_none() {
+            if let Some(phase) = self.phase.as_mut() {
+                phase.reset();
+            }
+            self.prev = None;
+        }
+        self.focus = Some(widened);
+    }
+
     /// Is the strobe running?
     pub fn strobed(&self) -> bool {
         self.phase.is_some()
@@ -110,6 +135,14 @@ impl<'a> StrobeGate<'a> {
     /// Frames taken so far.
     pub fn frames(&self) -> usize {
         self.frames
+    }
+
+    /// Have the frames followed the mask at any point? False when ungated.
+    pub fn locked(&self) -> bool {
+        self.phase
+            .as_ref()
+            .map(|p| p.ever_in_phase())
+            .unwrap_or(false)
     }
 
     /// The exposure the pairs are taken at.
@@ -152,7 +185,11 @@ impl<'a> StrobeGate<'a> {
             }
         }
         // The frame mean, computed once here for the phase check.
-        let in_phase = phase.push(img.mean());
+        let level = match self.focus {
+            Some(b) => img.region_mean(b),
+            None => img.mean(),
+        };
+        let in_phase = phase.push(level);
         let Some((p_img, _)) = self.prev.replace((img.clone(), seq)) else {
             return Ok(None);
         };
