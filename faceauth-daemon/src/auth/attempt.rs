@@ -6,7 +6,7 @@
 use super::cooldown::Strikes;
 #[cfg(feature = "dev-tools")]
 use super::outcome::SweepFrame;
-use super::outcome::{consent_denied, Outcome, Refusal};
+use super::outcome::{consent_denied, Cadence, Outcome, Refusal};
 use super::scan::{gated_face, scannable, Gated, Scan};
 use crate::capture::IrCapture;
 use crate::config::Config;
@@ -130,23 +130,61 @@ impl Authenticator {
     }
 
     /// One cheap look for the lock screen while its panel is blank: is
-    /// anyone there? The presence watch's look without its identity check,
-    /// so the probe stays detector-only, with no identity and no scores,
-    /// and the two looks cannot drift apart again (H12).
-    pub fn probe(&mut self) -> Outcome {
+    /// anyone there, and is it likely `user`? The presence watch's look
+    /// without its flash or identity check, so the two looks cannot drift
+    /// apart again (H12).
+    ///
+    /// H12 kept the probe detector-only, with no identity and no scores,
+    /// since a scored reply is a tuning oracle and replies that carry scores
+    /// go to root only. The lock screen's unlock cascade (a face, then
+    /// likely the user, then the full PAM scan) needs one yes or no about
+    /// the caller's own face, so the look now also scores the face on its
+    /// own frame, without the flash, against `user`'s templates, and the
+    /// reply carries only the answer to "at least `PROBE_LIKELY_THRESHOLD`",
+    /// never the score. That is the boundary the presence decision keeps
+    /// (H16): the socket answers a probe only for the caller's own user or
+    /// for root. The score leaves the daemon only in its debug log, beside
+    /// an attempt's per-frame scores: the look's frame is lit steadily and
+    /// metered on the whole frame, where the full scan scores strobed lit
+    /// frames metered on the face, so the 0.5 line has to be set against
+    /// real probe scores. The full scan still runs the liveness gate and
+    /// decides.
+    pub fn probe(&mut self, user: &str) -> Outcome {
         let t0 = Instant::now();
         let look = crate::presence::PresenceConfig::default();
-        match crate::presence::observe_in(self, &look, false, false, false) {
-            Ok(o) => Outcome::Probe {
-                face: o.face,
-                attentive: o.attentive,
-                face_px: o.bbox.map(|b| b[2]).unwrap_or(0.0),
-                scannable: match (o.bbox, o.frame.as_ref()) {
+        match crate::presence::probe_look(self, &look, user) {
+            Ok((o, reading)) => {
+                let scannable = match (o.bbox, o.frame.as_ref()) {
                     (Some(b), Some(f)) => scannable(b[2], f.width, f.height),
                     _ => false,
-                },
-                elapsed_ms: t0.elapsed().as_millis() as u64,
-            },
+                };
+                let likely = probe_likely(scannable, reading.score.ok());
+                match reading.score {
+                    Ok(score) => log::debug!(
+                        "probe for {}: score {:.2}, likely {}, lit {}",
+                        user,
+                        score,
+                        likely,
+                        reading.lit
+                    ),
+                    Err(why) => log::debug!(
+                        "probe for {}: no score ({}), likely {}, lit {}",
+                        user,
+                        why,
+                        likely,
+                        reading.lit
+                    ),
+                }
+                Outcome::Probe {
+                    face: o.face,
+                    attentive: o.attentive,
+                    face_px: o.bbox.map(|b| b[2]).unwrap_or(0.0),
+                    scannable,
+                    likely,
+                    cadence: Cadence::from_config(&self.cfg.unlock),
+                    elapsed_ms: t0.elapsed().as_millis() as u64,
+                }
+            }
             Err(e) => Outcome::Error {
                 message: e.to_string(),
             },
@@ -566,6 +604,21 @@ impl Authenticator {
     }
 }
 
+/// The best template score at or above which a probe's face reads as
+/// likely the asking user. Below `accept_threshold` on purpose: it is a
+/// filter that spares the lock screen a full scan when the face at the
+/// screen is plainly someone else, and the full scan, with the liveness
+/// gate, is still the check.
+pub const PROBE_LIKELY_THRESHOLD: f32 = 0.5;
+
+/// A probe's `likely`: a face near enough to judge, with the asking user's
+/// best score at least `PROBE_LIKELY_THRESHOLD`. No face, a face too far,
+/// nothing enrolled and a face that could not be scored have no score, so
+/// all read as false.
+fn probe_likely(scannable: bool, score: Option<f32>) -> bool {
+    scannable && score.is_some_and(|s| s >= PROBE_LIKELY_THRESHOLD)
+}
+
 /// How long the exposure takes to settle on a face before frames are
 /// scored.
 const SETTLE: Duration = Duration::from_millis(1200);
@@ -709,5 +762,60 @@ mod mesh_required_tests {
         assert!((det.inner.min_thr - floors.0).abs() < 1e-6);
         let shake = crate::consent::ShakeDetector::mesh(floors.1);
         assert!((shake.inner.min_thr - floors.1).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    /// The cascade's filter: likely only for a face near enough to judge
+    /// whose score reaches 0.5. The look gives no score for no face, a face
+    /// beyond the line, or a user with nothing enrolled.
+    #[test]
+    fn a_probe_reads_likely_only_for_a_near_face_at_the_threshold() {
+        let no_face = probe_likely(false, None);
+        let too_far = probe_likely(false, Some(0.9));
+        let not_enrolled = probe_likely(true, None);
+        let low = probe_likely(true, Some(0.3));
+        let just_under = probe_likely(true, Some(0.499));
+        let at = probe_likely(true, Some(PROBE_LIKELY_THRESHOLD));
+        let above = probe_likely(true, Some(0.8));
+        assert!(!no_face && !too_far && !not_enrolled && !low && !just_under);
+        assert!(at && above);
+        assert!(PROBE_LIKELY_THRESHOLD < Config::default().accept_threshold);
+    }
+
+    /// H12: the probe reply never carries a score, only the yes or no, and
+    /// it carries the lock screen's intervals from `[unlock]`.
+    #[test]
+    fn the_probe_reply_carries_likely_and_cadence_and_no_score() {
+        let o = Outcome::Probe {
+            face: true,
+            attentive: true,
+            face_px: 92.0,
+            scannable: true,
+            likely: true,
+            cadence: Cadence::from_config(&Config::default().unlock),
+            elapsed_ms: 470,
+        };
+        let json = serde_json::to_string(&o).unwrap();
+        assert_eq!(
+            json,
+            r#"{"result":"probe","face":true,"attentive":true,"face_px":92.0,"scannable":true,"likely":true,"cadence":{"ac":2.0,"performance":3.0,"balanced":5.0,"power-saver":8.0},"elapsed_ms":470}"#
+        );
+        assert!(!json.contains("score"), "{}", json);
+        // A reply from a daemon without the two fields reads as the lock
+        // screen reads it: likely, on the shipped intervals.
+        let old = r#"{"result":"probe","face":true,"attentive":true,"face_px":92.0,"scannable":true,"elapsed_ms":470}"#;
+        match serde_json::from_str::<Outcome>(old).unwrap() {
+            Outcome::Probe {
+                likely, cadence, ..
+            } => {
+                assert!(likely);
+                assert_eq!(cadence, Cadence::default());
+            }
+            other => panic!("{:?}", other),
+        }
     }
 }

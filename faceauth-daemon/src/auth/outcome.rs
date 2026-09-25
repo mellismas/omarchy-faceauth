@@ -30,7 +30,7 @@ pub enum Outcome {
     NotEnrolled,
     /// Camera or model failure; the caller falls through to the next factor.
     Error { message: String },
-    /// Answer to a presence probe: one short look, detector only.
+    /// Answer to a presence probe: one short look, and never a score.
     Probe {
         face: bool,
         attentive: bool,
@@ -38,6 +38,17 @@ pub enum Outcome {
         /// Near enough for an attempt to judge (`scannable`); the lock
         /// screen wakes the panel only for such a face.
         scannable: bool,
+        /// Likely the asking user: a face near enough to judge whose best
+        /// score against their templates on this look, taken without the
+        /// flash, reached `PROBE_LIKELY_THRESHOLD`. The lock screen's filter
+        /// before a full scan, never a decision. An older daemon's reply
+        /// without it reads as true, as the lock screen reads it.
+        #[serde(default = "likely_when_unsaid")]
+        likely: bool,
+        /// The lock screen's probe intervals, from `[unlock]`; the shipped
+        /// ones when an older daemon's reply carries none.
+        #[serde(default)]
+        cadence: Cadence,
         elapsed_ms: u64,
     },
     /// Root only, development builds only: every frame of a pose sweep
@@ -108,6 +119,43 @@ pub enum Outcome {
     /// instead: sudo's terminal prompt is where a password goes next, and a
     /// failure there would only make sudo ask again, ten times.
     Refused { reason: String, elapsed_ms: u64 },
+}
+
+/// A probe reply without `likely` came from a daemon that does not compute
+/// it; the lock screen then goes on to the full scan, so it reads as true.
+fn likely_when_unsaid() -> bool {
+    true
+}
+
+/// The lock screen's probe intervals in seconds, sent with every probe:
+/// `ac` on mains, the others on battery for each power profile. The lock
+/// screen picks one from its own power state.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Cadence {
+    pub ac: f32,
+    pub performance: f32,
+    pub balanced: f32,
+    #[serde(rename = "power-saver")]
+    pub power_saver: f32,
+}
+
+impl Cadence {
+    pub fn from_config(u: &crate::config::UnlockConfig) -> Cadence {
+        let b = &u.battery_probe_seconds;
+        Cadence {
+            ac: u.probe_seconds,
+            performance: b.performance,
+            balanced: b.balanced,
+            power_saver: b.power_saver,
+        }
+    }
+}
+
+impl Default for Cadence {
+    /// The shipped `[unlock]` intervals.
+    fn default() -> Self {
+        Cadence::from_config(&crate::config::UnlockConfig::default())
+    }
 }
 
 impl Outcome {

@@ -41,3 +41,7 @@ user = ""                     # whose templates define "present"
 # secure_away_seconds = 20.0  # secure mode: the same in seconds, no "never" (secure mode keeps the session open only for a verified face); `--secure` sets it
 # obscured_face_lock = "never"  # default mode, the obscured face lock time: how long a face that is partly covered or turned away (hand on the chin, a look down) keeps the session open since the last clear sighting, while the same shape is in the chair; "never" = until the chair changes (a coat on the chair can hold it too), or minutes, 1 or more; `faceauth presence obscured-lock --default` sets it
 # secure_obscured_face_lock = 2 # secure mode: the same in minutes, 1 to 10 (clamped); after it an unverified face counts as gone; `--secure` sets it
+
+[unlock]
+# probe_seconds = 2.0         # the lock screen's probe interval on mains: while its panel is blank it asks the daemon for one short look this often (is a face there, and is it likely you); the daemon hands these intervals to the lock screen in every probe reply
+# battery_probe_seconds = { performance = 3.0, balanced = 5.0, power-saver = 8.0 }   # the interval on battery for each power profile; the lock screen picks one from its own power state, the daemon does not read the profile

@@ -383,6 +383,25 @@ shipped (`PresenceConfig::away_for`). `faceauth presence away-time` writes
 them; `faceauth presence on` leaves them alone unless given
 `--away-seconds`.
 
+**Lock screen probe.** While its panel is blank the lock screen asks for a
+probe every `[unlock] probe_seconds` (2 s) on mains and every
+`battery_probe_seconds` on battery: 3, 5 or 8 s for the performance,
+balanced and power-saver profiles. The daemon does not read the power
+profile; it sends all four intervals in every probe reply and the lock
+screen picks one. A probe is the watch's look without the flash, about
+0.45 s of camera. For a face near enough to judge it also embeds the look's
+frame against the asking user's templates once the camera is closed: 134 ms
+wall and 262 ms of CPU per embed on the reference laptop
+(`bench_ort_pipeline`, release build, 2026-09-25), plus about 0.6 s once
+when the recognition model reloads after its idle release. The reply says
+`likely` when the best score reaches `PROBE_LIKELY_THRESHOLD` 0.5, under
+the 0.70 accept threshold on purpose, and it carries the yes or no, never
+the score. The score goes to the debug log only, beside an attempt's frame
+scores (`probe for USER: score 0.63, likely true, lit true`, or `no score
+(no face)` and the like), because the look's frame is lit steadily and
+metered on the whole frame while the scan scores strobed frames metered on
+the face, so the 0.5 line is set against real probe scores.
+
 **Timing.** The exposure loop settles on a face in about 1.2 s; a lock
 screen attempt matches in under two seconds from the panel becoming secure;
 the strobed confirm after the second nod takes about 0.6 s for two pairs.

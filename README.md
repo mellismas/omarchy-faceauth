@@ -29,9 +29,17 @@ One claim per bullet, each with where the code keeps it.
 
 - **The lock screen looks, it does not prompt.** A third PAM stack,
   `omarchy-lock-face`, answered by the face module and closed by
-  `pam_deny`. While the panel is blank the daemon takes one short look every
-  three seconds and wakes it only for an attentive face
-  (`auth::Authenticator::probe`, the lock shell's `Service.qml`).
+  `pam_deny`. While the panel is blank the lock screen asks the daemon for
+  one short look on the `[unlock]` intervals (every 2 seconds on mains; 3,
+  5 or 8 on battery for the performance, balanced and power-saver
+  profiles), which every reply carries. The reply says whether an attentive
+  face is there, whether it is near enough to judge, and whether it is
+  likely the asking user: a yes or no from the look's own frame, without
+  the flash, at a best score of 0.5 against their templates, below the
+  accept threshold on purpose and never sent as a score. The lock screen
+  goes on to the full PAM scan only for such a face, and that scan, with
+  the liveness gate, decides (`auth::Authenticator::probe`,
+  `auth::PROBE_LIKELY_THRESHOLD`, the lock shell's `Service.qml`).
 - **A request is approved by the daemon's own camera, never by a message.**
   Nothing elevates until the consent window has acknowledged the request
   over the socket, the face matches, the daemon sees two nods from that same
@@ -273,7 +281,7 @@ faceauth enroll [--user NAME] [--label TEXT] --terminal [--poses up,down]
 faceauth enroll [--user NAME] [--label TEXT] --look [--seconds N] [--count N]   one look, no walk-through
 faceauth calibrate [--user NAME] --guided
 faceauth auth [--user NAME] [--socket PATH] [--consent]
-faceauth probe [--user NAME]                   one short look: is a face there?
+faceauth probe [--user NAME]                   one short look: is a face there, and is it likely you?
 faceauth templates delete [--user NAME]
 faceauth presence on|off [--user NAME] [--away-seconds N]
 faceauth presence away-time [--default never|SECONDS] [--secure SECONDS]

@@ -42,6 +42,8 @@ pub struct Config {
     pub liveness_required: bool,
     /// The presence watch (auto-lock when the enrolled user leaves).
     pub presence: crate::presence::PresenceConfig,
+    /// How often the lock screen probes for a face while its panel is blank.
+    pub unlock: UnlockConfig,
     /// Seconds the scan waits for a face during a consent request (the window
     /// is up; the user may not be looking yet).
     pub consent_scan_seconds: f32,
@@ -80,6 +82,7 @@ impl Default for Config {
             ir_orientation: [true, true, true],
             liveness_required: true,
             presence: Default::default(),
+            unlock: Default::default(),
             consent_scan_seconds: 20.0,
             consent_seconds: 90.0,
             #[cfg(feature = "dev-tools")]
@@ -152,7 +155,59 @@ impl Config {
         if pr.enabled && pr.user.is_empty() {
             bail!("[presence] enabled = true needs a user");
         }
+        let (u, b) = (&self.unlock, &self.unlock.battery_probe_seconds);
+        if ![u.probe_seconds, b.performance, b.balanced, b.power_saver]
+            .into_iter()
+            .all(positive)
+        {
+            bail!(
+                "[unlock] probe_seconds and every battery_probe_seconds interval must be positive"
+            );
+        }
         Ok(())
+    }
+}
+
+/// `[unlock]`: how often the lock screen probes for a face while its panel
+/// is blank. The daemon itself reads none of it: it hands the intervals to
+/// the lock screen in every probe reply, and the lock screen picks one from
+/// its own power state, since the daemon does not read the power profile.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UnlockConfig {
+    /// Seconds between probes on mains power.
+    pub probe_seconds: f32,
+    /// Seconds between probes on battery, one interval per power profile.
+    pub battery_probe_seconds: BatteryProbeSeconds,
+}
+
+impl Default for UnlockConfig {
+    fn default() -> Self {
+        UnlockConfig {
+            probe_seconds: 2.0,
+            battery_probe_seconds: BatteryProbeSeconds::default(),
+        }
+    }
+}
+
+/// The lock screen's probe interval on battery for each power profile it
+/// can report, in seconds: a longer one where the profile asks for less.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BatteryProbeSeconds {
+    pub performance: f32,
+    pub balanced: f32,
+    #[serde(rename = "power-saver")]
+    pub power_saver: f32,
+}
+
+impl Default for BatteryProbeSeconds {
+    fn default() -> Self {
+        BatteryProbeSeconds {
+            performance: 3.0,
+            balanced: 5.0,
+            power_saver: 8.0,
+        }
     }
 }
 
@@ -307,6 +362,68 @@ mod tests {
                 _ => assert!(named(k), "key {} is not named in the shipped file", k),
             }
         }
+    }
+
+    /// `[unlock]`: the lock screen's probe intervals ship at 2 s on mains
+    /// and 3, 5 and 8 s on battery by power profile. Each may be set on its
+    /// own; a zero, negative or unreadable one refuses to start, and a
+    /// misspelt profile is named like any unknown key.
+    #[test]
+    fn the_unlock_cadence_defaults_parse_and_refuse_bad_values() {
+        let c = Config::default();
+        assert_eq!(c.unlock.probe_seconds, 2.0);
+        assert_eq!(
+            c.unlock.battery_probe_seconds,
+            BatteryProbeSeconds {
+                performance: 3.0,
+                balanced: 5.0,
+                power_saver: 8.0
+            }
+        );
+        let c = Config::from_text(
+            "[unlock]\nprobe_seconds = 1.5\nbattery_probe_seconds = { balanced = 4, power-saver = 10.0 }",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(c.unlock.probe_seconds, 1.5);
+        assert_eq!(
+            c.unlock.battery_probe_seconds,
+            BatteryProbeSeconds {
+                performance: 3.0,
+                balanced: 4.0,
+                power_saver: 10.0
+            }
+        );
+        let c = Config::from_text(
+            "[unlock.battery_probe_seconds]\nperformance = 2.5\n",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(c.unlock.battery_probe_seconds.performance, 2.5);
+        assert_eq!(c.unlock.probe_seconds, 2.0);
+        for bad in [
+            "[unlock]\nprobe_seconds = 0",
+            "[unlock]\nprobe_seconds = -2.0",
+            "[unlock]\nprobe_seconds = nan",
+            "[unlock]\nbattery_probe_seconds = { performance = 0 }",
+            "[unlock]\nbattery_probe_seconds = { balanced = -1.0 }",
+            "[unlock]\nbattery_probe_seconds = { power-saver = 0.0 }",
+        ] {
+            let e = Config::from_text(bad, "test")
+                .err()
+                .map(|e| format!("{:#}", e))
+                .unwrap_or_default();
+            assert!(
+                e.contains("refusing to start"),
+                "{:?} should refuse: {}",
+                bad,
+                e
+            );
+        }
+        assert!(Config::from_text("[unlock]\nprobe_seconds = \"fast\"", "test").is_err());
+        let warned = unknown_keys("[unlock]\nbattery_probe_seconds = { power_saver = 8.0 }\n");
+        assert_eq!(warned.len(), 1, "{:?}", warned);
+        assert!(warned[0].contains("power_saver"), "{:?}", warned);
     }
 
     #[test]

@@ -177,11 +177,7 @@ pub(super) fn handle(
             },
         );
     }
-    let allowed = cred.uid() == 0
-        || user_uid(&req.user)
-            .map(|u| u == cred.uid())
-            .unwrap_or(false);
-    if !allowed {
+    if !may_ask(cred.uid(), user_uid(&req.user)) {
         log::warn!("uid {} asked about {}: refused", cred.uid(), req.user);
         return reply(
             &mut stream,
@@ -551,7 +547,7 @@ pub(super) fn handle(
     }
     if req.probe {
         let outcome = match take() {
-            Some(mut a) => a.probe(),
+            Some(mut a) => a.probe(&req.user),
             None => Outcome::Error {
                 message: "busy".into(),
             },
@@ -757,6 +753,30 @@ pub(super) fn handle(
         outcome.redacted()
     };
     reply(&mut stream, &outcome)
+}
+
+/// May a caller running as `peer_uid` ask about the user whose uid is
+/// `user_uid`? Root may ask about anyone, everyone else about themselves
+/// only, and nobody but root about a user the system does not know. Every
+/// request passes this, so the probe's `likely` is only ever about the
+/// caller's own face, or answered to root; anyone else gets "not permitted".
+fn may_ask(peer_uid: u32, user_uid: Option<u32>) -> bool {
+    peer_uid == 0 || user_uid.map(|u| u == peer_uid).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod ask_tests {
+    use super::may_ask;
+
+    /// A probe, like every request, is answered for the caller's own user or
+    /// for root: another user's `likely` is refused with the request.
+    #[test]
+    fn a_caller_asks_only_about_themselves_unless_root() {
+        assert!(may_ask(1000, Some(1000)), "the caller's own face");
+        assert!(!may_ask(1000, Some(1001)), "another user's face");
+        assert!(!may_ask(1000, None), "a user the system does not know");
+        assert!(may_ask(0, Some(1001)), "root asks about anyone");
+    }
 }
 
 #[cfg(test)]

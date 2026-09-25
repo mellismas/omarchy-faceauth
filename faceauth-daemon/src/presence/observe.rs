@@ -87,11 +87,52 @@ pub(crate) fn observe_in(
     strict: bool,
     persist: bool,
 ) -> Result<Observation> {
+    look(a, cfg, identify, strict, persist, None).map(|(o, _)| o)
+}
+
+/// The lock screen probe's look: the same look without the identity check,
+/// and with `user`'s best template score for the face on the look's own
+/// frame, taken without the flash or the gate once the camera is closed. A
+/// filter for the probe's `likely`, never a decision.
+pub(crate) fn probe_look(
+    a: &mut Authenticator,
+    cfg: &PresenceConfig,
+    user: &str,
+) -> Result<(Observation, ProbeReading)> {
+    look(a, cfg, false, false, false, Some(user))
+}
+
+/// What a probe's look read of the asking user's face.
+pub(crate) struct ProbeReading {
+    /// The best template score, or why the look has none: no frame, no
+    /// face, a face beyond the line an attempt would judge, nothing
+    /// enrolled, no templates for this camera, or a face that could not be
+    /// scored.
+    pub(crate) score: std::result::Result<f32, &'static str>,
+    /// The look's frames were lit by the IR illuminator: every frame, with
+    /// the exposure metered on the whole frame, where a full scan scores the
+    /// lit frames of strobed pairs with the exposure settled on the face.
+    pub(crate) lit: bool,
+}
+
+fn look(
+    a: &mut Authenticator,
+    cfg: &PresenceConfig,
+    identify: bool,
+    strict: bool,
+    persist: bool,
+    score_for: Option<&str>,
+) -> Result<(Observation, ProbeReading)> {
     use crate::capture::IrCapture;
     let mut cap = IrCapture::open_at(&a.cfg, a.last_exposure)?;
     if let Some(i) = &cap.illuminator {
         i.set(true)?;
     }
+    let lit = cap.illuminator.is_some();
+    let unscored = |why: &'static str| ProbeReading {
+        score: Err(why),
+        lit,
+    };
     // Let exposure react for a handful of frames; the last one is what we look at.
     let mut img = None;
     let deadline = Instant::now() + Duration::from_millis(450);
@@ -102,14 +143,17 @@ pub(crate) fn observe_in(
     }
     let Some(mut img) = img else {
         cap.stop()?;
-        return Ok(Observation {
-            face: false,
-            attentive: false,
-            identity: None,
-            near_miss: false,
-            frame: None,
-            bbox: None,
-        });
+        return Ok((
+            Observation {
+                face: false,
+                attentive: false,
+                identity: None,
+                near_miss: false,
+                frame: None,
+                bbox: None,
+            },
+            unscored("no frame"),
+        ));
     };
     let mut faces = a.pipeline.detector.detect(&img, a.cfg.min_detection)?;
     // With someone there at the last look, keep looking for up to
@@ -131,14 +175,17 @@ pub(crate) fn observe_in(
     a.last_exposure = Some(cap.exposure);
     let Some(face) = faces.into_iter().max_by(|x, y| x.score.total_cmp(&y.score)) else {
         cap.stop()?;
-        return Ok(Observation {
-            face: false,
-            attentive: false,
-            identity: None,
-            near_miss: false,
-            frame: Some(img),
-            bbox: None,
-        });
+        return Ok((
+            Observation {
+                face: false,
+                attentive: false,
+                identity: None,
+                near_miss: false,
+                frame: Some(img),
+                bbox: None,
+            },
+            unscored("no face"),
+        ));
     };
     let p = pose::pose(&face.landmarks);
     // Attention from the mesh when the model is installed: its angles hold
@@ -211,26 +258,32 @@ pub(crate) fn observe_in(
             AfterGate::Embed => {}
             AfterGate::Refused => {
                 cap.stop()?;
-                return Ok(Observation {
-                    face: true,
-                    attentive,
-                    identity: Some(false),
-                    near_miss: false,
-                    frame: Some(img),
-                    bbox: Some(face.bbox),
-                });
+                return Ok((
+                    Observation {
+                        face: true,
+                        attentive,
+                        identity: Some(false),
+                        near_miss: false,
+                        frame: Some(img),
+                        bbox: Some(face.bbox),
+                    },
+                    unscored("not asked"),
+                ));
             }
             AfterGate::Unconfirmed => {
                 log::info!("presence: the gate read no signal; the look confirms nobody");
                 cap.stop()?;
-                return Ok(Observation {
-                    face: true,
-                    attentive,
-                    identity: None,
-                    near_miss: false,
-                    frame: Some(img),
-                    bbox: Some(face.bbox),
-                });
+                return Ok((
+                    Observation {
+                        face: true,
+                        attentive,
+                        identity: None,
+                        near_miss: false,
+                        frame: Some(img),
+                        bbox: Some(face.bbox),
+                    },
+                    unscored("not asked"),
+                ));
             }
         }
         let crop = faceauth_engine::align::align_112(&img, &face.landmarks);
@@ -259,14 +312,17 @@ pub(crate) fn observe_in(
                     );
                 }
                 cap.stop()?;
-                return Ok(Observation {
-                    face: true,
-                    attentive,
-                    identity: None,
-                    near_miss: false,
-                    frame: Some(img),
-                    bbox: Some(face.bbox),
-                });
+                return Ok((
+                    Observation {
+                        face: true,
+                        attentive,
+                        identity: None,
+                        near_miss: false,
+                        frame: Some(img),
+                        bbox: Some(face.bbox),
+                    },
+                    unscored("not asked"),
+                ));
             }
         };
         if score < a.cfg.accept_threshold {
@@ -289,7 +345,17 @@ pub(crate) fn observe_in(
     } else {
         (None, false)
     };
+    let device = cap.identity.clone();
     cap.stop()?;
+    // After the camera is closed, so the embed does not hold it.
+    let reading = match score_for {
+        None => unscored("not asked"),
+        Some(_) if !near_enough => unscored("face beyond the line"),
+        Some(user) => ProbeReading {
+            score: probe_score(a, user, &img, &face.landmarks, &device),
+            lit,
+        },
+    };
     log::debug!(
         "presence tick: face {:.2} yaw {:.2} pitch {:.2} roll {:.0} attentive {} identity {:?}",
         face.score,
@@ -300,14 +366,60 @@ pub(crate) fn observe_in(
         identity
     );
     let bbox = face.bbox;
-    Ok(Observation {
-        face: true,
-        attentive,
-        identity,
-        near_miss,
-        frame: Some(img),
-        bbox: Some(bbox),
-    })
+    Ok((
+        Observation {
+            face: true,
+            attentive,
+            identity,
+            near_miss,
+            frame: Some(img),
+            bbox: Some(bbox),
+        },
+        reading,
+    ))
+}
+
+/// Whether the last probe could not score its face (templates unreadable,
+/// or the embedder failing), so the warning is logged once per episode.
+static PROBE_UNSCORED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `user`'s best template score for the face at `landmarks` on `img`,
+/// against the templates enrolled on `device` only, or why there is none.
+/// The store is read first, so a user with nothing enrolled costs no embed.
+/// The score never leaves the daemon; `probe` logs it at debug only, as an
+/// attempt logs its frame scores.
+fn probe_score(
+    a: &mut Authenticator,
+    user: &str,
+    img: &Grey,
+    landmarks: &[[f32; 2]; 5],
+    device: &str,
+) -> std::result::Result<f32, &'static str> {
+    let scored = (|| -> Result<std::result::Result<f32, &'static str>> {
+        let Some(t) = a.store.load(user)? else {
+            return Ok(Err("not enrolled"));
+        };
+        let crop = faceauth_engine::align::align_112(img, landmarks);
+        let e = a.pipeline.embedder.embed(&crop)?;
+        Ok(t.best_match_on(&e, device)
+            .map(|(s, _)| s)
+            .ok_or("no templates for this camera"))
+    })();
+    match scored {
+        Ok(s) => {
+            PROBE_UNSCORED.store(false, Ordering::Relaxed);
+            s
+        }
+        Err(e) => {
+            if !PROBE_UNSCORED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "probe: the face could not be scored, so no probe reads as likely until it can: {:#}",
+                    e
+                );
+            }
+            Err("could not be scored")
+        }
+    }
 }
 
 /// How long a presence look may strobe for its one reading. The phase lock

@@ -47,7 +47,7 @@ pub use config::{
     PresenceMode, SECURE_OBSCURED_LOCK_MINUTES, SECURE_OBSCURED_LOCK_RANGE,
 };
 pub use lock::{SessionLock, LOCK_CHECK_TICKS, LOCK_HELPER, SESSION_LOCK};
-pub(crate) use observe::{observe_in, Observation};
+pub(crate) use observe::{observe_in, probe_look, Observation};
 pub use observe::{
     ATTENTIVE_MAX_ROLL_DEG, ATTENTIVE_MAX_YAW, FACE_SETTLE_MAX, LOOK_SEE_BUDGET, NEAR_MISS_SLACK,
     PRESENCE_STROBE_WINDOW,

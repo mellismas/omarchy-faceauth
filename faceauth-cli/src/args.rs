@@ -159,6 +159,8 @@ mod arg_tests {
                 attentive: false,
                 face_px: 0.0,
                 scannable: false,
+                likely: false,
+                cadence: Default::default(),
                 elapsed_ms: 1
             }),
             0
@@ -186,6 +188,39 @@ mod arg_tests {
             1
         );
         assert_eq!(exit_for(&Outcome::NoFace { elapsed_ms: 0 }), 1);
+    }
+}
+
+#[cfg(test)]
+mod probe_line_tests {
+    use faceauth_daemon::auth::Outcome;
+
+    /// `faceauth probe` prints the daemon's reply as one JSON line, so the
+    /// lock screen reads `likely` and `cadence` from it; against an older
+    /// daemon the line still carries both, as the lock screen would read
+    /// their absence (likely, the shipped intervals).
+    #[test]
+    fn the_probe_line_carries_likely_and_cadence() {
+        let cadence = r#""cadence":{"ac":2.5,"performance":3.0,"balanced":6.0,"power-saver":9.0}"#;
+        let reply = format!(
+            r#"{{"result":"probe","face":true,"attentive":true,"face_px":88.0,"scannable":true,"likely":false,{},"elapsed_ms":455}}"#,
+            cadence
+        );
+        let line =
+            serde_json::to_string(&serde_json::from_str::<Outcome>(&reply).unwrap()).unwrap();
+        assert!(line.contains(r#""likely":false"#), "{}", line);
+        assert!(line.contains(cadence), "{}", line);
+        assert!(!line.contains("score"), "{}", line);
+        let old = r#"{"result":"probe","face":true,"attentive":true,"face_px":88.0,"scannable":true,"elapsed_ms":455}"#;
+        let line = serde_json::to_string(&serde_json::from_str::<Outcome>(old).unwrap()).unwrap();
+        assert!(line.contains(r#""likely":true"#), "{}", line);
+        assert!(
+            line.contains(
+                r#""cadence":{"ac":2.0,"performance":3.0,"balanced":5.0,"power-saver":8.0}"#
+            ),
+            "{}",
+            line
+        );
     }
 }
 

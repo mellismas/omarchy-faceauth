@@ -27,7 +27,7 @@ mod dev;
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  faceauth cam probe\n  faceauth cam graph\n  faceauth auth [--user NAME] [--socket PATH] [--consent]   (asks a running faceauthd; --consent = window + nod)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there?)
+        "usage:\n  faceauth cam probe\n  faceauth cam graph\n  faceauth auth [--user NAME] [--socket PATH] [--consent]   (asks a running faceauthd; --consent = window + nod)\n  faceauth probe [--user NAME] [--socket PATH]     (one short look: is a face there, and is it likely you? the reply carries likely and the lock screen's cadence, never a score)
   faceauth enroll [--user NAME] [--label TEXT] [--start distance]   (root; the walk-through window, the same one Setup > Security > Face opens; --guided is accepted)
   faceauth enroll [--user NAME] [--label TEXT] --terminal [--poses up,down]   (root; the five looks from the terminal, no window)
   faceauth enroll [--user NAME] [--label TEXT] --look [--seconds N] [--count N]   (root; one look, as the camera sees it, no walk-through)
