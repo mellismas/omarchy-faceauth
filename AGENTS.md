@@ -13,5 +13,5 @@ For automated pull-request reviewers (Codex, Claude). Report only what a reviewe
 ## Git Workflow
 
 - Commit early and often on a feature branch, with a clear message for each logical step.
-- Open a pull request only when a component is complete and passes the local checks. No checkpoint or work-in-progress PRs: every PR triggers automated Codex and Claude reviews and CI.
+- Open a pull request only when a component is complete and passes the local checks. No checkpoint or work-in-progress PRs: every PR you open triggers automated Codex and Claude reviews.
 - Keep each pull request to one component, so reviews stay focused.
