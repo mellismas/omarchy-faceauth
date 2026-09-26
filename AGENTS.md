@@ -2,9 +2,9 @@
 
 ## Code Review Rules
 
-For automated pull-request reviewers (Codex, Claude). Report only what a reviewer adds beyond the agentright gate, which already enforces lint, typecheck, formatting, duplication, and the debt ratchet.
+For automated pull-request reviewers (Codex, Claude). The agentright gate enforces lint, typecheck, formatting, duplication, and the debt ratchet, but only on pushes from Mike's machine. PRs written in the cloud (Codex cloud tasks, Claude Code on the web) have not run it, so on those, report lint, type, and formatting problems too.
 
-- Report correctness bugs, security issues, data-handling problems, and broken contracts. Skip style and formatting.
+- Report correctness bugs, security issues, data-handling problems, and broken contracts. Skip style and formatting, except on cloud-written PRs (see above).
 - Every finding names the file and line in the diff and a concrete failure: the input or state, and the wrong result. No speculative "consider" notes.
 - Rank findings by severity. If nothing clears that bar, say so in one line.
 - Never propose editing or relaxing governance files to make a check pass: `.agentright-debt-baseline.json`, the `checkrepo-*.json` ledgers, `agentright.toml`, or hook configuration.
