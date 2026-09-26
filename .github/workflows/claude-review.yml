@@ -10,9 +10,15 @@
 # Actions and the review plugin are pinned to full commit SHAs.
 name: Claude Review
 
+# pull_request_target runs the base branch's copy of this file, and only PRs
+# into main trigger it, so a PR branch cannot rewrite the job that holds the
+# token. The token lives only in the claude-review environment, which only
+# main can use: a workflow pushed to any other branch gets nothing. The job
+# never checks out or runs PR code; it reads the change via `gh pr diff`.
 on:
-  pull_request:
+  pull_request_target: # zizmor: ignore[dangerous-triggers]
     types: [opened, ready_for_review, reopened]
+    branches: [main]
 
 permissions: {}
 
@@ -27,8 +33,8 @@ jobs:
     if: ${{ !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # Public repo: the token lives only in this environment, which requires
-    # Mike's approval on every run (Actions > Review deployments).
+    # Holds CLAUDE_CODE_OAUTH_TOKEN; only main may use it, and on this public
+    # repo every run waits for Mike's approval (Actions > Review deployments).
     environment: claude-review
     permissions:
       contents: read
