@@ -1,16 +1,20 @@
 # Automated PR review by Claude, billed to the Claude subscription via
 # CLAUDE_CODE_OAUTH_TOKEN (generated with `claude setup-token`). Reviews once
-# when a PR opens, is reopened, or leaves draft; for another pass, re-run this
-# workflow from the Actions tab (Codex re-reviews on an "@codex review" comment).
+# when a PR opens, is reopened, or leaves draft. Pushes to an open PR are not
+# re-reviewed: the code-review plugin stops on a PR Claude has already commented
+# on, so after fixing findings, comment "@codex review" for another pass.
 # Comments post under the Claude GitHub App's token (id-token exchange), so the
 # workflow token stays read-only, as in Anthropic's inline-review example.
 # Public repo: each run waits for Mike's approval before it gets the token.
 # Review rules live in AGENTS.md (## Code Review Rules), loaded via CLAUDE.md.
+# Actions and the review plugin are pinned to full commit SHAs.
 name: Claude Review
 
 on:
   pull_request:
     types: [opened, ready_for_review, reopened]
+
+permissions: {}
 
 concurrency:
   group: claude-review-${{ github.event.pull_request.number }}
@@ -18,6 +22,9 @@ concurrency:
 
 jobs:
   review:
+    # Drafts wait for ready_for_review. Fork and Dependabot PRs never receive
+    # repository secrets, so they are skipped instead of failing.
+    if: ${{ !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # Public repo: the token lives only in this environment, which requires
@@ -29,13 +36,34 @@ jobs:
       issues: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      # Base commit, not the PR head: the action restores CLAUDE.md from base,
+      # but the AGENTS.md it imports would otherwise come from the PR under
+      # review. The plugin reads the change itself through `gh pr diff`.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 1
-      - uses: anthropics/claude-code-action@v1
+          persist-credentials: false
+      # Anthropic's code-review plugin, pinned to a commit of anthropics/claude-code
+      # (plugin last changed 2026-03-12). The marketplace name claude-code-plugins
+      # is reserved for Anthropic's GitHub source, so the pinned copy is served
+      # from a local marketplace named pinned-review.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: anthropics/claude-code
+          ref: 7779afb12e3635f46f56ec823979d68350ae000b
+          path: .review-plugins
+          sparse-checkout: /plugins/code-review/
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Register pinned plugin marketplace
+        run: |
+          mkdir -p .review-plugins/.claude-plugin
+          echo '{"name":"pinned-review","owner":{"name":"mellismas"},"plugins":[{"name":"code-review","source":"./plugins/code-review"}]}' > .review-plugins/.claude-plugin/marketplace.json
+      - uses: anthropics/claude-code-action@756cc22e19660d20e8cc9496b4f242475a7f7790 # v1.0.235
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
-          plugins: "code-review@claude-code-plugins"
+          plugin_marketplaces: "./.review-plugins"
+          plugins: "code-review@pinned-review"
           prompt: "/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
           claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment"'
