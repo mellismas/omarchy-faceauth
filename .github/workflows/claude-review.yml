@@ -3,8 +3,9 @@
 # when a PR opens, is reopened, or leaves draft. Pushes to an open PR are not
 # re-reviewed: the code-review plugin stops on a PR Claude has already commented
 # on, so after fixing findings, comment "@codex review" for another pass.
-# Comments post under the Claude GitHub App's token (id-token exchange), so the
-# workflow token stays read-only, as in Anthropic's inline-review example.
+# Comments post as github-actions[bot] through the workflow token, which can
+# write to pull requests but only read code. The Claude app's OIDC token
+# exchange rejects pull_request_target runs (anthropics/claude-code-action#713).
 # Public repo: each run waits for Mike's approval before it gets the token.
 # Review rules live in AGENTS.md (## Code Review Rules), loaded via CLAUDE.md.
 # Actions and the review plugin are pinned to full commit SHAs.
@@ -28,8 +29,9 @@ concurrency:
 
 jobs:
   review:
-    # Drafts wait for ready_for_review. Fork and Dependabot PRs never receive
-    # repository secrets, so they are skipped instead of failing.
+    # Drafts wait for ready_for_review. This condition is the security boundary
+    # for forks and Dependabot: pull_request_target would hand their runs the
+    # token, so they are skipped here. Do not remove or loosen it.
     if: ${{ !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -38,9 +40,8 @@ jobs:
     environment: claude-review
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: write
       issues: read
-      id-token: write
     steps:
       # Base commit, not the PR head: the action restores CLAUDE.md from base,
       # but the AGENTS.md it imports would otherwise come from the PR under
@@ -69,6 +70,7 @@ jobs:
       - uses: anthropics/claude-code-action@756cc22e19660d20e8cc9496b4f242475a7f7790 # v1.0.235
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           plugin_marketplaces: "./.review-plugins"
           plugins: "code-review@pinned-review"
           prompt: "/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
