@@ -1,0 +1,41 @@
+# Automated PR review by Claude, billed to the Claude subscription via
+# CLAUDE_CODE_OAUTH_TOKEN (generated with `claude setup-token`). Reviews once
+# when a PR opens, is reopened, or leaves draft; for another pass, re-run this
+# workflow from the Actions tab (Codex re-reviews on an "@codex review" comment).
+# Comments post under the Claude GitHub App's token (id-token exchange), so the
+# workflow token stays read-only, as in Anthropic's inline-review example.
+# Public repo: each run waits for Mike's approval before it gets the token.
+# Review rules live in AGENTS.md (## Code Review Rules), loaded via CLAUDE.md.
+name: Claude Review
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened]
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Public repo: the token lives only in this environment, which requires
+    # Mike's approval on every run (Actions > Review deployments).
+    environment: claude-review
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
+          plugins: "code-review@claude-code-plugins"
+          prompt: "/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
+          claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment"'
