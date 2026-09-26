@@ -1,16 +1,20 @@
 # Automated PR review by Claude, billed to the Claude subscription via
 # CLAUDE_CODE_OAUTH_TOKEN (generated with `claude setup-token`). Reviews once
-# when a PR opens, is reopened, or leaves draft; for another pass, re-run this
-# workflow from the Actions tab (Codex re-reviews on an "@codex review" comment).
+# when a PR opens, is reopened, or leaves draft. Pushes to an open PR are not
+# re-reviewed: the code-review plugin stops on a PR Claude has already commented
+# on, so after fixing findings, comment "@codex review" for another pass.
 # Comments post under the Claude GitHub App's token (id-token exchange), so the
 # workflow token stays read-only, as in Anthropic's inline-review example.
 # Public repo: each run waits for Mike's approval before it gets the token.
 # Review rules live in AGENTS.md (## Code Review Rules), loaded via CLAUDE.md.
+# Actions are pinned to full commit SHAs; the trailing comment names the release.
 name: Claude Review
 
 on:
   pull_request:
     types: [opened, ready_for_review, reopened]
+
+permissions: {}
 
 concurrency:
   group: claude-review-${{ github.event.pull_request.number }}
@@ -18,6 +22,9 @@ concurrency:
 
 jobs:
   review:
+    # Drafts wait for ready_for_review. Fork and Dependabot PRs never receive
+    # repository secrets, so they are skipped instead of failing.
+    if: ${{ !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # Public repo: the token lives only in this environment, which requires
@@ -29,10 +36,15 @@ jobs:
       issues: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      # Base commit, not the PR head: the action restores CLAUDE.md from base,
+      # but the AGENTS.md it imports would otherwise come from the PR under
+      # review. The plugin reads the change itself through `gh pr diff`.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 1
-      - uses: anthropics/claude-code-action@v1
+          persist-credentials: false
+      - uses: anthropics/claude-code-action@756cc22e19660d20e8cc9496b4f242475a7f7790 # v1.0.235
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
