@@ -1,0 +1,24 @@
+# Dependency version updates (CI Hardening call M1). Weekly, with a
+# 7-day cooldown so a fresh release has time to be pulled if it's bad;
+# security updates skip the cooldown. Minor and patch updates group into
+# one PR per ecosystem; majors arrive as their own PRs.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directories: ["/"]
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions-minor-and-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: cargo
+    directories: ["/"]
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]

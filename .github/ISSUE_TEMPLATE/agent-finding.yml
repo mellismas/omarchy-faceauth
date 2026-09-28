@@ -1,0 +1,64 @@
+name: Agent finding
+description: For agents on Mike's computer (the healer, the PR shepherd, a coding session there). Cloud agents don't open issues. For a plain task, open a blank issue.
+labels:
+  - agent-filed
+  - "status: triage"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One problem per issue. Redact secrets, client data, and local paths from anything you paste.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What ran, what was expected, and what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnosis
+    attributes:
+      label: Diagnosis
+      description: What the investigation found, grounded in logs and source, with file and line.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: A minimal, deterministic repro if one was found. If none was, say so.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: The most relevant log lines or traces only. Redacted.
+      render: shell
+
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification
+      description: How to tell it's fixed, such as the test or command that fails now and should pass after the fix.
+    validations:
+      required: true
+
+  - type: input
+    id: related
+    attributes:
+      label: Related issues or PRs
+      description: Anything that looks similar, and why this isn't a duplicate.
+
+  - type: input
+    id: agent
+    attributes:
+      label: Filed by
+      description: Which agent and model filed this.
+      placeholder: claude (opus 5.5), healer
+    validations:
+      required: true

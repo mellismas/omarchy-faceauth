@@ -1,38 +1,106 @@
 # Automated PR review by Claude, billed to the Claude subscription via
 # CLAUDE_CODE_OAUTH_TOKEN (generated with `claude setup-token`). Reviews once
-# when a PR opens, is reopened, or leaves draft. Pushes to an open PR are not
-# re-reviewed: the code-review plugin stops on a PR Claude has already commented
-# on, so after fixing findings, comment "@codex review" for another pass.
+# when a PR into main opens, is reopened, or leaves draft. PRs that Mike's
+# account opens into any other branch are reviewed through Claude Review
+# Signal (claude-review-signal.yml) on the same events. The signal can't
+# fire when neither branch carries the signal file, or when the PR opens with
+# merge conflicts (GitHub runs no pull_request workflow then); fix the
+# branch, then close and reopen the PR. Any PR can also be reviewed on demand:
+#   gh workflow run claude-review.yml -f pr=<number>
+# Pushes to an open PR are not re-reviewed: the code-review plugin stops on a
+# PR Claude has already commented on, so after fixing findings, comment
+# "@codex review" for another pass.
 # Comments post as github-actions[bot] through the workflow token, which can
 # write to pull requests but only read code. The Claude app's OIDC token
 # exchange rejects pull_request_target runs (anthropics/claude-code-action#713).
-# Public repo: each run waits for Mike's approval before it gets the token.
 # Review rules live in AGENTS.md (## Code Review Rules), loaded via CLAUDE.md.
 # Actions and the review plugin are pinned to full commit SHAs.
+# Public repo: each run waits for Mike's approval before it gets the token.
 name: Claude Review
 
-# pull_request_target runs the base branch's copy of this file, and only PRs
-# into main trigger it, so a PR branch cannot rewrite the job that holds the
-# token. The token lives only in the claude-review environment, which only
-# main can use: a workflow pushed to any other branch gets nothing. The job
-# never checks out or runs PR code; it reads the change via `gh pr diff`.
+# Only main's copy of this file ever reviews, because the claude-review
+# environment that holds the token serves only main:
+# - pull_request_target runs the base branch's copy, and only PRs into main
+#   trigger it.
+# - workflow_run always runs the default branch's copy.
+# - workflow_dispatch runs the dispatched ref's copy; from any ref but main,
+#   the environment refuses the job.
+# No job ever checks out or runs PR code; the review reads the change via
+# `gh pr diff`.
 on:
   pull_request_target: # zizmor: ignore[dangerous-triggers]
     types: [opened, ready_for_review, reopened]
     branches: [main]
+  workflow_run: # zizmor: ignore[dangerous-triggers]
+    workflows: [Claude Review Signal]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number to review
+        required: true
+        type: number
 
 permissions: {}
 
-concurrency:
-  group: claude-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 jobs:
+  # Which PR to review. For workflow_run, the PR named in the signal's run
+  # title, accepted only if GitHub lists it on the run and it is an open,
+  # non-draft PR into a branch other than main opened by mellismas (a scope,
+  # not a boundary: agents open PRs as mellismas too). This job holds no
+  # secret; the review job below keys its cancel group by the number it
+  # returns, so an unvalidated title can't cancel another PR's review.
+  resolve:
+    # pull_request_target: drafts wait for ready_for_review, and this condition
+    # is the security boundary for forks and Dependabot: pull_request_target
+    # would hand their runs the token, so they are skipped here. Do not remove
+    # or loosen it.
+    # workflow_run: a successful signal from a same-repo PR. The step below
+    # reads the PR itself (author, draft, base) from the API, because the
+    # signal's copy is PR-controlled and its actor may not be the PR author.
+    # workflow_dispatch: only a run dispatched on main reviews.
+    if: >-
+      (github.event_name == 'pull_request_target' && !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]') ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.head_repository.full_name == github.repository) ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      number: ${{ steps.pr.outputs.number }}
+    steps:
+      - name: Resolve the pull request
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR_TARGET: ${{ github.event.pull_request.number }}
+          PR_INPUT: ${{ inputs.pr }}
+          RUN_TITLE: ${{ github.event.workflow_run.display_title }}
+          RUN_PRS: ${{ toJSON(github.event.workflow_run.pull_requests) }}
+        run: |
+          pr=""
+          case "$EVENT" in
+            pull_request_target) pr="$PR_TARGET" ;;
+            workflow_dispatch) pr="$PR_INPUT" ;;
+            workflow_run)
+              n=$(sed -n 's/^Claude Review Signal for PR \([0-9][0-9]*\)$/\1/p' <<<"$RUN_TITLE")
+              if [ -n "$n" ] && jq -e --argjson n "$n" 'any(.[]; .number == $n)' <<<"$RUN_PRS" >/dev/null; then
+                ok=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$n" --jq '.state == "open" and (.draft | not) and .user.login == "mellismas" and .base.ref != "main" and .head.repo.full_name == $ENV.GITHUB_REPOSITORY')
+                if [ "$ok" = true ]; then pr="$n"; fi
+              fi
+              ;;
+          esac
+          echo "number=$pr" >> "$GITHUB_OUTPUT"
+
   review:
-    # Drafts wait for ready_for_review. This condition is the security boundary
-    # for forks and Dependabot: pull_request_target would hand their runs the
-    # token, so they are skipped here. Do not remove or loosen it.
-    if: ${{ !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' }}
+    needs: resolve
+    if: needs.resolve.outputs.number != ''
+    # One review per PR, whatever started it, keyed by the validated number.
+    concurrency:
+      group: claude-review-${{ needs.resolve.outputs.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # Holds CLAUDE_CODE_OAUTH_TOKEN; only main may use it, and on this public
@@ -43,12 +111,15 @@ jobs:
       pull-requests: write
       issues: read
     steps:
-      # Base commit, not the PR head: the action restores CLAUDE.md from base,
-      # but the AGENTS.md it imports would otherwise come from the PR under
-      # review. The plugin reads the change itself through `gh pr diff`.
+      # The base commit of a PR into main, and main itself otherwise: never the
+      # PR head, and never a non-main base. Anyone who can push can write to a
+      # non-main branch without review, and its .claude/ settings, hooks, or
+      # .mcp.json would load in this job alongside the token. So a PR into
+      # another branch is reviewed against main's rules and context. The plugin
+      # reads the change itself through `gh pr diff`.
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
           fetch-depth: 1
           persist-credentials: false
       # Anthropic's code-review plugin, pinned to a commit of anthropics/claude-code
@@ -73,5 +144,5 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           plugin_marketplaces: "./.review-plugins"
           plugins: "code-review@pinned-review"
-          prompt: "/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
+          prompt: "/code-review:code-review --comment ${{ github.repository }}/pull/${{ needs.resolve.outputs.number }}"
           claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment"'
