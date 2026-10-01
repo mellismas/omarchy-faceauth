@@ -1,0 +1,63 @@
+name: Linux build and authentication fixtures
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Debian Linux build and fixtures
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container: rust:1-bookworm
+    steps:
+      # Dependencies and the fixture user exist only in the job container.
+      - name: Prepare build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends libpam0g-dev
+          useradd --create-home fixture
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build and test as an unprivileged user
+        working-directory: .
+        env:
+          CARGO_HOME: /tmp/fixture-cargo
+        run: |
+          chown -R fixture:fixture "$GITHUB_WORKSPACE"
+          runuser -u fixture -- cargo build --locked --workspace --release
+          runuser -u fixture -- cargo test --locked -p faceauth-daemon --lib server:: -- --nocapture
+          runuser -u fixture -- cargo test --locked -p pam_faceauth --lib -- --nocapture
+
+  arch:
+    name: Arch Linux build and fixtures
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container: archlinux:base-devel
+    steps:
+      - name: Prepare build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed git rust pam
+          useradd --create-home fixture
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build and test as an unprivileged user
+        working-directory: .
+        env:
+          CARGO_HOME: /tmp/fixture-cargo
+        run: |
+          chown -R fixture:fixture "$GITHUB_WORKSPACE"
+          runuser -u fixture -- cargo build --locked --workspace --release
+          runuser -u fixture -- cargo test --locked -p faceauth-daemon --lib server:: -- --nocapture
+          runuser -u fixture -- cargo test --locked -p pam_faceauth --lib -- --nocapture
+
+# These tests use synthetic process/session and socket fixtures. They do not
+# run the recorded biometric trace battery or establish camera, TPM, installed
+# PAM, real logind/session, consent UI, ONNX/model, or liveness acceptance.
