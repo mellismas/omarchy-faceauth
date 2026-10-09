@@ -1,0 +1,11 @@
+# Informational only: names the owner of the files an agent could edit to
+# change its own rules or turn a check green. Branch protection doesn't
+# require code-owner review, since a solo owner can't approve their own PRs.
+# The PR shepherd routes PRs that touch these paths to Mike instead of
+# merging them.
+AGENTS.md @mellismas
+CLAUDE.md @mellismas
+/.github/ @mellismas
+.agentright-debt-baseline.json @mellismas
+checkrepo-*.json @mellismas
+agentright.toml @mellismas

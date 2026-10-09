@@ -1,0 +1,28 @@
+# Signals a PR into a branch other than main, so that Claude Review
+# (claude-review.yml) reviews it. That workflow listens with workflow_run, which
+# always runs main's copy. This workflow runs the PR's own copy, so it holds no
+# permissions and does nothing. A branch that edits it gains nothing it could
+# not get from any workflow file it adds, and cannot reach the Claude token.
+name: Claude Review Signal
+# The run title carries the PR number. Claude Review accepts it only if
+# GitHub lists that PR on the run, so an edited title cannot redirect it.
+run-name: Claude Review Signal for PR ${{ github.event.pull_request.number }}
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened]
+    branches-ignore: [main]
+
+permissions: {}
+
+jobs:
+  signal:
+    # Drafts wait for ready_for_review. A skipped run is not a signal.
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Signal
+        env:
+          PR: ${{ github.event.pull_request.number }}
+        run: echo "PR $PR signaled for Claude review"
