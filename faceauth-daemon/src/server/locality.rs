@@ -48,7 +48,16 @@ pub(super) fn locality(
     pidfd: Option<&std::os::fd::OwnedFd>,
     target_user: &str,
 ) -> Locality {
-    match locality_inner(&LiveProcs, pid, target_user) {
+    locality_with(&LiveProcs, pid, pidfd, target_user)
+}
+
+fn locality_with(
+    procs: &dyn ProcView,
+    pid: i32,
+    pidfd: Option<&std::os::fd::OwnedFd>,
+    target_user: &str,
+) -> Locality {
+    match locality_inner(procs, pid, target_user) {
         Ok(Locality::Local(agent)) => match pidfd {
             // The /proc reads above were of a live process only if it is
             // still the same process now; without a pidfd to prove that,
@@ -695,8 +704,15 @@ mod locality_tests {
 
     #[test]
     fn a_caller_without_a_pidfd_is_not_local() {
-        let me = std::env::var("USER").unwrap_or_else(|_| "root".into());
-        match locality(std::process::id() as i32, None, &me) {
+        // Reach the pidfd guard even on a headless runner: its real process
+        // can already be remote for an unrelated cgroup or logind reason.
+        let mut t = Table::new();
+        t.add(500, 1, "quickshell", 1000, SHELL);
+        assert!(matches!(
+            locality_inner(&t, 500, "mike"),
+            Ok(Locality::Local(_))
+        ));
+        match locality_with(&t, 500, None, "mike") {
             Locality::Remote(why) => assert!(why.contains("pidfd"), "{}", why),
             Locality::Local(_) => panic!("no pidfd must not be local"),
         }
