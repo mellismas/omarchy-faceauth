@@ -117,7 +117,7 @@ jobs:
       # .mcp.json would load in this job alongside the token. So a PR into
       # another branch is reviewed against main's rules and context. The plugin
       # reads the change itself through `gh pr diff`.
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.base.sha || github.sha }}
           fetch-depth: 1
@@ -126,7 +126,7 @@ jobs:
       # (plugin last changed 2026-03-12). The marketplace name claude-code-plugins
       # is reserved for Anthropic's GitHub source, so the pinned copy is served
       # from a local marketplace named pinned-review.
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: anthropics/claude-code
           ref: 7779afb12e3635f46f56ec823979d68350ae000b
@@ -138,7 +138,7 @@ jobs:
         run: |
           mkdir -p .review-plugins/.claude-plugin
           echo '{"name":"pinned-review","owner":{"name":"mellismas"},"plugins":[{"name":"code-review","source":"./plugins/code-review"}]}' > .review-plugins/.claude-plugin/marketplace.json
-      - uses: anthropics/claude-code-action@756cc22e19660d20e8cc9496b4f242475a7f7790 # v1.0.235
+      - uses: anthropics/claude-code-action@ed670b4cf9de2a5a570d130d2f6197b9e543cd64 # v1.0.240
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
