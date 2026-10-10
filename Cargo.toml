@@ -17,7 +17,7 @@ log = "0.4"
 # terminal pipe, so the colour and regex-filter stacks (about 750 KB per
 # binary) buy nothing; RUST_LOG=level still works without them.
 env_logger = { version = "0.11", default-features = false }
-nix = { version = "0.30", features = ["ioctl", "fs", "poll", "mman", "socket", "uio"] }
+nix = { version = "0.31", features = ["ioctl", "fs", "poll", "mman", "socket", "uio"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
