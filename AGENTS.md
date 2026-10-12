@@ -7,6 +7,7 @@
 This section is generated from Mike's shared rules. It summarizes them and is never the only source of a rule. Don't edit it by hand.
 
 - Work on your own branch. Never push to main, force-push, use `--no-verify`, or merge.
+- Before any work, fetch and compare your branch with the latest `main`. If it's behind, rebase your work onto `main` (merge if the branch is already shared), keep every pending change, and re-run the tests. Never discard work or force-push to catch up; stop and report a conflict you can't resolve safely.
 - Open PRs ready for review, not as drafts. Don't open, comment on, or close other PRs or issues.
 - Never change a check's inputs to make it pass: governance files (AGENTS.md, CLAUDE.md, `.github/**`, `.agentright-debt-baseline.json`, `checkrepo-*.json`, `agentright.toml`), tests, assertions, or lint suppressions. Fix the code, or stop and report.
 - Never hand-edit a generated file. Edit its source and run the generator. This section comes from `sync-instructions.js`, and `codemap.json` comes from `agentright map`.
