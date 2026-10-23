@@ -322,17 +322,21 @@ impl LockWatch {
         every: Duration,
         live: &'static AtomicUsize,
     ) -> Result<LockWatch, LockQuestion> {
-        if live
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                (n < LOCK_WATCHES_MAX).then_some(n + 1)
-            })
-            .is_err()
-        {
-            log::info!(
-                "consent: {} lock watches are still finishing; the nod loop asks itself",
-                LOCK_WATCHES_MAX
-            );
-            return Err(question);
+        // Keep the bounded claim compatible with the workspace's Rust 1.88
+        // minimum: fetch_update is deprecated and try_update needs Rust 1.99.
+        let mut count = live.load(Ordering::SeqCst);
+        loop {
+            if count >= LOCK_WATCHES_MAX {
+                log::info!(
+                    "consent: {} lock watches are still finishing; the nod loop asks itself",
+                    LOCK_WATCHES_MAX
+                );
+                return Err(question);
+            }
+            match live.compare_exchange_weak(count, count + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(observed) => count = observed,
+            }
         }
         let shared = Arc::new(LockShared::default());
         let theirs = Arc::clone(&shared);
@@ -1082,6 +1086,34 @@ mod lock_watch_tests {
             "their threads ended"
         );
         assert!(LockWatch::start_counted(question, every, &LIVE).is_ok());
+    }
+
+    /// Simultaneous windows share the same limit and return every claimed
+    /// place when their watches end.
+    #[test]
+    fn concurrent_windows_cannot_claim_more_watch_threads() {
+        static LIVE: AtomicUsize = AtomicUsize::new(0);
+        let start = Arc::new(std::sync::Barrier::new(16));
+        let held: Vec<LockWatch> = std::thread::scope(|scope| {
+            let callers: Vec<_> = (0..16)
+                .map(|_| {
+                    let start = Arc::clone(&start);
+                    scope.spawn(move || {
+                        start.wait();
+                        LockWatch::start_counted(Arc::new(|| false), Duration::from_secs(60), &LIVE)
+                            .ok()
+                    })
+                })
+                .collect();
+            callers
+                .into_iter()
+                .filter_map(|caller| caller.join().unwrap())
+                .collect()
+        });
+        assert_eq!(held.len(), LOCK_WATCHES_MAX);
+        assert_eq!(LIVE.load(Ordering::SeqCst), LOCK_WATCHES_MAX);
+        drop(held);
+        assert!(soon(|| LIVE.load(Ordering::SeqCst) == 0));
     }
 
     /// A look that panics kills the watch's thread; the window then reads
