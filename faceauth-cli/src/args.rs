@@ -53,22 +53,97 @@ pub(super) fn opt<'a>(rest: &'a [&str], key: &str) -> Option<&'a str> {
     opt_value(rest, key).ok().flatten()
 }
 
-/// Refuse a flag no subcommand of this name takes: a misspelt `--user`
-/// must not fall through to the default user, and a misspelt `--dismiss`
-/// must not read as a password answer (J23).
-pub(super) fn only_flags(rest: &[&str], allowed: &[&str]) -> Result<()> {
-    if let Some(bad) = rest
-        .iter()
-        .find(|a| a.starts_with("--") && !allowed.contains(a))
-    {
-        bail!("unknown flag {}", bad);
+/// `--seconds N` when given, else `default`: a number of seconds from `lo`
+/// to `hi`. Anything else (a word, NaN, a negative, a length no request
+/// runs) is refused with the range, before it reaches a conversion that
+/// panics on it.
+pub(super) fn seconds_arg(rest: &[&str], default: f32, lo: f32, hi: f32) -> Result<f32> {
+    let Some(v) = opt(rest, "--seconds") else {
+        return Ok(default);
+    };
+    match v.parse::<f32>() {
+        Ok(s) if (lo..=hi).contains(&s) => Ok(s),
+        _ => bail!(
+            "--seconds takes a number of seconds from {} to {}, not {:?}",
+            lo,
+            hi,
+            v
+        ),
+    }
+}
+
+/// `--count N` when given, else `default`: a whole number from `lo` to
+/// `hi`, refused otherwise.
+pub(super) fn count_arg(rest: &[&str], default: usize, lo: usize, hi: usize) -> Result<usize> {
+    let Some(v) = opt(rest, "--count") else {
+        return Ok(default);
+    };
+    match v.parse::<usize>() {
+        Ok(n) if (lo..=hi).contains(&n) => Ok(n),
+        _ => bail!(
+            "--count takes a whole number from {} to {}, not {:?}",
+            lo,
+            hi,
+            v
+        ),
+    }
+}
+
+/// Refuse anything a command does not take: a flag it does not know, one
+/// of its `valued` flags without a value, and a stray word. A misspelt
+/// `--user` must not fall through to the default user, a misspelt
+/// `--dismiss` must not read as a password answer, and `presence of` must
+/// not read the watch's state as if nothing were wrong (J23).
+pub(super) fn only_flags(rest: &[&str], switches: &[&str], valued: &[&str]) -> Result<()> {
+    flags_and_words(rest, switches, valued, |_| false)
+}
+
+/// As `only_flags`, with the words `own` accepts taken as the command's
+/// own arguments: a development tool's images or directories.
+pub(super) fn flags_and_words(
+    rest: &[&str],
+    switches: &[&str],
+    valued: &[&str],
+    own: fn(&str) -> bool,
+) -> Result<()> {
+    let mut words = rest.iter();
+    while let Some(w) = words.next() {
+        if switches.contains(w) {
+            continue;
+        }
+        if valued.contains(w) {
+            match words.next() {
+                Some(v) if !v.starts_with("--") => continue,
+                _ => bail!("{} needs a value", w),
+            }
+        }
+        if own(w) {
+            continue;
+        }
+        if w.starts_with('-') {
+            bail!(
+                "unknown flag {} (faceauth --help lists each command's flags)",
+                w
+            );
+        }
+        bail!(
+            "unexpected argument {} (faceauth --help lists each command's arguments)",
+            w
+        );
     }
     Ok(())
 }
 
 /// The exit status for a scripted subcommand, from the daemon's answer:
 /// 0 when it did what was asked, 1 when it refused or the answer was a
-/// denial, 2 when the daemon could not do it at all (J27).
+/// denial, 2 when the daemon could not do it at all (J27). Of the answers
+/// a `templates delete` gets, only `Deleted` and `NotEnrolled` exit 0; an
+/// `Error` (busy, a caller refused as remote, a store error) exits 2, so a
+/// removal script does not report a deletion that did not happen and skip
+/// its own fallback. `key-lane`'s and `fprint-lane`'s `NotRunning` (no
+/// daemon to ask) exits 0: the lock screen reads it from stdout, says
+/// faceauth is not running, and goes back to stock Omarchy's fingerprint
+/// lane.
 fn exit_for(o: &faceauth_daemon::auth::Outcome) -> i32 {
     use faceauth_daemon::auth::Outcome;
     match o {
@@ -79,6 +154,9 @@ fn exit_for(o: &faceauth_daemon::auth::Outcome) -> i32 {
         | Outcome::Enrolled { .. }
         | Outcome::Pong { .. }
         | Outcome::Probe { .. }
+        | Outcome::KeyLane { .. }
+        | Outcome::FprintLane { .. }
+        | Outcome::NotRunning
         | Outcome::PresenceMode { .. } => 0,
         Outcome::Error { .. } => 2,
         _ => 1,
@@ -98,32 +176,47 @@ pub(super) fn finish(o: &faceauth_daemon::auth::Outcome) -> Result<()> {
     }
 }
 
-/// Whether the daemon's answer to `templates delete` means no templates
-/// are left: only `Deleted` and `NotEnrolled` do. Any other answer (busy,
-/// a caller refused as remote, a store error) leaves them on disk, and the
-/// command must fail so a removal script does not report a deletion that
-/// did not happen and skip its own fallback.
 #[cfg(test)]
 mod arg_tests {
     use super::*;
     use faceauth_daemon::auth::Outcome;
 
     /// J23: a `--user` with no name, or followed by another flag, is an
-    /// error rather than a fall-through; an unknown flag is refused.
+    /// error rather than a fall-through; an unknown flag and a stray word
+    /// are refused.
     #[test]
     fn a_valueless_user_flag_and_an_unknown_flag_are_refused() {
         assert_eq!(
-            opt_value(&["--user", "mike"], "--user").unwrap(),
-            Some("mike")
+            opt_value(&["--user", "alice"], "--user").unwrap(),
+            Some("alice")
         );
         assert_eq!(opt_value(&["--socket", "/x"], "--user").unwrap(), None);
         assert!(opt_value(&["--user"], "--user").is_err());
         assert!(opt_value(&["--user", "--dismiss"], "--user").is_err());
         assert!(user_arg(&["--user"]).is_err());
-        assert_eq!(user_arg(&["--user", "mike"]).unwrap(), "mike");
-        assert!(only_flags(&["--user", "mike", "--dismis"], &["--user", "--dismiss"]).is_err());
-        assert!(only_flags(&["--user", "mike", "--dismiss"], &["--user", "--dismiss"]).is_ok());
-        assert!(only_flags(&["continue"], &[]).is_ok());
+        assert_eq!(user_arg(&["--user", "alice"]).unwrap(), "alice");
+        let takes = |rest: &[&str]| only_flags(rest, &["--dismiss"], &["--user"]);
+        assert!(takes(&["--user", "alice", "--dismiss"]).is_ok());
+        assert!(takes(&[]).is_ok());
+        for bad in [
+            &["--user", "alice", "--dismis"][..],
+            &["--usr", "alice"],
+            &["-u", "alice"],
+            &["--user"],
+            &["--user", "--dismiss"],
+            &["--dismiss", "alice"],
+            &["continue"],
+        ] {
+            assert!(takes(bad).is_err(), "{:?} was taken", bad);
+        }
+        assert!(takes(&["--dismis"])
+            .unwrap_err()
+            .to_string()
+            .starts_with("unknown flag --dismis"));
+        assert_eq!(
+            takes(&["--user"]).unwrap_err().to_string(),
+            "--user needs a value"
+        );
     }
 
     /// J23: the default user is never the literal "user" and never root.
@@ -148,6 +241,8 @@ mod arg_tests {
         }
     }
 
+    /// J27: the exit status follows the daemon's answer for every scripted
+    /// subcommand.
     #[test]
     fn the_exit_status_follows_the_answer() {
         assert_eq!(exit_for(&Outcome::Noted), 0);
@@ -171,6 +266,7 @@ mod arg_tests {
                 watching: false,
                 state: None,
                 away_for: None,
+                secure_available: None,
             }),
             0
         );
@@ -188,6 +284,22 @@ mod arg_tests {
             1
         );
         assert_eq!(exit_for(&Outcome::NoFace { elapsed_ms: 0 }), 1);
+        // Round 5 (C): the lock screen reads "not running" from stdout.
+        assert_eq!(exit_for(&Outcome::NotRunning), 0);
+        assert_eq!(
+            exit_for(&Outcome::KeyLane {
+                available: false,
+                reason: None
+            }),
+            0
+        );
+        assert_eq!(
+            exit_for(&Outcome::FprintLane {
+                available: false,
+                reason: None
+            }),
+            0
+        );
     }
 }
 
@@ -216,7 +328,7 @@ mod probe_line_tests {
         assert!(line.contains(r#""likely":true"#), "{}", line);
         assert!(
             line.contains(
-                r#""cadence":{"ac":2.0,"performance":3.0,"balanced":5.0,"power-saver":8.0}"#
+                r#""cadence":{"ac":1.0,"performance":2.0,"balanced":3.0,"power-saver":5.0}"#
             ),
             "{}",
             line
@@ -246,5 +358,32 @@ mod delete_tests {
             assert_eq!(exit_for(&o), 2, "{:?}", serde_json::to_string(&o));
         }
         assert_eq!(exit_for(&Outcome::NoFace { elapsed_ms: 0 }), 1);
+    }
+}
+
+#[cfg(test)]
+mod seconds_tests {
+    use super::{count_arg, seconds_arg};
+
+    /// A length that is not a number of seconds the request can run is
+    /// refused with the range, never handed on to a conversion that
+    /// panics on NaN, a negative or an overflow.
+    #[test]
+    fn a_length_outside_its_range_is_refused_before_anything_runs() {
+        assert_eq!(seconds_arg(&[], 12.0, 4.0, 20.0).unwrap(), 12.0);
+        assert_eq!(
+            seconds_arg(&["--seconds", "8"], 12.0, 4.0, 20.0).unwrap(),
+            8.0
+        );
+        for bad in ["nan", "NaN", "-100", "1e30", "inf", "3", "21", "eight"] {
+            let e = seconds_arg(&["--seconds", bad], 12.0, 4.0, 20.0)
+                .expect_err(bad)
+                .to_string();
+            assert!(e.contains("from 4 to 20"), "{}: {}", bad, e);
+        }
+        assert_eq!(count_arg(&["--count", "10"], 10, 3, 40).unwrap(), 10);
+        for bad in ["0", "41", "-1", "many"] {
+            assert!(count_arg(&["--count", bad], 10, 3, 40).is_err(), "{}", bad);
+        }
     }
 }

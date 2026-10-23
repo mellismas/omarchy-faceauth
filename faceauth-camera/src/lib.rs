@@ -6,12 +6,15 @@
 //! - plain V4L2 capture nodes (UVC webcams and IR cameras), through [`Camera`]
 //!   with the format negotiated from what the node offers.
 //!
-//! The exposure and colour loops live in [`calib`] and are pure functions of
+//! The exposure and color loops live in [`calib`] and are pure functions of
 //! the frame; [`Camera`] applies their output through V4L2 controls, and the
 //! IR illuminator is a control on the IR sensor ([`Illuminator`]).
 
+#![deny(dead_code)]
+
 pub mod calib;
 pub mod ipu3;
+pub mod irlock;
 pub mod media;
 pub mod sys;
 pub mod unpack;
@@ -219,10 +222,30 @@ impl Camera {
 /// this crate can drive, and `open` says so by returning `None`. That is
 /// what makes the daemon's "liveness gate unavailable" refusal fire
 /// instead of an error out of the first `set_pattern`.
-pub struct Illuminator {
-    controls: Controls,
+pub struct Illuminator<C: ControlIo = Controls> {
+    controls: C,
     enable: ControlInfo,
     pattern: ControlInfo,
+}
+
+/// The control calls the illuminator and the strobe probe make: a device's
+/// `Controls`, or in a test a fake that records what was written.
+pub trait ControlIo {
+    fn list(&self) -> Result<Vec<ControlInfo>>;
+    fn get(&self, id: u32) -> Result<i32>;
+    fn set(&self, id: u32, value: i32) -> Result<i32>;
+}
+
+impl ControlIo for Controls {
+    fn list(&self) -> Result<Vec<ControlInfo>> {
+        Controls::list(self)
+    }
+    fn get(&self, id: u32) -> Result<i32> {
+        Controls::get(self, id)
+    }
+    fn set(&self, id: u32, value: i32) -> Result<i32> {
+        Controls::set(self, id, value)
+    }
 }
 
 /// The two strobe controls out of a sensor's control list, or `None` when
@@ -237,7 +260,11 @@ pub fn strobe_controls(list: &[ControlInfo]) -> Option<(ControlInfo, ControlInfo
 /// the strobe off when it is dropped, so a probe made by constructing one
 /// (as `doctor` once did) would turn the light off under a running gate.
 pub fn has_strobe(controls_path: impl AsRef<Path>) -> Result<bool> {
-    let controls = Controls::open(controls_path)?;
+    has_strobe_on(&Controls::open(controls_path)?)
+}
+
+/// `has_strobe` on controls already open.
+pub fn has_strobe_on(controls: &impl ControlIo) -> Result<bool> {
     Ok(strobe_controls(&controls.list()?).is_some())
 }
 
@@ -246,7 +273,13 @@ impl Illuminator {
     /// has no illuminator this crate can drive and the caller decides what
     /// that means (the daemon refuses by default).
     pub fn open(controls_path: impl AsRef<Path>) -> Result<Option<Self>> {
-        let controls = Controls::open(controls_path)?;
+        Illuminator::on(Controls::open(controls_path)?)
+    }
+}
+
+impl<C: ControlIo> Illuminator<C> {
+    /// `open` on controls already open.
+    pub fn on(controls: C) -> Result<Option<Self>> {
         let Some((enable, pattern)) = strobe_controls(&controls.list()?) else {
             return Ok(None);
         };
@@ -284,7 +317,7 @@ impl Illuminator {
     }
 }
 
-impl Drop for Illuminator {
+impl<C: ControlIo> Drop for Illuminator<C> {
     fn drop(&mut self) {
         let _ = self.controls.set(self.enable.id, 0);
     }
@@ -323,6 +356,52 @@ mod tests {
         let pattern_only = [control("Strobe Frame Pattern", 3)];
         assert!(strobe_controls(&pattern_only).is_none());
         assert!(strobe_controls(&[]).is_none());
+    }
+
+    /// Controls that answer from a list and record every write.
+    struct FakeControls {
+        list: Vec<ControlInfo>,
+        writes: std::rc::Rc<std::cell::RefCell<Vec<(u32, i32)>>>,
+    }
+
+    impl ControlIo for FakeControls {
+        fn list(&self) -> Result<Vec<ControlInfo>> {
+            Ok(self.list.clone())
+        }
+        fn get(&self, _id: u32) -> Result<i32> {
+            Ok(0)
+        }
+        fn set(&self, id: u32, value: i32) -> Result<i32> {
+            self.writes.borrow_mut().push((id, value));
+            Ok(value)
+        }
+    }
+
+    /// J22: the doctor's strobe probe reads the control list and writes
+    /// nothing, where an `Illuminator` made for the same question writes
+    /// the strobe off when it is dropped, under a running gate.
+    #[test]
+    fn has_strobe_writes_nothing() {
+        let writes = std::rc::Rc::default();
+        let fake = FakeControls {
+            list: vec![
+                control("Exposure", 1),
+                control("Strobe Output Enable", 2),
+                control("Strobe Frame Pattern", 3),
+            ],
+            writes: std::rc::Rc::clone(&writes),
+        };
+        assert!(has_strobe_on(&fake).unwrap());
+        assert!(writes.borrow().is_empty(), "{:?}", writes);
+        let without = FakeControls {
+            list: vec![control("Exposure", 1)],
+            writes: std::rc::Rc::clone(&writes),
+        };
+        assert!(!has_strobe_on(&without).unwrap());
+        assert!(writes.borrow().is_empty(), "{:?}", writes);
+        // What the probe replaced: the illuminator's drop is a write.
+        drop(Illuminator::on(fake).unwrap().unwrap());
+        assert_eq!(*writes.borrow(), vec![(2, 0)]);
     }
 }
 

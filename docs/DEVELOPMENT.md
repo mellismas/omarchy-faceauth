@@ -1,31 +1,12 @@
 # Development reference
 
-How the source tree is laid out, how to build and test it, how to run a
-daemon of your own, what the tuning tools report, and the measurements the
-shipped thresholds rest on. The README is the document to read first. The
-history of how each decision was reached is in the git log, not here.
+How the source tree is laid out, how to build and test it, how to run a daemon of your own, what the tuning tools report, and the measurements the shipped thresholds rest on. The README is the document to read first. The history of how each decision was reached is in the git log, not here.
 
 ## Workspace layout
 
-The Rust workspace has five crates. `faceauth-camera` is V4L2 and
-media-controller capture: the Intel IPU3 graph, the packed 10-bit unpack, the
-UVC greyscale decoders, the exposure loop and the IR illuminator as a V4L2
-control. `faceauth-engine` is detection (YuNet), alignment, embedding
-(glintr100, 512 dimensions), cosine matching, the dense face mesh (MediaPipe
-face landmark, 468 points) with head pose from it, the flash-response
-liveness gate and the region comparison the walk-away lock uses.
-`faceauth-daemon` builds
-`faceauthd`: authentication, consent, presence, the template store and the
-socket. `faceauth-cli` builds `faceauth`. `pam_faceauth` is the PAM module
-and links only libc and libpam.
+The Rust workspace has five crates. `faceauth-camera` is V4L2 and media-controller capture: the Intel IPU3 graph, the packed 10-bit unpack, the UVC grayscale decoders, the exposure loop and the IR illuminator as a V4L2 control. `faceauth-engine` is detection (YuNet), alignment, embedding (glintr100, 512 dimensions), cosine matching, the dense face mesh (MediaPipe face landmark, 468 points) with head pose from it, the flash-response liveness gate and the region comparison the walk-away lock uses. `faceauth-daemon` builds `faceauthd`: authentication, consent, presence, the template store and the socket. `faceauth-cli` builds `faceauth`. `pam_faceauth` is the PAM module and links only libc and libpam.
 
-Beside the crates: `packaging/` holds the service unit, the default config,
-the udev rule for the IR sensor, the lock helper and the PAM example;
-`models.toml` is the model manifest; `tools/` holds the battery and power
-scripts; `tests/` holds the shell test for the lock helper; and
-`faceauth-daemon/traces/` holds the recorded gesture rounds the unit tests
-replay. Nothing under `traces/` is an image: every file is numbers per
-frame.
+Beside the crates: `packaging/` holds the service unit, the default config, the udev rule for the IR sensor, the lock helper and the PAM example; `models.toml` is the model manifest; `tools/` holds the battery and power scripts; `tests/` holds the shell tests for the lock helper, the built PAM module and the model URLs; `.github/workflows/models.yml` runs the URL test on every push and weekly; `.github/workflows/check.yml` runs rustfmt, clippy with warnings denied and the intra-doc link check, each with and without dev-tools, and a build on the oldest toolchain `rust-version` claims, on every push; and `faceauth-daemon/traces/` holds the recorded gesture rounds the unit tests replay. Nothing under `traces/` is an image: every file is numbers per frame.
 
 ## Building
 
@@ -34,26 +15,11 @@ cargo build --release --locked
 cargo test --release --locked
 ```
 
-The build needs Arch's `onnxruntime-cpu`; the engine loads
-`/usr/lib/libonnxruntime.so` at run time through `ort` with `load-dynamic`,
-so nothing links it at build time. The few V4L2, media and subdev structs the
-camera crate uses are spelled out by hand and size- and offset-checked
-against the kernel headers in unit tests, so the build needs no libclang or
-bindgen.
+Nothing links ONNX Runtime at build time: the engine loads `/usr/lib/libonnxruntime.so` at run time through `ort` with `load-dynamic`, so running the daemon or a test that loads the models needs any Arch `onnxruntime` build (API 17 or newer). The few V4L2, media and subdev structs the camera crate uses are spelled out by hand and size- and offset-checked against the kernel headers in unit tests, so the build needs no libclang or bindgen.
 
 ### The dev-tools feature
 
-`cargo build --features faceauth-cli/dev-tools` compiles the tuning tools
-in. The feature lives on `faceauth-daemon` and the CLI's feature turns it on
-there. It gates `faceauth sweep` and `faceauth pose` (root; score and pose
-per frame while the head moves), the walk-through's record mode
-(`faceauth enroll --guided --start record`, which stores no templates and
-keeps one IR frame in five under `/var/lib/faceauth/record/<user>/`, root only),
-and the per-frame gesture recordings that the `gesture_trace` setting asks
-for. Without the feature the recording hooks compile to nothing, `sweep` and
-`pose` are unknown commands, and `--start record` is refused; the package is
-built without it, so none of that code is in the shipped binaries. Test both
-ways when you touch the daemon:
+`cargo build --features faceauth-cli/dev-tools` compiles the tuning tools in. The feature lives on `faceauth-daemon` and the CLI's feature turns it on there. It gates the CLI's bring-up and tuning tools (`cam test`, `engine`, `liveness capture`, `sweep`, `pose`, `enroll --store` and `verify`, which `faceauth --help` lists in such a build), the walk-through's record mode (`faceauth enroll --start record --label NAME`, which stores no templates and keeps one IR frame in five under `/var/lib/faceauth/record/<user>/<label>/`, root only; the label is letters, digits, `-`, `_` and `.`, not starting with a dot), and the per-frame gesture recordings that the `gesture_trace` setting asks for. Without the feature the recording hooks compile to nothing, the tools are unknown commands, and `--start record` is refused; the package is built without it, so none of that code is in the shipped binaries. Test both ways when you touch the daemon:
 
 ```
 cargo test -p faceauth-daemon
@@ -63,119 +29,57 @@ cargo test -p faceauth-cli --features dev-tools
 
 ## Tests
 
-Every crate has unit tests and `cargo test --locked` at the root runs them
-all. The store's sealing test needs a TPM and root; without both it prints
-that it skipped, and `FACEAUTH_REQUIRE_TPM=1` (the release check) turns the
-skip into a failure. The lock helper has a shell test,
-`tests/lock-session-test.sh`, which stubs `systemd-run` and checks that the
-helper resolves the Omarchy tree from every form `omarchy.conf` takes and
-answers 0 only when the compositor reports a session lock.
+Every crate has unit tests and `cargo test --locked` at the root runs them all. The store's sealing test needs a TPM and root; without both it prints that it skipped, and `FACEAUTH_REQUIRE_TPM=1` (the release check) turns the skip into a failure. The lock helper has a shell test, `tests/lock-session-test.sh`, which stubs `systemd-run` and checks that the helper hands the session the Omarchy tree the daemon resolved, runs nothing without one or without a pinned session, runs the lock command once, opens no PAM session (a system unit as the user carries each call to `systemd-run --user`), stops when a pinned session is gone or replaced before a call or as either unit of a call starts (its stubs run each unit's pin check, fix round 10), caps both units' runtime, lets no manager expand `$` in the arguments, and never asks the user's manager whether it locked (the daemon asks the anchored question). Its copy of the helper is refused, before anything runs, if it still names a real `timeout`, `systemd-run` or Omarchy command, or logind's real records. `tests/pam-module-test.sh` checks the built module links libpam, imports only `pam_get_item`, `pam_get_user` and `pam_syslog`, and exports the three entry points alone. `tests/model-urls-test.sh` checks that every URL in `models.toml` answers 200 with the size it gives. `faceauth-daemon/tests/fprint_virtual.rs` runs the fingerprint check against a real fprintd as the user: a private system bus of its own (`dbus-daemon`) whose default context is a copy of `/usr/share/dbus-1/system.conf`'s, with the package's bus policy (`packaging/system.d/faceauth-fprint.conf`) included from the tree, python-dbusmock's polkitd template allowing every action, `fprintd -t` with libfprint's `virtual_device` driver (`FP_DRIVERS_ALLOWLIST`, `FP_VIRTUAL_DEVICE`, and `STATE_DIRECTORY` and `RUNTIME_DIRECTORY` in a temporary directory), one finger enrolled through the virtual reader, then the check on the shipped stack's words with pam_fprintd named by its path in the prefix, each in a child process of the test: a matching scan is a match, three wrong scans spend the tries (`PAM_MAXTRIES`, no match), a second claim while one is held answers unavailable without asking for a finger, and a SIGTERM mid-verify frees the reader for the next claim, which matches. Before each first scan it forges a verify result from a connection that is not fprintd's: with the bus policy it approves nothing, also on a bus that adds a user policy allowing every signal (the policy's mandatory context holds there; the same rules in the default context do not), and a control run without the policy shows the forgery approving, so the test can see the attack. It needs a prefix and says it skipped without one. Nothing is installed: download `fprintd`, `libfprint`, `libgusb` and `python-dbusmock` from an Arch mirror (`extra/os/x86_64`), extract each with `tar --zstd -xf` into one directory, and run `FACEAUTH_FPRINT_PREFIX=/that/directory cargo test -p faceauth-daemon --test fprint_virtual`; the system needs `dbus-daemon`, `/usr/share/dbus-1/system.conf` and the system python's `dbus` module (`dbus`, `python-dbus`), and the python path in the prefix names the python version it was built for (3.14 as written). `faceauth-cli/tests/usage.rs` checks that help goes to stdout with exit 0 and an unknown command to stderr with exit 2.
 
-The gesture detectors are regression-tested on recorded rounds in
-`faceauth-daemon/traces/v2`, replayed frame by frame through the same
-detector code the daemon runs. There is one gesture path, the face mesh's
-angles, and the daemon refuses to start without the mesh model
-(`auth::mesh_missing`), so one corpus and one synthetic module guard it:
+The gesture detectors are regression-tested on recorded rounds in `faceauth-daemon/traces/v2`, replayed frame by frame through the same detector code the daemon runs. There is one gesture path, the face mesh's angles, and the daemon refuses to start without the mesh model (`auth::mesh_missing`), so one corpus and one synthetic module guard it:
 
-`mesh_battery_holds` replays `traces/v2`, twelve rounds recorded through the
-enrolment walk-through with the face mesh (format in its README: yaw, pitch
-and roll in degrees plus the detector box; the files carry two image-motion
-columns from the detectors that were removed, which nothing reads). Both
-nod rounds must read as two nods, both shake rounds as two shakes, and the
-eight everyday rounds (glances each way, the keyboard, reading, talking,
-leaning) as nothing, at the default mesh floors.
-`the_derived_floors_keep_the_reference_users_own_gestures` derives the
-floors from those rounds the way the walk-through does and requires the
-same reads at the derived floors.
+`mesh_battery_holds` replays `traces/v2`, twelve rounds recorded through the enrollment walk-through with the face mesh (format in its README: yaw, pitch and roll in degrees plus the detector box; the files carry two image-motion columns from the detectors that were removed, which nothing reads). Both nod rounds must read as two nods, both shake rounds as two shakes, and the eight everyday rounds (glances each way, the keyboard, reading, talking, leaning) as nothing, at the default mesh floors. `the_derived_floors_keep_the_reference_users_own_gestures` derives the floors from those rounds the way the walk-through does and requires the same reads at the derived floors.
 
-`mesh_redteam` is the attack module, synthetic in degrees and box geometry:
-a frozen box whose pitch oscillates reads as nothing and the box-motion
-rule is what refuses it (with the rule off it reads as nods); a waggled
-board carries its box and passes the detector by design, because the
-strobed confirm after the nods is what refuses it; a plateau flicker over a
-still box reads as nothing at any nod-sized height; the recorded nods
-re-centred 30 degrees off still read and are refused from 36 either way;
-and a synthetic nod made with the head turned reads as nothing.
+`mesh_redteam` is the attack module, synthetic in degrees and box geometry: a frozen box whose pitch oscillates reads as nothing and the box-motion rule is what refuses it (with the rule off it reads as nods); a waggled board carries its box and passes the detector by design, because the strobed confirm after the nods is what refuses it; a plateau flicker over a still box reads as nothing at any nod-sized height; the recorded nods re-centered 30 degrees off still read and are refused from 36 either way; and a synthetic nod made with the head turned reads as nothing.
 
-Recordings of your own come from the daemon: a walk-through round or a
-consent window with `gesture_trace` on writes `consent::ROUND_HEADER` and
-one line per frame in the same format, so a live misfire drops straight
-into a test. Whenever a gesture misfires live, pull the recording, add it
-with a one-line label, and let the suite fail before you touch a detector.
+Recordings of your own come from the daemon: a walk-through round or a consent window with `gesture_trace` on writes `consent::ROUND_HEADER` and one line per frame in the same format, so a live misfire drops straight into a test. Whenever a gesture misfires live, pull the recording, add it with a one-line label, and let the suite fail before you touch a detector.
 
 ## The consent lane, step by step
 
-What the daemon does between a `sudo` and its approval, in the order the
-code runs it, so a change to one step can be checked against the others
-(`auth::consent_begin`, `auth::consent_round`, `auth::consent_finish`).
+What the daemon does between a `sudo` and its approval, in the order the code runs it, so a change to one step can be checked against the others (`auth::consent_begin`, `auth::consent_round`, `auth::consent_finish`).
 
-1. The request arrives from the PAM module with `consent` set. The daemon
-   refuses it before any window if the caller is not local, if another
-   user's request is live, or if a refusal from a recent no is still
-   standing (`server::locality`, `server::refusal_standing`).
-2. The window is summoned in the user's own manager with a payload that
-   names the request and carries a per-request token. Nothing is read from
-   the camera until the window has answered `--ack` with that token: the
-   card is on screen before a nod can count.
-3. A short dwell follows the acknowledgement, and the nod detector arms
-   only once the head has been still. A nod already under way when the
-   card appears is not counted.
-4. The scan matches the face, follows that box, and reads nods and shakes
-   from the mesh angles on it. Nods are read for `consent_seconds` after a
-   match; when that passes unanswered they are disarmed and the camera
-   drops to the presence rhythm. They are re-armed by a face that was away
-   and is back and attentive (checked to be the user first), by the card's
-   Ready to nod button (`--rearm`), or by a face unlock of the lock screen.
-5. After the second nod the illuminator draws a fresh mask and two lit and
-   unlit pairs must pass the flash gate and match the templates on that
-   box (`auth::confirm`). Only then does `consent_finish` answer match,
-   reset faillock and, if a rider was armed, write the passwordless rule.
-6. A password typed into the card is checked once against `system-auth`
-   (`pamcheck::check`) and counts as an approval; a wrong one is charged
-   like a non-match.
+1. The request arrives from the PAM module with `consent` set. The daemon refuses it before any window if the caller is not local, if another user's request is live, or if a refusal from a recent no is still standing (`server::locality`, `server::refusal_standing`).
+2. The window is summoned in the user's own manager with a payload that names the request and carries a per-request token. Nothing is read from the camera until the window has answered `--ack` with that token: the card is on screen before a nod can count.
+3. Nods count from the scan's match, with no dwell and no still second before the first leg (Mike, 2026-10-19): finding the face takes long enough on its own. A nod still in motion from approving one card can count toward a card queued behind it, and the change from one card to the next is plain on screen. A card that names a passwordless rider keeps both, a dwell after the fresh acknowledgment and a still second before the first leg (`ConsentState::rider_on_card`, `consent::wait::nod_detector`), however the rider reached it: re-shown after the nods began, or on the first nod show when it was armed just after the match. A shake always follows a still second. The question whether the session locked under the card runs on a thread of its own every 2 seconds (`consent::wait::LockWatch`), so no frame waits for it; the nod's commit asks afresh.
+4. The scan matches the face, follows that box, and reads nods and shakes from the mesh angles on it. Nods are read for `consent_seconds` after a match; when that passes unanswered they are disarmed and the camera drops to short looks, every 2 seconds on mains and every `battery_tick_seconds` on battery (never oftener than 2 seconds, and 0 keeps 2), while the card's answers, the heartbeat and the session-lock check keep their own faster rhythm (`auth/rearm.rs`: `Pace`). A look checks identity every third time, every time once half the away time has run, and every time in secure mode. The nods are re-armed by a face that was away and is back and attentive (checked to be the user first), by the card's Ready to nod button (`--rearm`), or by a face unlock of the lock screen. The request's away clock runs on a copy of the walk-away watch as it stands (`UserSeen`), so a hidden face holds it and a secure mode miss counts as gone exactly where the watch would; with the watch on for the user, a user gone locks the session and parks the request until a face unlock.
+5. After the second nod the illuminator draws a fresh mask and two lit and unlit pairs must pass the flash gate and match the templates on that box (`auth::confirm`). Only then does `consent_finish` answer match, reset faillock and, if a rider was armed, write the passwordless rule.
+6. A password typed into the card is checked once against `system-auth` (`pamcheck::check`) and counts as an approval; a wrong one is charged like a non-match.
+7. While the nods are armed (each scan and the nod window after it), a key watch (`consent::KEY`) asks the user's FIDO2 key when the lane's pam_u2f line is one the card can mirror (`consent::key_offer`). Each check is `faceauth-keycheck LANE USER` in a transient unit of its own (`systemd-run --pipe --wait`, the sandbox in `KEY_UNIT_PROPERTIES`), with the PIN on its stdin when the line asks for one; exit 42 is a touch. Checks start every 2 seconds, one per user, a dwell after the card's latest acknowledgment (dropped when the card comes back after an unlock, which waits for a fresh one). A touch is written into the record only for the armed generation of the request that armed it, while its card is acknowledged and no rider waits, from a watch that is not ending, and when the anchored compositor (`consent::anchored_lock_state`, below) reports the session unlocked (anything else counts as locked). Every consent reply passes `auth::lane_answer` on its way out of `handle`: while the session reads as locked, a sudo request's unapproved end answers `refused_parked` (PAM_AUTHINFO_UNAVAIL) and a polkit one's `refused`; unlocked, every answer passes, and sudo goes on to its key-fallback line. The watch ends with the nod window or the scan, and its check is stopped before the round goes on; a hold, the wait for attention and a park move the generation on.
+8. The lock screen's key lane (`omarchy-lock-fido2`, pam_faceauth's `key-unlock` line) asks the daemon for one check at a time (`KeyLane::unlock`): only from the user's own session, only while the anchored compositor says Locked, on lane `unlock` (sudo's key line's policy, no PIN), and stopped when the lock screen hangs up or the session unlocks. The lock screen's `key_lane` question (`faceauth key-lane`, no camera, before the lock and every 2 seconds while it stands), its asks and the daemon's own lock latch the user (`ConsentState::latch_lock_screen`): until the daemon sees the unlock and `key_unlock_hold_ms` passes, the card is off the key, no key fallback runs, and `consent::session_locked` reads locked.
+9. While face is set up, sudo's and polkit's key line is pam_faceauth's `key-fallback` line (`KeyLane::fallback`; the module's `key_line`). Every path through the daemon that lets the key approve asks one verdict, `lockgate::is_locked` (`src/faceauth-daemon/src/lockgate.rs`, compiled into the daemon as `KeyLane::verdict` and `ConsentState::judge`; the module includes the file by source for the wait budget): the compositor, logind's records for every user, the latch, the lock screen's reserved channel (`server/channel.rs`, `faceauth lock-channel`), the daemon's start and a refusal at its connection places (`server/limits.rs`), failing closed. In the daemon a positive lock needs the channel open and the compositor's lock. The module first asks on a short connection whether it may run (`key_ready`); the daemon says `key_wait` with the kind (`locked`, `held`, `unknown`, `card`) until the verdict says unlocked, says no at once to a request from a text console or a remote login (`lockgate::origin_of`), no after 10 s of an unknown verdict (`ConsentState::doubt_for`), and no for a while after a consent request of the user's spent its wait budget (`ConsentState::budget_spent`). The module keeps one wait budget per line (`lockgate::WaitBudget`): every wait on a verdict that is neither unlocked nor a positive lock, and every check such a verdict cut off, summed and never reset; at 10 s it goes to the password, and a check under way is given up then too. A parked consent request keeps one of its own (`server/rounds.rs`: `Park`). A latch reads `Held` only while its hold clock runs (`Facts::holding`); a dropped channel's latch is `Unknown` until the compositor has said unlocked, look after look, for `DROP_CLEARS` (3 s). Every account's key unlock comes first: once a fresh anchored look finds the asking account locked (`ConsentState::start_priority`), no account's approval check runs until that account's anchored unlock and the hold, or until logind's record for the session pinned when the priority started (`lockgate::controlled_session_of`) stops saying `ACTIVE=1` on a seat or is gone (`lockgate::session_on_seat_in_front`, the rule approvals use, fix round 13); no timer ends it, the unlock check stops the moment its session leaves the foreground (`ConsentState::holds_priority`), and the held-off accounts look at the holders' sessions (`ConsentState::unlock_priority`, `KeyLane::refresh_priority`, `KeyLane::claim`). A nod approval commits on a fresh anchored look under the epochs, as a key touch does (`KeyLane::nod_may_commit`): each account's own, moved by its latches, and the global one, moved by the priority starting and the connection places refusing callers (`ConsentState::epochs_of`), with a beat to the PAM line before each step from the nods to the commit (`ConsentState::beat_now`). Once ready the module asks a PIN line's PIN with no connection open, then sends the check on a fresh one and reads the daemon's `{"result":"pending"}` keepalives (`BEAT`, 2 s; it gives up after `LIVENESS`, 6 s); the check waits for a touch 6 s (`FALLBACK_DEADLINE`) and counts only if the verdict, asked again at the commit, says unlocked. With the daemon down (the socket missing or refusing and its runtime directory gone, `connect_kind`, `runtime_dir_present`; the unit keeps /run/faceauth across a restart, `RuntimeDirectoryPreserve=restart`, so a restart goes to the password), the line is stock Omarchy's pam_u2f line (fix round 10, item 6, Mike's ruling): each turn of `key_line` probes the socket first and goes back to the daemon the moment it answers; meanwhile it asks no lock question, reads no logind record and waits for no unlock, and runs `faceauth-keycheck --converse` itself as root with `RLIMIT_CORE` 0 (`run_converse`: pam_u2f's conversation relayed line by line, `Q style hex` out and `A hex` or `N` back, the answer `R code` last, read from a pipe, the child killed through a pidfd, the touch window not counting the time a prompt waits on the user; fix round 11, Codex 4), stopped when the daemon answers, a touch counting only while the daemon is still down. The helper picks the private stack from the line's own words (`stock_service`) and applies none of the card's credential rules (`key_check_stock`, `pamcheck::check_key_relay`). A line that waited on the daemon before it went down keeps only what is left of its wait budget. Every key check, the daemon's unit's and this one, takes the key's lease (`lockgate::take_key_lease` on `/run/faceauth-key.lease`, from `packaging/faceauth.tmpfiles`) before it asks the key and holds it to its exit; the check units carry `StopPropagatedFrom=faceauth.service` (stopped with the service, never restarted by it), and `serve` stops any `faceauth-key-*.service` left from before (`consent::stale_checks_stop`). While a prompt of the stock check waits on the user, `run_converse_full` watches it on a thread of its own and kills it when faceauthd is back or at its overall bound; the helper has its own 60 s deadline and runs in a session of its own (`new_session` in `become_root`). The helper reads its answers from fd 0 directly, never through `Stdin`'s buffer (`converse_on_stdin`, fix round 13), and the module takes the child's pidfd from the child itself before its exec (`spawn_with_pidfd`) and signals and reaps it only through that (`kill_pid`, `waitid(P_PIDFD)`); the daemon and its helpers do the same through `faceauth_daemon::child`. `faceauth key-lane` answers `not_running` for the lock screen. The daemon's own lock question is the same anchor in a transient system unit, `faceauth-lockstate --anchor UID BIND` (`consent/anchor.rs`, `ANCHOR_UNIT_PROPERTIES`: a dynamic user with CAP_DAC_OVERRIDE alone, dropped before the compositor's answer is read), bound to the request's session (`server/locality.rs`: `bind_of_pid`), answered only as an exact pair of exit status and byte (`anchor::answer_of`, read with a deadline by `run_anchor`); a no answer carries the step that failed (`lockgate::Why`, written after the no-answer byte), which the daemon logs, a reason it already logged only once a minute (`anchor::why_of`, `WHY_AGAIN`). Polled answers are shared for `POLL_CACHE` (1 s) and concurrent polls coalesce (`KeyLane::compositor_polled`); the commits ask afresh (`compositor_fresh`) and before they take the consent record's lock (an epoch refuses a touch when a latch began meanwhile). A parked request looks on a cadence (`server/rounds.rs`: `Cadence`) and waits on the record's changes (`ConsentState::wait_change`). The enumeration under `hypr/` is bounded (`MAX_ENTRIES`, `MAX_CONNECTS`), opened race-free (one component at a time with `O_NOFOLLOW`, the mount checked at each step, `lockgate::entry_on_mount`; not `openat2`, which systemd blocks with ENOSYS in a dynamic user's unit; connect through /proc/self/fd) and guarded (`lockgate::guarded`). An open lock channel the anchored compositor contradicts for `CHANNEL_EXPIRES` expires and is closed (`server/channel.rs`, `Ended::Expired`; the CLI exits 4 after the lock screen's word). Nothing runs in a user's manager without a desktop in logind's records (`consent/shell.rs`: `desktop_gate_at`; `presence/lock.rs`: `lock_session_at`), and the walk-away watch pauses without one and backs off failed locks (`presence/run.rs`: `Governor`). The module asks for the PIN from the effective policy, the line's word else pam_u2f.conf's (`wants_pin`, the shared reader `lockgate::u2f_conf_words`). The guarantee that ties the bounds together (the password within about 15 s) is in SECURITY.md; `the_real_timing_keeps_the_password_within_reach` holds it.
 
-The passwordless rider (`consent::arm_passwordless`,
-`consent::take_passwordless`, `consent::enable_passwordless`): the card asks
-for it with the token while the enrolled face is in the nod window, on the
-sudo lane only. The daemon then re-shows the card naming the rider, waits
-for a fresh acknowledgement and starts the dwell and the nods over. The
-rider belongs to the request it was armed on and is dropped with it, so a
-request that ends without approval leaves nothing armed for the next one.
-The rule and the timer that removes it are the same ones
-`omarchy-sudo-passwordless` writes.
+10. The fingerprint (`consent::FPRINT`, `consent/fprint.rs`) is armed with the nods and the key (`auth::consent_round`) and finished with them, under the key's rules on a generation of its own (`ConsentState::arm_fprint`, `fprint_may_check`, `fprint_matched`, `Answer::Fingerprint`): one long check per armed window, since every check claims the reader and a claim opens the device, rather than the key's check every 2 seconds. Each check is `faceauth-fprintcheck LANE USER` in a transient unit of its own (`systemd-run --pipe --wait`, the sandbox in `FPRINT_UNIT_PROPERTIES`: AF_UNIX for the system bus, no device), running pam_fprintd from `packaging/pam.d/faceauth-fprint` through `pam_start_confdir` (`pamcheck::check_fprint`); exit 42 is a match, 3 the reader not answering, 1 anything else, and the words it writes as pam_fprintd talks (`place`, `retry`) become the card's `fprint_status`. A check that never reached the reader (another client holds it, no reader) says busy and is retried after `FPRINT_BUSY_AGAIN`; one whose try timed out is followed at once; three wrong fingers end the fingerprint for the window (`fprint_spent`). The reader is one claim at a time, through the key's arbiter (`KeyLane::claim_reader`): the lock screen's ask latches the user, which moves the card's generation on and stops its check, and `claim_reader_within` then hands the reader over. The lock screen's lane is pam_faceauth's `fprint-unlock` line (`FprintLane::unlock`, the request's `fprint_unlock`), which mirrors the key's unlock and keeps its own ask count on the latch (`begin_fprint_unlock`), so the key's lane and the fingerprint's run side by side; the daemon beats on the line and writes each status as `{"result":"fprint_status","status":...}`, which the module passes to the lock screen as pam_fprintd's own messages. With faceauthd down the line answers PAM_IGNORE and the stack's stock pam_fprintd line runs. `faceauth fprint-lane` (the request's `fprint_lane`) answers whether the lane goes through the daemon, or `not_running`. Every lid shut arms nothing (`server::lid_closed`). The stale units of a crash are stopped at start (`consent::stale_fprint_checks_stop`). The recipe, outside this tree, needs `install -Dm755 target/release/faceauth-fprintcheck "$pkgdir/usr/lib/faceauth/faceauth-fprintcheck"`, `install -Dm644 packaging/pam.d/faceauth-fprint -t "$pkgdir/usr/lib/faceauth/pam.d/"`, root's and closed to other writers like the rest of `/usr/lib/faceauth`, and the bus policy, `install -Dm644 packaging/system.d/faceauth-fprint.conf "$pkgdir/usr/share/dbus-1/system.d/faceauth-fprint.conf"`, without which the fingerprint is offered nowhere (`consent::bus_policy_state`: the file root's and exactly as shipped; doctor's `fprint.bus_policy`). It lets fprintd's device signals reach a receiver only from fprintd itself, which closes a forged-result weakness in upstream pam_fprintd (SECURITY.md). Arch's `dbus-reload.hook` (the dbus package's pacman hook on `usr/share/dbus-1/system.d/*`) reloads the bus when the package installs or changes the file, so no restart is needed; a bus that has not reloaded does not have it. The offer follows sudo's and polkit's `include` and `substack` lines (`consent::fprintd_reached`, at most 8 deep and 32 files, plain names in `/etc/pam.d` only, anything unfollowable withholding), and so does doctor's `fprint.stray`. The card's check runs as `faceauth-fprint-card-<user>.service` and the lock screen's as `faceauth-fprint-unlock-<user>.service`. `faceauth-daemon/tests/fprint_virtual.rs` runs its bus on a copy of `/usr/share/dbus-1/system.conf`'s default context: a control run without the file shows a forged verify result approving, and the file holds it off, beside a user-context policy that allows every signal too.
 
-Requests from the same user queue and take the window in turn; a request
-from another user while one is live is refused at once, so the window on
-screen is always one user's (`server::handle`).
+The passwordless rider (`consent::arm_passwordless`, `consent::take_passwordless`, `consent::enable_passwordless`): the card asks for it with the token while the enrolled face is in the nod window, on the sudo lane only. The daemon then re-shows the card naming the rider, waits for a fresh acknowledgment and starts the dwell and the nods over. The rider belongs to the request it was armed on and is dropped with it, so a request that ends without approval leaves nothing armed for the next one. The rule and the timer that removes it are the same ones `omarchy-sudo-passwordless` writes.
 
-## The enrolment walk-through
+Requests from the same user queue and take the window in turn; a request from another user while one is live is refused at once, so the window on screen is always one user's (`server::handle`).
 
-`faceauth enroll --guided` (root; `omarchy setup security face` runs it)
-opens a full-screen window on the laptop's own panel that draws a dot for
-where the head points and a ring for the target, fed by the daemon with one
-line per analysed frame (position, size, yaw, pitch, roll and whether the
-step is satisfied); no image leaves the daemon. The steps: welcome; centre
-(sit normally, look at the centre; the dot's size says too close or too
-far); range (turn the head all the way round once so the ring is set from
-the person's reach); path (follow the ring from the centre out to the edge
-and round); hold (centre, left, right, centre, up, down, each held while
-templates are taken); verify (look at the camera); then twelve gesture and
-everyday rounds: two nods, two shakes, two glances right, two glances left,
-a look at the keyboard, reading text placed around the screen, talking
-while facing the screen, and leaning in. Each round is recorded in degrees
-from the face mesh and stored with the templates; the floors come from the
-nods and shakes as described under Tuning tools. Add Look starts at the
-centre step and stops after verify; `calibrate --guided` runs the rounds
-alone. Continue, Redo and Cancel come from the window over the socket
-(`faceauth enrol-control`), per session and per user.
+## The enrollment walk-through
+
+`faceauth enroll` (root; `omarchy setup security face` runs it) opens a full-screen window on the laptop's own panel that draws a dot for where the head points and a ring for the target, fed by the daemon with one line per analyzed frame (position, size, yaw, pitch, roll and whether the step is satisfied); no image leaves the daemon. The steps: welcome; center (sit normally, look at the center; the dot's size says too close or too far); range (turn the head all the way round once so the ring is set from the person's reach); path (follow the ring from the center out to the edge and round); hold (center, left, right, center, up, down, each held while templates are taken); verify (look at the camera); the bridge; then twelve gesture and everyday rounds: two nods, two shakes, two glances right, two glances left, a look at the keyboard, reading text placed around the screen, talking while facing the screen, and leaning in. Each round is recorded in degrees from the face mesh and stored with the templates; the floors come from the nods and shakes as described under Tuning Tools. Add Look starts at the center step and stops after verify; `calibrate --guided` runs the rounds alone and knows its person by the templates they hold on this camera. Continue, Redo and Cancel come from the window over the socket (`faceauth enrol-control`), per session and per user, and Redo drops what the step at hand added.
+
+Whose face is read (`enrol/follow.rs`). One face per frame, so with two above the detection floor nothing is taken and nothing moves. The center step learns the session's reference from the still face (the latest five embeddings, at least three) and follows that face frame to frame with the consent window's tracker (`consent::track`). The followed box outlives frames with no face for `TRACK_GAP` (0.5 seconds). Past that, or when a face appears somewhere else, nothing counts until a face is embedded (at most every 0.25 seconds) and matches the reference at the accept threshold.
+
+Liveness (`enrol/flash.rs`). One strobed pair at the followed face must pass the flash gate at the center step and at each hold, through the gate the scan uses. A refusal ends the session with nothing stored, and so do five checks in a row that read nothing at one look. Without the strobe control the session refuses to start unless `liveness_required` is off. The illuminator is steady between checks.
+
+Verify (`new_set_is_the_face`). The path's and the holds' templates stay apart from the set until verify, which needs live frames of the followed face that match both the new templates and the reference at the threshold. Each new template must match the reference: one taken straight on at the accept threshold, a turned one within `REFERENCE_SLACK` (0.30, provisional and not measured on a corpus). A turned template under that is dropped and its look is named at the end. The set fails with nothing stored on a straight-on template that misses, over half of one look's templates dropped, `DROP_RUN` (3) dropped in a row, or over a quarter of the set.
+
+Saving and the camera. The looks and the rounds are stored once, when the session ends well, so Cancel, a failure or a window that goes away stores nothing. The camera streams only while a step reads the face: it opens on leaving Welcome, stops at the Bridge, and opens again from the exposure it had.
+
+The everyday check (`enrol/everyday.rs`). When the rounds end, each everyday round is replayed through the detectors at the floors the gesture rounds derived. A floor that lets one through is raised a degree at a time until none reads, up to the detector's ceiling (`MESH_MAX_DEG`, 60 degrees for the nod and 80 for the shake). A raise past where the person's own recorded gesture stops reading is kept, and the window, the journal and the root terminal say that gesture is switched off, so approvals then take the password, or refusals the card. An everyday round that reads even at the ceiling fails the session with nothing stored.
+
+Terminal enrollment (`enrol/terminal.rs`). `enroll --terminal` (five looks, or those `--poses` names) and `--look` (one) run in one request with the camera open throughout while the terminal prints the prompts. The session first learns the reference from a still, level, straight look once the exposure has settled, within `STRAIGHT_SECONDS` (10). Every look then keeps the rules above: one face, the followed face, a flash pass at each look before it takes anything, and the reference check before the one save. A look that kept fewer than three templates keeps none and is named at the end with the `--poses` to add it. A terminal that goes away ends the session with nothing stored. No terminal enrollment records rounds.
+
+No enrollment yet compares the session's face with the looks the account already holds, so whoever sits for Add Look or a terminal enrollment is added to the account. The planned check compares half faces and waits on a measurement of how the recognition model scores them.
 
 ## A daemon of your own
 
-The daemon takes its config path as its one argument and defaults to
-`/etc/faceauth/config.toml`. The store (`/var/lib/faceauth`) and the socket
-(`/run/faceauth/sock`) are fixed and are not config keys, so a development
-daemon does not run beside the packaged one: it replaces it. Stop the
-service first, then run the build from the workspace root:
+The daemon takes its config path as its one argument and defaults to `/etc/faceauth/config.toml`. The store (`/var/lib/faceauth`) and the socket (`/run/faceauth/sock`) are fixed and are not config keys, so a development daemon does not run beside the packaged one: it replaces it. Stop the service first, then run the build from the workspace root:
 
 ```
 sudo systemctl stop faceauth.service
@@ -184,291 +88,68 @@ sudo ./target/debug/faceauthd /path/to/dev/config.toml
 sudo ./target/debug/faceauth auth
 ```
 
-`faceauth-cli/dev-tools` switches the daemon and camera crates' `dev-tools`
-features on with it. The development config needs only the keys it changes;
-`models_dir` is the one most builds set, and the two development-only keys
-(`gesture_trace`, `gesture_record_only`) exist in that build alone. Root is
-needed because the udev rule makes the IR sensor's subdev root-only and
-enrolment and deletion are accepted from root alone. The development daemon
-serves the packaged socket, so PAM, sudo and the lock screen talk to it while
-it is up; templates it enrols land in the packaged store, sealed to the TPM
-where there is one, and the walk-away watch runs on whatever the config
-says. Start the service again when the build is done. `FACEAUTH_MODELS`
-points the CLI's direct-camera commands (`cam test`, `engine live`,
-`liveness capture`, `verify --store`) at a models directory; those commands
-never touch a daemon.
+`faceauth-cli/dev-tools` switches the daemon and camera crates' `dev-tools` features on with it. The development config needs only the keys it changes; `models_dir` is the one most builds set, and the two development-only keys (`gesture_trace`, `gesture_record_only`) exist in that build alone. Root is needed because the udev rule makes the IR sensor's subdev root-only and enrollment and deletion are accepted from root alone. The development daemon serves the packaged socket, so PAM, sudo and the lock screen talk to it while it is up; templates it enrolls land in the packaged store, sealed to the TPM where there is one, and the walk-away watch runs on whatever the config says. Start the service again when the build is done. `FACEAUTH_MODELS` points the CLI's direct-camera commands (`cam test`, `engine live`, `liveness capture`, `verify --store`) at a models directory; those commands never touch a daemon.
 
 ## Tuning tools and what their output means
 
-`faceauth cam probe` lists the IPU3 graph by entity name, classifying each
-sensor by its media-bus code and its `camera_orientation` control, and says
-whether the IR sensor exposes the strobe control and its frame pattern. On a
-UVC IR module there is no strobe control: the liveness gate cannot run, and
-with the default `liveness_required = true` the daemon refuses every attempt
-on such a camera. Do not read a probe that finds a UVC camera as a working
-setup.
+`faceauth cam probe` lists the IPU3 graph by entity name, classifying each sensor by its media-bus code and its `camera_orientation` control, and says whether the IR sensor exposes the strobe control and its frame pattern. On a UVC IR module there is no strobe control: the liveness gate cannot run, and with the default `liveness_required = true` the daemon refuses every attempt on such a camera. Do not read a probe that finds a UVC camera as a working setup.
 
-`faceauth cam test --seconds N --led on|off|alt --snapshot DIR` streams the
-cameras and prints a line per second: frame count and rate per camera, the
-exposure loop's exposure and gain, the white-balance gains and the meter
-readings. `--exposure LINES` freezes exposure, which is how a print of a
-fixed-exposure IR frame is made for a spoof test. `--ir-only` skips the RGB
-sensor.
+`faceauth cam test --seconds N --led on|off|alt --snapshot DIR` streams the cameras and prints a line per second: frame count and rate per camera, the exposure loop's exposure and gain, the white-balance gains and the meter readings. `--exposure LINES` freezes exposure, which is how a print of a fixed-exposure IR frame is made for a spoof test. `--ir-only` skips the RGB sensor.
 
-`faceauth engine live --models DIR --led on` runs detect, align and embed on
-a live IR stream and prints, per analysed frame, the detector score, the
-box, the pipeline time and the cosine similarity against the previous frame
-and the first. A same-person similarity that decays as the exposure loop
-climbs means the crop normalisation is not doing its job; it should hold
-above 0.7 across the ramp and above 0.9 frame to frame.
+`faceauth engine live --models DIR --led on` runs detect, align and embed on a live IR stream and prints, per analyzed frame, the detector score, the box, the pipeline time and the cosine similarity against the previous frame and the first. A same-person similarity that decays as the exposure loop climbs means the crop normalization is not doing its job; it should hold above 0.7 across the ramp and above 0.9 frame to frame.
 
-`faceauth liveness capture --models DIR --label TEXT --save DIR` settles
-exposure with the LEDs steady, freezes it, switches the strobe to a random mask (0xaa only when the OS gives no randomness), pairs each lit frame with the unlit one before it and
-logs the flash-response cues per pair to a CSV: the face's flash response
-normalised by exposure, gain and face size (the reflectance cue), the ring
-flash divided by the face flash (the surround cue), and the eye glint
-statistic. Run it once on a real face and once on a print at the same
-distance to see the separation the gate relies on.
+`faceauth liveness capture --models DIR --label TEXT --save DIR` settles exposure with the LEDs steady, freezes it, switches the strobe to a random mask (0xaa only when the OS gives no randomness), pairs each lit frame with the unlit one before it and logs the flash-response cues per pair to a CSV: the face's flash response normalized by exposure, gain and face size (the reflectance cue), the ring flash divided by the face flash (the surround cue), and the eye glint statistic. Run it once on a real face and once on a print at the same distance to see the separation the gate relies on.
 
-`faceauth sweep` (dev-tools, root) asks the running daemon to score every
-frame for twenty seconds while the user follows on-screen cues to turn
-slowly left, right, up and down, and prints the score binned by yaw with
-the pass rate at the threshold. It shows how far a person can turn before
-the match falls off, which is what the off-axis looks at enrolment exist to
-fix. `faceauth pose` (dev-tools, root) is a live readout of the pose
-measures a few seconds at a time, so a person can see what a turn or a tilt
-reads as.
+`faceauth sweep` (dev-tools, root) asks the running daemon to score every frame for twenty seconds while the user follows on-screen cues to turn slowly left, right, up and down, and prints the score binned by yaw with the pass rate at the threshold. It shows how far a person can turn before the match falls off, which is what the off-axis looks at enrollment exist to fix. `faceauth pose` (dev-tools, root) is a live readout of the pose measures a few seconds at a time, so a person can see what a turn or a tilt reads as.
 
-`faceauth calibrate --guided` (root; Tune Gestures in the menu) runs the
-walk-through's twelve rounds alone: two nods, two shakes, two glances each
-way, a look at the keyboard, reading, talking and leaning in. Each round is
-recorded in degrees from the face mesh and stored with the person's
-templates, and each gesture round is replayed through the mesh detector to
-find the highest floor at which it still reads; the person's floor is 0.85
-of the lowest of those, never under the detector's minimum nor over the
-cap (`GestureCal::floors_deg`). `faceauth doctor` reports those floors on
-its `gestures.calibrated` row, and they are the floors the nod window runs
-at (`auth::consent_floors`). The everyday rounds are recorded and stored
-but not yet replayed against the floors (round-4 STORE-5).
+`faceauth calibrate --guided` (root; Tune Gestures in the menu) runs the walk-through's twelve rounds alone: two nods, two shakes, two glances each way, a look at the keyboard, reading, talking and leaning in. Each round is recorded in degrees from the face mesh and stored with the person's templates, and each gesture round is replayed through the mesh detector to find the highest floor at which it still reads. The derived floor is 0.85 of the lowest of those, never under the detector's minimum nor over the cap (`GestureCal::derived_floors_deg`), and the everyday check under The Enrollment Walk-Through may raise it past the cap (`GestureCal::floors_deg`). `faceauth doctor` reports the resulting floors on its `gestures.calibrated` row, and they are the floors the nod window runs at (`auth::consent_floors`).
 
-`tools/battery.sh [USER] [OUTDIR]` records a battery of consent windows: it
-turns on `gesture_trace` and `gesture_record_only` in the live config
-(root, with a backup beside it), restarts the service, runs the labelled
-windows through `faceauth auth --consent` (which grants nothing), restores
-the config and collects the recordings under their item names.
-`gesture_trace` writes each consent round's per-frame recording (the mesh's
-angles and the box, format v3) to `/var/lib/faceauth/gestures/<user>/`, root-only,
-newest sixty kept; `gesture_record_only` makes the daemon
-recognise gestures without acting on them, so a recording captures each
-gesture to its rest instead of ending at the decision. Both are off in the
-shipped config and the recording hooks exist only in dev-tools builds.
+`tools/battery.sh [USER] [OUTDIR]` records a battery of consent windows: it turns on `gesture_trace` and `gesture_record_only` in the live config (root, with a backup beside it), restarts the service, runs the labeled windows through `faceauth auth --consent` (which grants nothing), restores the config and collects the recordings under their item names. `gesture_trace` writes each consent round's per-frame recording (the mesh's angles and the box, format v3) to `/var/lib/faceauth/gestures/<user>/`, root-only, newest sixty kept; `gesture_record_only` makes the daemon recognize gestures without acting on them, so a recording captures each gesture to its rest instead of ending at the decision. Both are off in the shipped config and the recording hooks exist only in dev-tools builds.
 
-`tools/power-measure.sh` reads the battery meter over timed phases. Its
-whole-system figures are dominated by whatever else the machine is doing; a
-clean comparison needs a quiet machine and phases of minutes, not seconds.
+`tools/power-measure.sh` reads the battery meter over timed phases. Its whole-system figures are dominated by whatever else the machine is doing; a clean comparison needs a quiet machine and phases of minutes, not seconds.
 
 ## Models
 
-Weights are never vendored. `models.toml` names each model with its URL,
-SHA-256, size, licence, provenance and input contract, and `faceauth models
-fetch` downloads each file with `curl` by absolute path in a clean
-environment, verifies the size and hash, and installs it under
-`/usr/share/faceauth/models` (or `--dir`). `faceauth doctor` re-checks the
-hashes on its `models.file` rows.
+Weights are never vendored. `models.toml` names each model with its URL, SHA-256, size, license, provenance and input contract, and `faceauth models fetch` downloads each file with `curl` by absolute path in a clean environment, over https only and within a time and size bound, verifies the size and hash, and installs it under `$XDG_DATA_HOME/faceauth/models` (or `--dir`; on an installed system the omarchy-faceauth-models package owns `/usr/share/faceauth/models`). The daemon refuses to start unless `models_dir`, every directory above it and every file in it are root-owned and closed to group and other writers (no symlinks), so a fetched copy must be installed as root (`install -o root -m 644`) under such a path before the daemon is pointed at it. `faceauth doctor` re-checks the hashes on its `models.file` rows.
 
-Three models: the YuNet detector from OpenCV Zoo (MIT), the glintr100
-recognition model from fal's AuraFace-v1 (Apache-2.0; only that one file,
-since the repository's bundled detector and landmark models are
-InsightFace-derived and non-commercial), and the MediaPipe face landmark
-model (Apache-2.0). The last is Google's `face_landmark.tflite` converted
-one-to-one to ONNX with tf2onnx, opset 13, and published on this project's
-GitHub release `models-1` with its licence text and a NOTICE describing the
-conversion; the manifest records the original file's hash and size beside
-the converted one's. The engine loads the mesh when the file is present;
-the daemon refuses to start without it, naming the file and the package,
-because the gestures are read from the head's angles and nothing else. The
-CLI's engine tools load a pipeline without it.
+Three models: the YuNet detector from OpenCV Zoo (MIT), the glintr100 recognition model from fal's AuraFace-v1 (Apache-2.0; only that one file, since the repository's bundled detector and landmark models are InsightFace-derived and non-commercial), and the MediaPipe face landmark model (Apache-2.0). The last is Google's `face_landmark.tflite` converted one-to-one to ONNX with tf2onnx, opset 13, and published on this project's GitHub release `models-1` with its license text and a NOTICE describing the conversion; the manifest records the original file's hash and size beside the converted one's. The engine loads the mesh when the file is present; the daemon refuses to start without it, naming the file and the package, because the gestures are read from the head's angles and nothing else. The CLI's engine tools load a pipeline without it.
 
 ## The kernel dependency
 
-The IR illuminator is driven through a V4L2 strobe control that the stock
-ov7251 driver does not have. Kernel patch 0010 (`media: i2c: ov7251: expose
-the strobe output as a flash control`) adds `strobe_output_enable` and a
-frame-pattern bitmask; without it `cam probe` reports no illuminator, the
-liveness gate cannot run, and the daemon refuses. Patch 0009 (`media:
-ipu3-cio2: support concurrent streams on multiple CSI-2 ports`), after
-seven CIO2 bug fixes and a bounds check in 0001-0008, gives each CIO2 queue
-its own DMA channel so the RGB camera can stream while the IR camera does, which is
-what keeps a consent window from killing a video call's camera. Neither is
-in a shipped kernel yet; both are kept with their measurements and review
-history in the project's kernel pack, outside this source tree. The daemon
-needs read and write access to `/dev/media*`, `/dev/video*` and
-`/dev/v4l-subdev*`; the packaged unit gets that through `DeviceAllow`, and
-the udev rule in `packaging/` makes the IR sensor's subdev root 0600 so an
-ordinary user cannot drive the strobe or take IR frames through it.
+The IR illuminator is driven through a V4L2 strobe control that the stock ov7251 driver does not have. Kernel patch 0010 (`media: i2c: ov7251: expose the strobe output as a flash control`) adds `strobe_output_enable` and a frame-pattern bitmask; without it `cam probe` reports no illuminator, the liveness gate cannot run, and the daemon refuses. Patch 0009 (`media: ipu3-cio2: support concurrent streams on multiple CSI-2 ports`), after seven CIO2 bug fixes and a bounds check in 0001-0008, gives each CIO2 queue its own DMA channel so the RGB camera can stream while the IR camera does, which is what keeps a consent window from killing a video call's camera. Neither is in a shipped kernel yet; both are kept with their measurements and review history in the project's kernel pack, outside this source tree. The daemon needs read and write access to `/dev/media*`, `/dev/video*` and `/dev/v4l-subdev*`; the packaged unit gets that through `DeviceAllow`, and the udev rule in `packaging/` makes the IR sensor's subdev root 0600 so an ordinary user cannot drive its strobe, exposure or gain. The CIO2 capture node the IR frames arrive on is locked by face setup with a rule of its own (Mike's ruling, fix round 11): `faceauth cam ir-rule` prints it from faceauth's own detection (`faceauth_camera::irlock`: the config's `ir_video`, else the IPU3 graph's IR sensor, whose port streams only the sensor's Y10), only when the node carries infrared or grey formats and no colour one, pinned by its name and the CIO2's PCI function (a USB camera by its interface and node index on one line, which sets `ENV{FACEAUTH_IR_NODE}`, and its port and ids on the next), checked to be the node whose formats were read (canonical path, class `dev` equal to the opened node's device number), and setup writes it to `/etc/udev/rules.d/72-faceauth-ir-node.rules`, which face removal deletes. Anything unclear leaves it open, and doctor's `camera.ir_capture` says why.
 
 ## Measurements behind the thresholds
 
-Everything below was measured on one machine, a Surface Book 2 (Intel IPU3,
-ov7251 IR sensor at 640x480), with one enrolled subject. The impostor side
-is one life-size paper print and one phone screen. That is the honest scope:
-before the accept threshold is trusted as a `sudo` factor on other faces, it
-needs other people measured.
+Everything below was measured on one machine, a Surface Book 2 (Intel IPU3, ov7251 IR sensor at 640x480), with one enrolled subject. The impostor side is one life-size paper print and one phone screen. That is the honest scope: before the accept threshold is trusted as a `sudo` factor on other faces, it needs other people measured.
 
-**Accept threshold 0.70, two matching frames.** Genuine attempts score 0.86
-to 0.96 on the best template; the ten enrolment templates agree with each
-other at 0.90 minimum and 0.945 mean over 45 pairs. A visible-light print of
-the enrolled face is detected (scores 0.84 to 0.91) and reaches the
-recogniser, which puts it at 0.37 to 0.56. A partially blocked genuine face
-once reached 0.797 on a single frame, which is why `required_matches` is 2
-and not 1, and why the threshold is expected to rise once more subjects are
-measured. The threshold is not a liveness defence: a print made from an IR
-frame of the enrolled face scores far closer, and a 1.5x life-size print of
-a fixed-exposure IR frame, held at the lock screen for twelve minutes, was
-refused by the gate or failed to match on every frame that passed it.
+**Accept threshold 0.70, two matching frames.** Genuine attempts score 0.86 to 0.96 on the best template; the ten enrollment templates agree with each other at 0.90 minimum and 0.945 mean over 45 pairs. A visible-light print of the enrolled face is detected (scores 0.84 to 0.91) and reaches the recognizer, which puts it at 0.37 to 0.56. A partially blocked genuine face once reached 0.797 on a single frame, which is why `required_matches` is 2 and not 1, and why the threshold is expected to rise once more subjects are measured. The threshold is not a liveness defense: a print made from an IR frame of the enrolled face scores far closer, and a 1.5x life-size print of a fixed-exposure IR frame, held at the lock screen for twelve minutes, was refused by the gate or failed to match on every frame that passed it.
 
-**Liveness cues.** `REFLECTANCE_DENY` is 0.80 and `SURROUND_DENY` 0.42 in
-`faceauth-engine/src/liveness.rs`, from 110 lit/unlit pairs each of the face
-and the print at the same distance. The reflectance cue (face flash response
-over exposure times gain, normalised by face size so it is distance-free)
-read 0.28 for the face and 1.66 to 2.2 for the print. The surround cue
-(flash on a ring 1.4 to 2.0 face widths out, over flash on the face) read
-0.31 to 0.36 for the face and 0.44 to 0.54 for the print, because a print's
-surround is at the print's distance while a head's surround is the room
-behind it. Paper reflects near infrared several times more strongly than
-skin, so the exposure loop settled at 267 on the face and 66 on the print.
-The eye-glint statistic did not separate them at this face size and is not
-used. The gate is deny-only; a pair with too little face flash
-(`MIN_FACE_FLASH`) decides nothing. The phone screen never reaches the
-recogniser at all: a display emits almost nothing in the near infrared and
-its glass mirrors the illuminator. The gate has not been measured against a
-video rendered on a display the IR camera can see, and is not claimed to
-stop that.
+**Liveness cues.** `REFLECTANCE_DENY` is 0.80 and `SURROUND_DENY` 0.42 in `faceauth-engine/src/liveness.rs`, from 110 lit/unlit pairs each of the face and the print at the same distance. The reflectance cue (face flash response over exposure times gain, normalized by face size so it is distance-free) read 0.28 for the face and 1.66 to 2.2 for the print. The surround cue (flash on a ring 1.4 to 2.0 face widths out, over flash on the face) read 0.31 to 0.36 for the face and 0.44 to 0.54 for the print, because a print's surround is at the print's distance while a head's surround is the room behind it. Paper reflects near infrared several times more strongly than skin, so the exposure loop settled at 267 on the face and 66 on the print. The eye-glint statistic did not separate them at this face size and is not used. The gate is deny-only; a pair with too little face flash (`MIN_FACE_FLASH`) decides nothing. In the tests made the phone screen never reached the recognizer, since a display emits almost nothing in the near infrared and its glass mirrors the illuminator. The gate has not been measured against a video rendered on a display the IR camera can see, and is not claimed to stop that.
 
-**Gesture floors, mesh.** From the `traces/v2` rounds: a nod's legs are 12
-to 35 degrees of pitch and take 0.23 to 0.33 s, reversing at once; a look at
-the keyboard is 17 to 21 degrees a leg but takes 0.9 to 2 s and holds at the
-bottom; a lean is 18 to 30 degrees over 1.1 to 3.3 s. A shake's legs are 33
-to 53 degrees of yaw in about 0.3 s; a glance aside is as large but takes
-0.8 to 2.2 s and holds at the side. Size does not separate a gesture from an
-everyday movement; leg time does, so a leg may take at most `MESH_LEG_MAX_S`
-(0.6 s). The floors are `MESH_MIN_DEG` 8 for the nod and 15 for the shake;
-the walk-through sets a person's floor to 0.85 of the lowest floor at which
-their recorded gesture rounds still read, never under those minimums and
-never over 16 and 24 degrees. A still head reads about
-0.7 degrees between frames, a turnaround several, so rest is under
-`MESH_REST_STEP` (1.5).
+**Gesture floors, mesh.** From the `traces/v2` rounds: a nod's legs are 12 to 35 degrees of pitch and take 0.23 to 0.33 s, reversing at once; a look at the keyboard is 17 to 21 degrees a leg but takes 0.9 to 2 s and holds at the bottom; a lean is 18 to 30 degrees over 1.1 to 3.3 s. A shake's legs are 33 to 53 degrees of yaw in about 0.3 s; a glance aside is as large but takes 0.8 to 2.2 s and holds at the side. Size does not separate a gesture from an everyday movement; leg time does, so a leg may take at most `MESH_LEG_MAX_S` (0.6 s). The floors are `MESH_MIN_DEG` 8 for the nod and 15 for the shake; the walk-through derives a person's floor as 0.85 of the lowest floor at which their recorded gesture rounds still read, never under those minimums and never over 16 and 24 degrees, and the everyday check may then raise it past that cap. A still head reads about 0.7 degrees between frames, a turnaround several, so rest is under `MESH_REST_STEP` (1.5).
 
-**Presence.** The watch takes one look every 5 s on mains and 10 s on
-battery, with an identity and liveness check every third look in default mode and on every look in secure mode; camera duty
-is about 14 and 7 percent. Detection costs about 14 ms a frame and the
-embedder about 0.35 core-seconds a run, so a watch that identifies every
-tick from a cold exposure is expensive and wrong: ticks start from the
-exposure the last attempt settled on. A hidden face is not absence, in
-either mode: when a look holds nothing and is not a stranger (no face, a face turned
-away, a face the strobe read no signal from, or a failed check within
-`NEAR_MISS_SLACK` 0.25 of the threshold, which is what a hand on the chin,
-leaning in or a look down at a phone gives the mesh and the embedder), the torso under the last full sighting is
-compared by normalised cross-correlation, and `SAME_SHAPE` 0.60 holds the
-away clock for the obscured face lock time: `obscured_face_lock` (default
-mode, "never" as shipped) or `secure_obscured_face_lock` (secure mode, 2
-minutes, clamped to 1 to 10) and stays the secure mode's
-first-miss lock. Measured: a hand over part of the face 1.00, a
-sheet over it 0.95, the face fully covered 0.79, the chair empty -0.34.
-The away time is per mode and is read for the mode in force, by the watch
-and by the consent round's away clock alike: `away_seconds` in the default
-mode (seconds, or "never", when the default mode never locks by time) and
-`secure_away_seconds` in the secure mode (seconds only), 20 s each as
-shipped (`PresenceConfig::away_for`). `faceauth presence away-time` writes
-them; `faceauth presence on` leaves them alone unless given
-`--away-seconds`.
+**Presence.** The watch takes one look every 10 s in the default mode and every 5 s in secure mode, 10 s on battery in both (`tick_for`), with an identity and liveness check every third look in the default mode and on every look in secure mode. Camera duty was about 14 and 7 percent at an earlier cadence and has not been measured since. Detection costs about 14 ms a frame and the embedder about 0.35 core-seconds a run, so a watch that identifies every tick from a cold exposure is expensive and wrong: ticks start from the exposure the last attempt settled on. A print held up to the watch on 2026-09-22 locked the session. Under the illuminator a print, a phone or a screen saturates to a white blob in which the detector finds no face, so the watch counts an empty chair. A hidden face is not absence, in either mode: when a look holds nothing and is not a stranger (no face, a face turned away, a face the strobe read no signal from, or a failed check within `NEAR_MISS_SLACK` 0.25 of the threshold, which is what a hand on the chin, leaning in or a look down at a phone gives the mesh and the embedder), the torso under the last full sighting is compared by normalized cross-correlation, and `SAME_SHAPE` 0.60 holds the away clock for the obscured face lock time: `obscured_face_lock` (default mode, "never" as shipped) or `secure_obscured_face_lock` (secure mode, 2 minutes, clamped to 1 to 10) and stays the secure mode's first-miss lock. Measured: a hand over part of the face 1.00, a sheet over it 0.95, the face fully covered 0.79, the chair empty -0.34. The away time is per mode and is read for the mode in force, by the watch and by the consent round's away clock alike: `away_seconds` in the default mode (seconds, or "never", when the default mode never locks by time) and `secure_away_seconds` in the secure mode (seconds only), 20 s each as shipped (`PresenceConfig::away_for`). `faceauth presence away-time` writes them; `faceauth presence on` leaves them alone unless given `--away-seconds`.
 
-**Lock screen probe.** While its panel is blank the lock screen asks for a
-probe every `[unlock] probe_seconds` (2 s) on mains and every
-`battery_probe_seconds` on battery: 3, 5 or 8 s for the performance,
-balanced and power-saver profiles. The daemon does not read the power
-profile; it sends all four intervals in every probe reply and the lock
-screen picks one. A probe is the watch's look without the flash, about
-0.45 s of camera. For a face near enough to judge it also embeds the look's
-frame against the asking user's templates once the camera is closed: 134 ms
-wall and 262 ms of CPU per embed on the reference laptop
-(`bench_ort_pipeline`, release build, 2026-09-25), plus about 0.6 s once
-when the recognition model reloads after its idle release. The reply says
-`likely` when the best score reaches `PROBE_LIKELY_THRESHOLD` 0.5, under
-the 0.70 accept threshold on purpose, and it carries the yes or no, never
-the score. The score goes to the debug log only, beside an attempt's frame
-scores (`probe for USER: score 0.63, likely true, lit true`, or `no score
-(no face)` and the like), because the look's frame is lit steadily and
-metered on the whole frame while the scan scores strobed frames metered on
-the face, so the 0.5 line is set against real probe scores.
+**Lock screen probe.** While its panel is blank the lock screen asks for a probe every `[unlock] probe_seconds` (1 s) on mains and every `battery_probe_seconds` on battery: 2, 3 or 5 s for the performance, balanced and power-saver profiles (round 19; it was 2 s and 3, 5 and 8 s). The lock screen never probes more often than once a second. The daemon does not read the power profile; it sends all four intervals in every probe reply and the lock screen picks one. A probe is the watch's look without the flash, about 0.45 s of camera. For a face near enough to judge it also embeds the look's frame against the asking user's templates once the camera is closed: 134 ms wall and 262 ms of CPU per embed on the reference laptop (`bench_ort_pipeline`, release build, 2026-09-25), plus about 0.6 s once when the recognition model reloads after its idle release. The reply says `likely` when the best score reaches `PROBE_LIKELY_THRESHOLD` 0.5, under the 0.70 accept threshold on purpose, and it carries the yes or no, never the score. A probe for the same user within `PROBE_MIN_GAP` (1 s) of the last gets the last answer with no look, and an attempt for the user clears it, so a fresh answer comes at most once a second. The score goes to the debug log only, beside an attempt's frame scores (`probe for USER: score 0.63, likely true, lit true`, or `no score (no face)` and the like), because the look's frame is lit steadily and metered on the whole frame while the scan scores strobed frames metered on the face, so the 0.5 line is set against real probe scores.
 
-**Timing.** The exposure loop settles on a face in about 1.2 s; a lock
-screen attempt matches in under two seconds from the panel becoming secure;
-the strobed confirm after the second nod takes about 0.6 s for two pairs.
-Unsealing a template file costs about a second of TPM time on a cold daemon
-and is cached against the file afterwards.
+**Timing.** An attempt scores nothing until the exposure has settled on a face: `SETTLE` (1.2 s) into the attempt with a face in view, and up to 0.8 s more while the flash clips the face (`auth/attempt.rs`). Unlock and approval latency have not been measured since the strobed confirm (2026-09-22) and the face mesh (2026-09-23) were added. Unsealing a template file costs about a second of TPM time on a cold daemon (the store's own note, undated) and is cached against the file afterwards.
 
 ## Decisions carried into the code
 
-The daemon owns the cameras. No loopback node sits in the authentication
-path, so frames never leave the process that scores them, which removes the
-frame-injection surface and the exclusive-access problem together. The
-graph is found by entity name and sensors by what they produce: device
-numbers move across boots and module reloads; entity names, media-bus codes
-and the orientation control do not. Calibration is pure: `calib` computes
-the next setting from a frame and the device layer applies it, so the loops
-are unit-tested without hardware.
+The daemon owns the cameras. No loopback node sits in the authentication path, so frames never leave the process that scores them, which removes the frame-injection surface and the exclusive-access problem together. The graph is found by entity name and sensors by what they produce: device numbers move across boots and module reloads; entity names, media-bus codes and the orientation control do not. Calibration is pure: `calib` computes the next setting from a frame and the device layer applies it, so the loops are unit-tested without hardware.
 
-Templates are sealed with `systemd-creds` to the TPM, scoped to root with
-the host secret in the mix, with no recovery key anywhere on disk: a
-template that cannot be unsealed is set aside and re-enrolled. Each
-template records the camera that enrolled it and matches only there. Match
-scores go to root callers only, never to the lock screen's helper or a user
-shell, and never to the journal at info level, because a visible score is a
-hill-climbing oracle for a spoof. The socket is 0660 with a per-user ACL
-for each enrolled user, refreshed on every enrolment and deletion.
+Templates are sealed with `systemd-creds` to the TPM, scoped to root with the host secret in the mix, with no recovery key anywhere on disk: a template that cannot be unsealed is set aside and re-enrolled. Each template records the camera that enrolled it and matches only there. Match scores go to root callers only, never to the lock screen's helper or a user shell, and never to the journal at info level, because a visible score is a hill-climbing oracle for a spoof. The socket is 0660 with a per-user ACL for each enrolled user, refreshed on every enrollment and deletion.
 
-A consent request has no deadline: the reply arrives when the user answers
-the window or never, a caller must set no read deadline, and the daemon
-notices a caller that hung up. Nothing elevates until the window has
-acknowledged the request, the face has matched, the daemon has seen the
-nods from that same face, and a strobed confirm has shown it live and
-enrolled. Locality is a positive, fail-closed check from `/proc` and logind:
-an sshd ancestor is remote, root in the system slice is local, a process in
-a logind session is local only if that session is on a seat and not marked
-remote, and any read error or vanished caller is remote. Every failure that
-is not a decision returns `PAM_IGNORE` so the password path is untouched;
-only a refusal on a polkit consent line is `PAM_AUTH_ERR`.
+A consent request has no deadline: the reply arrives when the user answers the window or never, a caller must set no read deadline, and the daemon notices a caller that hung up. On the polkit lane it also watches the process polkitd named, through the pidfd the locality check pinned (`ConsentState::take_turn_watching`), since polkit's helper holds the socket and outlives a request polkitd gives up: when that process exits the request ends, waiting or parked, and as a refusal (`server::rounds::gone_now`), so polkit's stack ends there instead of going on to its key line. The module, on polkit's stack, watches the helper's standard input too, its connection to the agent, for a hang-up while a consent or key line waits (`Agent`, `exchange_within`, `key_line`): a cancelling agent only closes it (polkit's `kill_helper`), whatever made it cancel, so the line ends with an auth error and closes its connection to the daemon, which ends the request and takes its card down. A polkit request's description, the context its agent sends as it starts the helper, is tied to the request by polkitd's cookie (round 16c): an agent that says it answers pam_faceauth's cookie prompt, by sending that prompt's own text as `context_cookie_prompt` (`requester::note_cookie_agent`, kept per uid of the sender, dead peers dropped first, and revoked by any later context of that peer's without it), has each of its helpers' consent requests answered `need_cookie`; the module then asks the agent, through polkit's own helper conversation with the echo off, `lockgate::POLKIT_COOKIE_PROMPT` followed by a fresh challenge, 16 bytes from getrandom(2) as hex (`lockgate::polkit_cookie_question`, round 18; Omarchy's agent answers `lockgate::POLKIT_COOKIE_TAG`, that challenge and `flow.cookie`, and shows nothing), and asks again with `polkit_cookie` (a `Secret` in the daemon). An answer without the tag and that challenge goes nowhere and the line has no answer (`lockgate::polkit_cookie_answer`), so nothing typed into a prompt an agent showed by mistake, a password that starts with the tag included, is ever taken for a cookie: the challenge did not exist before the question. An agent that hung up during the prompt ends it as abandoned. A change to the question or its answer renames the daemon's `need_cookie` reply as well: the module takes only that exact reply (`classify`), so a module and a daemon from different rounds ignore each other rather than ask a shell that answers another question, which would show it as a field. The card shows only the context with that cookie from that same peer (`requester::take_context_by_cookie`), or none, and the context stays until it expires, so every helper of the request, a password retry's included, finds it. A context sent with the prompt's word is served by its cookie alone, never by arrival, so a request whose agent lost its mark (pushed out of its bucket, or revoked) shows no action rather than another request's. A context from an agent that never said so is matched by arrival (`requester::pick_context`: the same peer, sent no more than `CONTEXT_LEAD` before the helper started) and is the agent's word alone: never shown as verified, never offered to kill, never watched (`CallerInfo::polkit_with`). Cookies are kept only in their form (`lockgate::polkit_cookie_ok`) and never logged. The requester polkitd names is pinned by a pidfd before anything about it is read and checked alive after (`CallerInfo::requester_fd`), and that pidfd is what the locality check and the request's watch use. Nothing elevates until the window has acknowledged the request, the face has matched, the daemon has seen the nods from that same face, and a strobed confirm has shown it live and enrolled. Locality is a positive, fail-closed check from `/proc` and logind: an sshd ancestor is remote, root in the system slice is local, a process in a logind session is local only if that session is on a seat and not marked remote, and any read error or vanished caller is remote. Every failure that is not a decision returns `PAM_IGNORE` so the password path is untouched; only a refusal on a polkit consent line is `PAM_AUTH_ERR`.
 
-The daemon never switches uid. Anything that must run in the user's session
-(the lock command, the consent window, the notices) runs inside the user's
-own systemd manager through `systemd-run --machine=user@.host --user`,
-because the hardened unit has an empty capability set and a PAM session
-opened from inside the sandbox fails. A transient test unit must never be
-given `RuntimeDirectory=faceauth`: systemd removes that directory when the
-unit exits and takes the live socket with it.
+The daemon never switches uid. Anything that must run in the user's session (the lock command, the consent window, the notices) runs inside the user's own systemd manager, because the hardened unit has an empty capability set and a PAM session opened from inside the sandbox fails. Since fix round 9 the route can never start a manager (`consent/shell.rs`: `user_command`; the lock helper does the same): a system unit runs as the user with no `PAMName=` and runs `systemd-run --user` over the user's own bus socket, which does not exist while no manager runs. `systemd-run --machine=user@.host --user` is not used: sd-bus turns it into a PAM session, for which logind starts the manager. Every dispatch first checks the sessions pinned when the work began are still the user's live desktops (`Pin`, taken by the card when it is made, by a request's notices when it starts, by an enrollment when it starts), and both units check them again as they start (`PIN_CHECK`, `/bin/sh -c` in front of the inner `systemd-run --user` and of the command; the lock helper carries the same text, and a test holds them equal). Neither manager expands `$` in the arguments (`--expand-environment=no`). Every call is read with a deadline and an output cap and never to the end of its pipes, which PID 1 and the units hold (`consent/bounded.rs`: `run_bounded`, shared with the anchor: one read per stream per pass, the deadline checked every pass, and a bounded last read after the command exits, so writers that keep a pipe full cannot outrun it), and both units carry `RuntimeMaxSec=` and `KillSignal=SIGKILL`, since `timeout` ends only the launcher and a stop otherwise sends SIGTERM first. A request queued behind cards that never show gives up after `QUEUE_UNSEEN` (`ConsentState::take_turn`). A transient test unit must never be given `RuntimeDirectory=faceauth`: systemd removes that directory when the unit exits and takes the live socket with it.
 
 ## Conventions
 
-Comments are full sentences in plain English that say why, not what, and
-name the measurement or the failure that led to a rule. No em dashes. A
-constant that came from a recording names the corpus in its doc comment.
-Review identifiers and dates belong in commit messages, not in code.
+Comments are full sentences in plain English that say why, not what, and name the measurement or the failure that led to a rule. No em dashes. A constant that came from a recording names the corpus in its doc comment. Review identifiers and dates belong in commit messages, not in code.
 
-`cargo fmt` and `cargo clippy` run clean, and a clippy fix that would change
-behaviour is not applied as a lint fix: it gets its own commit with its own
-test, or a targeted allow with the reason in a sentence. The same goes for
-any inline suppression.
+`cargo fmt` and `cargo clippy` run clean, and a clippy fix that would change behavior is not applied as a lint fix: it gets its own commit with its own test, or a targeted allow with the reason in a sentence. The same goes for any inline suppression.
 
-Gesture floors and liveness thresholds are never moved by hand. A floor
-changes only when the recorded rounds show the new value is correct on
-every file and the suite is updated in the same change. When a gesture
-misfires live, the recording becomes a test first. Detector changes are
-checked against the mesh battery and the red-team module; there is no
-other gesture signal.
+Gesture floors and liveness thresholds are never moved by hand. A floor changes only when the recorded rounds show the new value is correct on every file and the suite is updated in the same change. When a gesture misfires live, the recording becomes a test first. Detector changes are checked against the mesh battery and the red-team module; there is no other gesture signal.
 
-A UVC camera is not a supported configuration and the docs must not say
-otherwise: a UVC IR module has no strobe control, so with the default
-config every attempt on one refuses. Anything measured is stated with its
-scope (which machine, how many subjects, what impostor) and a claim that
-outruns its measurement is cut rather than softened.
+A UVC camera is not a supported configuration and the docs must not say otherwise: a UVC IR module has no strobe control, so with the default config every attempt on one refuses. Anything measured is stated with its scope (which machine, how many subjects, what impostor) and a claim that outruns its measurement is cut rather than softened.

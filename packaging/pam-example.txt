@@ -1,18 +1,40 @@
-# pam_faceauth has three answers. A match is PAM_SUCCESS. A refusal at the
-# consent window (a head shake, a dismissed card, a confirm after the nods
-# that failed) is PAM_AUTH_ERR, and only on a line carrying `consent`. Every
-# other outcome (no daemon, timeout, no face, no match, malformed reply,
-# panic) is PAM_IGNORE, which is what makes the module safe in a stack that
-# has a password behind it. A stack with NOTHING behind it is still closed
-# with pam_deny, as belt and braces: on Linux-PAM 1.7.2 an auth stack whose
-# only module returned PAM_IGNORE answers PAM_PERM_DENIED (measured against a
-# stopped backend), so an ignore-only stack fails closed on its own, but that
-# is a library behaviour and not a promise, and `doctor` checks for the
-# pam_deny line.
+# pam_faceauth has four answers. A match is PAM_SUCCESS. A refusal at the
+# consent card (a head shake, a dismissed card, a confirm after the nods
+# that failed) is PAM_AUTH_ERR, and only on a `consent` line that polkit's
+# helper runs: the daemon sends a refusal to that caller alone. Any other
+# caller's refusal, sudo's included, comes back as a consent denial ("not by
+# face"), which the module maps to PAM_IGNORE, so the stack goes on to its
+# key line and its password. On a consent line, a request that ends
+# unapproved while the session is locked, the daemon's error and every
+# failure to reach the daemon at all (no daemon, a peer that is not root, a
+# reply broken off, a panic) are PAM_AUTHINFO_UNAVAIL, which reads as an
+# ignore under the controls below. On a look, every other outcome (no
+# daemon, timeout, no face, no match, malformed reply, panic) is
+# PAM_IGNORE, which is what makes the module safe in a stack that has a
+# password behind it. A stack with nothing behind it is still closed with
+# pam_deny. On Linux-PAM 1.7.2 an auth stack whose only module returned
+# PAM_IGNORE answers PAM_PERM_DENIED (measured against a stopped backend),
+# so an ignore-only stack fails closed on its own, but that is library
+# behavior and not a promise, and `doctor` checks for the pam_deny line.
 #
-# The module's arguments are socket=PATH, timeout=SECONDS (a plain look only)
-# and consent. It never converses with the application: no prompt, no
-# password passes through it.
+# The module's arguments are socket=PATH, timeout=SECONDS (a plain look
+# only), consent, key-fallback (the stack's own key line, below, with cue,
+# pinverification= and userverification= mirrored from the pam_u2f line it
+# replaces), and key-unlock (the lock screen's key lane, below). On a key
+# line anything but a touch is PAM_AUTH_ERR. The module converses only to
+# ask a key-fallback line's PIN on the terminal, to say to touch the key,
+# and to say once that the key waits for the unlock; it never sees a
+# password.
+#
+# While face is set up and the daemon runs, every use of the security key
+# goes through it: the card, the stacks' key-fallback lines and the lock
+# screen's key lane. No pam_u2f line stays in sudo or polkit-1; one that
+# does (added by hand, or a second one) reads the key outside the daemon,
+# so the daemon then offers the key nowhere, and `faceauth doctor` says
+# why. With the daemon down (its socket missing, or nothing listening on
+# it, and nothing else), the key-fallback line takes the key as stock
+# Omarchy's pam_u2f line does, except while the screen is locked: see the
+# sudo stack below.
 
 # /etc/pam.d/omarchy-lock-face   (the lock screen's third stack, beside -password and -fingerprint;
 #                                 the password is a separate service on its own lane, so this one
@@ -24,18 +46,82 @@ account    include                     system-local-login
 
 # /etc/pam.d/sudo: one line at the top, opt-in. The password lines below it
 # are the fallback, so no pam_deny here. `consent` makes elevation a
-# deliberate act: the daemon opens a window naming the command and the
-# requester, and the request is approved by two nods or by the password typed
-# into that window. The window waits until it is answered (`timeout=` is
-# ignored on a consent line). Sitting in front of the machine never elevates
-# anything by itself. `sufficient` is right here: a refusal falls through to
-# the terminal's password prompt, where sudo asks anyway.
+# deliberate act: the daemon opens a card naming the command and the
+# requester, and the request is approved by two nods, by the password typed
+# into that card, or by a touch of a FIDO2 key that /etc/fido2/fido2 names,
+# with the PIN or user verification the key line asks for. The card waits
+# until it is answered (`timeout=` is ignored on a consent line). Sitting in
+# front of the machine never elevates anything by itself. The daemon answers
+# a refusal here with `consent_denied`, the module ignores it, and the key
+# line and then sudo's own password prompt follow, so `sufficient` is the
+# right control on its own:
 auth      sufficient pam_faceauth.so socket=/run/faceauth/sock consent
+# With a FIDO2 key set up, the key line goes right below it, in place of
+# the pam_u2f line: the daemon runs the same check the card does, asking
+# for the PIN on the terminal when the line has pinverification=1, or says
+# nothing and /etc/security/pam_u2f.conf does. It runs
+# only on the one lock verdict's "unlocked" (the compositor, logind, the
+# latch and the lock screen's reserved channel, all failing closed). Otherwise the line
+# says once "The screen is locked. Your security key will be offered after
+# you unlock it." and waits, asking again each second on a short
+# connection: without a deadline while the screen is positively locked
+# (the lock screen's channel open and the compositor saying locked),
+# for at most 10 s in all on anything else (one budget per line that
+# churn cannot reset), and not at all for
+# a sudo from a text console or a remote login, which goes straight to the
+# password. It runs once the daemon has seen the unlock and
+# key_unlock_hold_ms (500 by default) has passed; a check under way is
+# stopped the moment the verdict leaves unlocked or a card takes the key,
+# and a touch counts only if the verdict still says unlocked when it lands.
+# The check waits 6 s for a touch. With no graphical session of anyone's
+# at all (a text console, no desktop) and nothing latched, it runs at once. A touch is success; anything else goes on
+# to the password, which faceauth never keeps out of reach for more than
+# about 15 s unless the screen is positively locked and the request comes
+# from the locked desktop.
+#
+# With the daemon down, the same line asks the daemon again every second
+# and goes back to it the moment it answers. Meanwhile it is its own gate
+# on the same verdict, latched by any lock, doubt or switch: root names the
+# genuine compositor through logind (CONTROLLER= of the session sudo runs
+# in, resolved on the system bus to a pid), connects without blocking only
+# to a Hyprland socket the user owns whose listener is that pid, within
+# one deadline, and faceauth-lockstate, run as nobody with that
+# connection, asks and hands back one byte; only "unlocked" passes, after
+# any wait only once it has held for key_unlock_hold_ms. A sudo from a
+# text console never asks the compositor: with a desktop anywhere it goes
+# to the password. Then the line runs
+# /usr/lib/faceauth/faceauth-keycheck on the same private stack the daemon
+# uses, as root with no core dump, stopped the moment the daemon answers
+# or the session stops reading unlocked. A busy daemon, a malformed reply,
+# a listener that is not root and a timeout are not "down": they go on to
+# the password. pam_u2f's defaults in /etc/security/pam_u2f.conf count for
+# the words the line leaves out; a file that sets anything else keeps the
+# key off, and so does a credential without +presence or userpresence=0:
+# a key that approves without a touch is on no lane.
+auth      sufficient pam_faceauth.so socket=/run/faceauth/sock key-fallback cue
 
-# /etc/pam.d/polkit-1: the same line with a different control. Under
-# `sufficient` a refusal would fall through to polkit's password dialog, and
+# /etc/pam.d/polkit-1: the same lines with a different control on the face
+# line. polkit's helper is the one caller a refusal reaches as PAM_AUTH_ERR.
+# Under `sufficient` it would fall through to polkit's password dialog, and
 # polkit would start the helper again and ask forever; `auth_err=die` ends
-# the stack on the refusal instead, the agent cancels the request, and polkit
-# reports "Not authorized" with no password dialog. Every other answer is
-# ignored and the password lines below take over as usual.
+# the stack on the refusal instead, the agent cancels the request, and
+# polkit reports "Not authorized" with no key and no password dialog. Every
+# other answer is ignored, and the key line and the password lines below
+# take over as usual.
 auth      [success=done auth_err=die default=ignore] pam_faceauth.so socket=/run/faceauth/sock consent
+auth      sufficient pam_faceauth.so socket=/run/faceauth/sock key-fallback cue
+
+# /etc/pam.d/omarchy-lock-fido2   (the lock screen's key lane, beside -face; written by
+#                                  Omarchy's FIDO2 setup only with face set up)
+# The daemon asks the key itself, on the policy of sudo's key-fallback line
+# (user verification carried over, no lane for a line that asks for the
+# PIN), only while the session is locked, and from the lock screen's first
+# ask until it sees the unlock keeps the consent card and the stacks' key
+# lines off the key, so a touch while locked can only unlock. Never a
+# pam_u2f line here. Anything but a touch, no daemon included, is
+# PAM_AUTH_ERR, and the stack is closed besides. With the daemon down the
+# lock screen hides face and key and says to use the password.
+#%PAM-1.0
+auth       sufficient                  pam_faceauth.so socket=/run/faceauth/sock key-unlock
+auth       required                    pam_deny.so
+account    include                     system-local-login

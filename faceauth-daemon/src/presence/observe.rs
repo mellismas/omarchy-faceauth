@@ -5,8 +5,12 @@
 
 use super::config::PresenceConfig;
 use crate::auth::Authenticator;
+use crate::capture::IrCapture;
+use crate::store::UserTemplates;
 use anyhow::Result;
-use faceauth_engine::{pose, Grey};
+use faceauth_camera::calib::Exposure;
+use faceauth_engine::mesh::HeadPose;
+use faceauth_engine::{Face, Grey};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -27,12 +31,85 @@ static STORE_UNREADABLE: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// Whether the last look found the face beyond the line, so the note is
 /// logged once per episode.
 static BEYOND_LINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// A face turned to the screen: yaw within this on the five-point
-/// measure (the mesh's degrees convert through `YAW_DEG_PER_UNIT`) and
-/// roll within this many degrees. What "attentive" means everywhere a
-/// look asks it: the watch, the lock screen's probe and the re-arm gate.
-pub const ATTENTIVE_MAX_YAW: f32 = 0.25;
+/// Whether the last check read a side view past the enrolled looks, so the
+/// note is logged once per episode.
+static SIDE_VIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A face turned to the screen: yaw within `ATTENTIVE_MAX_YAW_DEG` on the
+/// face mesh and roll within `ATTENTIVE_MAX_ROLL_DEG`
+/// (`faceauth_engine::mesh::is_attentive`, the one attention rule). What
+/// "attentive" means everywhere a look asks it: the watch, the lock
+/// screen's probe and the re-arm gate. The yaw bound was set as 0.25 of
+/// the five-point measure, where a 30 degree turn reads about 0.35: 21.4
+/// degrees. A face the mesh reads no pose from is not attentive, so the
+/// watch treats it as hidden (the user's own hand over the mouth or
+/// chin), with one exception, `facing_the_session`: when this look's
+/// identity check scored it and failed it by more than `NEAR_MISS_SLACK`
+/// (a scored wide miss, never a strobe-gate refusal), it is someone
+/// else's face at the session, mesh or no mesh, and it is reported
+/// attentive so the watch's stranger rule sees it (the secure mode locks
+/// on that tick; the default mode labels it Stranger). A near miss or no
+/// check keeps it hidden. The shape under the box tells a person from the
+/// wall, not one person from another, so it must not hold for a face the
+/// check has already said is not the user.
+pub const ATTENTIVE_MAX_YAW_DEG: f32 = 21.428_572;
 pub const ATTENTIVE_MAX_ROLL_DEG: f32 = 25.0;
+
+/// How far past the widest enrolled look on its side a face may turn, in
+/// the five-point yaw's inter-eye units (about 0.35 is a 30 degree turn),
+/// before a failed check on it reads as nothing rather than as someone
+/// else. A judgment, not a measurement: about 9 degrees past the last look
+/// the templates hold.
+const SIDE_VIEW_MARGIN: f32 = 0.10;
+
+/// The least reach on each side, whatever the templates recorded: about the
+/// attention rule's 21 degrees, so a face turned to the screen is always
+/// checked as itself. A set enrolled before pose was recorded, or one whose
+/// looks all sit to one side, reaches this far.
+const MIN_REACH: f32 = 0.25;
+
+/// Whether a face at five-point `yaw` (`pose::Pose`, the measure the
+/// templates record) is turned past every look enrolled on `device`, on its
+/// own side, by more than `SIDE_VIEW_MARGIN`; never within `MIN_REACH`. The
+/// embedding of a face turned that far scores low whoever it is, so a miss
+/// there says nothing about who it is.
+pub(crate) fn past_enrolled_looks(yaw: f32, t: &UserTemplates, device: &str) -> bool {
+    let yaws = t
+        .templates
+        .iter()
+        .filter(|x| x.device == device)
+        .filter_map(|x| x.yaw);
+    let left = yaws.clone().fold(-MIN_REACH, f32::min);
+    let right = yaws.fold(MIN_REACH, f32::max);
+    yaw > right + SIDE_VIEW_MARGIN || yaw < left - SIDE_VIEW_MARGIN
+}
+
+/// A check that read the face: pass or fail, and whether a fail was near
+/// enough the line to be the user's own face half covered. The score
+/// itself stays at debug: the journal is readable by wheel on Omarchy, and
+/// a scored stream is a tuning oracle.
+fn checked(
+    score: f32,
+    accept_threshold: f32,
+    face: &Face,
+    eyes: &dyn Eyes,
+) -> (Option<bool>, bool) {
+    if score < accept_threshold {
+        log::info!("presence: identity check failed");
+        let e = eyes.exposure();
+        log::debug!(
+            "presence: identity score {:.2} (exp {} gain {}, face {:.2})",
+            score,
+            e.map(|e| e.exposure).unwrap_or(0),
+            e.map(|e| e.gain).unwrap_or(0),
+            face.score
+        );
+    }
+    let passed = score >= accept_threshold;
+    (
+        Some(passed),
+        !passed && score >= accept_threshold - NEAR_MISS_SLACK,
+    )
+}
 
 #[derive(Clone)]
 pub(crate) struct Observation {
@@ -48,6 +125,12 @@ pub(crate) struct Observation {
     /// threshold: the user's own face half covered by a hand or pitched
     /// over a phone scores there; another person scores far below it.
     pub(crate) near_miss: bool,
+    /// The default mode's check missed a face turned past every enrolled
+    /// look (`past_enrolled_looks`), and so read nothing (`identity` is
+    /// None): the user reading a second screen, or anyone turned that way.
+    /// The watch lets it hold the clock only for a while after a check
+    /// confirmed the user (`watch::SIDE_VIEW_HOLD`).
+    pub(crate) side_view: bool,
 }
 
 /// What the flash gate's verdict lets the identity check do.
@@ -55,12 +138,13 @@ pub(crate) struct Observation {
 pub(crate) enum AfterGate {
     /// The gate refused: not the user, no embedding needed.
     Refused,
-    /// The gate passed, or could not run at all (no strobe control, or the
-    /// gate switched off in the config): the embedding decides.
+    /// The gate passed, or could not run at all (the sensor has no strobe
+    /// control) in the default mode: the embedding decides.
     Embed,
-    /// The gate ran and read no signal (a bright room, a face far back).
-    /// In the secure mode that confirms nothing: the embedding alone must
-    /// not hold the clock there (E4), so the look ends unchecked.
+    /// The gate ran and read no signal (a bright room, a face far back), or
+    /// could not run at all. In the secure mode that confirms nothing: the
+    /// embedding alone must not hold the clock there (E4), so the look ends
+    /// unchecked.
     Unconfirmed,
 }
 
@@ -68,18 +152,32 @@ pub(crate) enum AfterGate {
 /// answer (`None` for no signal); `strict` is the secure mode.
 pub(crate) fn after_gate(gate_ran: bool, verdict: Option<bool>, strict: bool) -> AfterGate {
     match (gate_ran, verdict) {
+        // No strobe control. The secure mode is not offered on such a
+        // camera (`secure_mode_for`), and should a secure look run there
+        // anyway (the first look after a start, before the camera has been
+        // opened) it confirms nobody: a print of the user must not hold the
+        // clock. The default mode's embedding decides, as with no signal
+        // below.
+        (false, _) if strict => AfterGate::Unconfirmed,
         (false, _) => AfterGate::Embed,
         (true, Some(false)) => AfterGate::Refused,
         (true, Some(true)) => AfterGate::Embed,
         (true, None) if strict => AfterGate::Unconfirmed,
+        // The default mode's look is the convenience lane: with no signal,
+        // a failed exposure read-back (J19) included, the embedding still
+        // decides. Refusing here would lock the user out in a bright room,
+        // where every pair reads no signal. Nothing is unlocked by it: the
+        // scan, the confirm and the enrollment check never pass a pair they
+        // could not verify.
         (true, None) => AfterGate::Embed,
     }
 }
 
 /// One short look: open the camera, LEDs on, a few frames, detect, maybe
 /// identify, close. With `strict` (the secure mode) a face the gate read
-/// no signal from comes back unchecked (`identity: None`) rather than
-/// judged by the embedding alone; without it the embedding decides.
+/// no signal from, or could not run on, comes back unchecked
+/// (`identity: None`) rather than judged by the embedding alone; without
+/// it the embedding decides.
 pub(crate) fn observe_in(
     a: &mut Authenticator,
     cfg: &PresenceConfig,
@@ -87,7 +185,9 @@ pub(crate) fn observe_in(
     strict: bool,
     persist: bool,
 ) -> Result<Observation> {
-    look(a, cfg, identify, strict, persist, None).map(|(o, _)| o)
+    let accept = a.cfg.accept_threshold;
+    let mut eyes = LiveEyes::open(a)?;
+    look(&mut eyes, cfg, accept, identify, strict, persist, None).map(|(o, _)| o)
 }
 
 /// The lock screen probe's look: the same look without the identity check,
@@ -99,7 +199,20 @@ pub(crate) fn probe_look(
     cfg: &PresenceConfig,
     user: &str,
 ) -> Result<(Observation, ProbeReading)> {
-    look(a, cfg, false, false, false, Some(user))
+    let accept = a.cfg.accept_threshold;
+    let mut eyes = LiveEyes::open(a)?;
+    probe_look_with(&mut eyes, cfg, accept, user)
+}
+
+/// `probe_look` through any eyes: the watch's own look, asked for no
+/// identity and for the probe's score.
+pub(crate) fn probe_look_with(
+    eyes: &mut dyn Eyes,
+    cfg: &PresenceConfig,
+    accept_threshold: f32,
+    user: &str,
+) -> Result<(Observation, ProbeReading)> {
+    look(eyes, cfg, accept_threshold, false, false, false, Some(user))
 }
 
 /// What a probe's look read of the asking user's face.
@@ -115,56 +228,200 @@ pub(crate) struct ProbeReading {
     pub(crate) lit: bool,
 }
 
+/// What a look needs from the camera, the models and the store, so one
+/// look serves the watch, the consent waits and the lock screen's probe,
+/// and a test can run it with none of them (H12). `LiveEyes` is the
+/// daemon's.
+pub(crate) trait Eyes {
+    /// Whether the illuminator lights the look, and can strobe its pair.
+    fn lit(&self) -> bool;
+    /// The next frame, written into `img`; false when none came within
+    /// `timeout`, and `img` is then left as it was.
+    fn frame(&mut self, img: &mut Grey, timeout: Duration) -> Result<bool>;
+    /// The faces on `img` the detector is sure enough of.
+    fn detect(&mut self, img: &Grey) -> Result<Vec<Face>>;
+    /// The face mesh's head pose for `face`, when the mesh reads it.
+    fn head_pose(&mut self, img: &Grey, face: &Face) -> Option<HeadPose>;
+    /// The exposure in force now, for the log; None once closed.
+    fn exposure(&self) -> Option<Exposure>;
+    /// The next look starts from the exposure in force now.
+    fn keep_exposure(&mut self);
+    /// Settle the exposure on `face` before the flash, as an unlock
+    /// attempt does (C10).
+    fn settle_on(&mut self, face: &Face) -> Result<()>;
+    /// One strobed pair gated at `face` (`strobe_pair`).
+    fn strobe_pair(&mut self, face: &Face) -> Result<Option<bool>>;
+    /// The camera's identity, which templates are bound to.
+    fn device(&self) -> String;
+    /// Close the camera.
+    fn close(&mut self) -> Result<()>;
+    fn embed(&mut self, crop: &Grey) -> Result<Vec<f32>>;
+    fn templates(&mut self, user: &str) -> Result<Option<UserTemplates>>;
+}
+
+/// The daemon's eyes: the IR camera for one look, the authenticator's
+/// models and its template store.
+struct LiveEyes<'a> {
+    a: &'a mut Authenticator,
+    /// None once closed.
+    cap: Option<IrCapture>,
+}
+
+impl<'a> LiveEyes<'a> {
+    /// Open the camera at the exposure the last look ended on, LEDs on.
+    fn open(a: &'a mut Authenticator) -> Result<Self> {
+        let cap = IrCapture::open_at(&a.cfg, a.last_exposure)?;
+        if let Some(i) = &cap.illuminator {
+            i.set(true)?;
+        }
+        Ok(LiveEyes { a, cap: Some(cap) })
+    }
+
+    fn cap(&mut self) -> Result<&mut IrCapture> {
+        self.cap
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("the look's camera is closed"))
+    }
+}
+
+impl Eyes for LiveEyes<'_> {
+    fn lit(&self) -> bool {
+        self.cap.as_ref().is_some_and(|c| c.tier().gated())
+    }
+
+    fn frame(&mut self, img: &mut Grey, timeout: Duration) -> Result<bool> {
+        self.cap()?.next_into(img, timeout)
+    }
+
+    fn detect(&mut self, img: &Grey) -> Result<Vec<Face>> {
+        self.a
+            .pipeline
+            .detector
+            .detect(img, self.a.cfg.min_detection)
+    }
+
+    fn head_pose(&mut self, img: &Grey, face: &Face) -> Option<HeadPose> {
+        self.a
+            .pipeline
+            .mesh
+            .as_mut()
+            .and_then(|m| m.for_face(img, face).ok().flatten())
+            .map(|m| faceauth_engine::mesh::head_pose(&m))
+    }
+
+    fn exposure(&self) -> Option<Exposure> {
+        self.cap.as_ref().map(|c| c.exposure)
+    }
+
+    fn keep_exposure(&mut self) {
+        if let Some(e) = self.exposure() {
+            self.a.last_exposure = Some(e);
+        }
+    }
+
+    fn settle_on(&mut self, face: &Face) -> Result<()> {
+        // The look's exposure came from the whole frame, and a face near
+        // the screen then clips under the strobe: 20 to 23 percent of the
+        // face blown out, read as no signal, measured live on 2026-09-24
+        // at an ordinary seated distance. Bounded, since auto-exposure can
+        // hold where a face clips a few percent.
+        let cap = self.cap()?;
+        cap.meter_on(face);
+        let until = Instant::now() + FACE_SETTLE_MAX;
+        let mut steps = 0;
+        let mut scratch = Grey::default();
+        while Instant::now() < until {
+            if cap.next_into(&mut scratch, Duration::from_millis(200))? {
+                steps += 1;
+                if steps >= 3 && cap.metering.clip < 0.05 {
+                    break;
+                }
+            }
+        }
+        self.keep_exposure();
+        Ok(())
+    }
+
+    fn strobe_pair(&mut self, face: &Face) -> Result<Option<bool>> {
+        let min_detection = self.a.cfg.min_detection;
+        let cap = self
+            .cap
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("the look's camera is closed"))?;
+        strobe_pair(cap, &mut self.a.pipeline.detector, min_detection, face)
+    }
+
+    fn device(&self) -> String {
+        self.cap
+            .as_ref()
+            .map(|c| c.identity.clone())
+            .unwrap_or_default()
+    }
+
+    fn close(&mut self) -> Result<()> {
+        match self.cap.take() {
+            Some(c) => c.stop(),
+            None => Ok(()),
+        }
+    }
+
+    fn embed(&mut self, crop: &Grey) -> Result<Vec<f32>> {
+        self.a.pipeline.embedder.embed(crop)
+    }
+
+    fn templates(&mut self, user: &str) -> Result<Option<UserTemplates>> {
+        self.a.store.load(user)
+    }
+}
+
+/// The look itself, through `eyes`: the watch's, the consent waits' and
+/// the probe's alike.
 fn look(
-    a: &mut Authenticator,
+    eyes: &mut dyn Eyes,
     cfg: &PresenceConfig,
+    accept_threshold: f32,
     identify: bool,
     strict: bool,
     persist: bool,
     score_for: Option<&str>,
 ) -> Result<(Observation, ProbeReading)> {
-    use crate::capture::IrCapture;
-    let mut cap = IrCapture::open_at(&a.cfg, a.last_exposure)?;
-    if let Some(i) = &cap.illuminator {
-        i.set(true)?;
-    }
-    let lit = cap.illuminator.is_some();
+    let lit = eyes.lit();
     let unscored = |why: &'static str| ProbeReading {
         score: Err(why),
         lit,
     };
-    // Let exposure react for a handful of frames; the last one is what we look at.
-    let mut img = None;
+    // Let exposure react for a handful of frames; the last one is what we
+    // look at. One frame, read into again and again (C7).
+    let mut img = Grey::default();
+    let mut got = false;
     let deadline = Instant::now() + Duration::from_millis(450);
     while Instant::now() < deadline {
-        if let Some(g) = cap.next(Duration::from_millis(500))? {
-            img = Some(g);
-        }
+        got |= eyes.frame(&mut img, Duration::from_millis(500))?;
     }
-    let Some(mut img) = img else {
-        cap.stop()?;
+    if !got {
+        eyes.close()?;
         return Ok((
             Observation {
                 face: false,
                 attentive: false,
                 identity: None,
                 near_miss: false,
+                side_view: false,
                 frame: None,
                 bbox: None,
             },
             unscored("no frame"),
         ));
-    };
-    let mut faces = a.pipeline.detector.detect(&img, a.cfg.min_detection)?;
+    }
+    let mut faces = eyes.detect(&img)?;
     // With someone there at the last look, keep looking for up to
     // `LOOK_SEE_BUDGET` before calling it no face (a hand over the face for
     // a moment is not an empty chair).
     if persist && faces.is_empty() {
         let until = Instant::now() + LOOK_SEE_BUDGET;
         while faces.is_empty() && Instant::now() < until {
-            if let Some(g) = cap.next(Duration::from_millis(200))? {
-                faces = a.pipeline.detector.detect(&g, a.cfg.min_detection)?;
-                img = g;
+            if eyes.frame(&mut img, Duration::from_millis(200))? {
+                faces = eyes.detect(&img)?;
             }
         }
     }
@@ -172,37 +429,30 @@ fn look(
     // no face: a seed that saturates after the light changes is escaped one
     // step per look this way, where saving it only behind a found face left
     // the watch blind until an authentication refreshed it (E4).
-    a.last_exposure = Some(cap.exposure);
+    eyes.keep_exposure();
     let Some(face) = faces.into_iter().max_by(|x, y| x.score.total_cmp(&y.score)) else {
-        cap.stop()?;
+        eyes.close()?;
         return Ok((
             Observation {
                 face: false,
                 attentive: false,
                 identity: None,
                 near_miss: false,
+                side_view: false,
                 frame: Some(img),
                 bbox: None,
             },
             unscored("no face"),
         ));
     };
-    let p = pose::pose(&face.landmarks);
-    // Attention from the mesh when the model is installed: its angles hold
-    // where the five points' do not (a chin-up seen from below).
-    let attentive = match a
-        .pipeline
-        .mesh
-        .as_mut()
-        .and_then(|m| m.for_face(&img, &face).ok().flatten())
-    {
-        Some(m) => faceauth_engine::mesh::is_attentive(
-            &faceauth_engine::mesh::head_pose(&m),
-            ATTENTIVE_MAX_YAW * crate::consent::NodDetector::YAW_DEG_PER_UNIT,
-            ATTENTIVE_MAX_ROLL_DEG,
-        ),
-        None => pose::is_attentive(&p, ATTENTIVE_MAX_YAW, ATTENTIVE_MAX_ROLL_DEG),
-    };
+    // Attention from the mesh's angles, the one rule: they hold where the
+    // five detector points' do not (a chin-up seen from below). No pose
+    // from the mesh on a detected face is not attentive.
+    let hp = eyes.head_pose(&img, &face);
+    let posed = hp.as_ref().is_some_and(|hp| {
+        faceauth_engine::mesh::is_attentive(hp, ATTENTIVE_MAX_YAW_DEG, ATTENTIVE_MAX_ROLL_DEG)
+    });
+    let attentive = facing_the_session(hp.is_some(), posed, None, false);
     // Beyond the line an unlock attempt would not judge, the look does not
     // flash or check identity either: it cannot read the face there, and
     // flashing at someone out of range every tick is what the user saw as
@@ -220,50 +470,34 @@ fn look(
         BEYOND_LINE.store(false, Ordering::Relaxed);
     }
     let identify = identify && near_enough;
-    if identify && cap.illuminator.is_some() {
-        // Settle the exposure on the face before the flash, as an unlock
-        // attempt does (C10). The look's exposure came from the whole frame,
-        // and a face near the screen then clips under the strobe: 20 to 23
-        // percent of the face blown out, read as no signal, measured live
-        // on 2026-09-24 at an ordinary seated distance. Bounded, since
-        // auto-exposure can hold where a face clips a few percent.
-        cap.meter_on(&face);
-        let until = Instant::now() + FACE_SETTLE_MAX;
-        let mut steps = 0;
-        while Instant::now() < until {
-            if cap.next(Duration::from_millis(200))?.is_some() {
-                steps += 1;
-                if steps >= 3 && cap.metering.clip < 0.05 {
-                    break;
-                }
-            }
-        }
-        a.last_exposure = Some(cap.exposure);
+    if identify && eyes.lit() {
+        eyes.settle_on(&face)?;
     }
-    let (identity, near_miss) = if identify {
+    let (identity, near_miss, side_view) = if identify {
         // Liveness first: one lit/unlit pair under the look's own mask,
         // with exposure frozen for it as the confirm does, since an
         // auto-exposure step inside the pair breaks the phase lock or skews
         // the lit and unlit frames against each other (E4). A refusal is
-        // "not the user"; no signal decides nothing in the default mode and
-        // ends the look unchecked in the secure mode.
-        let gate_ran = cap.illuminator.is_some();
-        let verdict = strobe_pair(
-            &mut cap,
-            &mut a.pipeline.detector,
-            a.cfg.min_detection,
-            &face,
-        )?;
+        // "not the user"; no signal, or no gate at all, decides nothing in
+        // the default mode and ends the look unchecked in the secure mode.
+        let gate_ran = eyes.lit();
+        let verdict = eyes.strobe_pair(&face)?;
         match after_gate(gate_ran, verdict, strict) {
             AfterGate::Embed => {}
             AfterGate::Refused => {
-                cap.stop()?;
+                eyes.close()?;
                 return Ok((
                     Observation {
                         face: true,
-                        attentive,
+                        // The gate refuses for reasons that are not identity
+                        // (an exposure read-back mismatch, a lit surround, a
+                        // reflectance the user's own forearm at the chin could
+                        // give), so a refusal is not a wide miss: no check, as
+                        // far as attention goes.
+                        attentive: facing_the_session(hp.is_some(), posed, None, false),
                         identity: Some(false),
                         near_miss: false,
+                        side_view: false,
                         frame: Some(img),
                         bbox: Some(face.bbox),
                     },
@@ -271,14 +505,19 @@ fn look(
                 ));
             }
             AfterGate::Unconfirmed => {
-                log::info!("presence: the gate read no signal; the look confirms nobody");
-                cap.stop()?;
+                if gate_ran {
+                    log::info!("presence: the gate read no signal; the look confirms nobody");
+                } else {
+                    log::info!("presence: no strobe control, so the secure look confirms nobody");
+                }
+                eyes.close()?;
                 return Ok((
                     Observation {
                         face: true,
                         attentive,
                         identity: None,
                         near_miss: false,
+                        side_view: false,
                         frame: Some(img),
                         bbox: Some(face.bbox),
                     },
@@ -287,23 +526,27 @@ fn look(
             }
         }
         let crop = faceauth_engine::align::align_112(&img, &face.landmarks);
-        let e = a.pipeline.embedder.embed(&crop)?;
+        let e = eyes.embed(&crop)?;
         // Templates only count on the camera they were enrolled on, and a
         // store that cannot be read is nobody, not everybody: the check fails
         // closed rather than skipping the tick with identity still assumed.
-        let score = match a.store.load(&cfg.user) {
+        // The default mode also asks whether the face is turned past every
+        // enrolled look, as when the user reads a second screen: a miss
+        // there says nothing about who it is (below).
+        let (score, turned) = match eyes.templates(&cfg.user) {
             Ok(Some(t)) => {
                 STORE_UNREADABLE.store(false, Ordering::Relaxed);
-                t.best_match_on(&e, &cap.identity)
-                    .map(|(s, _)| s)
-                    .unwrap_or(-1.0)
+                let device = eyes.device();
+                let score = t.best_match_on(&e, &device).map(|(s, _)| s).unwrap_or(-1.0);
+                let yaw = faceauth_engine::pose::pose(&face.landmarks).yaw;
+                (score, !strict && past_enrolled_looks(yaw, &t, &device))
             }
-            Ok(None) => -1.0,
+            Ok(None) => (-1.0, false),
             Err(e) => {
                 // Not a failed check: there is nothing to check against.
                 // The look decides nothing, so the watch does not run a
                 // check on every tick (the stranger cadence) and hold the
-                // camera against the re-enrolment that fixes it. Warned
+                // camera against the re-enrollment that fixes it. Warned
                 // once per episode.
                 if !STORE_UNREADABLE.swap(true, Ordering::Relaxed) {
                     log::warn!(
@@ -311,13 +554,14 @@ fn look(
                         e
                     );
                 }
-                cap.stop()?;
+                eyes.close()?;
                 return Ok((
                     Observation {
                         face: true,
                         attentive,
                         identity: None,
                         near_miss: false,
+                        side_view: false,
                         frame: Some(img),
                         bbox: Some(face.bbox),
                     },
@@ -325,43 +569,43 @@ fn look(
                 ));
             }
         };
-        if score < a.cfg.accept_threshold {
-            // The score itself stays at debug: the journal is readable by
-            // wheel on Omarchy, and a scored stream is a tuning oracle.
-            log::info!("presence: identity check failed");
-            log::debug!(
-                "presence: identity score {:.2} (exp {} gain {}, face {:.2})",
-                score,
-                cap.exposure.exposure,
-                cap.exposure.gain,
-                face.score
-            );
+        if score < accept_threshold && turned {
+            // The embedding of a face turned that far scores low whoever it
+            // is, so the miss is no reading, and two side views do not make
+            // a stranger of the user. How long it may hold the clock is the
+            // watch's call (`watch::SIDE_VIEW_HOLD`). The secure mode never
+            // takes this path. Logged once per episode.
+            if !SIDE_VIEW.swap(true, Ordering::Relaxed) {
+                log::info!("presence: the face is turned past the enrolled looks; the check reads nothing until it turns back");
+            }
+            (None, false, true)
+        } else {
+            SIDE_VIEW.store(false, Ordering::Relaxed);
+            let (identity, near_miss) = checked(score, accept_threshold, &face, &*eyes);
+            (identity, near_miss, false)
         }
-        let passed = score >= a.cfg.accept_threshold;
-        (
-            Some(passed),
-            !passed && score >= a.cfg.accept_threshold - NEAR_MISS_SLACK,
-        )
     } else {
-        (None, false)
+        (None, false, false)
     };
-    let device = cap.identity.clone();
-    cap.stop()?;
+    let attentive = facing_the_session(hp.is_some(), posed, identity, near_miss);
+    let device = eyes.device();
+    eyes.close()?;
     // After the camera is closed, so the embed does not hold it.
     let reading = match score_for {
         None => unscored("not asked"),
         Some(_) if !near_enough => unscored("face beyond the line"),
         Some(user) => ProbeReading {
-            score: probe_score(a, user, &img, &face.landmarks, &device),
+            score: probe_score(eyes, user, &img, &face.landmarks, &device),
             lit,
         },
     };
     log::debug!(
-        "presence tick: face {:.2} yaw {:.2} pitch {:.2} roll {:.0} attentive {} identity {:?}",
+        "presence tick: face {:.2} mesh {} attentive {} identity {:?}",
         face.score,
-        p.yaw,
-        p.pitch,
-        p.roll.to_degrees(),
+        hp.map_or("none".to_string(), |hp| format!(
+            "yaw {:.0} pitch {:.0} roll {:.0}",
+            hp.yaw, hp.pitch, hp.roll
+        )),
         attentive,
         identity
     );
@@ -372,6 +616,7 @@ fn look(
             attentive,
             identity,
             near_miss,
+            side_view,
             frame: Some(img),
             bbox: Some(bbox),
         },
@@ -389,18 +634,18 @@ static PROBE_UNSCORED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// The score never leaves the daemon; `probe` logs it at debug only, as an
 /// attempt logs its frame scores.
 fn probe_score(
-    a: &mut Authenticator,
+    eyes: &mut dyn Eyes,
     user: &str,
     img: &Grey,
     landmarks: &[[f32; 2]; 5],
     device: &str,
 ) -> std::result::Result<f32, &'static str> {
     let scored = (|| -> Result<std::result::Result<f32, &'static str>> {
-        let Some(t) = a.store.load(user)? else {
+        let Some(t) = eyes.templates(user)? else {
             return Ok(Err("not enrolled"));
         };
         let crop = faceauth_engine::align::align_112(img, landmarks);
-        let e = a.pipeline.embedder.embed(&crop)?;
+        let e = eyes.embed(&crop)?;
         Ok(t.best_match_on(&e, device)
             .map(|(s, _)| s)
             .ok_or("no templates for this camera"))
@@ -427,9 +672,9 @@ fn probe_score(
 /// follow the mask), so the 0.6 s the look used to allow left room for one
 /// pair at best, and many looks at a user sitting in front of the screen
 /// read nothing. Two seconds, so a hand or a turn in the middle of a look
-/// does not end it unread (Mike, 2026-09-24: "keeps looking until it sees or
-/// for 2 sec"). The look returns at the first verdict, so an ordinary look
-/// still strobes for about half a second.
+/// does not end it unread: the look keeps trying until it has a verdict
+/// or two seconds have passed. It returns at the first verdict, so an
+/// ordinary look still strobes for about half a second.
 pub const PRESENCE_STROBE_WINDOW: Duration = Duration::from_millis(2000);
 
 /// One strobed lit/unlit pair on the open camera, gated at the face:
@@ -505,8 +750,448 @@ fn strobe_pair(
 /// 0.3 against a set on this model; a hand on the chin or a face pitched
 /// over a phone lands between. Reasoned, not measured on a corpus: the
 /// scores are logged at debug so it can be. A near miss holds the clock
-/// only through the shape in the chair, never on its own.
+/// only through the shape in the chair, never on its own. The covered
+/// face's mesh and identity scores are to be measured in the a6 recording
+/// (condition a6-cover), and this slack revisited then.
 pub const NEAR_MISS_SLACK: f32 = 0.25;
+
+/// Whether a detected face counts as turned to the session. `posed` is
+/// the mesh rule's answer when the mesh read a pose (`pose_read`). A face
+/// the mesh read no pose from is not attentive unless this look's identity
+/// check scored it and failed it by a wide margin: that is another person
+/// at the session whatever hides the mouth or chin, so it is reported
+/// attentive for the watch's stranger rule. A near miss, no check, or a
+/// strobe-gate refusal (which is not an identity reading, and which a live
+/// stranger passes anyway) leaves it hidden, the user's own covered face.
+fn facing_the_session(
+    pose_read: bool,
+    posed: bool,
+    identity: Option<bool>,
+    near_miss: bool,
+) -> bool {
+    if pose_read {
+        posed
+    } else {
+        identity == Some(false) && !near_miss
+    }
+}
+
+/// Eyes with no camera, models or store behind them, for the tests: one
+/// face on every frame, a fixed head pose, a fixed embedding, and a count
+/// of what the look asked for.
+#[cfg(test)]
+pub(crate) mod stub_eyes {
+    use super::*;
+
+    pub(crate) struct StubEyes {
+        pub face: Option<Face>,
+        pub pose: HeadPose,
+        /// The mesh reads no pose from the face (a hand over the mouth or
+        /// chin): `head_pose` answers None.
+        pub no_pose: bool,
+        pub embedding: Vec<f32>,
+        pub templates: Option<UserTemplates>,
+        pub device: String,
+        /// The illuminator lights the look and can strobe its pair; without
+        /// it the pair reads None, as the live camera's does.
+        pub lit: bool,
+        /// The strobed pair's verdict.
+        pub gate: Option<bool>,
+        pub strobes: usize,
+        pub embeds: usize,
+        /// Embeds made while the camera was still open.
+        pub embeds_open: usize,
+        pub closed: bool,
+    }
+
+    impl StubEyes {
+        /// A face `width` px wide, straight at the camera, in a 480x640
+        /// frame, whose embedding is `embedding`, for a user whose one
+        /// template on this camera is `template`.
+        pub(crate) fn new(width: f32, embedding: Vec<f32>, template: Vec<f32>) -> StubEyes {
+            let (cx, cy) = (240.0, 320.0);
+            let u = width / 4.0;
+            StubEyes {
+                face: Some(Face {
+                    bbox: [cx - width / 2.0, cy - width * 0.6, width, width * 1.2],
+                    score: 0.9,
+                    landmarks: [
+                        [cx - u, cy - u],
+                        [cx + u, cy - u],
+                        [cx, cy],
+                        [cx - u * 0.8, cy + u],
+                        [cx + u * 0.8, cy + u],
+                    ],
+                    embedding: None,
+                }),
+                pose: HeadPose {
+                    yaw: 0.0,
+                    pitch: 10.0,
+                    roll: 0.0,
+                },
+                no_pose: false,
+                embedding,
+                templates: Some(UserTemplates {
+                    version: 1,
+                    user: "alice".into(),
+                    uid: 1000,
+                    model: String::new(),
+                    templates: vec![crate::store::Template {
+                        embedding: template,
+                        quality: 0.9,
+                        face_width: 90.0,
+                        created: 0,
+                        label: "enrol".into(),
+                        device: "stub-camera".into(),
+                        yaw: None,
+                        nose_pitch: None,
+                    }],
+                    gesture: Default::default(),
+                }),
+                device: "stub-camera".into(),
+                lit: true,
+                gate: Some(true),
+                strobes: 0,
+                embeds: 0,
+                embeds_open: 0,
+                closed: false,
+            }
+        }
+    }
+
+    impl Eyes for StubEyes {
+        fn lit(&self) -> bool {
+            self.lit
+        }
+        fn frame(&mut self, img: &mut Grey, _timeout: Duration) -> Result<bool> {
+            std::thread::sleep(Duration::from_millis(30));
+            if img.data.is_empty() {
+                // Textured, so the shape under the box can be compared
+                // between looks (a flat frame has no shape to match).
+                *img = Grey::new(480, 640);
+                img.data
+                    .iter_mut()
+                    .enumerate()
+                    .for_each(|(i, v)| *v = (i % 251) as u8);
+            }
+            Ok(true)
+        }
+        fn detect(&mut self, _img: &Grey) -> Result<Vec<Face>> {
+            Ok(self.face.iter().cloned().collect())
+        }
+        fn head_pose(&mut self, _img: &Grey, _face: &Face) -> Option<HeadPose> {
+            (!self.no_pose).then_some(self.pose)
+        }
+        fn exposure(&self) -> Option<Exposure> {
+            None
+        }
+        fn keep_exposure(&mut self) {}
+        fn settle_on(&mut self, _face: &Face) -> Result<()> {
+            Ok(())
+        }
+        fn strobe_pair(&mut self, _face: &Face) -> Result<Option<bool>> {
+            if !self.lit {
+                return Ok(None);
+            }
+            self.strobes += 1;
+            Ok(self.gate)
+        }
+        fn device(&self) -> String {
+            self.device.clone()
+        }
+        fn close(&mut self) -> Result<()> {
+            self.closed = true;
+            Ok(())
+        }
+        fn embed(&mut self, _crop: &Grey) -> Result<Vec<f32>> {
+            self.embeds += 1;
+            if !self.closed {
+                self.embeds_open += 1;
+            }
+            Ok(self.embedding.clone())
+        }
+        fn templates(&mut self, _user: &str) -> Result<Option<UserTemplates>> {
+            Ok(self.templates.clone())
+        }
+    }
+}
+
+#[cfg(test)]
+mod look_tests {
+    use super::stub_eyes::StubEyes;
+    use super::*;
+
+    /// H12: the watch's identity look and the probe's look are one look.
+    /// Asked for identity it strobes a pair and embeds with the camera
+    /// open; asked for the probe it never strobes, and scores the face
+    /// only once the camera is closed.
+    #[test]
+    fn the_watch_look_strobes_and_the_probe_look_does_not() {
+        let cfg = PresenceConfig {
+            user: "alice".into(),
+            ..Default::default()
+        };
+        let mut watch = StubEyes::new(90.0, vec![1.0, 0.0], vec![1.0, 0.0]);
+        let (o, reading) = look(&mut watch, &cfg, 0.7, true, false, false, None).unwrap();
+        assert_eq!((o.face, o.attentive, o.identity), (true, true, Some(true)));
+        assert_eq!((watch.strobes, watch.embeds_open), (1, 1));
+        assert!(watch.closed && reading.score.is_err());
+
+        let mut probe = StubEyes::new(90.0, vec![1.0, 0.0], vec![1.0, 0.0]);
+        let (o, reading) = probe_look_with(&mut probe, &cfg, 0.7, "alice").unwrap();
+        assert_eq!((o.face, o.attentive, o.identity), (true, true, None));
+        assert_eq!(probe.strobes, 0, "the probe never strobes");
+        assert_eq!((probe.embeds, probe.embeds_open), (1, 0));
+        assert_eq!(reading.score, Ok(1.0));
+    }
+
+    /// A face the mesh reads no pose from, through the look and into the
+    /// watch. A wide identity miss on it is a stranger: the secure mode
+    /// locks on that tick and the default mode labels it Stranger. A near
+    /// miss, or a look that ran no check, is the user's own covered face:
+    /// not attentive, and the shape under the box holds as before.
+    #[test]
+    fn a_face_without_a_mesh_pose_is_a_stranger_only_on_a_wide_miss() {
+        use super::super::watch::{State, Watch};
+        use crate::presence::PresenceMode;
+        let cfg = PresenceConfig {
+            user: "alice".into(),
+            ..Default::default()
+        };
+        let no_pose = |embedding: Vec<f32>| {
+            let mut eyes = StubEyes::new(90.0, embedding, vec![1.0, 0.0]);
+            eyes.no_pose = true;
+            eyes
+        };
+        // (a) Secure mode, wide miss: attentive for the stranger rule, and
+        // the watch locks on that very tick.
+        let mut eyes = no_pose(vec![0.0, 1.0]);
+        let (far, _) = look(&mut eyes, &cfg, 0.7, true, true, false, None).unwrap();
+        assert_eq!(
+            (far.face, far.attentive, far.identity, far.near_miss),
+            (true, true, Some(false), false)
+        );
+        let t0 = Instant::now();
+        let mut w = Watch::new(cfg.clone());
+        let mut eyes = StubEyes::new(90.0, vec![1.0, 0.0], vec![1.0, 0.0]);
+        let (seen, _) = look(&mut eyes, &cfg, 0.7, true, true, false, None).unwrap();
+        w.step(&seen, t0, PresenceMode::Secure);
+        let step = w.step(&far, t0 + Duration::from_secs(5), PresenceMode::Secure);
+        assert!(
+            step.lock,
+            "secure: a wide miss on an unread face locks on the tick"
+        );
+        assert_eq!(w.state, State::Away);
+        // (b) Secure mode, near miss or no check: hidden, not attentive, and
+        // the same shape holds the clock as before.
+        let mut eyes = no_pose(vec![0.6, 0.8]);
+        let (near, _) = look(&mut eyes, &cfg, 0.7, true, true, false, None).unwrap();
+        assert_eq!(
+            (near.attentive, near.identity, near.near_miss),
+            (false, Some(false), true)
+        );
+        let mut eyes = no_pose(vec![0.0, 1.0]);
+        let (unchecked, _) = look(&mut eyes, &cfg, 0.7, false, true, false, None).unwrap();
+        assert_eq!((unchecked.attentive, unchecked.identity), (false, None));
+        // A strobe-gate refusal is not an identity reading: a forearm at
+        // the chin can light the surround, and a live stranger passes the
+        // gate to be scored anyway. Not attentive, held by shape.
+        let mut eyes = no_pose(vec![0.0, 1.0]);
+        eyes.gate = Some(false);
+        let (refused, _) = look(&mut eyes, &cfg, 0.7, true, true, false, None).unwrap();
+        assert_eq!(
+            (refused.attentive, refused.identity, refused.near_miss),
+            (false, Some(false), false)
+        );
+        for (what, o) in [
+            ("near miss", &near),
+            ("no check", &unchecked),
+            ("gate refusal", &refused),
+        ] {
+            let mut w = Watch::new(cfg.clone());
+            w.step(&seen, t0, PresenceMode::Secure);
+            let mut locked = false;
+            for i in 1..=6 {
+                locked |= w
+                    .step(o, t0 + Duration::from_secs(5 * i), PresenceMode::Secure)
+                    .lock;
+            }
+            assert!(
+                !locked,
+                "secure: a {} on an unread face holds by shape",
+                what
+            );
+        }
+        // (c) Default mode, wide miss: after the two strikes the face holds
+        // the clock as a stranger looking at the session (Q9) and the shell
+        // reads Stranger.
+        let mut w = Watch::new(cfg.clone());
+        w.step(&seen, t0, PresenceMode::Default);
+        let mut locked = false;
+        for i in 1..=6 {
+            locked |= w
+                .step(
+                    &far,
+                    t0 + Duration::from_secs(10 * i),
+                    PresenceMode::Default,
+                )
+                .lock;
+        }
+        assert!(
+            !locked,
+            "default: never locks on a stranger looking at the screen"
+        );
+        assert_eq!(w.state, State::Stranger);
+    }
+
+    /// E4 on a camera without the strobe control. The gate cannot run
+    /// there, so the secure mode is not offered on it, and a secure look
+    /// that runs there anyway (before the watch has learned what the camera
+    /// can do) must not take identity from the embedding alone: a print of
+    /// the user would hold the away clock. The default mode's look still
+    /// lets the embedding decide, as it does when the gate reads no signal.
+    #[test]
+    fn a_secure_look_without_the_strobe_confirms_nobody() {
+        let cfg = PresenceConfig {
+            user: "alice".into(),
+            ..Default::default()
+        };
+        let unlit = || {
+            let mut eyes = StubEyes::new(90.0, vec![1.0, 0.0], vec![1.0, 0.0]);
+            eyes.lit = false;
+            eyes
+        };
+        let mut eyes = unlit();
+        let (secure, _) = look(&mut eyes, &cfg, 0.7, true, true, false, None).unwrap();
+        assert_eq!(secure.identity, None, "secure: no gate, no identity");
+        assert_eq!(eyes.embeds, 0, "secure: nothing is scored");
+        let mut eyes = unlit();
+        let (default, _) = look(&mut eyes, &cfg, 0.7, true, false, false, None).unwrap();
+        assert_eq!(
+            default.identity,
+            Some(true),
+            "default: the embedding decides"
+        );
+    }
+
+    /// The user turned to a second screen, the face still in frame: the
+    /// embedding of a face turned past every enrolled look scores low
+    /// whoever it is. In the default mode a miss there reads as nothing,
+    /// so the user's last confirmed check stands and two side views do not
+    /// make a stranger of them. The secure mode still counts the miss, and
+    /// a frontal miss counts in both.
+    #[test]
+    fn a_side_view_past_the_enrolled_looks_reads_nothing_in_the_default_mode() {
+        let cfg = PresenceConfig {
+            user: "alice".into(),
+            ..Default::default()
+        };
+        // Someone else's embedding, so the check misses; the nose moved by
+        // 0.6 inter-eye distances is a head turned well to the side.
+        let turned = || {
+            let mut eyes = StubEyes::new(90.0, vec![0.0, 1.0], vec![1.0, 0.0]);
+            let face = eyes.face.as_mut().unwrap();
+            let inter_eye = face.landmarks[1][0] - face.landmarks[0][0];
+            face.landmarks[2][0] += 0.6 * inter_eye;
+            eyes.pose.yaw = 45.0;
+            eyes
+        };
+        let mut eyes = turned();
+        let (default, _) = look(&mut eyes, &cfg, 0.7, true, false, false, None).unwrap();
+        assert_eq!(default.identity, None, "default: a side view reads nothing");
+        assert!(!default.near_miss);
+        assert!(!default.attentive, "turned away from this screen");
+        // The watch: the user confirmed, then a minute and a half of side
+        // views. With no frame the shape cannot hold the clock, so only the
+        // standing check does, and it stands.
+        {
+            use super::super::watch::{State, Watch};
+            use crate::presence::{AwayTime, PresenceMode};
+            let cfg = PresenceConfig {
+                away_seconds: AwayTime::Seconds(20.0),
+                ..cfg.clone()
+            };
+            let mut w = Watch::new(cfg.clone());
+            let mut eyes = StubEyes::new(90.0, vec![1.0, 0.0], vec![1.0, 0.0]);
+            let (seen, _) = look(&mut eyes, &cfg, 0.7, true, false, false, None).unwrap();
+            let t0 = Instant::now();
+            w.step(&seen, t0, PresenceMode::Default);
+            let side = Observation {
+                frame: None,
+                ..default.clone()
+            };
+            for i in 1..=9 {
+                let step = w.step(
+                    &side,
+                    t0 + Duration::from_secs(10 * i),
+                    PresenceMode::Default,
+                );
+                assert!(!step.lock, "default: side views never lock the user out");
+            }
+            assert_eq!(w.state, State::Present);
+        }
+        let mut eyes = turned();
+        let (secure, _) = look(&mut eyes, &cfg, 0.7, true, true, false, None).unwrap();
+        assert_eq!(secure.identity, Some(false), "secure: the miss counts");
+        let mut eyes = StubEyes::new(90.0, vec![0.0, 1.0], vec![1.0, 0.0]);
+        let (frontal, _) = look(&mut eyes, &cfg, 0.7, true, false, false, None).unwrap();
+        assert_eq!(
+            frontal.identity,
+            Some(false),
+            "default: a frontal miss counts"
+        );
+    }
+
+    /// The enrolled reach on each side is the widest enrolled look on that
+    /// side of this camera, and never less than `MIN_REACH`, so a face
+    /// turned to the screen is always checked as itself: a set whose looks
+    /// all sit to one side (an off-axis camera) still checks a face just
+    /// to the other side.
+    #[test]
+    fn the_enrolled_reach_is_per_side_and_per_camera() {
+        let mut t = StubEyes::new(90.0, vec![1.0, 0.0], vec![1.0, 0.0])
+            .templates
+            .unwrap();
+        let base = t.templates[0].clone();
+        let at = |yaw: f32, device: &str| crate::store::Template {
+            yaw: Some(yaw),
+            device: device.into(),
+            ..base.clone()
+        };
+        t.templates = vec![at(-0.45, "cam"), at(0.10, "cam"), at(0.90, "other")];
+        assert!(
+            !past_enrolled_looks(-0.50, &t, "cam"),
+            "within the widest look plus the margin"
+        );
+        assert!(
+            past_enrolled_looks(-0.60, &t, "cam"),
+            "past the widest look on this camera"
+        );
+        assert!(
+            !past_enrolled_looks(0.30, &t, "cam"),
+            "a narrow side still reaches the floor"
+        );
+        assert!(
+            past_enrolled_looks(0.40, &t, "cam"),
+            "the other camera's wide look does not count"
+        );
+        // Looks all to one side, as an off-axis camera records them.
+        t.templates = vec![at(0.02, "cam"), at(0.12, "cam")];
+        for yaw in [-0.11, -0.30, 0.20, 0.30] {
+            assert!(
+                !past_enrolled_looks(yaw, &t, "cam"),
+                "{} is within reach",
+                yaw
+            );
+        }
+        assert!(past_enrolled_looks(-0.40, &t, "cam"));
+        // No recorded angles: the floor on both sides.
+        t.templates = vec![base.clone()];
+        assert!(!past_enrolled_looks(0.30, &t, "stub-camera"));
+        assert!(past_enrolled_looks(0.40, &t, "stub-camera"));
+        assert!(past_enrolled_looks(-0.40, &t, "stub-camera"));
+    }
+}
 
 #[cfg(test)]
 mod watch_tests {
@@ -515,8 +1200,9 @@ mod watch_tests {
     /// The secure mode does not accept identity from the embedding alone:
     /// a gate that ran and read no signal ends the look unchecked there,
     /// while the default mode lets the embedding decide as before. A gate
-    /// that cannot run (no strobe control, or switched off) is not a
-    /// no-signal read, and the embedding decides in both modes (E4).
+    /// that cannot run (no strobe control) ends the secure look unchecked
+    /// too: the secure mode is not offered on such a camera, and a secure
+    /// look that runs there anyway confirms nobody (E4).
     #[test]
     fn secure_mode_does_not_take_identity_from_the_embedding_alone() {
         assert_eq!(after_gate(true, None, true), AfterGate::Unconfirmed);
@@ -524,7 +1210,7 @@ mod watch_tests {
         assert_eq!(after_gate(true, Some(true), true), AfterGate::Embed);
         assert_eq!(after_gate(true, Some(false), true), AfterGate::Refused);
         assert_eq!(after_gate(true, Some(false), false), AfterGate::Refused);
-        assert_eq!(after_gate(false, None, true), AfterGate::Embed);
+        assert_eq!(after_gate(false, None, true), AfterGate::Unconfirmed);
         assert_eq!(after_gate(false, None, false), AfterGate::Embed);
     }
 }

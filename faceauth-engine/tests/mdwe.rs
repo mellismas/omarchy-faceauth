@@ -37,10 +37,8 @@ fn onnxruntime_runs_all_three_models_with_write_xor_execute_enforced() {
         return skip("this kernel has no PR_SET_MDWE");
     }
     // SAFETY: as above, a read of the policy.
-    assert_eq!(
-        unsafe { libc::prctl(PR_GET_MDWE, 0u64, 0u64, 0u64, 0u64) },
-        1
-    );
+    let policy = unsafe { libc::prctl(PR_GET_MDWE, 0u64, 0u64, 0u64, 0u64) };
+    assert_eq!(policy, 1);
     // SAFETY: an anonymous mapping request that must be refused; on the
     // failure path nothing is mapped, and a success would be unmapped at once.
     let p = unsafe {

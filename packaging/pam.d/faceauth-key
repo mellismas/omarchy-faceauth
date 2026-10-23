@@ -1,0 +1,11 @@
+#%PAM-1.0
+# The security key check's stack for a key line that says neither
+# pinverification= nor userverification=. The package installs it as
+# /usr/lib/faceauth/pam.d/faceauth-key, with one stack beside it for each
+# other policy the check mirrors (-pin, -nopin, -uv, -nouv and their pairs:
+# a word absent, =1 and =0 differ to pam_u2f), and only faceauth-keycheck
+# reads them (pam_start_confdir), never through /etc/pam.d. faceauthd picks
+# the one that matches the lane's own key line, so a touch here is the touch
+# that line accepts, against the same key file, and a line it cannot match
+# keeps the key off.
+auth       required     pam_u2f.so cue authfile=/etc/fido2/fido2

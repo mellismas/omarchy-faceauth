@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "faceauth_daemon"
@@ -13,14 +15,30 @@ path = "src/lib.rs"
 name = "faceauthd"
 path = "src/main.rs"
 
+# The security key check, run by faceauthd in a transient unit of its own
+# (consent/key.rs), so pam_u2f and libfido2 never load into the daemon.
+[[bin]]
+name = "faceauth-keycheck"
+path = "src/keycheck.rs"
+
+[[bin]]
+name = "faceauth-lockstate"
+path = "src/lockstate.rs"
+
+# The fingerprint check, run by faceauthd in a transient unit of its own
+# (consent/fprint.rs), so pam_fprintd never loads into the daemon.
+[[bin]]
+name = "faceauth-fprintcheck"
+path = "src/fprintcheck.rs"
+
 [lints]
 workspace = true
 
 [dependencies]
 anyhow.workspace = true
 env_logger.workspace = true
-faceauth-camera = { version = "0.1.0", path = "../faceauth-camera" }
-faceauth-engine = { version = "0.1.0", path = "../faceauth-engine" }
+faceauth-camera.workspace = true
+faceauth-engine.workspace = true
 libc.workspace = true
 log.workspace = true
 nix = { workspace = true, features = ["socket", "user", "fs", "poll"] }

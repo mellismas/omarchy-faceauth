@@ -21,7 +21,18 @@ pub enum Confirm {
 }
 
 /// How long the confirm may take before it gives up.
-const CONFIRM_SECONDS: f32 = 2.5;
+const CONFIRM_WINDOW: Duration = Duration::from_millis(2500);
+
+/// The longest the confirm waits for one strobed pair.
+const CONFIRM_FRAME_WAIT: Duration = Duration::from_secs(1);
+
+/// The confirm's bound as a waiting PAM line sees it: its window and one
+/// last wait for a pair (fix round 10, Opus N3), below `LIVENESS`, so a
+/// beat before it carries the line through it. The last pair's embedding
+/// comes on top, as every frame's does.
+pub const CONFIRM_LIMIT: Duration = Duration::from_millis(
+    CONFIRM_WINDOW.as_millis() as u64 + CONFIRM_FRAME_WAIT.as_millis() as u64,
+);
 
 /// The confirm's answer when its window ran out: refused only on two
 /// pairs under the threshold (the same two strikes a pass takes);
@@ -50,14 +61,12 @@ pub fn confirm(
     templates: &UserTemplates,
     followed: [f32; 4],
 ) -> Result<Confirm> {
-    if cap.illuminator.is_none() {
+    match crate::tier::gate(cap.tier(), cfg.liveness_required) {
+        crate::tier::Gate::Run => {}
         // No strobe control: the scan already ran ungated under the
         // administrator's explicit setting, and so does this.
-        return Ok(if cfg.liveness_required {
-            Confirm::Refused("no strobe control".into())
-        } else {
-            Confirm::Live
-        });
+        crate::tier::Gate::Ungated => return Ok(Confirm::Live),
+        crate::tier::Gate::Refuse => return Ok(Confirm::Refused("no strobe control".into())),
     }
     let t0 = Instant::now();
     let device = cap.identity.clone();
@@ -67,10 +76,10 @@ pub fn confirm(
     gate.focus_on(tracked);
     let (mut passed, mut failed, mut nosignal, mut pairs) = (0usize, 0usize, 0usize, 0usize);
     let verdict = loop {
-        if t0.elapsed().as_secs_f32() > CONFIRM_SECONDS {
+        if t0.elapsed() > CONFIRM_WINDOW {
             break confirm_at_timeout(failed);
         }
-        let Some(pair) = gate.next_frame(Duration::from_secs(1))? else {
+        let Some(pair) = gate.next_frame(CONFIRM_FRAME_WAIT)? else {
             continue;
         };
         let face = match gated_face(&gate, pipeline, &pair, cfg.min_detection, Some(tracked))? {
@@ -178,8 +187,8 @@ pub fn nod_frames_match(
 /// of the nod legs, chin down or chin up, which is where the embedder is
 /// weakest on an enrolled face; another person's face scores far below
 /// this against the user's templates, since different identities sit
-/// around 0.1 to 0.3 on this model, and the live confirm just before the
-/// nods matched at the full threshold. Set by reasoning, not measured on
+/// around 0.1 to 0.3 on this model, and the scan before the nods and the
+/// live confirm after them both match at the full threshold. Set by reasoning, not measured on
 /// a corpus; the refusal log carries the scores so it can be.
 pub const NOD_FRAME_SLACK: f32 = 0.30;
 

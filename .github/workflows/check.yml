@@ -1,0 +1,85 @@
+name: Check
+
+# The gates every change passes (H1): the tree is as rustfmt writes it,
+# clippy finds nothing with warnings denied, with and without the
+# development tools, every intra-doc link resolves (I5), and the oldest
+# toolchain the workspace claims (`rust-version` in Cargo.toml) still
+# builds it. The lint levels themselves are the workspace's, in Cargo.toml.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt && rustup default stable
+
+      - name: The tree is formatted
+        run: cargo fmt --all -- --check
+
+      # H3: the dependency tree is a number someone chose, not one that
+      # drifts. A change that brings a crate into the tree bumps the count
+      # here in the same change, with the reason in its message. Normal edges only, the
+      # workspace's own crates included, one line per package: cargo
+      # marks a package it has already printed with "(*)", which is
+      # stripped so a second edge to the same crate is not a new count.
+      - name: The dependency count is the one on record
+        run: |
+          count=$(cargo tree --workspace --edges normal --prefix none --locked | sed 's/ (\*)$//' | sort -u | wc -l)
+          echo "normal dependencies: $count (on record: 36)"
+          test "$count" -eq 36
+
+  clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # The package builds without the development tools; a developer's
+        # build has them. Each compiles code the other does not.
+        features: ["", "--features dev-tools"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+
+      - name: Clippy finds nothing
+        run: cargo clippy --workspace --all-targets --locked ${{ matrix.features }} -- -D warnings
+
+      - name: Every intra-doc link resolves
+        env:
+          RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
+        run: cargo doc --workspace --no-deps --document-private-items --locked ${{ matrix.features }}
+
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "--features dev-tools"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        # The workspace's rust-version, in Cargo.toml.
+        run: rustup toolchain install 1.88 --profile minimal && rustup default 1.88
+
+      - name: The oldest supported toolchain builds it
+        run: cargo check --workspace --locked ${{ matrix.features }}

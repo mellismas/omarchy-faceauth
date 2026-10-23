@@ -60,7 +60,7 @@ pub fn invert(m: &[[f32; 3]; 2]) -> [[f32; 3]; 2] {
 }
 
 /// The 112x112 aligned crop for a detection's five landmarks, photometrically
-/// normalised: the crop's 1st..99th percentiles are stretched to 0..255 so the
+/// normalized: the crop's 1st..99th percentiles are stretched to 0..255 so the
 /// embedding does not move with the exposure loop or the illuminator level.
 pub fn align_112(img: &Grey, landmarks: &[[f32; 2]; 5]) -> Grey {
     let fwd = similarity(landmarks, &ARCFACE_112);

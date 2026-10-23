@@ -61,7 +61,7 @@ impl Backoff {
 /// The refusal standing for this uid now, and whether this is the first
 /// request refused by it (the one that gets a notice).
 pub(super) fn refusal_standing(uid: u32, now: Instant) -> Option<(Duration, bool)> {
-    let mut r = REFUSALS.lock().ok()?;
+    let mut r = REFUSALS.lock().unwrap_or_else(|p| p.into_inner());
     r.retain(|(_, b)| {
         b.until.is_some_and(|u| u > now)
             || b.last
@@ -76,9 +76,7 @@ pub(super) fn refusal_standing(uid: u32, now: Instant) -> Option<(Duration, bool
 /// The user said no to a request of this uid's: start or lengthen the
 /// standing refusal.
 pub(super) fn refused(uid: u32, now: Instant) -> Duration {
-    let Ok(mut r) = REFUSALS.lock() else {
-        return Duration::ZERO;
-    };
+    let mut r = REFUSALS.lock().unwrap_or_else(|p| p.into_inner());
     if let Some((_, b)) = r.iter_mut().find(|(u, _)| *u == uid) {
         return b.refuse(now);
     }
@@ -92,7 +90,9 @@ pub(super) fn refused(uid: u32, now: Instant) -> Duration {
 /// not a timeout, a wrong password or a request that fell through.
 pub(super) fn is_explicit_no(o: &Outcome) -> bool {
     match o {
-        Outcome::Refused { reason, .. } | Outcome::ConsentDenied { reason, .. } => {
+        Outcome::Refused { reason, .. }
+        | Outcome::ConsentDenied { reason, .. }
+        | Outcome::RefusedParked { reason, .. } => {
             Refusal::parse(reason).is_some_and(|r| r.is_explicit_no())
         }
         _ => false,
@@ -209,8 +209,41 @@ mod backoff_tests {
         ] {
             assert_eq!(is_explicit_no(&o), no, "{:?}", o);
         }
-        if let Ok(mut r) = REFUSALS.lock() {
-            r.retain(|(u, _)| *u != uid);
-        }
+        REFUSALS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(u, _)| *u != uid);
+    }
+
+    /// A5: the table is a gate, so a panic that poisons its lock must not
+    /// open it. A refusal recorded before the poisoning still stands, and a
+    /// new no is still recorded, after it.
+    #[test]
+    fn a_poisoned_lock_still_refuses() {
+        let uid = 4_000_000_101u32;
+        let now = Instant::now();
+        refused(uid, now);
+        let poison = std::thread::spawn(|| {
+            let _guard = REFUSALS.lock().unwrap_or_else(|p| p.into_inner());
+            std::panic::resume_unwind(Box::new("poison the refusals lock"));
+        })
+        .join();
+        assert!(poison.is_err(), "the poisoning thread panicked");
+        assert!(REFUSALS.is_poisoned(), "the lock is poisoned");
+        assert!(
+            refusal_standing(uid, now).is_some(),
+            "the standing refusal survives a poisoned lock"
+        );
+        assert_eq!(
+            refused(uid + 1, now),
+            Duration::from_secs(60),
+            "a new no is recorded through a poisoned lock"
+        );
+        assert!(refusal_standing(uid + 1, now).is_some());
+        REFUSALS.clear_poison();
+        REFUSALS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(u, _)| *u != uid && *u != uid + 1);
     }
 }

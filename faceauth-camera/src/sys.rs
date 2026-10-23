@@ -492,7 +492,7 @@ mod layout_tests {
     }
 
     #[test]
-    fn fourccs() {
+    fn pixel_formats_match_the_kernel_fourccs() {
         assert_eq!(V4L2_PIX_FMT_IPU3_Y10, 0x7933_7069);
         assert_eq!(V4L2_PIX_FMT_IPU3_SBGGR10, 0x6233_7069);
         assert_eq!(V4L2_PIX_FMT_GREY, 0x5945_5247);

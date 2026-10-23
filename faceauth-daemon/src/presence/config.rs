@@ -17,7 +17,8 @@ pub struct PresenceConfig {
     pub mode: PresenceMode,
     pub tick_seconds: f32,
     /// On battery (no mains supply online) the tick stretches to this.
-    /// Zero keeps the mains cadence.
+    /// Zero keeps the mains cadence. Clamped as the config loads, 0 to
+    /// `BATTERY_TICK_MAX_SECONDS` (D3).
     pub battery_tick_seconds: f32,
     /// Default mode: the away time, how many seconds the clock may run with
     /// nobody holding it before the session is locked, or "never", when the
@@ -65,6 +66,11 @@ pub enum LockWord {
 /// range a config may set (outside it the value is clamped, with a warning).
 pub const SECURE_OBSCURED_LOCK_MINUTES: u32 = 2;
 pub const SECURE_OBSCURED_LOCK_RANGE: (u32, u32) = (1, 10);
+
+/// The longest battery tick a config may set. The walk-away watch and a
+/// waiting consent card look at the chair once a tick on battery, so a
+/// longer one would leave a user who left unnoticed for minutes (D3).
+pub const BATTERY_TICK_MAX_SECONDS: f32 = 60.0;
 
 impl PresenceConfig {
     /// The away time in `mode`: how long the clock may run with nobody
@@ -116,6 +122,34 @@ impl PresenceConfig {
             w.push("obscured_face_lock = 0 is under 1 minute; using 1".into());
         }
         w
+    }
+
+    /// Bring `battery_tick_seconds` into 0 to `BATTERY_TICK_MAX_SECONDS`,
+    /// as the config loads: a negative or unreadable value is 0, the mains
+    /// cadence, and a longer one is the maximum (D3). The warning for the
+    /// start-up log, when the value changed.
+    pub fn clamp_battery_tick(&mut self) -> Option<String> {
+        let was = self.battery_tick_seconds;
+        let tick = if was.is_nan() {
+            0.0
+        } else {
+            was.clamp(0.0, BATTERY_TICK_MAX_SECONDS)
+        };
+        if tick == was {
+            return None;
+        }
+        self.battery_tick_seconds = tick;
+        Some(format!(
+            "battery_tick_seconds = {} is outside 0 to {} seconds; using {}{}",
+            was,
+            BATTERY_TICK_MAX_SECONDS,
+            tick,
+            if tick == 0.0 {
+                " (the mains cadence)"
+            } else {
+                ""
+            }
+        ))
     }
 }
 
@@ -196,6 +230,29 @@ pub fn set_presence_mode(mode: PresenceMode) {
     );
 }
 
+/// Why the secure mode is not offered on a camera without the strobe
+/// controls: the refusal of a switch to it, and the watch's warning when
+/// the config asks for it there.
+pub const SECURE_NEEDS_STROBE: &str = "secure mode needs a camera whose IR light faceauth can flash, and this camera cannot; the walk-away lock runs in default mode";
+
+/// Why a switch to the secure mode waits: the camera has not been opened
+/// since faceauth started, so whether it can hold the secure mode is not
+/// known yet. The watch's first look finds out within a tick.
+pub const SECURE_NOT_KNOWN: &str = "the camera has not been opened since faceauth started, so whether it can hold secure mode is not known yet; try again in a few seconds";
+
+/// The mode a watch runs in on a camera of `tier`, or one not opened yet
+/// (None). The secure mode's promise, that only the user's own face holds
+/// the clock, rests on the flash gate, so it is offered only where the
+/// tier says so (`Tier::secure_available`): elsewhere the watch runs in the
+/// default mode, and says so. Lowering it is the camera's limit, never a
+/// setting.
+pub fn mode_for_camera(mode: PresenceMode, tier: Option<crate::tier::Tier>) -> PresenceMode {
+    match (mode, tier) {
+        (PresenceMode::Secure, Some(t)) if !t.secure_available() => PresenceMode::Default,
+        (mode, _) => mode,
+    }
+}
+
 #[cfg(test)]
 mod watch_tests {
     use super::*;
@@ -210,15 +267,32 @@ mod watch_tests {
         set_presence_mode(PresenceMode::Default);
         assert_eq!(presence_mode(), PresenceMode::Default);
     }
+
+    /// The secure mode runs only on a camera the flash gate can run on: on
+    /// one without the strobe controls the watch runs in the default mode.
+    /// Before the camera has been opened nothing is known, and the mode
+    /// stands until the first look finds out.
+    #[test]
+    fn the_secure_mode_needs_a_camera_that_can_strobe() {
+        use crate::tier::Tier::{NoFlash, RandomFlash};
+        use PresenceMode::{Default, Secure};
+        assert_eq!(mode_for_camera(Secure, Some(NoFlash)), Default);
+        assert_eq!(mode_for_camera(Secure, Some(RandomFlash)), Secure);
+        assert_eq!(mode_for_camera(Secure, None), Secure);
+        for tier in [Some(NoFlash), Some(RandomFlash), None] {
+            assert_eq!(mode_for_camera(Default, tier), Default);
+        }
+        assert!(SECURE_NEEDS_STROBE.contains("default"));
+    }
 }
 
 #[cfg(test)]
 mod partial_tests {
     use super::*;
 
-    /// Mike, 2026-09-24: the default mode ships with "never", the secure
-    /// mode with two minutes; secure is bounded 1 to 10 minutes, the default
-    /// takes "never" or minutes from 1.
+    /// The default mode ships with "never", the secure mode with two
+    /// minutes; secure is bounded 1 to 10 minutes, the default takes
+    /// "never" or minutes from 1.
     #[test]
     fn obscured_face_lock_defaults_parse_and_clamp() {
         let c = PresenceConfig::default();
@@ -258,9 +332,9 @@ mod partial_tests {
 mod away_tests {
     use super::*;
 
-    /// Mike, 2026-09-25: the away time is per mode. The default mode takes a
-    /// number of seconds or "never"; the secure mode takes seconds only,
-    /// since it promises that only a verified face keeps the session open.
+    /// The away time is per mode. The default mode takes a number of
+    /// seconds or "never"; the secure mode takes seconds only, since it
+    /// promises that only a verified face keeps the session open.
     /// Both ship at 20 s, and an older config's single away time becomes
     /// the default mode's.
     #[test]
@@ -307,5 +381,49 @@ mod away_tests {
             );
         }
         crate::config::Config::from_text("[presence]\naway_seconds = \"never\"", "test").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod battery_tick_tests {
+    use super::*;
+
+    /// D3: the battery tick is brought into 0 to 60 seconds as the config
+    /// loads. A negative or unreadable value is the mains cadence, a
+    /// longer one the maximum, and a value in range stays as written.
+    #[test]
+    fn the_battery_tick_is_clamped_as_the_config_loads() {
+        let tick = |t: &str| {
+            crate::config::Config::from_text(&format!("[presence]\n{}", t), "test")
+                .unwrap()
+                .presence
+                .battery_tick_seconds
+        };
+        assert_eq!(tick(""), 10.0, "the shipped value");
+        for (text, want) in [
+            ("battery_tick_seconds = 300", BATTERY_TICK_MAX_SECONDS),
+            ("battery_tick_seconds = 1e30", BATTERY_TICK_MAX_SECONDS),
+            ("battery_tick_seconds = inf", BATTERY_TICK_MAX_SECONDS),
+            ("battery_tick_seconds = -5.0", 0.0),
+            ("battery_tick_seconds = nan", 0.0),
+            ("battery_tick_seconds = 0", 0.0),
+            ("battery_tick_seconds = 30.5", 30.5),
+            ("battery_tick_seconds = 60", 60.0),
+        ] {
+            assert_eq!(tick(text), want, "{}", text);
+        }
+        let mut c = PresenceConfig {
+            battery_tick_seconds: 120.0,
+            ..Default::default()
+        };
+        let w = c
+            .clamp_battery_tick()
+            .expect("a warning for the start-up log");
+        assert!(w.contains("using 60"), "{}", w);
+        assert_eq!(
+            c.clamp_battery_tick(),
+            None,
+            "a value in range is not a warning"
+        );
     }
 }

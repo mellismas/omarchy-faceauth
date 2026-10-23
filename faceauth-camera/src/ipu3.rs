@@ -183,7 +183,7 @@ impl Ipu3Graph {
         self.pick(SensorKind::Infrared)
     }
 
-    /// The colour sensor facing the user, or none if only a back camera exists.
+    /// The color sensor facing the user, or none if only a back camera exists.
     pub fn colour_sensor(&self) -> Option<&Ipu3Sensor> {
         self.pick(SensorKind::Colour)
     }
@@ -239,7 +239,7 @@ impl Ipu3Graph {
 mod tests {
     use super::*;
 
-    /// The IR sensor is the Y10 code; every 10-bit Bayer code is a colour
+    /// The IR sensor is the Y10 code; every 10-bit Bayer code is a color
     /// sensor with the matching IPU3 packed format; a DPCM8 or unknown code
     /// is neither.
     #[test]

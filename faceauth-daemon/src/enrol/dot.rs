@@ -1,11 +1,11 @@
 //! Where the dot goes: the head's place in ring units from the person's
-//! own centre and reach, the path the target walks, the zones it holds
+//! own center and reach, the path the target walks, the zones it holds
 //! at, and whether the dot counts as on target.
 
 /// The face width, as a fraction of the frame's shorter side, that reads
 /// as the right distance: from the reference machine's templates (78 to
 /// 96 px on a 480 px side).
-pub const SIZE_RIGHT: (f32, f32) = (0.14, 0.24);
+pub const SIZE_RIGHT: (f32, f32) = faceauth_engine::profile::OV7251_SURFACE_BOOK_2.size_right;
 
 pub fn distance_of(size: f32) -> &'static str {
     if size < SIZE_RIGHT.0 {
@@ -24,13 +24,13 @@ pub fn distance_of(size: f32) -> &'static str {
 /// the range step and sets the ring at `RING_OF_REACH` of their reach.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Reach {
-    /// The pose readings: turn left and right of the centre, chin up and
+    /// The pose readings: turn left and right of the center, chin up and
     /// down of the level.
     pub left: f32,
     pub right: f32,
     pub up: f32,
     pub down: f32,
-    /// The face's place in the frame, the same four ways from its centre
+    /// The face's place in the frame, the same four ways from its center
     /// place, in frame units, and which way each axis runs (a turn to the
     /// left moves the face one way or the other across the frame
     /// depending on the camera's orientation; learned with the reach).
@@ -93,7 +93,7 @@ pub const REACH_FLOOR: Reach = Reach {
 /// target's own axis (the radial direction, what the look is about), and
 /// within `ON_TARGET_ACROSS` across it: turning the head drags the pitch
 /// reading with it, and that cross-talk must not throw a good turn off the
-/// target. At the centre both are `ON_TARGET`.
+/// target. At the center both are `ON_TARGET`.
 pub const ON_TARGET: f32 = 0.35;
 pub const ON_TARGET_ACROSS: f32 = 0.65;
 
@@ -111,8 +111,8 @@ pub fn on_target(dot: (f32, f32), target: (f32, f32)) -> bool {
 }
 
 impl Reach {
-    /// The ring from a person's measured extents (as far as they went in
-    /// each direction from their centre), pose and place alike.
+    /// The ring from a person's measured pose extents (as far as they went
+    /// in each direction from their center); `with_place` adds the place.
     pub fn from_extents(left: f32, right: f32, up: f32, down: f32) -> Reach {
         Reach {
             left: (left * RING_OF_REACH).max(REACH_FLOOR.left),
@@ -268,8 +268,8 @@ impl Default for Filter {
 pub const TOP: f32 = 1.0;
 
 /// The path the target walks, as a point in ring units for `s` in 0..1:
-/// from the centre out to the left edge, once round the ring (left, up,
-/// right, down, left) and back to the centre, the top flattened to `TOP`.
+/// from the center out to the left edge, once round the ring (left, up,
+/// right, down, left) and back to the center, the top flattened to `TOP`.
 pub fn path_point(s: f32) -> (f32, f32) {
     let s = s.clamp(0.0, 1.0);
     if s < 0.15 {
@@ -328,7 +328,7 @@ mod tests {
         assert_eq!(distance_of(96.0 / 480.0), "right");
     }
 
-    /// The path leaves the centre to the left, goes once round over the
+    /// The path leaves the center to the left, goes once round over the
     /// top, and comes back; every point on the ring names a look.
     #[test]
     fn the_path_goes_out_round_and_back() {
@@ -350,7 +350,7 @@ mod tests {
         assert_eq!(zone_of_point(0.1, 0.1), "centre");
     }
 
-    /// The dot is drawn against the person's own centre, and the ring is
+    /// The dot is drawn against the person's own center, and the ring is
     /// where the readings say a look begins.
     #[test]
     fn the_dot_is_relative_to_the_persons_centre_and_reach() {
@@ -487,7 +487,7 @@ mod tests {
         assert!(on_target((-0.75, -0.6), (-1.0, 0.0)));
         assert!(
             !on_target((-0.5, 0.0), (-1.0, 0.0)),
-            "too far back toward the centre"
+            "too far back toward the center"
         );
         assert!(!on_target((-1.0, 0.8), (-1.0, 0.0)), "too far across");
         // Top target: y must be near -1.

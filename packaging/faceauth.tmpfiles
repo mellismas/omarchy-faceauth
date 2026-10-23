@@ -1,0 +1,8 @@
+# The security key's lease (fix round 11): every key check, the daemon's
+# unit's or the PAM module's while faceauthd is down, holds an exclusive
+# flock on this file from before it asks the key until it exits, so two
+# never run at once, across a restart of the daemon too. Outside
+# /run/faceauth, which the daemon's restarts keep but its stops remove;
+# root's alone, so no one else can hold it and keep every check off the key.
+# Installed as /usr/lib/tmpfiles.d/faceauth.conf.
+f /run/faceauth-key.lease 0600 root root -

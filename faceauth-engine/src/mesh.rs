@@ -15,7 +15,7 @@ use std::path::Path;
 
 pub const FACE_MESH_FILE: &str = "face_landmark.onnx";
 const SIDE: usize = 192;
-/// The crop is this many times the detector's box, square, on its centre.
+/// The crop is this many times the detector's box, square, on its center.
 const CROP_SCALE: f32 = 1.5;
 
 /// Landmark indices in MediaPipe's canonical face mesh.
@@ -154,7 +154,10 @@ pub fn head_pose(m: &Mesh) -> HeadPose {
 /// Facing the camera closely enough to count as attention: within
 /// `max_yaw_deg` of straight on, rolled no more than `max_roll_deg`, and
 /// pitched within the band a person looking at their screen uses (a lid
-/// camera looks up at the face, so level already reads chin-down).
+/// camera looks up at the face, so level already reads chin-down). The
+/// one attention rule: every look that asks (the watch, the lock screen's
+/// probe, the re-arm gate) asks it, and a face the mesh reads no pose
+/// from is not attentive.
 pub fn is_attentive(hp: &HeadPose, max_yaw_deg: f32, max_roll_deg: f32) -> bool {
     hp.yaw.abs() <= max_yaw_deg
         && hp.roll.abs() <= max_roll_deg

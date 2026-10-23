@@ -1,0 +1,5 @@
+#%PAM-1.0
+# The key check's stack for a FIDO2 line that also asks for the key's PIN,
+# which the card asks for and faceauthd hands to the check over a pipe.
+# Installed beside faceauth-key, and run only by faceauth-keycheck.
+auth       required     pam_u2f.so cue authfile=/etc/fido2/fido2 pinverification=1

@@ -248,7 +248,7 @@ pub const RGB_LIMITS: ExposureLimits = ExposureLimits {
 pub const AE_TARGET: f64 = 0.30;
 
 #[cfg(feature = "dev-tools")]
-/// Grey-world white balance on Bayer-reduced RGB: gains that bring the R and B
+/// Gray-world white balance on Bayer-reduced RGB: gains that bring the R and B
 /// means to the G mean, using mid-tone blocks only (0.08..0.85 of range) so
 /// highlights and the black floor do not vote. Smoothed with alpha 0.15.
 #[derive(Clone, Copy, Debug)]
@@ -315,8 +315,9 @@ pub fn percentile(px: &[u16], step: usize, p: f64) -> u16 {
 }
 
 #[cfg(feature = "dev-tools")]
-/// The signed-off fixed look for the two displays (used by the viewer and by
-/// the enrolment preview). The matcher's input is normalised separately.
+/// A fixed look for the development viewer's displays (`IR_LOOK`, and the
+/// neutral one the capture tools use). The matcher's input is normalized
+/// separately.
 #[derive(Clone, Copy, Debug)]
 pub struct IrLook {
     pub dgain: f64,
@@ -353,7 +354,7 @@ pub const RGB_LOOK: RgbLook = RgbLook {
 };
 
 #[cfg(feature = "dev-tools")]
-/// IR frame to 8-bit grey with black/white stretch and the fixed look.
+/// IR frame to 8-bit gray with black/white stretch and the fixed look.
 pub fn ir_to_grey8(px: &[u16], black: u16, white: u16, look: IrLook, out: &mut [u8]) {
     let span = (white.max(black + 1) - black) as f64;
     for (o, &v) in out.iter_mut().zip(px) {
@@ -405,7 +406,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ae_factor_rules() {
+    fn the_exposure_step_is_rate_limited_and_backs_off_on_clipping() {
         let t = AE_TARGET;
         assert_eq!(
             ae_factor(

@@ -22,6 +22,7 @@ pub(super) fn obs_at(face: bool, attentive: bool, identity: Option<bool>) -> Obs
         },
         identity,
         near_miss: false,
+        side_view: false,
     }
 }
 

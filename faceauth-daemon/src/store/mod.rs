@@ -1,4 +1,4 @@
-//! Enrolment templates: fixed-length embeddings, never images.
+//! Enrollment templates: fixed-length embeddings, never images.
 //!
 //! One file per user. On a machine with a TPM 2.0 the file is
 //! `<dir>/<user>.cred`: the JSON sealed by `systemd-creds` (AES-256-GCM under
@@ -11,9 +11,9 @@
 //! for any caller that is not root. So a copy of the file is useless off
 //! this machine, and on it only root can open it or forge one.
 //! There is no recovery key anywhere on disk, by design: templates that
-//! cannot be unsealed are re-enrolled (enrolment sets an unreadable blob
+//! cannot be unsealed are re-enrolled (enrollment sets an unreadable blob
 //! aside and starts fresh). Without a working TPM the file is `<user>.json`,
-//! plaintext, root 0600, and every surface says so (`doctor`, enrolment). A
+//! plaintext, root 0600, and every surface says so (`doctor`, enrollment). A
 //! plaintext file met by a store that can seal is sealed on first load and
 //! the plaintext unlinked from the live tree; filesystem snapshots taken
 //! before that still hold it. Sealing is sticky: a store that finds a sealed
@@ -27,7 +27,7 @@
 //! camera swapped in for the enrolled one gets nothing to match against.
 //! Every template names its camera and every set names the account's uid;
 //! a file missing either is from before this was required, does not parse,
-//! and reads as unreadable (re-enrol), never as a match.
+//! and reads as unreadable (re-enroll), never as a match.
 
 mod files;
 mod seal;

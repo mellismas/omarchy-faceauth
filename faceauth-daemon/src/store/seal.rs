@@ -1,5 +1,5 @@
 //! Sealing a template file to this machine's TPM through `systemd-creds`,
-//! scoped to root. A failed unseal is classified, so enrolment sets a blob
+//! scoped to root. A failed unseal is classified, so enrollment sets a blob
 //! aside only when the failure says the blob itself is unreadable.
 
 #[cfg(test)]
@@ -105,7 +105,7 @@ fn creds_failure(args: &[&str], out: &std::process::Output) -> anyhow::Error {
     .context(kind)
 }
 
-/// Whether a failed unseal says anything about the blob. Enrolment sets a
+/// Whether a failed unseal says anything about the blob. Enrollment sets a
 /// blob aside and starts fresh only on a definitive failure; a passing
 /// condition (the TPM busy or unreachable, the tool timed out or could not
 /// start, the sandbox refusing the device) must not discard a good set of
@@ -227,12 +227,12 @@ mod tests {
         assert!(e.contains("refusing to write them in plaintext"), "{}", e);
         assert!(sealed.exists(), "the sealed file must survive");
         assert!(!store.path_for("alice").unwrap().exists());
-        // Loading it fails (it is not a blob), and enrolment's recovery does
+        // Loading it fails (it is not a blob), and enrollment's recovery does
         // not set it aside either: on a store that cannot seal, that would be
         // the same downgrade by another route (F2).
         assert!(store.load("alice").is_err());
         let e = store.set_aside_unreadable("alice").unwrap_err().to_string();
-        assert!(e.contains("enrolment refused"), "{}", e);
+        assert!(e.contains("enrollment refused"), "{}", e);
         assert!(
             sealed.exists(),
             "the sealed file must survive the recovery path too"
@@ -322,7 +322,7 @@ mod tests {
         let sealed2 = plain.sealed_path_for("alice").unwrap();
         std::fs::write(&sealed2, b"blob").unwrap();
         let e = plain.check_can_replace("alice").unwrap_err().to_string();
-        assert!(e.contains("enrolment refused"), "{}", e);
+        assert!(e.contains("enrollment refused"), "{}", e);
         assert!(
             plain.set_aside_if_unreadable("alice", &definitive).is_err(),
             "no set-aside on a store that would then write plaintext"
@@ -330,7 +330,7 @@ mod tests {
         assert!(sealed2.exists());
         assert!(
             plain.check_can_replace("bob").is_ok(),
-            "a user without sealed templates may enrol plain"
+            "a user without sealed templates may enroll plain"
         );
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(dir2);
@@ -350,9 +350,9 @@ mod tests {
         p
     }
 
-    /// The walk-through and the terminal enrolment open the set the same
+    /// The walk-through and the terminal enrollment open the set the same
     /// way: a TPM that timed out keeps the sealed blob and fails the
-    /// enrolment; only the tool's verdict on the blob sets it aside (F2,
+    /// enrollment; only the tool's verdict on the blob sets it aside (F2,
     /// round-4 C8).
     #[test]
     fn enrolment_keeps_a_sealed_set_the_tpm_could_not_open_in_time() {
@@ -405,7 +405,7 @@ mod tests {
         let sealed2 = plain.sealed_path_for("alice").unwrap();
         std::fs::write(&sealed2, b"blob").unwrap();
         let e = plain.open_for_enrolment("alice").unwrap_err().to_string();
-        assert!(e.contains("enrolment refused"), "{}", e);
+        assert!(e.contains("enrollment refused"), "{}", e);
         assert!(sealed2.exists());
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(dir2);

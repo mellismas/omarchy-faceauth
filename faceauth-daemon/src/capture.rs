@@ -1,6 +1,6 @@
-//! Owning the IR camera for one attempt: open, illuminate, meter on the face,
-//! hand frames to the engine, close. The camera is only streaming while an
-//! attempt runs, which is the idle gating the design asks for.
+//! Owning the IR camera for one use: open, illuminate, meter on the face,
+//! hand frames to the engine, close. The camera streams only while a
+//! request or a presence look is using it, and is closed between them.
 
 use crate::config::Config;
 use anyhow::{anyhow, Context, Result};
@@ -90,7 +90,7 @@ fn ipu3_identity(sysfs_class: &Path, subdev: &Path, entity_name: &str) -> String
 /// The identity templates bind to on `ir`, read from the live sysfs tree:
 /// what `open` records in `IrCapture::identity` for that sensor, for a
 /// caller that has probed the graph but is not streaming (the doctor's
-/// binding check, the development enrolment).
+/// binding check, the development enrollment).
 pub fn ipu3_identity_of(ir: &faceauth_camera::ipu3::Ipu3Sensor) -> String {
     ipu3_identity(Path::new("/sys/class/video4linux"), &ir.subdev, &ir.name)
 }
@@ -167,8 +167,11 @@ impl IrCapture {
         // The gate runs whenever the sensor can strobe; there is no switch
         // for it (H15).
         let illuminator = Illuminator::open(&subdev)?;
+        crate::tier::note(crate::tier::Tier::of(illuminator.is_some()));
         let start = seed.unwrap_or(Exposure {
-            exposure: 500.min(cam.limits.exposure.1),
+            exposure: faceauth_engine::profile::OV7251_SURFACE_BOOK_2
+                .start_exposure
+                .min(cam.limits.exposure.1),
             gain: cam.limits.gain.map(|g| g.0).unwrap_or(0),
             dgain: 1.0,
         });
@@ -188,6 +191,11 @@ impl IrCapture {
             ae_enabled: true,
             identity,
         })
+    }
+
+    /// This camera's liveness tier (`tier`), from its illuminator.
+    pub fn tier(&self) -> crate::tier::Tier {
+        crate::tier::Tier::of(self.illuminator.is_some())
     }
 
     pub fn freeze_exposure(&mut self, frozen: bool) {
@@ -214,11 +222,23 @@ impl IrCapture {
         self.frame.sequence
     }
 
-    /// Block for the next frame and return it oriented as 8-bit grey (linear,
+    /// Block for the next frame and return it oriented as 8-bit gray (linear,
     /// 10-bit shifted down: a fixed mapping so consecutive frames are comparable).
+    /// A frame of its own, for a caller that keeps it; a loop that looks at
+    /// each frame and moves on reads them with `next_into`.
     pub fn next(&mut self, timeout: Duration) -> Result<Option<Grey>> {
+        let mut img = Grey::default();
+        Ok(self.next_into(&mut img, timeout)?.then_some(img))
+    }
+
+    /// `next`, written into `img`: false when no frame came, and `img` is
+    /// then left as it was. The frame's buffer is reused, so a loop that
+    /// keeps one frame for its reads allocates nothing per frame, where a
+    /// fresh 300 kB frame per call was an allocation on every frame the
+    /// camera delivers (C7).
+    pub fn next_into(&mut self, img: &mut Grey, timeout: Duration) -> Result<bool> {
         if !self.cam.capture(&mut self.frame, timeout)? {
-            return Ok(None);
+            return Ok(false);
         }
         self.frames += 1;
         if self.ae_enabled {
@@ -239,9 +259,8 @@ impl IrCapture {
         // delivers (320 against 220 us, engine `bench_frame`).
         let f = &self.frame;
         let [t, fx, fy] = self.orientation;
-        Ok(Some(Grey::from_u10_oriented(
-            &f.px, f.width, f.height, t, fx, fy,
-        )))
+        img.set_from_u10_oriented(&f.px, f.width, f.height, t, fx, fy);
+        Ok(true)
     }
 
     /// Meter on this face from now on (box in oriented coordinates).
@@ -264,7 +283,7 @@ impl IrCapture {
 
 /// The raw-frame window under a face box given in oriented coordinates:
 /// the orientation (transpose, flip x, flip y) is undone on the box's two
-/// corners and the result normalised to a non-empty rectangle inside the
+/// corners and the result normalized to a non-empty rectangle inside the
 /// raw frame of `raw_w` x `raw_h`.
 fn metering_window(bbox: [f32; 4], raw_w: usize, raw_h: usize, orientation: [bool; 3]) -> Window {
     let (rw, rh) = (raw_w as f32, raw_h as f32);

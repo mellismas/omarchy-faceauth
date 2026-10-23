@@ -1,5 +1,5 @@
 #!/bin/bash
-# Record a gesture calibration battery: twenty labelled consent windows with
+# Record a gesture calibration battery: twenty labeled consent windows with
 # the daemon recording every frame and deciding nothing, then the recordings
 # copied here under their item names. Needs root twice (turning recording on,
 # restoring the config); the windows themselves grant nothing.
@@ -12,7 +12,7 @@
 #
 #   tools/battery.sh [USER] [OUTDIR]      default: $USER, faceauth-daemon/traces/cal-$(date +%Y%m%d)
 #
-# For each window: once it says "Recognised", do what the label says; otherwise stay as you are.
+# For each window: once it says "Recognized", do what the label says; otherwise stay as you are.
 set -u
 user=${1:-$USER}
 out=${2:-"$(dirname "$0")/../faceauth-daemon/traces/cal-$(date +%Y%m%d)"}

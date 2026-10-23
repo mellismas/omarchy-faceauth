@@ -14,6 +14,12 @@ pub const STORE_DIR: &str = "/var/lib/faceauth";
 /// to. Fixed: the PAM lines, the windows and the CLI all name it, so a
 /// changed key would break them without a word.
 pub const SOCKET: &str = "/run/faceauth/sock";
+/// The lock screen's reserved channel (round 7, B): a socket of its own,
+/// outside the connection limits, at most two open per user.
+pub const LOCK_SOCKET: &str = "/run/faceauth/lock.sock";
+/// The most `max_connections` may be: what the unit's TasksMax holds
+/// (packaging/faceauth.service; serve.rs's test pins the two).
+pub const MAX_CONNECTIONS_CAP: usize = 128;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -52,6 +58,25 @@ pub struct Config {
     /// presence rhythm and an attentive face re-arms a fresh scan; the
     /// request itself has no deadline. Never under 10.
     pub consent_seconds: f32,
+    /// Milliseconds the lock screen's latch outlives the unlock the daemon
+    /// sees: from the lock screen's first ask for the key (or its word that
+    /// it is up) until this long after the session is seen unlocked, the
+    /// consent card takes no touch of the key and no stack's key line runs,
+    /// so a touch while locked can only unlock. Longer covers more of the
+    /// lock screen's two-second gap between asks; a parked card comes back
+    /// this much later after an unlock. At most 30000.
+    pub key_unlock_hold_ms: u64,
+    /// Connections the daemon serves at once, as systemd's
+    /// `MaxConnections=`; the rest are refused at once, and every user is
+    /// latched for a hold (no approval opens while the places are full).
+    /// At most `MAX_CONNECTIONS_CAP`. The lock screen's channel is not
+    /// counted.
+    pub max_connections: usize,
+    /// Connections one account may hold at once, as systemd's
+    /// `MaxConnectionsPerSource=`. Unset: `max_connections` over the
+    /// enrolled users, never under a floor (`server/limits.rs`). A refusal
+    /// here latches that account alone.
+    pub max_connections_per_source: Option<usize>,
     /// Write each consent round's per-frame gesture recording (the head's
     /// angles from the face mesh and the detector box; never images) to
     /// `<store_dir>/gestures/<user>/`, root-only, newest sixty kept. Off by
@@ -60,7 +85,7 @@ pub struct Config {
     /// journal.
     #[cfg(feature = "dev-tools")]
     pub gesture_trace: bool,
-    /// Recognise gestures but never act on them: the window waits until it
+    /// Recognize gestures but never act on them: the window waits until it
     /// is answered or the requester gives up. For recording a battery of
     /// rounds to each gesture's rest. Development builds only, like
     /// `gesture_trace`.
@@ -79,12 +104,15 @@ impl Default for Config {
             ir_video: None,
             ir_subdev: None,
             // The reference machine (Surface Book 2): transpose plus both flips.
-            ir_orientation: [true, true, true],
+            ir_orientation: faceauth_engine::profile::OV7251_SURFACE_BOOK_2.orientation,
             liveness_required: true,
             presence: Default::default(),
             unlock: Default::default(),
             consent_scan_seconds: 20.0,
             consent_seconds: 90.0,
+            key_unlock_hold_ms: crate::consent::DEFAULT_HOLD_MS,
+            max_connections: 64,
+            max_connections_per_source: None,
             #[cfg(feature = "dev-tools")]
             gesture_trace: false,
             #[cfg(feature = "dev-tools")]
@@ -96,20 +124,32 @@ impl Default for Config {
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let p = path.as_ref();
-        if !p.exists() {
-            return Ok(Config::default());
-        }
-        let text = std::fs::read_to_string(p).with_context(|| format!("read {}", p.display()))?;
-        Self::from_text(&text, &p.display().to_string())
+        let mut cfg = if p.exists() {
+            let text =
+                std::fs::read_to_string(p).with_context(|| format!("read {}", p.display()))?;
+            Self::from_text(&text, &p.display().to_string())?
+        } else {
+            Config::default()
+        };
+        // The canonical path goes back into the config so every later open
+        // (each model file at load) uses the path that was checked, not one
+        // a symlink could swap under it in between.
+        cfg.models_dir = check_models_dir(&cfg.models_dir)
+            .with_context(|| format!("{}: models_dir; refusing to start", p.display()))?;
+        Ok(cfg)
     }
 
     /// Parse `text` (named `origin` in messages), warn on every key the
-    /// daemon does not know, naming the table it landed in, and refuse a
-    /// value that would switch a check off.
+    /// daemon does not know, naming the table it landed in, bring the
+    /// battery tick into its range, and refuse a value that would switch
+    /// a check off.
     pub fn from_text(text: &str, origin: &str) -> Result<Self> {
-        let cfg: Config = toml::from_str(text).with_context(|| format!("parse {}", origin))?;
+        let mut cfg: Config = toml::from_str(text).with_context(|| format!("parse {}", origin))?;
         for line in unknown_keys(text) {
             log::warn!("{}: {}", origin, line);
+        }
+        if let Some(w) = cfg.presence.clamp_battery_tick() {
+            log::warn!("{}: [presence] {}", origin, w);
         }
         cfg.validate()
             .with_context(|| format!("{}: refusing to start", origin))?;
@@ -143,6 +183,22 @@ impl Config {
         }
         if !positive(self.consent_scan_seconds) || !positive(self.consent_seconds) {
             bail!("consent_scan_seconds and consent_seconds must be positive");
+        }
+        if self.max_connections == 0 || self.max_connections > MAX_CONNECTIONS_CAP {
+            bail!(
+                "max_connections = {} is outside 1 to {}; the unit's TasksMax holds no more",
+                self.max_connections,
+                MAX_CONNECTIONS_CAP
+            );
+        }
+        if self.max_connections_per_source == Some(0) {
+            bail!("max_connections_per_source = 0 would refuse everyone");
+        }
+        if self.key_unlock_hold_ms > 30_000 {
+            bail!(
+                "key_unlock_hold_ms = {} is over 30000; the card would wait that long after every unlock",
+                self.key_unlock_hold_ms
+            );
         }
         let pr = &self.presence;
         let away_ok = match pr.away_seconds {
@@ -184,7 +240,7 @@ pub struct UnlockConfig {
 impl Default for UnlockConfig {
     fn default() -> Self {
         UnlockConfig {
-            probe_seconds: 2.0,
+            probe_seconds: 1.0,
             battery_probe_seconds: BatteryProbeSeconds::default(),
         }
     }
@@ -204,11 +260,73 @@ pub struct BatteryProbeSeconds {
 impl Default for BatteryProbeSeconds {
     fn default() -> Self {
         BatteryProbeSeconds {
-            performance: 3.0,
-            balanced: 5.0,
-            power_saver: 8.0,
+            performance: 2.0,
+            balanced: 3.0,
+            power_saver: 5.0,
         }
     }
+}
+
+/// The models directory is read by a root daemon that serves sudo and
+/// polkit, and nothing checks the weights' hashes at load: whoever can
+/// write the directory, or any directory above it, chooses the model that
+/// decides who is recognized. So the directory and every ancestor must be
+/// root-owned and writable by nobody else, and so must every file in it:
+/// `sudo cp -a` keeps the user's ownership on the weights, and a file the
+/// user owns is rewritten in place whatever the directory's mode says.
+/// `faceauth models fetch` writes to the user's data directory by default,
+/// which fails here on purpose; a development daemon points `models_dir` at
+/// a root-owned copy installed with `install -o root -m 644`. Returns the
+/// canonical path, which the caller uses from then on.
+pub fn check_models_dir(dir: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = std::fs::canonicalize(dir).with_context(|| format!("resolve {}", dir.display()))?;
+    for p in dir.ancestors() {
+        let md = std::fs::metadata(p).with_context(|| format!("stat {}", p.display()))?;
+        models_dir_component_ok(p, md.uid(), md.mode())?;
+    }
+    check_models_files(&dir)?;
+    Ok(dir)
+}
+
+/// Every entry of the models directory, without following symlinks: a
+/// symlink is refused outright (it points wherever its owner likes), and
+/// anything else must be root's and not writable by group or others.
+pub fn check_models_files(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let path = entry?.path();
+        let md =
+            std::fs::symlink_metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+        if md.file_type().is_symlink() {
+            bail!(
+                "{} is a symlink: a root daemon loads only regular files it can vouch for",
+                path.display()
+            );
+        }
+        models_dir_component_ok(&path, md.uid(), md.mode())?;
+    }
+    Ok(())
+}
+
+/// One path component of the models directory: owner root, no write bit
+/// for group or others. The error names the path, owner and mode.
+pub fn models_dir_component_ok(p: &Path, uid: u32, mode: u32) -> Result<()> {
+    if uid != 0 {
+        bail!(
+            "{} is owned by uid {}, not root: a root daemon loads only models from a root-owned directory; install omarchy-faceauth-models, or point models_dir at a root-owned copy",
+            p.display(),
+            uid
+        );
+    }
+    if mode & 0o022 != 0 {
+        bail!(
+            "{} has mode {:04o}, writable by group or others: a root daemon loads only models nobody else can replace",
+            p.display(),
+            mode & 0o7777
+        );
+    }
+    Ok(())
 }
 
 /// A finite number above zero (NaN is not).
@@ -232,13 +350,14 @@ pub fn unknown_keys(text: &str) -> Vec<String> {
 }
 
 /// The default config with every optional field filled in, so that the
-/// serialised form names every key the daemon reads. A `None` serialises to
-/// nothing at all, and the walk below would otherwise call `omarchy_path`
-/// or `ir_video` unknown on a machine that sets them.
+/// serialized form names every key the daemon reads. A `None` serializes to
+/// nothing at all, and the walk below would otherwise call `ir_video` or
+/// `ir_subdev` unknown on a machine that sets them.
 fn every_key() -> Config {
     Config {
         ir_video: Some(PathBuf::from("/dev/video0")),
         ir_subdev: Some(PathBuf::from("/dev/v4l-subdev0")),
+        max_connections_per_source: Some(16),
         ..Config::default()
     }
 }
@@ -338,7 +457,7 @@ mod tests {
         );
         assert!(unknown_keys(text).is_empty(), "{:?}", unknown_keys(text));
         let toml::Value::Table(known) = toml::Value::try_from(every_key()).unwrap() else {
-            panic!("config serialises as a table");
+            panic!("config serializes as a table");
         };
         let named = |key: &str| {
             text.lines().any(|l| {
@@ -364,20 +483,73 @@ mod tests {
         }
     }
 
-    /// `[unlock]`: the lock screen's probe intervals ship at 2 s on mains
-    /// and 3, 5 and 8 s on battery by power profile. Each may be set on its
-    /// own; a zero, negative or unreadable one refuses to start, and a
-    /// misspelt profile is named like any unknown key.
+    /// Round 7 (C): the connection limits are settings, as systemd's
+    /// socket's are: 64 places, a per-source share computed from the
+    /// enrolled users unless set, and neither past what the unit's
+    /// TasksMax holds.
+    #[test]
+    fn the_connection_limits_are_settings() {
+        let d = Config::default();
+        assert_eq!(d.max_connections, 64);
+        assert_eq!(d.max_connections_per_source, None, "computed");
+        let c = Config::from_text(
+            "max_connections = 32\nmax_connections_per_source = 8\n",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            (c.max_connections, c.max_connections_per_source),
+            (32, Some(8))
+        );
+        assert!(unknown_keys("max_connections = 32\nmax_connections_per_source = 8\n").is_empty());
+        for bad in [
+            "max_connections = 0\n",
+            &format!("max_connections = {}\n", MAX_CONNECTIONS_CAP + 1),
+            "max_connections_per_source = 0\n",
+        ] {
+            assert!(Config::from_text(bad, "test").is_err(), "{}", bad);
+        }
+    }
+
+    /// Round 4: the lock screen's hold is a setting, 500 ms unless set,
+    /// read from the top level and refused past 30 s.
+    #[test]
+    fn the_key_unlock_hold_is_a_setting() {
+        // Round 7 (B): shipped at 500, now that the lock screen's channel
+        // holds the latch for the whole lock.
+        assert_eq!(Config::default().key_unlock_hold_ms, 500);
+        assert_eq!(
+            Config::default().key_unlock_hold_ms,
+            crate::consent::DEFAULT_HOLD_MS
+        );
+        let c = Config::from_text("key_unlock_hold_ms = 2500\n", "test").unwrap();
+        assert_eq!(c.key_unlock_hold_ms, 2500);
+        assert_eq!(
+            Config::from_text("key_unlock_hold_ms = 0\n", "test")
+                .unwrap()
+                .key_unlock_hold_ms,
+            0
+        );
+        assert!(Config::from_text("key_unlock_hold_ms = 30001\n", "test").is_err());
+        assert!(Config::from_text("key_unlock_hold_ms = -1\n", "test").is_err());
+        assert!(unknown_keys("key_unlock_hold_ms = 1000\n").is_empty());
+    }
+
+    /// `[unlock]`: the lock screen's probe intervals ship at 1 s on mains
+    /// and 2, 3 and 5 s on battery by power profile (round 19: Mike, after
+    /// timing a sit-down, wanted the lock to see him sooner). Each may be
+    /// set on its own; a zero, negative or unreadable one refuses to start,
+    /// and a misspelt profile is named like any unknown key.
     #[test]
     fn the_unlock_cadence_defaults_parse_and_refuse_bad_values() {
         let c = Config::default();
-        assert_eq!(c.unlock.probe_seconds, 2.0);
+        assert_eq!(c.unlock.probe_seconds, 1.0);
         assert_eq!(
             c.unlock.battery_probe_seconds,
             BatteryProbeSeconds {
-                performance: 3.0,
-                balanced: 5.0,
-                power_saver: 8.0
+                performance: 2.0,
+                balanced: 3.0,
+                power_saver: 5.0
             }
         );
         let c = Config::from_text(
@@ -389,7 +561,7 @@ mod tests {
         assert_eq!(
             c.unlock.battery_probe_seconds,
             BatteryProbeSeconds {
-                performance: 3.0,
+                performance: 2.0,
                 balanced: 4.0,
                 power_saver: 10.0
             }
@@ -400,7 +572,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.unlock.battery_probe_seconds.performance, 2.5);
-        assert_eq!(c.unlock.probe_seconds, 2.0);
+        assert_eq!(c.unlock.probe_seconds, 1.0);
         for bad in [
             "[unlock]\nprobe_seconds = 0",
             "[unlock]\nprobe_seconds = -2.0",
@@ -494,5 +666,69 @@ mod tests {
                 .mode,
             crate::presence::PresenceMode::Secure
         );
+    }
+}
+
+#[cfg(test)]
+mod models_dir_tests {
+    use super::*;
+
+    /// The daemon refuses a models directory (or any directory above it)
+    /// that is not root's or that others can write; the error names the
+    /// path and the offending owner or mode.
+    #[test]
+    fn models_dir_must_be_root_owned_and_not_writable_by_others() {
+        let p = Path::new("/home/a/.local/share/faceauth/models");
+        assert!(models_dir_component_ok(p, 0, 0o040755).is_ok());
+        assert!(models_dir_component_ok(p, 0, 0o040700).is_ok());
+        let e = models_dir_component_ok(p, 1000, 0o040755)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains(p.to_str().unwrap()) && e.contains("uid 1000"),
+            "{}",
+            e
+        );
+        assert!(e.contains("omarchy-faceauth-models"), "{}", e);
+        let e = models_dir_component_ok(p, 0, 0o040775)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("0775"), "{}", e);
+        assert!(models_dir_component_ok(Path::new("/tmp"), 0, 0o041777).is_err());
+        assert!(models_dir_component_ok(p, 0, 0o040757).is_err());
+    }
+
+    /// The installed location passes on a stock system; a directory under a
+    /// user's home fails on the home component even when the leaf is root's.
+    #[test]
+    fn the_check_walks_every_ancestor() {
+        if std::fs::metadata("/usr/share").is_ok() {
+            assert!(check_models_dir(Path::new("/usr/share")).is_ok());
+        }
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        if let Some(h) = home.filter(|h| h.starts_with("/home")) {
+            assert!(check_models_dir(&h).is_err(), "{}", h.display());
+        }
+        assert!(check_models_dir(Path::new("/nonexistent/faceauth/models")).is_err());
+    }
+
+    /// The files are checked too, not only the directory: a weight the user
+    /// owns (what `sudo cp -a` leaves) is refused by name, and a symlink is
+    /// refused without being followed. An empty directory has nothing to
+    /// refuse.
+    #[test]
+    fn the_files_in_the_directory_must_be_root_owned_too() {
+        let base = std::env::temp_dir().join(format!("faceauth-models-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        assert!(check_models_files(&base).is_ok());
+        let weight = base.join("glintr100.onnx");
+        std::fs::write(&weight, b"x").unwrap();
+        let e = check_models_files(&base).unwrap_err().to_string();
+        assert!(e.contains("glintr100.onnx") && e.contains("uid"), "{}", e);
+        std::fs::remove_file(&weight).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", &weight).unwrap();
+        let e = check_models_files(&base).unwrap_err().to_string();
+        assert!(e.contains("symlink"), "{}", e);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

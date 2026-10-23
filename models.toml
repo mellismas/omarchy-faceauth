@@ -1,6 +1,6 @@
 # Model manifest for Omarchy FaceAuth. Weights are never vendored in the source tree: the
 # omarchy-faceauth-models package installs the three files from the project's models-N
-# GitHub release, with their licence texts, and `faceauth doctor` verifies the installed
+# GitHub release, with their license texts, and `faceauth doctor` verifies the installed
 # files against the SHA-256 and size here. `faceauth models fetch` (developers) downloads
 # them from the URLs below into a directory of your choosing and verifies the same way.
 
@@ -13,7 +13,7 @@ size = 232589
 license = "MIT"
 license_url = "https://github.com/opencv/opencv_zoo/blob/main/models/face_detection_yunet/LICENSE"
 provenance = "OpenCV Zoo; trained by the YuNet authors on WIDER Face"
-input = "1x3x640x640 float, 0..255, BGR order (grey replicated)"
+input = "1x3x640x640 float, 0..255, BGR order (gray replicated)"
 
 [[model]]
 name = "glintr100.onnx"
@@ -31,11 +31,11 @@ name = "face_landmark.onnx"
 role = "landmarks"
 # Converted on 2026-09-23 from Google's canonical file (below) with tf2onnx 1.17.0 on
 # TensorFlow 2.21.0, opset 13, and published on the project's models-1 release with
-# its licence text and a NOTICE of the conversion.
+# its license text and a NOTICE of the conversion.
 url = "https://github.com/mellismas/omarchy-faceauth/releases/download/models-1/face_landmark.onnx"
 sha256 = "628e17ded45708571b8c6cb9da2438c32844cba8c3a9ed25e929fa9e318c5357"
 size = 2429024
 license = "Apache-2.0"
 license_url = "https://github.com/google-ai-edge/mediapipe/blob/master/LICENSE"
 provenance = "Google MediaPipe face_landmark.tflite (storage.googleapis.com/mediapipe-assets/face_landmark.tflite, sha256 1055cb9d4a9ca8b8c688902a3a5194311138ba256bcc94e336d8373a5f30c814, 1242398 bytes, 2023-02-13), converted to ONNX one-to-one; 468 face mesh points with relative depth"
-input = "1x192x192x3 float NHWC, 0..1, RGB (grey replicated), a square crop 1.5x the detector's box; outputs conv2d_21 1404 floats (468 x, y in crop pixels, z) and conv2d_31 a face-presence logit"
+input = "1x192x192x3 float NHWC, 0..1, RGB (gray replicated), a square crop 1.5x the detector's box; outputs conv2d_21 1404 floats (468 x, y in crop pixels, z) and conv2d_31 a face-presence logit"

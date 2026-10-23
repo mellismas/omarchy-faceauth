@@ -1,0 +1,11 @@
+#%PAM-1.0
+# The default beside faceauth's private key stacks: the package installs it
+# as /usr/lib/faceauth/pam.d/other, which libpam reads with any service it
+# opens from that directory (pam_start_confdir), and whose absence it logs
+# as an error on every key check. faceauth-keycheck only authenticates,
+# and every stack here defines auth, so none of this decides a check; for
+# anything else, every type denies.
+auth       required     pam_deny.so
+account    required     pam_deny.so
+password   required     pam_deny.so
+session    required     pam_deny.so

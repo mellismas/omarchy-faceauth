@@ -151,13 +151,13 @@ mod passwordless_tests {
                 Ok(())
             } else {
                 Err(anyhow!(
-                    "Unit omarchy-nopasswd-expire-mellis.timer already exists"
+                    "Unit omarchy-nopasswd-expire-alice.timer already exists"
                 ))
             }
         };
-        let file = enable_passwordless(&dir, "mellis", 20, &arm).unwrap();
+        let file = enable_passwordless(&dir, "alice", 20, &arm).unwrap();
         assert!(file.exists(), "the first spell is in place with its timer");
-        let err = enable_passwordless(&dir, "mellis", 40, &arm).unwrap_err();
+        let err = enable_passwordless(&dir, "alice", 40, &arm).unwrap_err();
         assert!(err.to_string().contains("no rule is in place"), "{:#}", err);
         assert!(
             !file.exists(),
@@ -180,11 +180,11 @@ mod passwordless_tests {
             seen.lock().unwrap().extend(args.iter().cloned());
             Ok(())
         };
-        let file = enable_passwordless(&dir, "mellis", 20, &arm).unwrap();
-        assert_eq!(file, dir.join("99-omarchy-nopasswd-mellis"));
+        let file = enable_passwordless(&dir, "alice", 20, &arm).unwrap();
+        assert_eq!(file, dir.join("99-omarchy-nopasswd-alice"));
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
-            "mellis ALL=(ALL) NOPASSWD: ALL\n"
+            "alice ALL=(ALL) NOPASSWD: ALL\n"
         );
         assert_eq!(
             std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
@@ -193,7 +193,7 @@ mod passwordless_tests {
         let args = seen.lock().unwrap().join(" ");
         assert!(
             args.contains("--on-active 20m")
-                && args.contains("--unit=omarchy-nopasswd-expire-mellis")
+                && args.contains("--unit=omarchy-nopasswd-expire-alice")
                 && args.ends_with(&format!("/usr/bin/rm -f -- {}", file.display())),
             "{}",
             args

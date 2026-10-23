@@ -24,13 +24,14 @@ pub(crate) enum Gated {
 /// marginal (0.65 to 0.73), 30 to 34 px missed although the flash still
 /// read, and under 30 px the gate refused. The limit is the face's detail,
 /// not light: exposure was at its maximum from about 50 px out. The line
-/// sits a little inside the measured limit (distance-20260924.txt in the
-/// development tree's fa-build). 60 px was tried first and discarded most
-/// frames at an ordinary sitting-back distance, so consent never matched
-/// and nods never armed. A face under this is treated as no face: never scored, so never a
-/// match and never charged against the five-a-minute rule, and the lock
-/// screen's probe does not wake the panel for it.
-pub const SCAN_MIN_FACE_FRAC: f32 = 0.084;
+/// sits a little inside the measured limit. 60 px was tried first and
+/// discarded most frames at an ordinary sitting-back distance, so consent
+/// never matched and nods never armed. A face under this is treated as no
+/// face: never scored, so never a match and never charged against the
+/// five-a-minute rule, and the lock screen's probe does not wake the panel
+/// for it.
+pub const SCAN_MIN_FACE_FRAC: f32 =
+    faceauth_engine::profile::OV7251_SURFACE_BOOK_2.scan_min_face_frac;
 
 /// The cutoff in force: `SCAN_MIN_FACE_FRAC`, or in a development build
 /// `FACEAUTH_DEV_SCAN_MIN_FRAC` from the environment, for measuring where

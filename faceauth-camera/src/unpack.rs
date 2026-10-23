@@ -50,7 +50,7 @@ pub fn unpack_ipu3_10(src: &[u8], width: usize, height: usize, dst: &mut [u16]) 
     true
 }
 
-/// 8-bit grey (UVC `GREY`) widened to the 10-bit scale used everywhere else.
+/// 8-bit gray (UVC `GREY`) widened to the 10-bit scale used everywhere else.
 pub fn unpack_grey8(src: &[u8], width: usize, height: usize, dst: &mut [u16]) -> bool {
     let Some(pixels) = plane(width, height, 1) else {
         return false;
@@ -78,7 +78,7 @@ pub fn unpack_yuyv_luma(src: &[u8], width: usize, height: usize, dst: &mut [u16]
     true
 }
 
-/// 10-bit or 16-bit little-endian grey (`Y10 `, `Y16 `), normalised to 10 bits.
+/// 10-bit or 16-bit little-endian gray (`Y10 `, `Y16 `), normalized to 10 bits.
 pub fn unpack_y16(
     src: &[u8],
     width: usize,

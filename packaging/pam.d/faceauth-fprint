@@ -1,0 +1,10 @@
+#%PAM-1.0
+# The fingerprint check's stack. The package installs it as
+# /usr/lib/faceauth/pam.d/faceauth-fprint, beside the key's, and only
+# faceauth-fprintcheck reads it (pam_start_confdir), never through
+# /etc/pam.d. The tries are pam_fprintd's own default, as Omarchy's sudo
+# line gives a finger; the timeout, which pam_fprintd counts per try, is
+# the card's whole armed window as shipped (the 20 s scan and the 90 s nod
+# window), so one claim of the reader serves the window. consent/fprint.rs
+# (FPRINT_TRIES, FPRINT_TRY_SECONDS) holds these to it.
+auth       required     pam_fprintd.so max-tries=3 timeout=110

@@ -7,15 +7,28 @@
 # the daemon mid-capture and drive the strobe itself. After it, exposure,
 # gain and the strobe are root-only. Only faceauthd (root) needs this node.
 #
-# What it does not close: the CIO2 capture node for the IR port
-# (/dev/videoN, "ipu3-cio2 N"), the CSI-2 receiver subdevs and /dev/media0
-# stay open to the seat user, because the RGB webcam shares the receiver
-# and the port-to-sensor map is firmware-specific. Starting a stream on
-# that capture node makes the kernel start the linked sensor, so a process
+# The capture node the IR frames arrive on (/dev/videoN, "ipu3-cio2 N" for
+# the IR port) is not in this file. Face setup locks it with a rule of its
+# own (Mike's ruling, fix round 11), /etc/udev/rules.d/72-faceauth-ir-node.rules,
+# which `faceauth cam ir-rule` prints from faceauth's own camera detection
+# and face removal deletes (then `faceauth cam ir-reset` gives the node back
+# root's, the video group's and no ACL, and add events, which alone set a
+# video node's group, have uaccess grant the seat user afresh; fix round
+# 13): exactly the node faceauth reads its IR frames
+# from, only when it carries infrared or grey formats and no colour one,
+# pinned by attributes that do not move (a CIO2 port by its name and the
+# IPU3's PCI function; a USB camera by its interface and node index on one
+# line, which marks it, and its port, vendor and product on the next, since
+# udev matches one line's parent keys on one ancestor alone), never by
+# number. Anything unclear leaves the node open, and
+# `faceauth doctor` (camera.ir_capture) says why. While it is open, starting
+# a stream on it makes the kernel start the linked sensor, so a process
 # running as the user can plausibly take ambient IR frames with the
-# illuminator off, and any process that holds the node (a browser sharing
-# the camera through PipeWire) makes a face attempt fall to the password
-# until it lets go. The README's "Not defended" list says so.
+# illuminator off, and any process that holds it (a browser sharing the
+# camera through PipeWire) makes a face attempt fall to the password until
+# it lets go. Neither rule ever touches the RGB webcam, the CSI-2 receiver
+# subdevs or /dev/media0: the RGB webcam shares the receiver, and the
+# port-to-sensor map is firmware-specific.
 #
 # The file name is the ordering. 70-uaccess.rules adds the tag and
 # 73-seat-late.rules turns the tag into the ACL, so this file must sort between
@@ -30,17 +43,12 @@
 # current tags, not this file.
 #
 # A UVC IR camera (a USB module rather than an IPU3 sensor) has no v4l-subdev
-# node; its control path is the capture node itself, so it cannot be locked
-# down without also taking the stream away from the user, and matching by name
-# alone would be wrong because two identical modules (front and rear, or a
-# dock) would share a name. Setup would identify the sensor it detected by
-# ENV{ID_PATH} (the bus position, stable across boots) and ATTR{index} (the
-# node's index within the device), and write one extra rule of this shape:
-#
-#   SUBSYSTEM=="video4linux", ENV{ID_PATH}=="pci-0000:00:14.0-usb-0:5:1.0", ATTR{index}=="2", TAG-="uaccess", GROUP="root", MODE="0600"
-#
-# That writer is not built: the UVC path is not wired yet (see doctor's
-# camera.ir check), and a wrong rule would silently take a webcam away.
+# node; its control path is its capture node, which the setup rule above
+# covers when the camera is the one faceauth reads (the config's ir_video)
+# and carries infrared alone, pinned by its USB interface, port, vendor and
+# product and the node's index, so two identical modules (front and rear, or
+# a dock) are told apart and its RGB sibling, which can also be index 0 on
+# another interface, stays open.
 
 ACTION=="remove", GOTO="faceauth_ir_end"
 SUBSYSTEM=="video4linux", KERNEL=="v4l-subdev*", ATTR{name}=="ov7251 *", TAG-="uaccess", GROUP="root", MODE="0600"

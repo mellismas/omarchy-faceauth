@@ -72,7 +72,35 @@ impl SessionLock {
         if let Some(t) = self.locked_at() {
             return Ok(t);
         }
-        lock_session(user, omarchy_path)?;
+        // The user's card is off the key from before the lock is up, until
+        // the daemon sees the unlock (`ConsentState::latch_lock_screen`).
+        crate::consent::CONSENT.latch_lock_screen(user);
+        let uid = nix::unistd::User::from_name(user)
+            .ok()
+            .flatten()
+            .map(|u| u.uid.as_raw())
+            .ok_or_else(|| anyhow::anyhow!("no user {}", user))?;
+        // Whether the lock happened is the anchored question's to say,
+        // asked of the session the lock was pinned to (fix round 9).
+        let logind = std::path::Path::new("/run/systemd");
+        let desktops = crate::lockgate::user_desktops(logind, uid);
+        let bind = match desktops.as_slice() {
+            [one] => crate::lockgate::Bind::Session(one.clone()),
+            _ => crate::lockgate::Bind::OnlyDesktop,
+        };
+        let verify = || match crate::consent::anchored_lock_state(user, &bind) {
+            crate::lockgate::LockState::Locked => LockedAnswer::Locked,
+            _ => LockedAnswer::NotYet,
+        };
+        lock_session_at(
+            logind,
+            std::path::Path::new(LOCK_HELPER),
+            user,
+            uid,
+            omarchy_path,
+            &verify,
+            LOCK_VERIFY,
+        )?;
         Ok(self.adopt(Instant::now()))
     }
 
@@ -123,27 +151,112 @@ impl SessionLock {
 }
 
 /// The lock helper the package ships, run as root with the user whose
-/// session to lock and the Omarchy tree the shell was launched from. It
-/// runs the lock inside the user's own manager and answers with what the
-/// compositor says (0 locked, 1 not), so a lock that never happened is
-/// not believed.
-pub const LOCK_HELPER: &str = "/usr/bin/faceauth-lock-session";
+/// session to lock, the Omarchy tree the shell was launched from, the
+/// user's uid and the sessions the lock is pinned to. It runs the lock
+/// inside the user's own manager, by a route that can never start one,
+/// checking the pinned sessions before each call, and answers whether the
+/// lock commands ran; whether the session is locked is the daemon's
+/// anchored question to answer (fix round 9). An internal helper, so under
+/// /usr/lib, off every PATH.
+pub const LOCK_HELPER: &str = "/usr/lib/faceauth/faceauth-lock-session";
 
-fn lock_session(user: &str, omarchy_path: &str) -> Result<()> {
-    let o = std::process::Command::new(LOCK_HELPER)
-        .args([user, omarchy_path])
-        .env_clear()
-        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-        .output()?;
-    if !o.status.success() {
+/// How long the daemon waits, after the lock commands, for the anchored
+/// question to say the session is locked.
+const LOCK_VERIFY: Duration = Duration::from_secs(3);
+
+/// How long the daemon reads the lock helper before it gives it up and
+/// kills what it started (fix round 10, Codex 2, Opus N4): the helper's two
+/// calls into the user's manager, each under `timeout -k 1 4` with both
+/// units capped at 4 s, and a moment for its own checks. The helper's
+/// pipes are never read to their end, since a unit of the user's may hold
+/// them.
+const LOCK_HELPER_WITHIN: Duration = Duration::from_secs(11);
+
+/// What the anchored question said of a lock just made.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LockedAnswer {
+    Locked,
+    NotYet,
+}
+
+/// Lock `user`'s (`uid`'s) session with `helper` (fix rounds 8 and 9).
+/// Only while logind's records under `logind` show them a desktop: the
+/// sessions found are pinned, handed to the helper (which checks them
+/// before each call into the manager), and checked again here at every
+/// look. The lock counts only once `verify`, the anchored question, says
+/// locked within `within`, never on the helper's or the manager's word;
+/// a pinned session gone or replaced meanwhile is no lock.
+fn lock_session_at(
+    logind: &std::path::Path,
+    helper: &std::path::Path,
+    user: &str,
+    uid: u32,
+    omarchy_path: &str,
+    verify: &dyn Fn() -> LockedAnswer,
+    within: Duration,
+) -> Result<()> {
+    lock_session_within(
+        logind,
+        helper,
+        user,
+        uid,
+        omarchy_path,
+        verify,
+        within,
+        LOCK_HELPER_WITHIN,
+    )
+}
+
+/// `lock_session_at`, reading the helper for at most `helper_within`.
+#[allow(clippy::too_many_arguments)]
+fn lock_session_within(
+    logind: &std::path::Path,
+    helper: &std::path::Path,
+    user: &str,
+    uid: u32,
+    omarchy_path: &str,
+    verify: &dyn Fn() -> LockedAnswer,
+    within: Duration,
+    helper_within: Duration,
+) -> Result<()> {
+    let pinned = crate::lockgate::user_desktops(logind, uid);
+    if pinned.is_empty() {
         anyhow::bail!(
-            "exited {}: {} {}",
-            o.status,
-            String::from_utf8_lossy(&o.stdout).trim(),
-            String::from_utf8_lossy(&o.stderr).trim()
+            "{} has no graphical session; nothing is run in their manager",
+            user
         );
     }
-    Ok(())
+    let mut c = std::process::Command::new(helper);
+    c.args([user, omarchy_path, &uid.to_string()])
+        .args(&pinned)
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin");
+    let o = match crate::consent::run_bounded(c, None, helper_within, 4096) {
+        Ok(o) => o,
+        Err(e) => anyhow::bail!("the lock helper {}", e),
+    };
+    if o.code != Some(0) {
+        anyhow::bail!(
+            "exited {:?}: {} {}",
+            o.code,
+            String::from_utf8_lossy(&o.out).trim(),
+            String::from_utf8_lossy(&o.err).trim()
+        );
+    }
+    let by = Instant::now() + within;
+    loop {
+        let answer = verify();
+        if crate::lockgate::user_desktops(logind, uid) != pinned {
+            anyhow::bail!("the pinned session is gone or replaced; no lock");
+        }
+        if answer == LockedAnswer::Locked {
+            return Ok(());
+        }
+        if Instant::now() >= by {
+            anyhow::bail!("faceauth-lock-session: the session is not locked");
+        }
+        std::thread::sleep(within / 6);
+    }
 }
 
 #[cfg(test)]
@@ -302,5 +415,173 @@ mod watch_tests {
             Some("by face")
         );
         assert_eq!(asked.get(), before);
+    }
+
+    /// Fix round 8 (item 14): the lock helper runs only while the user has
+    /// a desktop in logind's records; with none it is not run at all, so
+    /// nothing the daemon starts brings up a user manager that was not
+    /// running.
+    #[test]
+    fn the_lock_helper_runs_only_with_a_desktop() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("faceauth-lockgate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logind/sessions")).unwrap();
+        let marker = dir.join("ran");
+        let helper = dir.join("helper");
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let logind = dir.join("logind");
+        let locked = || LockedAnswer::Locked;
+        let e = lock_session_at(
+            &logind,
+            &helper,
+            "alice",
+            1000,
+            "/usr/share/omarchy",
+            &locked,
+            SHORT_VERIFY,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("no graphical session"), "{}", e);
+        assert!(!marker.exists(), "the helper was not run");
+        std::fs::write(logind.join("sessions/2"), "UID=1000\nTYPE=wayland\n").unwrap();
+        lock_session_at(
+            &logind,
+            &helper,
+            "alice",
+            1000,
+            "/usr/share/omarchy",
+            &locked,
+            SHORT_VERIFY,
+        )
+        .unwrap();
+        assert!(marker.exists(), "with a desktop it runs");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The verification's bound in these tests.
+    const SHORT_VERIFY: Duration = Duration::from_millis(300);
+
+    /// Fix round 9 (Codex 5, Opus L1): the helper only runs the lock; the
+    /// daemon asks the anchored question whether it happened, never the
+    /// user's manager. The helper is handed the uid and the pinned session
+    /// ids, which it checks before each of its calls, and the daemon
+    /// checks them too: a pinned session gone, or replaced by a new one,
+    /// is no lock.
+    #[test]
+    fn the_daemon_asks_the_anchor_whether_the_lock_happened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("faceauth-lockverify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logind/sessions")).unwrap();
+        let logind = dir.join("logind");
+        std::fs::write(logind.join("sessions/7"), "UID=1000\nTYPE=wayland\n").unwrap();
+        let args = dir.join("args");
+        let helper = dir.join("helper");
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", args.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let asked = std::cell::Cell::new(0);
+        let second = || {
+            asked.set(asked.get() + 1);
+            if asked.get() >= 2 {
+                LockedAnswer::Locked
+            } else {
+                LockedAnswer::NotYet
+            }
+        };
+        lock_session_at(
+            &logind,
+            &helper,
+            "alice",
+            1000,
+            "/usr/share/omarchy",
+            &second,
+            SHORT_VERIFY,
+        )
+        .unwrap();
+        let got = std::fs::read_to_string(&args).unwrap();
+        assert_eq!(
+            got, "alice\n/usr/share/omarchy\n1000\n7\n",
+            "the uid and the pinned session"
+        );
+        let never = || LockedAnswer::NotYet;
+        let t0 = Instant::now();
+        let e = lock_session_at(
+            &logind,
+            &helper,
+            "alice",
+            1000,
+            "/usr/share/omarchy",
+            &never,
+            SHORT_VERIFY,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("not locked"), "{}", e);
+        assert!(t0.elapsed() < SHORT_VERIFY + Duration::from_millis(400));
+        // The pinned session replaced while the lock runs: no lock.
+        let relogin = || {
+            let _ = std::fs::remove_file(logind.join("sessions/7"));
+            let _ = std::fs::write(logind.join("sessions/8"), "UID=1000\nTYPE=wayland\n");
+            LockedAnswer::Locked
+        };
+        let e = lock_session_at(
+            &logind,
+            &helper,
+            "alice",
+            1000,
+            "/usr/share/omarchy",
+            &relogin,
+            SHORT_VERIFY,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("pinned session"), "{}", e);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fix round 10 (Codex 2, Opus N4): a helper that never ends, and
+    /// holds its pipes, is given up at its bound with what it started
+    /// killed; nothing waits for the pipes' end, and no lock is counted.
+    #[test]
+    fn a_lock_helper_that_holds_its_pipes_is_given_up() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("faceauth-lockstall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logind/sessions")).unwrap();
+        let logind = dir.join("logind");
+        std::fs::write(logind.join("sessions/7"), "UID=1000\nTYPE=wayland\n").unwrap();
+        let helper = dir.join("helper");
+        std::fs::write(&helper, "#!/bin/sh\nsleep 30 & exec sleep 30\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let locked = || LockedAnswer::Locked;
+        let t0 = Instant::now();
+        let e = lock_session_within(
+            &logind,
+            &helper,
+            "alice",
+            1000,
+            "/usr/share/omarchy",
+            &locked,
+            SHORT_VERIFY,
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("did not finish"), "{}", e);
+        assert!(
+            t0.elapsed() < Duration::from_millis(900),
+            "{:?}",
+            t0.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        // The real bound covers the helper's two bounded calls.
+        assert!(LOCK_HELPER_WITHIN >= Duration::from_secs(2 * 5));
     }
 }

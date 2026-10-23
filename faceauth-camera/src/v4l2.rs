@@ -107,6 +107,16 @@ impl VideoDevice {
         &self.path
     }
 
+    /// The device number (major, minor) of the node this opened, from its
+    /// own descriptor, never from the path.
+    pub fn device_number(&self) -> Option<(u32, u32)> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let md = self.file.metadata().ok()?;
+        md.file_type()
+            .is_char_device()
+            .then(|| (libc::major(md.rdev()), libc::minor(md.rdev())))
+    }
+
     pub fn multiplanar(&self) -> bool {
         self.buf_type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
     }

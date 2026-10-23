@@ -23,6 +23,8 @@ fn main() -> Result<()> {
         faceauth_daemon::config::STORE_DIR,
         faceauth_daemon::config::SOCKET
     );
+    faceauth_daemon::consent::CONSENT
+        .set_key_unlock_hold(std::time::Duration::from_millis(cfg.key_unlock_hold_ms));
     let socket = std::path::PathBuf::from(faceauth_daemon::config::SOCKET);
     let presence = cfg.presence.clone();
     let authenticator = Authenticator::new(cfg)?;

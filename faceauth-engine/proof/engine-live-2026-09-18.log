@@ -89,5 +89,5 @@ t=14.6s face score 0.82 bbox 55x82 at (287,328) 129 ms | vs prev 0.961 vs first 
 t=14.8s face score 0.82 bbox 54x82 at (288,329) 134 ms | vs prev 0.963 vs first 0.723 | exp=881 gain=16 meter 0.31
 t=15.0s face score 0.83 bbox 54x81 at (287,329) 131 ms | vs prev 0.947 vs first 0.755 | exp=881 gain=16 meter 0.31
 t=15.1s face score 0.83 bbox 53x80 at (288,330) 136 ms | vs prev 0.947 vs first 0.730 | exp=881 gain=16 meter 0.31
-best crop (score 0.88) saved to /tmp/claude-1000/-home-mellis-Work/cdfa30ff-532f-46cf-824f-3ef914ce7f76/scratchpad/live3
+best crop (score 0.88) saved to [scratch dir]/live3
 90 frames analysed, mean 133.1 ms per frame (detect + align + embed)

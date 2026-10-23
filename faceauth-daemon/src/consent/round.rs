@@ -1,12 +1,12 @@
 //! Recorded rounds: the per-frame line format and the replay that feeds a
-//! recording back through the detectors. The enrolment walk-through and the
+//! recording back through the detectors. The enrollment walk-through and the
 //! consent window write the same format, so a round from either replays
 //! here.
 
 use super::detector::{NodDetector, ShakeDetector};
 
 /// One frame of a recorded round: the head's angles in degrees and the
-/// detector box (width, centre x, centre y). What the detectors read.
+/// detector box (width, center x, center y). What the detectors read.
 #[derive(Clone, Debug)]
 pub struct RoundFrame {
     pub t: f32,
@@ -70,8 +70,10 @@ pub fn parse_round(text: &str) -> Vec<RoundFrame> {
 /// (degrees): nods and shakes counted.
 pub fn replay_round(frames: &[RoundFrame], floors_deg: (f32, f32)) -> (usize, usize) {
     // A recorded round starts at the "go" and the still second before it
-    // was not recorded, so the replay credits it; the live nod window
-    // does not (D4), it observes the still second inside the window.
+    // was not recorded, so the replay credits it; the live window does
+    // not (D4), it observes the still second inside the window. Only the
+    // shake asks for one now (Mike, 2026-10-19): the nod's credit is kept
+    // so a detector that asks again replays as it did.
     let mut det = NodDetector::mesh(floors_deg.0);
     let mut shake = ShakeDetector::mesh(floors_deg.1);
     det.inner.prior_still = 1.0;
@@ -371,7 +373,7 @@ mod mesh_redteam {
 
     /// A head held turned toward another screen nods the same way on the
     /// pitch axis, but it is not nodding at the card. The reference nods,
-    /// re-centred so their mean yaw is the offset, still read as two held
+    /// re-centered so their mean yaw is the offset, still read as two held
     /// 30 degrees off (the gate is `YAW_FACING_DEG`, 34.29) and read as
     /// nothing from 36 degrees either way.
     #[test]

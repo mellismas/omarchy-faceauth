@@ -3,8 +3,8 @@
 //! and remote on any read error or unfamiliar shape.
 
 use super::user_uid;
+use crate::procfs;
 use anyhow::{bail, Context, Result};
-use std::os::fd::AsFd;
 
 /// Where a request comes from, as far as the daemon can prove it.
 pub enum Locality {
@@ -41,8 +41,9 @@ pub enum Locality {
 /// local one. What stands between that and root is the consent window, which
 /// names the requester, and the nod, which a remote shell cannot produce.
 ///
-/// `pidfd`, when the kernel gives one (SO_PEERPIDFD), is checked after the
-/// reads: a caller that exits before its /proc is read is not local.
+/// `pidfd` (SO_PEERPIDFD) is required and checked after the reads: without
+/// one the caller is remote, and so is a caller that exited before its
+/// /proc could be read.
 pub(super) fn locality(
     pid: i32,
     pidfd: Option<&std::os::fd::OwnedFd>,
@@ -110,30 +111,73 @@ pub(super) fn active_graphical_session(v: &dyn ProcView, uid: u32) -> bool {
     false
 }
 
+/// Where the process `pid` comes from, for the key-fallback line and
+/// polkit's answer (round 6, item 7): its cgroup read from /proc, weighed
+/// against logind's records (`lockgate::origin_of`). A cgroup that cannot
+/// be read is the desktop: the request may wait, and never gets the key
+/// while locked either way.
+pub(super) fn origin_of_pid(pid: i32) -> crate::lockgate::Origin {
+    crate::lockgate::origin_of(
+        &LiveProcs.cgroup(pid).unwrap_or_default(),
+        std::path::Path::new("/run/systemd"),
+    )
+}
+
+/// The binding of a request from the PAM process `pid` for the account
+/// `uid` (round 8, Codex 3; `lockgate::bind_for`): sudo's own logind
+/// session, or the session of the agent that connected polkit's helper.
+/// Ambiguous for an unknown account.
+pub(super) fn bind_of_pid(pid: i32, uid: Option<u32>) -> crate::lockgate::Bind {
+    let Some(uid) = uid else {
+        return crate::lockgate::Bind::Ambiguous;
+    };
+    let cgroup = LiveProcs.cgroup(pid).unwrap_or_default();
+    // polkit's helper's signs, both readable without ptrace rights (fix
+    // round 14, Opus N1, Codex 2; `lockgate::HelperSigns`).
+    let comm = LiveProcs.comm(pid);
+    let signs = crate::lockgate::HelperSigns {
+        ruid: LiveProcs.real_uid(pid),
+        comm: Some(comm.as_str()),
+    };
+    // The agent's pid only while it is still the process systemd named.
+    let id = crate::lockgate::polkit_instance_id(&cgroup, signs);
+    crate::lockgate::bind_for(&cgroup, signs, uid, &|p| {
+        let p = i32::try_from(p).ok()?;
+        if id.is_some() && LiveProcs.pidfd_id(p) != id {
+            return None;
+        }
+        LiveProcs.cgroup(p)
+    })
+}
+
 pub(super) struct LiveProcs;
 
 /// A pidfd for a live process, or None when it is gone.
 pub(super) fn pidfd_open(pid: i32) -> Option<std::os::fd::OwnedFd> {
     use std::os::fd::FromRawFd;
+    // SAFETY: pidfd_open takes a pid and flags and no pointers; nix has
+    // no wrapper for it.
     let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
     if raw < 0 {
         return None;
     }
+    // SAFETY: a non-negative return is a new file descriptor that nothing
+    // else owns, so the OwnedFd is its only owner and closes it once.
     Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) })
 }
 
 impl ProcView for LiveProcs {
     fn ppid(&self, pid: i32) -> Option<i32> {
-        crate::consent::ppid_of(pid)
+        procfs::ppid(pid)
     }
     fn comm(&self, pid: i32) -> String {
         crate::consent::comm_of(pid)
     }
     fn real_uid(&self, pid: i32) -> Option<u32> {
-        crate::consent::real_uid_of(pid)
+        procfs::real_uid(pid)
     }
     fn cgroup(&self, pid: i32) -> Option<String> {
-        crate::consent::read_proc(pid, "cgroup")
+        procfs::read(pid, "cgroup")
     }
     fn pidfd_id(&self, pid: i32) -> Option<u64> {
         nix::sys::stat::fstat(&pidfd_open(pid)?)
@@ -230,19 +274,24 @@ fn locality_of(
     let cgroup = v
         .cgroup(pid)
         .ok_or_else(|| anyhow::anyhow!("no cgroup for process {}", pid))?;
-    let path = cgroup
-        .lines()
-        .find_map(|l| l.splitn(3, ':').nth(2))
+    let path = procfs::cgroup_path(&cgroup)
         .ok_or_else(|| anyhow::anyhow!("no cgroup path"))?
         .to_string();
     let target_uid = v
         .user_uid(target_user)
         .ok_or_else(|| anyhow::anyhow!("unknown user {}", target_user))?;
-    // 2. Root's services: only polkit's helper, and only through to the
+    // 2. Root's services: only polkit's helper, in its own slice (fix round
+    // 13, Codex 5), root with the helper's comm (fix round 14: never by its
+    // executable, which faceauthd cannot read), and only through to the
     // agent that connected it.
     if real_uid == 0 && path.starts_with("/system.slice/") {
         let unit = path.trim().rsplit('/').next().unwrap_or("").to_string();
-        let Some(instance) = polkit_helper_instance(&unit) else {
+        let comm = v.comm(pid);
+        let signs = crate::lockgate::HelperSigns {
+            ruid: Some(real_uid),
+            comm: Some(comm.as_str()),
+        };
+        let Some(instance) = crate::lockgate::polkit_helper_instance(&cgroup, signs) else {
             return Ok(Locality::Remote(format!(
                 "root service {} is not a session",
                 unit
@@ -336,13 +385,6 @@ fn locality_of(
     )))
 }
 
-/// The instance of a `polkit-agent-helper@<instance>.service` unit name.
-fn polkit_helper_instance(unit: &str) -> Option<&str> {
-    unit.strip_prefix("polkit-agent-helper@")?
-        .strip_suffix(".service")
-        .filter(|i| !i.is_empty())
-}
-
 /// The peer systemd wrote into a socket-activated instance name,
 /// `<n>-<cookie>-<pid>_<pidfd id>-<uid>` (or `<n>-<cookie>-<pid>-<uid>` from
 /// a systemd without pidfd ids): the pid and the id. Anything else is None.
@@ -379,16 +421,7 @@ fn loginctl(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// A pidfd polls readable once its process has exited.
-fn process_exited(fd: &std::os::fd::OwnedFd) -> bool {
-    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-    let mut fds = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
-    match poll(&mut fds, PollTimeout::ZERO) {
-        Ok(n) if n > 0 => true,
-        Ok(_) => false,
-        Err(_) => true,
-    }
-}
+pub(super) use crate::consent::process_exited;
 
 /// OpenSSH's per-connection processes: `sshd` up to 9.7, `sshd-session`
 /// from 9.8 (and `sshd-auth` during authentication, never an ancestor of a
@@ -560,7 +593,7 @@ mod locality_tests {
         }
         fn user_uid(&self, name: &str) -> Option<u32> {
             match name {
-                "mike" => Some(1000),
+                "alice" => Some(1000),
                 "other" => Some(1001),
                 _ => None,
             }
@@ -618,7 +651,7 @@ mod locality_tests {
         let mut t = Table::new();
         t.add(500, 1, "quickshell", 1000, SHELL)
             .add(600, 1, "polkit-agent-he", 0, HELPER);
-        match locality_inner(&t, 600, "mike").unwrap() {
+        match locality_inner(&t, 600, "alice").unwrap() {
             Locality::Local(agent) => assert_eq!(
                 agent,
                 Some(crate::consent::AgentPeer { pid: 500, id: 5000 })
@@ -635,7 +668,7 @@ mod locality_tests {
         t.add(400, 1, "sshd-session", 1000, SSH)
             .add(500, 400, "pkexec", 0, SSH)
             .add(600, 1, "polkit-agent-he", 0, HELPER);
-        let why = remote(locality_inner(&t, 600, "mike"));
+        let why = remote(locality_inner(&t, 600, "alice"));
         assert!(
             why.contains("agent pid 500") && why.contains("sshd-session"),
             "{}",
@@ -649,14 +682,14 @@ mod locality_tests {
     fn a_polkit_helper_whose_agent_cannot_be_pinned_is_remote() {
         let mut t = Table::new();
         t.add(600, 1, "polkit-agent-he", 0, HELPER);
-        assert!(remote(locality_inner(&t, 600, "mike")).contains("is gone"));
+        assert!(remote(locality_inner(&t, 600, "alice")).contains("is gone"));
         t.add(500, 1, "quickshell", 1000, SHELL);
         t.procs.get_mut(&500).unwrap().4 = Some(5001);
-        assert!(remote(locality_inner(&t, 600, "mike")).contains("is gone"));
+        assert!(remote(locality_inner(&t, 600, "alice")).contains("is gone"));
         t.add(601, 1, "polkit-agent-he", 0, "0::/system.slice/system-polkit\\x2dagent\\x2dhelper.slice/polkit-agent-helper@306-8263-500-1000.service\n");
-        assert!(remote(locality_inner(&t, 601, "mike")).contains("no pidfd id"));
+        assert!(remote(locality_inner(&t, 601, "alice")).contains("no pidfd id"));
         t.add(602, 1, "polkit-agent-he", 0, "0::/system.slice/system-polkit\\x2dagent\\x2dhelper.slice/polkit-agent-helper@garbage.service\n");
-        assert!(remote(locality_inner(&t, 602, "mike")).contains("does not name its agent"));
+        assert!(remote(locality_inner(&t, 602, "alice")).contains("does not name its agent"));
     }
 
     /// Root in system.slice is no longer local on its own.
@@ -664,7 +697,7 @@ mod locality_tests {
     fn a_root_service_that_is_not_the_polkit_helper_is_remote() {
         let mut t = Table::new();
         t.add(700, 1, "cron", 0, "0::/system.slice/cronie.service\n");
-        assert!(remote(locality_inner(&t, 700, "mike")).contains("not a session"));
+        assert!(remote(locality_inner(&t, 700, "alice")).contains("not a session"));
     }
 
     /// A session scope is local only when it is the target user's session.
@@ -682,7 +715,7 @@ mod locality_tests {
             locality_inner(&t, 800, "other").unwrap(),
             Locality::Local(None)
         ));
-        assert!(remote(locality_inner(&t, 800, "mike")).contains("not mike's"));
+        assert!(remote(locality_inner(&t, 800, "alice")).contains("not alice's"));
     }
 
     #[test]
@@ -695,11 +728,104 @@ mod locality_tests {
         assert_eq!(helper_peer("23"), None);
         assert_eq!(helper_peer("a-b-c-d"), None);
         assert_eq!(helper_peer("306-8263-3747358_x-1000"), None);
+        let signs = crate::lockgate::HelperSigns {
+            ruid: Some(0),
+            comm: Some(crate::lockgate::POLKIT_HELPER_COMM),
+        };
         assert_eq!(
-            polkit_helper_instance("polkit-agent-helper@23.service"),
+            crate::lockgate::polkit_helper_instance(
+                "0::/system.slice/system-polkit\\x2dagent\\x2dhelper.slice/polkit-agent-helper@23.service\n",
+                signs
+            ),
             Some("23")
         );
-        assert_eq!(polkit_helper_instance("polkit.service"), None);
+        assert_eq!(
+            crate::lockgate::polkit_helper_instance("0::/system.slice/polkit.service\n", signs),
+            None
+        );
+    }
+
+    /// Fix round 14 (Opus N1, Codex 2; Opus's probe
+    /// `opus14_probe_helper_exe_unreadable`, turned around): faceauthd, uid
+    /// 0 with no capability, cannot read polkit's helper's exe (root with
+    /// its unit's full permitted set: fs/proc/base.c, `call_proc_get_link`;
+    /// security/commoncap.c, `cap_ptrace_access_check`), and with the exe
+    /// condition every polkit request was refused as remote. Nothing here
+    /// asks for it now: from what /proc gives without ptrace (cgroup,
+    /// status, comm) a genuine helper is local, bound through its agent,
+    /// and charged to the agent's account. The fake has no exe to give, as
+    /// the kernel gives none.
+    #[test]
+    fn polkits_helper_is_local_bound_and_attributed_without_its_exe() {
+        let mut t = Table::new();
+        t.add(500, 1, "quickshell", 1000, SHELL)
+            .add(600, 1, "polkit-agent-he", 0, HELPER);
+        match locality_inner(&t, 600, "alice").unwrap() {
+            Locality::Local(agent) => assert_eq!(
+                agent,
+                Some(crate::consent::AgentPeer { pid: 500, id: 5000 })
+            ),
+            Locality::Remote(why) => panic!("polkit's helper is local: {}", why),
+        }
+        let comm = t.comm(600);
+        let signs = crate::lockgate::HelperSigns {
+            ruid: t.real_uid(600),
+            comm: Some(comm.as_str()),
+        };
+        assert_eq!(
+            crate::lockgate::bind_for(HELPER, signs, 1000, &|p| {
+                (p == 500).then(|| SHELL.to_string())
+            }),
+            crate::lockgate::Bind::OnlyDesktop,
+            "bound through its agent"
+        );
+        assert_eq!(
+            crate::server::limits::attribute(
+                0,
+                Some(HELPER),
+                Some(comm.as_str()),
+                Some("4294967295"),
+                t.real_uid(600),
+                true
+            ),
+            crate::server::limits::Source::User(1000),
+            "charged to the agent's account"
+        );
+    }
+
+    /// Fix round 14 (Opus N1, Codex 2): nothing that decides whether a
+    /// process is polkit's helper reads an executable link.
+    #[test]
+    fn nothing_on_the_polkit_path_reads_an_exe() {
+        for (name, source) in [
+            ("lockgate.rs", include_str!("../lockgate.rs")),
+            ("locality.rs", include_str!("locality.rs")),
+            ("serve.rs", include_str!("serve.rs")),
+            ("limits.rs", include_str!("limits.rs")),
+        ] {
+            let code = source
+                .split(concat!("#[cfg(test)]\n", "mod "))
+                .next()
+                .unwrap();
+            for read in [
+                concat!("procfs::", "exe("),
+                concat!(".", "exe("),
+                concat!("read_", "link("),
+            ] {
+                assert!(!code.contains(read), "{} calls {}", name, read);
+            }
+        }
+    }
+
+    /// Fix round 13 (Codex 5): a root process in the helpers' slice that
+    /// is not polkit's helper (fix round 14: by its comm) is not followed to
+    /// an agent: it is a root service, and not local.
+    #[test]
+    fn a_root_process_in_the_helpers_slice_that_is_not_the_helper_is_remote() {
+        let mut t = Table::new();
+        t.add(500, 1, "quickshell", 1000, SHELL)
+            .add(600, 1, "sh", 0, HELPER);
+        assert!(remote(locality_inner(&t, 600, "alice")).contains("not a session"));
     }
 
     #[test]
@@ -709,10 +835,10 @@ mod locality_tests {
         let mut t = Table::new();
         t.add(500, 1, "quickshell", 1000, SHELL);
         assert!(matches!(
-            locality_inner(&t, 500, "mike"),
+            locality_inner(&t, 500, "alice"),
             Ok(Locality::Local(_))
         ));
-        match locality_with(&t, 500, None, "mike") {
+        match locality_with(&t, 500, None, "alice") {
             Locality::Remote(why) => assert!(why.contains("pidfd"), "{}", why),
             Locality::Local(_) => panic!("no pidfd must not be local"),
         }
@@ -729,11 +855,8 @@ mod locality_tests {
 
     #[test]
     fn a_process_that_exited_is_not_local() {
-        use std::os::fd::FromRawFd;
         let child = std::process::Command::new("/bin/true").spawn().unwrap();
-        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) };
-        assert!(raw >= 0, "pidfd_open");
-        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
+        let fd = pidfd_open(child.id() as i32).expect("pidfd_open");
         let mut child = child;
         child.wait().unwrap();
         assert!(process_exited(&fd));
@@ -745,11 +868,7 @@ mod locality_tests {
     fn this_test_process_is_classified() {
         let me = std::env::var("USER").unwrap_or_else(|_| "root".into());
         // With a pidfd of this very process, as the daemon would hold for a peer.
-        use std::os::fd::FromRawFd;
-        let raw =
-            unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id() as libc::pid_t, 0) };
-        assert!(raw >= 0, "pidfd_open");
-        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
+        let fd = pidfd_open(std::process::id() as i32).expect("pidfd_open");
         let r = locality(std::process::id() as i32, Some(&fd), &me);
         if std::env::var_os("SSH_CONNECTION").is_some() {
             assert!(

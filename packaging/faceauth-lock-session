@@ -1,43 +1,108 @@
 #!/bin/bash
 # Lock a user's Omarchy session from the faceauth daemon (root).
-#   faceauth-lock-session <user> <omarchy-path>
-# The lock command runs inside the user's own systemd manager, with that
-# session's environment, so the daemon never switches uid itself: the service
-# sandbox drops CAP_SETUID, and runuser/su would open a PAM session whose
-# modules fail under it. The Omarchy tree is the daemon's to resolve (its
-# config, then /etc/omarchy.conf, then the package), so it is passed in and
-# never parsed here a second time.
+#   faceauth-lock-session <user> <omarchy-path> <uid> <session-id>...
+# The lock commands run inside the user's own systemd manager, with that
+# manager's environment, so the daemon never switches uid itself: the
+# service sandbox drops CAP_SETUID, and runuser/su would open a PAM session
+# whose modules fail under it. The Omarchy tree is the daemon's to resolve
+# (/etc/omarchy.conf, else the package), so it is passed in and never parsed
+# here a second time.
+#
+# The route can never start a manager (fix round 9). `systemd-run
+# --machine=USER@.host --user` opens a PAM session (sd-bus runs `systemd-run
+# -pPAMName=login systemd-stdio-bridge`), and logind starts the user's
+# manager for a new session. Instead a system unit runs as the user with no
+# PAMName= (no session), its runtime directory and bus address set outright,
+# and runs `systemd-run --user`, which reaches the manager over the user's
+# own bus socket; with no manager running there is no socket, and nothing
+# starts.
+#
+# The sessions the daemon pinned are checked before every call: each still
+# in logind's records, the user's, graphical and not closing. A logout, or a
+# logout and a fresh login, between the daemon's check and a call stops the
+# rest (exit 3). Both units of each call check them again the moment they
+# start (fix round 10): the carrier before it reaches the user's manager,
+# the user's unit before the command, so a call a manager starts late runs
+# nothing once the session is gone. `pin_check` is the daemon's PIN_CHECK
+# (faceauth-daemon/src/consent/shell.rs), word for word; it exits 75 when a
+# pinned session is gone. No manager expands `$` in the arguments
+# (--expand-environment=no), so it arrives as written.
+#
+# Each call is bounded: `timeout -k 1 4` on the launcher, and
+# RuntimeMaxSec=4s on both units, since ending the launcher leaves a unit
+# running (fix round 10), with KillSignal=SIGKILL, so a command that ignores
+# SIGTERM does not act late (fix round 11). The daemon reads this helper for
+# at most 11 s.
 #
 # A presence lock keeps the panel lit for ten minutes rather than the usual
 # few seconds: the owner may be a few feet away and wants to see the screen
 # waiting for them. `lock lockPresence` sets that before locking; the system
 # lock command then runs its usual extras (password manager, screensaver).
 #
-# The exit code is the daemon's only evidence. 0 means the compositor holds a
-# session lock; 1 means it does not, whatever the lock command said, so the
-# daemon keeps its away state and tries again on the next tick instead of
-# believing a lock that never happened.
+# The exit code says whether the lock commands ran (0), failed (1) or were
+# not run because a pinned session is gone (3). Whether the session is
+# locked is the daemon's anchored question to answer, never this helper's or
+# the user's manager's.
 set -uo pipefail
 
-user=${1:?user}
-omarchy_path=${2:?omarchy-path}
+user=${1:-}
+omarchy_path=${2:-}
+uid=${3:-}
+[[ -n $user && -n $omarchy_path && $uid =~ ^[0-9]+$ ]] || {
+  echo "faceauth-lock-session: usage: <user> <omarchy-path> <uid> <session-id>..." >&2
+  exit 1
+}
+shift 3
+(( $# > 0 )) || { echo "faceauth-lock-session: no pinned session" >&2; exit 1; }
+pinned=("$@")
+pin_check='uid=$1; shift; [ "$1" != -- ] || exit 75; while [ "$#" -gt 0 ] && [ "$1" != -- ]; do case $1 in ""|*[!A-Za-z0-9]*) exit 75;; esac; r=/run/systemd/sessions/$1; [ -f "$r" ] && /usr/bin/grep -qx "UID=$uid" "$r" && /usr/bin/grep -qxE "(ORIGINAL_)?TYPE=(wayland|x11|mir)" "$r" && ! /usr/bin/grep -qxE "STATE=closing|CLASS=greeter" "$r" || exit 75; shift; done; [ "$#" -gt 1 ] || exit 75; shift; exec "$@"'
+
+still_pinned() {
+  local id rec
+  for id in "${pinned[@]}"; do
+    [[ $id =~ ^[A-Za-z0-9]+$ ]] || return 1
+    rec=/run/systemd/sessions/$id
+    [[ -f $rec ]] || return 1
+    /usr/bin/grep -qx "UID=$uid" "$rec" || return 1
+    /usr/bin/grep -qx 'STATE=closing' "$rec" && return 1
+    /usr/bin/grep -qxE '(ORIGINAL_)?TYPE=(wayland|x11|mir)' "$rec" || return 1
+    /usr/bin/grep -qx 'CLASS=greeter' "$rec" && return 1
+  done
+  return 0
+}
 
 run_as_user() {
-  /usr/bin/timeout 15 /usr/bin/systemd-run --machine="$user@.host" --user --wait --collect --quiet \
-    -E "OMARCHY_PATH=$omarchy_path" "$@"
+  local rc
+  if ! still_pinned; then
+    echo "faceauth-lock-session: the pinned session is gone; nothing more is run" >&2
+    exit 3
+  fi
+  /usr/bin/timeout -k 1 4 /usr/bin/systemd-run --quiet --collect --expand-environment=no --wait --service-type=exec \
+    --description="Omarchy FaceAuth call into the user's manager" \
+    --property="User=$user" \
+    --property="Environment=XDG_RUNTIME_DIR=/run/user/$uid" \
+    --property="Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
+    --property=NoNewPrivileges=yes --property=CapabilityBoundingSet= \
+    --property=ProtectSystem=strict --property=ProtectHome=read-only \
+    --property=PrivateTmp=yes --property=PrivateNetwork=yes \
+    --property=RestrictAddressFamilies=AF_UNIX \
+    --property=LockPersonality=yes --property=RestrictSUIDSGID=yes \
+    --property=RuntimeMaxSec=4s --property=KillSignal=SIGKILL \
+    /bin/sh -c "$pin_check" faceauth-pin "$uid" "${pinned[@]}" -- \
+    /usr/bin/systemd-run --user --quiet --collect --expand-environment=no --wait \
+    --property=RuntimeMaxSec=4s --property=KillSignal=SIGKILL "-EOMARCHY_PATH=$omarchy_path" \
+    /bin/sh -c "$pin_check" faceauth-pin "$uid" "${pinned[@]}" -- "$@"
+  rc=$?
+  if (( rc == 75 )); then
+    echo "faceauth-lock-session: the pinned session ended as the call started; nothing more is run" >&2
+    exit 3
+  fi
+  return "$rc"
 }
 
 run_as_user /usr/bin/omarchy-shell lock lockPresence || true
-run_as_user /usr/bin/omarchy-system-lock || echo "faceauth-lock-session: the lock command failed" >&2
-
-# The lock command can return before the lock is up, or return 0 without
-# locking at all (a dev-linked shell answering an IPC it does not serve). Ask
-# the compositor, for up to three seconds, and answer with what it says.
-for _ in 1 2 3 4 5 6; do
-  if run_as_user /usr/bin/omarchy-hyprland-session-locked; then
-    exit 0
-  fi
-  sleep 0.5
-done
-echo "faceauth-lock-session: the session is not locked" >&2
-exit 1
+if ! run_as_user /usr/bin/omarchy-system-lock; then
+  echo "faceauth-lock-session: the lock command failed" >&2
+  exit 1
+fi
+exit 0

@@ -5,7 +5,7 @@
 //! mask, a lit frame paired with the unlit one before it):
 //!
 //! - **Reflectance.** Paper and card reflect near-infrared several times more
-//!   than skin. The face's flash response per unit exposure, normalised for
+//!   than skin. The face's flash response per unit exposure, normalized for
 //!   distance through the face width (flash goes as 1/d^2, width as 1/d), is an
 //!   albedo estimate: measured 0.28 for a face and 1.7 for a plain-paper print.
 //! - **Surround.** A print's surround is at the print's distance and lights up
@@ -17,7 +17,7 @@
 //!
 //! Both measurements need the lit frame to be a measurement: at the exposure
 //! a scan settles on (256 to 400 lines, from a 500-line start stepping down
-//! by a fifth every 400 ms) a print's flash is several hundred grey levels
+//! by a fifth every 400 ms) a print's flash is several hundred gray levels
 //! and the 8-bit frame clips at 255, which reads as an ordinary reflectance.
 //! A pair whose face is mostly clipped is therefore no signal, not a pass.
 //!
@@ -28,20 +28,20 @@ use crate::image::Grey;
 use crate::Face;
 
 /// Face width the reflectance was calibrated at, in pixels of the oriented frame.
-pub const REFERENCE_FACE_PX: f32 = 87.0;
-/// Normalised reflectance above this is not skin (face 0.28, print 1.66).
-pub const REFLECTANCE_DENY: f32 = 0.80;
+pub const REFERENCE_FACE_PX: f32 = crate::profile::OV7251_SURFACE_BOOK_2.reference_face_px;
+/// Normalized reflectance above this is not skin (face 0.28, print 1.66).
+pub const REFLECTANCE_DENY: f32 = crate::profile::OV7251_SURFACE_BOOK_2.reflectance_deny;
 /// Surround-to-face flash ratio above this means the surround is at the face's distance.
-pub const SURROUND_DENY: f32 = 0.42;
+pub const SURROUND_DENY: f32 = crate::profile::OV7251_SURFACE_BOOK_2.surround_deny;
 /// Below this flash response the pair carries no usable signal (LEDs off, or too far).
-pub const MIN_FACE_FLASH: f32 = 4.0;
+pub const MIN_FACE_FLASH: f32 = crate::profile::OV7251_SURFACE_BOOK_2.min_face_flash;
 /// A lit pixel at or above this is clipped: its flash is unknown.
 pub const CLIP_LEVEL: u8 = 250;
 /// When more of the face than this is clipped the reflectance cannot be
 /// read. A clipped print is clipped over its whole face; a real face wearing
 /// glasses throws two glints of a few pixels each, a percent or two of the
 /// face, so this is set well above what glints reach and well below a print.
-pub const MAX_CLIPPED: f32 = 0.20;
+pub const MAX_CLIPPED: f32 = crate::profile::OV7251_SURFACE_BOOK_2.max_clipped;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FlashResponse {
@@ -51,7 +51,7 @@ pub struct FlashResponse {
     pub ring_flash: f32,
     /// ring / face.
     pub surround: f32,
-    /// face_flash / (exposure * gain/16), distance-normalised to REFERENCE_FACE_PX.
+    /// face_flash / (exposure * gain/16), distance-normalized to REFERENCE_FACE_PX.
     pub reflectance: f32,
     pub face_px: f32,
     /// Share of the inner face's lit pixels at or above `CLIP_LEVEL`.
@@ -211,23 +211,39 @@ impl FlashResponse {
 /// once the last eight frames' brightness has followed a rotation of that
 /// mask. A stream that brightens on its own schedule is never a pair.
 ///
+/// The sensor takes the mask's bits in turn from bit 7 towards bit 0,
+/// wrapping, and the check reads the last eight frames oldest first into
+/// bit 7 down to bit 0 to match. That order is measured, not assumed: the
+/// sensor's documentation leaves it open, and under the other order the 32
+/// masks that are not a rotation of their own mirror image would never
+/// pair. On a Surface Book 2 all 247 presence looks logged without a
+/// reading on 2026-09-24 and 25 followed their mask, where the other order
+/// would have left about half of them never following it. `backwards`
+/// tells when the frames follow the mask the other way.
+///
 /// What that is worth, measured (`phase_tests`): the 68 masks fall into 9
 /// rotation classes, and any rotation is accepted, so a recording that
 /// loops one fixed balanced mask is in phase for 8 of the 68 draws, one
 /// gate in nine. A gate that redraws the mask after each scored pair
 /// (`redraw`) and wants its pairs under different masks brings that to 64
 /// in 4624, about 1.4 percent. Out-of-phase frames cost the replayer
-/// nothing unless the caller charges them; `edges_off_mask` counts the
-/// brightness steps that never lined up, which a steady scene never
-/// produces. A device that honours the control but replays a face in step
-/// is not caught by any of this (see the README's "Not defended" list).
+/// nothing: `edges_off_mask` counts the strong brightness steps that never
+/// lined up, which a steady scene never produces, and the daemon's attempt
+/// logs a scan that stepped off the mask throughout but does not charge it,
+/// since a lamp flickering with the mains makes a live face step that way
+/// too (C11). A device that honors the control but replays a
+/// face in step is not caught by any of this (see the README's "Not
+/// defended" list).
 #[derive(Clone, Debug)]
 pub struct StrobePhase {
     pattern: u8,
     /// Brightness class of the frames seen so far, newest last: true is lit.
     bits: Vec<bool>,
     last_mean: Option<f64>,
-    /// Rising edges seen while the frames were not following the mask.
+    /// Strong rising edges (`OFF_MASK_STEP`) seen while the frames were not
+    /// following the mask, since the last reset.
+    run_off_mask: usize,
+    /// The most `run_off_mask` reached in one unbroken run of frames.
     edges_off_mask: usize,
     /// Whether the frames have followed the mask at least once.
     matched: bool,
@@ -237,7 +253,21 @@ pub struct StrobePhase {
 
 /// A lit frame is at least this much brighter than the frame before it (the
 /// same margin every gate path used before the phase check existed).
-pub const LIT_STEP: f64 = 1.15;
+pub const LIT_STEP: f64 = crate::profile::OV7251_SURFACE_BOOK_2.lit_step;
+/// A step up counts as off the mask only at this ratio or more (C11). A
+/// live face whose flash contrast sits near `LIT_STEP` (a sunlit desk, the
+/// user sitting back) has the classifier catch some of its steps and miss
+/// others, so its frames may never follow the mask while the steps it does
+/// catch pile up; those steps sit near 1.15, where a replay looping its
+/// own pattern at a clear contrast steps hard. The margin is from the
+/// simulation in the daemon's `strobe` tests, 1020 runs per condition: at
+/// 1.28 no live run was flagged at contrasts 1.05 to 1.30 with 1 to 3
+/// percent frame noise, dropped frames or not, and a replay looping its
+/// own pattern at 1.3 was flagged in 362 runs of 364 or more. A lamp
+/// flickering with the mains still gets a live face flagged, so the flag
+/// is logged, never charged. The live side is a model, not a measurement
+/// of faces in sunlight.
+pub const OFF_MASK_STEP: f64 = crate::profile::OV7251_SURFACE_BOOK_2.off_mask_step;
 /// The fall-back mask when the OS gives no randomness: plain alternation,
 /// which the phase check still enforces.
 pub const ALTERNATING: u8 = 0xaa;
@@ -253,6 +283,7 @@ impl StrobePhase {
             pattern,
             bits: Vec::new(),
             last_mean: None,
+            run_off_mask: 0,
             edges_off_mask: 0,
             matched: false,
             draws: 1,
@@ -277,10 +308,13 @@ impl StrobePhase {
     /// Forget the frames seen so far and keep the mask: after a dropped
     /// frame the frames either side of the gap may be any two of the mask,
     /// so the next pair is offered only once eight frames have followed
-    /// it again (J8).
+    /// it again (J8). The off-mask steps start a new run too: frames lost
+    /// to the driver break the lock the same way a replay never makes one,
+    /// so steps either side of a gap never add up (C11).
     pub fn reset(&mut self) {
         self.bits.clear();
         self.last_mean = None;
+        self.run_off_mask = 0;
     }
 
     /// How many masks this gate has drawn.
@@ -288,9 +322,10 @@ impl StrobePhase {
         self.draws
     }
 
-    /// Brightness steps up that arrived while the frames were not following
+    /// The most strong brightness steps up (`OFF_MASK_STEP`) that arrived
+    /// in one unbroken run of frames while the frames were not following
     /// the mask. A scene under the strobe steps only on the mask; a stream
-    /// brightening on its own schedule steps and never lines up.
+    /// brightening on its own schedule steps hard and never lines up.
     pub fn edges_off_mask(&self) -> usize {
         self.edges_off_mask
     }
@@ -312,6 +347,7 @@ impl StrobePhase {
             Some(_) => self.bits.last().copied().unwrap_or(false),
         };
         let rising = matches!(self.bits.last(), Some(false)) && lit;
+        let strong = self.last_mean.is_some_and(|p| mean >= p * OFF_MASK_STEP);
         self.last_mean = Some(mean);
         self.bits.push(lit);
         if self.bits.len() > 16 {
@@ -319,21 +355,41 @@ impl StrobePhase {
         }
         let in_phase = self.in_phase();
         self.matched |= in_phase;
-        if rising && !in_phase {
-            self.edges_off_mask += 1;
+        if rising && !in_phase && strong {
+            self.run_off_mask += 1;
+            self.edges_off_mask = self.edges_off_mask.max(self.run_off_mask);
         }
         rising && in_phase
     }
 
     /// Do the last eight frames follow some rotation of the mask?
     pub fn in_phase(&self) -> bool {
-        if self.bits.len() < 8 {
+        self.bits.len() >= 8 && follows(self.pattern, &self.bits[self.bits.len() - 8..])
+    }
+
+    /// Do the recent frames follow the mask backwards? True when the last
+    /// sixteen frames repeat one eight-frame cycle that is a rotation of
+    /// the mask with its bits reversed and no rotation of the mask itself.
+    /// Only a mask that is not a rotation of its own mirror image can show
+    /// this; for the rest both orders read the same. Two full cycles, so
+    /// eight stray frames that happen to spell the reversed mask do not
+    /// count. A diagnostic only: such frames are never in phase.
+    pub fn backwards(&self) -> bool {
+        if self.bits.len() < 16 {
             return false;
         }
-        let tail = &self.bits[self.bits.len() - 8..];
-        let observed = tail.iter().fold(0u8, |acc, &b| (acc << 1) | b as u8);
-        (0..8).any(|r| self.pattern.rotate_left(r) == observed)
+        let tail = &self.bits[self.bits.len() - 16..];
+        tail[..8] == tail[8..]
+            && follows(self.pattern.reverse_bits(), &tail[8..])
+            && !follows(self.pattern, &tail[8..])
     }
+}
+
+/// Do eight frames, oldest first, read as some rotation of `mask` taken
+/// from bit 7 towards bit 0?
+fn follows(mask: u8, frames: &[bool]) -> bool {
+    let observed = frames.iter().fold(0u8, |acc, &b| (acc << 1) | b as u8);
+    (0..8).any(|r| mask.rotate_left(r) == observed)
 }
 
 /// A mask with four lit and four unlit frames that is not 0xaa or 0x55,
@@ -502,6 +558,46 @@ mod phase_tests {
         assert!(real.edges_off_mask() <= 3, "{}", real.edges_off_mask());
     }
 
+    /// C11: a step off the mask counts only when it is strong, and only
+    /// within an unbroken run of frames. Steps a little over `LIT_STEP`
+    /// (a live face at a faint flash) count nothing however many there
+    /// are; hard steps count, a reset after a dropped frame starts a new
+    /// run, and the most any run reached is kept.
+    #[test]
+    fn only_strong_steps_off_the_mask_count_and_a_gap_starts_a_new_run() {
+        let mask = 0b1011_0100u8;
+        let stream = |phase: &mut StrobePhase, step: f64, n: usize| {
+            for i in 0..n {
+                let lit = (0xaau8 >> (7 - (i % 8))) & 1 == 1;
+                phase.push(if lit { 100.0 * step } else { 100.0 });
+            }
+        };
+        let mut faint = StrobePhase::with_pattern(mask);
+        stream(&mut faint, 1.2, 80);
+        assert!(!faint.ever_in_phase());
+        assert_eq!(faint.edges_off_mask(), 0, "steps of 1.2 are not strong");
+        // The first frame has nothing to step from, so 0xaa rises on
+        // frames 2, 4, 6 and so on: eight times in seventeen frames.
+        let mut hard = StrobePhase::with_pattern(mask);
+        stream(&mut hard, OFF_MASK_STEP, 17);
+        assert_eq!(hard.edges_off_mask(), 8, "every rising edge");
+        hard.reset();
+        stream(&mut hard, 2.0, 6);
+        assert_eq!(hard.edges_off_mask(), 8, "the longest run is kept");
+        // A frame dropped every six: two rising edges a run, however long
+        // the stream goes on.
+        let mut gappy = StrobePhase::with_pattern(mask);
+        for _ in 0..40 {
+            stream(&mut gappy, 2.0, 6);
+            gappy.reset();
+        }
+        assert_eq!(
+            gappy.edges_off_mask(),
+            2,
+            "runs broken by gaps never add up"
+        );
+    }
+
     /// A redraw starts the eight-frame wait again under a fresh balanced
     /// mask, and counts the draw.
     #[test]
@@ -517,6 +613,34 @@ mod phase_tests {
         let offered = run(next, &mut phase, 0, 24);
         assert!(offered[..7].iter().all(|o| !o), "{:?}", offered);
         assert!(offered[8..].iter().any(|o| *o), "{:?}", offered);
+    }
+
+    /// The walk order (J9): frames that take a mask's bits from bit 0
+    /// towards bit 7 never pair 32 of the 68 masks, and read as backwards
+    /// on exactly those; the other 36 read the same both ways. Frames
+    /// taken the measured way round are never backwards.
+    #[test]
+    fn a_mask_walked_backwards_never_pairs_and_reads_as_backwards() {
+        let mut shown = 0;
+        for mask in balanced_masks() {
+            let mut back = StrobePhase::with_pattern(mask);
+            let offered = run(mask.reverse_bits(), &mut back, 3, 32);
+            if back.backwards() {
+                shown += 1;
+                assert!(!offered.iter().any(|o| *o), "{:#04x}", mask);
+                assert!(!back.ever_in_phase(), "{:#04x}", mask);
+            } else {
+                assert!(back.in_phase(), "{:#04x}", mask);
+            }
+            let mut fwd = StrobePhase::with_pattern(mask);
+            run(mask, &mut fwd, 3, 32);
+            assert!(fwd.in_phase() && !fwd.backwards(), "{:#04x}", mask);
+        }
+        assert_eq!(shown, 32);
+        // Short of two full cycles is too few to tell.
+        let mut back = StrobePhase::with_pattern(0b1110_1000);
+        run(0b0001_0111, &mut back, 0, 15);
+        assert!(!back.backwards());
     }
 }
 

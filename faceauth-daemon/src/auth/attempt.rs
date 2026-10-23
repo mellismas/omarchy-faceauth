@@ -13,13 +13,15 @@ use crate::config::Config;
 use crate::consent::{Answer, ConsentState};
 use crate::store::{Store, UserTemplates};
 use anyhow::{anyhow, Result};
-use faceauth_engine::Pipeline;
+use faceauth_engine::{Grey, Pipeline};
 use std::time::{Duration, Instant};
 
-/// The optional hook `run_with` calls on the still-open camera once two
-/// frames matched; `Ok(false)` from it turns the match into `ConsentDenied`.
+/// The optional hook `run_with` calls on the still-open camera once
+/// `required_matches` frames matched, with the matched face and the lit frame it matched on;
+/// `Ok(false)` from it turns the match into `ConsentDenied`.
 type AfterMatch<'a> = Option<
-    &'a mut (dyn FnMut(&mut IrCapture, &mut Pipeline, &faceauth_engine::Face) -> Result<bool> + 'a),
+    &'a mut (dyn FnMut(&mut IrCapture, &mut Pipeline, &faceauth_engine::Face, &Grey) -> Result<bool>
+                 + 'a),
 >;
 
 pub struct Authenticator {
@@ -37,6 +39,8 @@ pub struct Authenticator {
     /// The exposure the last attempt settled on with a face in view; the
     /// presence watch starts its short looks from it.
     pub last_exposure: Option<faceauth_camera::calib::Exposure>,
+    /// The last probe answer per user, for the probe's rate cap.
+    probe_cap: ProbeCap,
 }
 
 impl Authenticator {
@@ -58,15 +62,14 @@ impl Authenticator {
             failures: Default::default(),
             last_consent: Default::default(),
             last_exposure: None,
+            probe_cap: ProbeCap::default(),
         })
     }
 
-    /// One cheap look for the lock screen while its panel is blank: is anyone
-    /// there? About half a second of camera, detection only, no identity.
     /// A pose sweep: score every frame for `seconds` against the user's
     /// templates and record the head pose with it, so the curve of how the
     /// match falls off with yaw and pitch can be measured, and measured
-    /// again after enrolment changes. Root only (the server enforces it):
+    /// again after enrollment changes. Root only (the server enforces it):
     /// it returns scores.
     #[cfg(feature = "dev-tools")]
     pub fn sweep(&mut self, user: &str, seconds: f32) -> Outcome {
@@ -88,10 +91,11 @@ impl Authenticator {
             let device = cap.identity.clone();
             let deadline = Duration::from_secs_f32(seconds.clamp(3.0, 60.0));
             let mut frames = Vec::new();
+            let mut img = Grey::default();
             while t0.elapsed() < deadline {
-                let Some(img) = cap.next(Duration::from_secs(2))? else {
+                if !cap.next_into(&mut img, Duration::from_secs(2))? {
                     continue;
-                };
+                }
                 if cap.frames % 2 != 0 {
                     continue;
                 }
@@ -131,8 +135,8 @@ impl Authenticator {
 
     /// One cheap look for the lock screen while its panel is blank: is
     /// anyone there, and is it likely `user`? The presence watch's look
-    /// without its flash or identity check, so the two looks cannot drift
-    /// apart again (H12).
+    /// without its flash or its gated identity check, so the two looks
+    /// cannot drift apart again (H12).
     ///
     /// H12 kept the probe detector-only, with no identity and no scores,
     /// since a scored reply is a tuning oracle and replies that carry scores
@@ -149,46 +153,31 @@ impl Authenticator {
     /// frames metered on the face, so the 0.5 line has to be set against
     /// real probe scores. The full scan still runs the liveness gate and
     /// decides.
+    ///
+    /// The yes or no is a deliberate trade, a one-bit answer for the unlock
+    /// cascade, and a rate cap keeps it a slow oracle: a probe that comes
+    /// within `PROBE_MIN_GAP` of the last one for the same user gets that
+    /// answer again, with no look. An attempt for the user forgets the kept answer, so the probe
+    /// after a scan always looks again.
     pub fn probe(&mut self, user: &str) -> Outcome {
+        let now = Instant::now();
+        let mut cap = std::mem::take(&mut self.probe_cap);
+        let o = cap.answer(user, now, || self.fresh_probe(user));
+        self.probe_cap = cap;
+        o
+    }
+
+    /// A probe's own look, past the cap.
+    fn fresh_probe(&mut self, user: &str) -> Outcome {
         let t0 = Instant::now();
         let look = crate::presence::PresenceConfig::default();
-        match crate::presence::probe_look(self, &look, user) {
-            Ok((o, reading)) => {
-                let scannable = match (o.bbox, o.frame.as_ref()) {
-                    (Some(b), Some(f)) => scannable(b[2], f.width, f.height),
-                    _ => false,
-                };
-                let likely = probe_likely(scannable, reading.score.ok());
-                match reading.score {
-                    Ok(score) => log::debug!(
-                        "probe for {}: score {:.2}, likely {}, lit {}",
-                        user,
-                        score,
-                        likely,
-                        reading.lit
-                    ),
-                    Err(why) => log::debug!(
-                        "probe for {}: no score ({}), likely {}, lit {}",
-                        user,
-                        why,
-                        likely,
-                        reading.lit
-                    ),
-                }
-                Outcome::Probe {
-                    face: o.face,
-                    attentive: o.attentive,
-                    face_px: o.bbox.map(|b| b[2]).unwrap_or(0.0),
-                    scannable,
-                    likely,
-                    cadence: Cadence::from_config(&self.cfg.unlock),
-                    elapsed_ms: t0.elapsed().as_millis() as u64,
-                }
-            }
-            Err(e) => Outcome::Error {
-                message: e.to_string(),
-            },
-        }
+        let cadence = Cadence::from_config(&self.cfg.unlock);
+        probe_reply(
+            user,
+            crate::presence::probe_look(self, &look, user),
+            cadence,
+            t0,
+        )
     }
 
     pub fn ping(&self, user: &str) -> Outcome {
@@ -217,6 +206,8 @@ impl Authenticator {
     }
 
     pub fn authenticate(&mut self, user: &str) -> Outcome {
+        // The camera is about to look again: the next probe does too.
+        self.probe_cap.forget(user);
         let templates = match self.store.load(user) {
             Ok(Some(t)) => t,
             Ok(None) => return Outcome::NotEnrolled,
@@ -240,7 +231,7 @@ impl Authenticator {
                         self.failures.remove(user);
                         faillock_reset(user);
                     }
-                    Outcome::NoMatch { .. } | Outcome::Denied { .. } => {
+                    o if charges(o) => {
                         let _ = self.charge(user);
                     }
                     _ => {}
@@ -285,8 +276,8 @@ impl Authenticator {
         }
     }
 
-    /// `after_match` runs on the still-open camera once two frames matched, before
-    /// the outcome is returned; `Ok(false)` from it turns the match into
+    /// `after_match` runs on the still-open camera once `required_matches`
+    /// frames matched, before the outcome is returned; `Ok(false)` from it turns the match into
     /// `ConsentDenied`. Keeping the camera open avoids the two-to-three second
     /// restart that would otherwise eat the start of a consent gesture.
     fn run_with(
@@ -295,49 +286,52 @@ impl Authenticator {
         after_match: AfterMatch<'_>,
         timeout_seconds: f32,
     ) -> Result<Scan> {
-        self.run_with_answers(templates, after_match, timeout_seconds, None)
+        self.run_with_answers(templates, after_match, timeout_seconds, None, None)
     }
 
     /// The scan, with the consent window's answers read between frames
     /// when `state` names the live request: an answer ends the scan at
-    /// once as `Scan::Answered`, before the camera has said anything.
+    /// once as `Scan::Answered`, before the camera has said anything. A
+    /// key check that spent the card's PIN meanwhile has the card sent
+    /// again through `refresh`, so it asks for the PIN once more rather
+    /// than for a touch no check is waiting for.
     pub(super) fn run_with_answers(
         &mut self,
         templates: &UserTemplates,
         after_match: AfterMatch<'_>,
         timeout_seconds: f32,
         state: Option<(&ConsentState, &str)>,
+        refresh: Option<&dyn Fn()>,
     ) -> Result<Scan> {
         let t0 = Instant::now();
         let deadline = Duration::from_secs_f32(timeout_seconds);
         let ms = |t: Instant| t.elapsed().as_millis() as u64;
         let mut cap = IrCapture::open(&self.cfg)?;
-        let strobe = cap.illuminator.is_some();
         // Without the strobe the flash-response gate cannot run, and a print in
         // front of an IR camera is the documented attack. Refuse unless the
         // administrator has explicitly accepted ungated authentication.
-        if !strobe && self.cfg.liveness_required {
+        let tier = cap.tier();
+        if crate::tier::gate(tier, self.cfg.liveness_required) == crate::tier::Gate::Refuse {
             cap.stop()?;
             return Ok(Scan::Done(Outcome::Error {
-                message:
-                    "liveness gate unavailable (no strobe control) and liveness_required is set"
-                        .into(),
+                message: crate::tier::NO_GATE.into(),
             }));
         }
+        let strobe = tier.gated();
         // Templates only match on the camera they were enrolled on: a camera
         // swapped in for it has nothing to match against.
         let device = cap.identity.clone();
         if templates.usable_on(&device) == 0 {
             cap.stop()?;
             log::warn!(
-                "attempt for {}: templates are bound to {:?}, this camera is {:?}; re-enrol",
+                "attempt for {}: templates are bound to {:?}, this camera is {:?}; re-enroll",
                 templates.user,
                 templates.bound_devices(),
                 device
             );
             return Ok(Scan::Done(Outcome::Error {
                 message: format!(
-                    "templates are bound to another camera ({}); this one is {}; re-enrol",
+                    "templates are bound to another camera ({}); this one is {}; re-enroll",
                     templates.bound_devices().join(", "),
                     device
                 ),
@@ -352,6 +346,8 @@ impl Authenticator {
         let mut settle_info = String::new();
         let mut n_frames = 0usize;
         let cap_after = scoring_cap(self.cfg.attempt_timeout);
+        // One frame, read into again and again (C7).
+        let mut img = Grey::default();
         loop {
             if t0.elapsed() > deadline {
                 break;
@@ -364,10 +360,11 @@ impl Authenticator {
                         return Ok(Scan::Answered(a));
                     }
                 }
+                refresh_if_stale(st, u, refresh);
             }
-            let Some(img) = cap.next(Duration::from_secs(2))? else {
+            if !cap.next_into(&mut img, Duration::from_secs(2))? {
                 continue;
-            };
+            }
             n_frames += 1;
             if cap.frames % 3 != 0 {
                 continue;
@@ -422,7 +419,7 @@ impl Authenticator {
         if let Some(b) = last_face {
             gate.focus_on(b);
         }
-        let matched: Option<faceauth_engine::Face> = loop {
+        let matched: Option<(faceauth_engine::Face, Grey)> = loop {
             if t0.elapsed() > deadline {
                 break None;
             }
@@ -435,6 +432,7 @@ impl Authenticator {
                         return Ok(Scan::Answered(a));
                     }
                 }
+                refresh_if_stale(st, u, refresh);
             }
             // Scoring is bounded like a lock-screen attempt: a face that has
             // been scored for `scoring_cap` without matching ends the scan
@@ -527,7 +525,7 @@ impl Authenticator {
                 self.cfg.required_matches
             );
             if matches >= self.cfg.required_matches {
-                break Some(face);
+                break Some((face, pair.lit));
             }
             // The next match must come under a fresh mask (C11). Only a
             // match earns the redraw: redrawing after every scored pair
@@ -539,10 +537,11 @@ impl Authenticator {
             }
         };
         let n_frames = n_frames + gate.frames();
+        let off_mask = gate.off_mask();
         // The gate ends here: steady light and free-running exposure for
         // whatever follows, the gesture included.
         drop(gate);
-        let Some(face) = matched else {
+        let Some((face, frame)) = matched else {
             // How many frames matched is logged only on success: on a failure
             // it says how close the presentation came (D6).
             log::info!(
@@ -561,7 +560,7 @@ impl Authenticator {
             );
             cap.stop()?;
             return Ok(Scan::Done(if scored == 0 {
-                Outcome::NoFace { elapsed_ms: ms(t0) }
+                unscored(off_mask, ms(t0))
             } else {
                 Outcome::NoMatch {
                     score: Some(best),
@@ -588,7 +587,7 @@ impl Authenticator {
             score_trail.join(" ")
         );
         if let Some(hook) = after_match {
-            let ok = hook(&mut cap, &mut self.pipeline, &face)?;
+            let ok = hook(&mut cap, &mut self.pipeline, &face, &frame)?;
             cap.stop()?;
             if !ok {
                 return Ok(Scan::Done(consent_denied(Refusal::NoNod, ms(t0))));
@@ -601,6 +600,119 @@ impl Authenticator {
             frames: scored,
             elapsed_ms: ms(t0),
         }))
+    }
+}
+
+/// Does an attempt's outcome count against the user's cooldown? A face
+/// that did not match, and a liveness refusal.
+fn charges(o: &Outcome) -> bool {
+    matches!(o, Outcome::NoMatch { .. } | Outcome::Denied { .. })
+}
+
+/// How an attempt that scored no frame ends: as no face, uncharged,
+/// whatever its frames did. Nobody was in view, or the flash gave no
+/// reading. Frames that stepped hard off the mask all along and never
+/// followed it (`StrobeGate::off_mask`, `off_mask` holding the steps) are
+/// what a stream looping a pattern of its own gives, and the journal says
+/// so; they are not charged. A lamp flickering with the mains makes a live
+/// face at the desk step the same way (the `strobe` simulation), and a
+/// replay is closed only where one is reproduced live, so a charge would
+/// cost real users their cooldown and buy little (C11, the charge
+/// withdrawn 2026-09-25).
+fn unscored(off_mask: Option<usize>, elapsed_ms: u64) -> Outcome {
+    if let Some(steps) = off_mask {
+        log::info!(
+            "attempt: the frames never followed the strobe mask ({} strong steps off it in one unbroken run); not charged",
+            steps
+        );
+    }
+    Outcome::NoFace { elapsed_ms }
+}
+
+/// The probe's reply from its look: the face, whether it is turned to the
+/// screen and near enough to judge, whether it is likely `user`, and the
+/// lock screen's cadence. Never the score, which goes to the debug log.
+fn probe_reply(
+    user: &str,
+    looked: Result<(crate::presence::Observation, crate::presence::ProbeReading)>,
+    cadence: Cadence,
+    t0: Instant,
+) -> Outcome {
+    let (o, reading) = match looked {
+        Ok(l) => l,
+        Err(e) => {
+            return Outcome::Error {
+                message: e.to_string(),
+            }
+        }
+    };
+    let scannable = match (o.bbox, o.frame.as_ref()) {
+        (Some(b), Some(f)) => scannable(b[2], f.width, f.height),
+        _ => false,
+    };
+    let likely = probe_likely(scannable, reading.score.ok());
+    match reading.score {
+        Ok(score) => log::debug!(
+            "probe for {}: score {:.2}, likely {}, lit {}",
+            user,
+            score,
+            likely,
+            reading.lit
+        ),
+        Err(why) => log::debug!(
+            "probe for {}: no score ({}), likely {}, lit {}",
+            user,
+            why,
+            likely,
+            reading.lit
+        ),
+    }
+    Outcome::Probe {
+        face: o.face,
+        attentive: o.attentive,
+        face_px: o.bbox.map(|b| b[2]).unwrap_or(0.0),
+        scannable,
+        likely,
+        cadence,
+        elapsed_ms: t0.elapsed().as_millis() as u64,
+    }
+}
+
+/// How soon after a probe for a user the next one for the same user gets
+/// the same answer rather than a look of its own. The lock screen probes
+/// no oftener than once a second (`MIN_CADENCE_SECONDS` in its
+/// LockFaceModel.js; the daemon's config only requires the intervals to be
+/// positive), so its own cadence never meets the cap; a caller asking
+/// faster gets one fresh answer a second.
+pub const PROBE_MIN_GAP: Duration = Duration::from_secs(1);
+
+/// The last probe answer per user and when it was asked for: the probe's
+/// rate cap (H12).
+#[derive(Default)]
+struct ProbeCap {
+    last: std::collections::HashMap<String, (Instant, Outcome)>,
+}
+
+impl ProbeCap {
+    /// The answer to a probe for `user` that arrived at `now`: the last
+    /// one, when it was asked for less than `PROBE_MIN_GAP` before, and
+    /// otherwise a fresh one from `look`, kept for the next probe.
+    fn answer(&mut self, user: &str, now: Instant, look: impl FnOnce() -> Outcome) -> Outcome {
+        if let Some((at, o)) = self.last.get(user) {
+            if now.saturating_duration_since(*at) < PROBE_MIN_GAP {
+                return o.clone();
+            }
+        }
+        let o = look();
+        self.last
+            .retain(|_, (at, _)| now.saturating_duration_since(*at) < PROBE_MIN_GAP);
+        self.last.insert(user.to_string(), (now, o.clone()));
+        o
+    }
+
+    /// Forget `user`'s kept answer.
+    fn forget(&mut self, user: &str) {
+        self.last.remove(user);
     }
 }
 
@@ -641,7 +753,7 @@ pub fn scoring_over(since: Option<Instant>, now: Instant, cap: Duration) -> bool
 /// A face match is proof a password guesser does not have: it clears the
 /// account's bad-password lockout (pam_faillock), the way a correct
 /// password would, since our line answers before faillock's own reset
-/// module ever runs. Mike's call, 2026-09-22.
+/// module ever runs.
 pub(super) fn faillock_reset(user: &str) {
     match std::process::Command::new("/usr/bin/faillock")
         .env_clear()
@@ -662,12 +774,9 @@ pub(super) fn faillock_reset(user: &str) {
     }
 }
 
-/// What the window asks for in a calibration round, and the prompt once
-/// the face has matched. The everyday rounds record what a person does when
-/// they are not gesturing, so their floors stand clear of it.
 /// The floors the consent window's detectors run at for this person, in
-/// degrees: the walk-through's derived ones, never under the detectors'
-/// own minimums. `ping` reports the same pair, so the floors doctor shows
+/// degrees: the walk-through's derived ones, raised where its everyday
+/// replay needed it, never under the detectors' own minimums. `ping` reports the same pair, so the floors doctor shows
 /// are the floors the nod window uses.
 pub fn consent_floors(g: &crate::store::GestureCal) -> (f32, f32) {
     g.floors_deg(
@@ -677,16 +786,27 @@ pub fn consent_floors(g: &crate::store::GestureCal) -> (f32, f32) {
 }
 
 /// The face mesh is not optional: the gestures are read from its angles
-/// and nothing else, and the enrolment walk-through refuses without it. A
+/// and nothing else, and the enrollment walk-through refuses without it. A
 /// daemon that started without it would open a nod window that can never
 /// count, so it does not start at all; every PAM stack it sits in falls to
 /// the password, and the log names the file and the package that ships it.
 pub fn mesh_missing(models_dir: &std::path::Path) -> anyhow::Error {
     anyhow!(
-        "the face mesh model {} is not in {}: the omarchy-faceauth-models package installs it (a development checkout runs `faceauth models fetch`); refusing to start",
+        "the face mesh model {} is not in {}: install the omarchy-faceauth-models package (a development build may instead run `faceauth models fetch --dir DIR` into a root-owned directory nobody else can write, and set models_dir to it); refusing to start",
         faceauth_engine::mesh::FACE_MESH_FILE,
         models_dir.display()
     )
+}
+
+/// Re-send the card through `refresh` when a key check spent its PIN, or
+/// the fingerprint's status changed, since the card was last sent
+/// (`ConsentState::take_key_card_stale`).
+fn refresh_if_stale(st: &ConsentState, user: &str, refresh: Option<&dyn Fn()>) {
+    if let Some(r) = refresh {
+        if st.take_key_card_stale(user) {
+            r();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -712,6 +832,86 @@ mod scoring_cap_tests {
         );
         assert!(!scoring_over(Some(t), t + Duration::from_millis(4700), cap));
         assert!(scoring_over(Some(t), t + Duration::from_millis(4900), cap));
+    }
+}
+
+#[cfg(test)]
+mod off_mask_tests {
+    use super::*;
+    use faceauth_engine::liveness::StrobePhase;
+
+    /// Feed a phase tracker `n` frames of the brightness a stream looping
+    /// `stream` from bit 7 gives, or a steady scene for `None`.
+    fn feed(phase: &mut StrobePhase, stream: Option<u8>, n: usize) {
+        for i in 0..n {
+            let lit = stream.is_some_and(|m| (m >> (7 - (i % 8))) & 1 == 1);
+            phase.push(if lit { 120.0 } else { 60.0 });
+        }
+    }
+
+    /// C11: frames that stepped in brightness and never followed the mask
+    /// are told apart, and the attempt that saw them ends as no face,
+    /// uncharged, like a steady scene or a live face that followed the
+    /// mask but gave no score: the flag goes to the journal only. Frames
+    /// that follow the mask backwards (the sensor's walk order, J9) are not
+    /// flagged either.
+    #[test]
+    fn an_attempt_whose_frames_never_followed_the_mask_is_logged_not_charged() {
+        let mask = 0b1011_0100u8;
+        // About a scan's worth of frames: 4.8 s at 30 frames a second.
+        let frames = 144;
+        let mut canned = StrobePhase::with_pattern(mask);
+        feed(&mut canned, Some(0b1100_1100), frames);
+        assert!(crate::strobe::off_mask(&canned, canned.backwards()));
+        let o = unscored(Some(canned.edges_off_mask()), 4800);
+        assert!(matches!(o, Outcome::NoFace { .. }), "{:?}", o);
+        assert!(!charges(&o));
+
+        let mut steady = StrobePhase::with_pattern(mask);
+        feed(&mut steady, None, frames);
+        assert_eq!(steady.edges_off_mask(), 0);
+        assert!(!crate::strobe::off_mask(&steady, steady.backwards()));
+        let o = unscored(None, 4800);
+        assert!(matches!(o, Outcome::NoFace { .. }));
+        assert!(!charges(&o));
+
+        let mut live = StrobePhase::with_pattern(mask);
+        feed(&mut live, Some(mask), frames);
+        assert!(live.ever_in_phase());
+        assert!(!crate::strobe::off_mask(&live, live.backwards()));
+
+        let chiral = 0b1110_1000u8;
+        let mut walked_back = StrobePhase::with_pattern(chiral);
+        feed(&mut walked_back, Some(chiral.reverse_bits()), frames);
+        assert!(!walked_back.ever_in_phase());
+        assert!(walked_back.edges_off_mask() >= crate::strobe::OFF_MASK_STEPS);
+        assert!(!crate::strobe::off_mask(
+            &walked_back,
+            walked_back.backwards()
+        ));
+    }
+
+    /// The two outcomes a face gives that count, and none that do not.
+    #[test]
+    fn only_a_non_match_and_a_liveness_refusal_are_charged() {
+        assert!(charges(&Outcome::NoMatch {
+            score: None,
+            frames: 3,
+            elapsed_ms: 1
+        }));
+        assert!(charges(&Outcome::Denied {
+            reason: "x".into(),
+            elapsed_ms: 1
+        }));
+        assert!(!charges(&Outcome::NoFace { elapsed_ms: 1 }));
+        assert!(!charges(&Outcome::Match {
+            score: None,
+            frames: 2,
+            elapsed_ms: 1
+        }));
+        assert!(!charges(&Outcome::Error {
+            message: "x".into()
+        }));
     }
 }
 
@@ -786,6 +986,129 @@ mod probe_tests {
         assert!(PROBE_LIKELY_THRESHOLD < Config::default().accept_threshold);
     }
 
+    /// H12: the probe goes through the watch's own look, with stubbed
+    /// eyes in place of the camera, the models and the store. The reply
+    /// says the face is there, turned to the screen, near enough, and
+    /// likely the user only when the look's score reaches the line; the
+    /// look never strobed, and the score is not in the reply.
+    #[test]
+    fn the_probe_answers_through_the_shared_look() {
+        use crate::presence::{probe_look_with, PresenceConfig, StubEyes};
+        let look = PresenceConfig::default();
+        let accept = Config::default().accept_threshold;
+        let cadence = Cadence::from_config(&Config::default().unlock);
+        let reply = |eyes: &mut StubEyes| {
+            let t0 = Instant::now();
+            probe_reply(
+                "alice",
+                probe_look_with(eyes, &look, accept, "alice"),
+                cadence,
+                t0,
+            )
+        };
+        let mut user = StubEyes::new(90.0, vec![0.8, 0.6], vec![1.0, 0.0]);
+        let o = reply(&mut user);
+        match &o {
+            Outcome::Probe {
+                face,
+                attentive,
+                face_px,
+                scannable,
+                likely,
+                cadence: c,
+                ..
+            } => {
+                assert!(*face && *attentive && *scannable && *likely, "{:?}", o);
+                assert_eq!(*face_px, 90.0);
+                assert_eq!(*c, cadence);
+            }
+            other => panic!("{:?}", other),
+        }
+        assert_eq!(user.strobes, 0);
+        assert!(!serde_json::to_string(&o).unwrap().contains("score"));
+        // Another face: scored under the line, so not likely.
+        let mut stranger = StubEyes::new(90.0, vec![0.3, 0.95], vec![1.0, 0.0]);
+        assert!(matches!(
+            reply(&mut stranger),
+            Outcome::Probe {
+                face: true,
+                likely: false,
+                ..
+            }
+        ));
+        // A face beyond the line is not scanned, and not even scored.
+        let mut far = StubEyes::new(30.0, vec![1.0, 0.0], vec![1.0, 0.0]);
+        assert!(matches!(
+            reply(&mut far),
+            Outcome::Probe {
+                face: true,
+                scannable: false,
+                likely: false,
+                ..
+            }
+        ));
+        assert_eq!(far.embeds, 0);
+        // A look that failed is an error, which the lock screen reads as
+        // no face.
+        let o = probe_reply(
+            "alice",
+            Err(anyhow!("camera busy")),
+            cadence,
+            Instant::now(),
+        );
+        assert!(matches!(o, Outcome::Error { .. }));
+        assert!(!serde_json::to_string(&o).unwrap().contains("\"face\""));
+    }
+
+    /// H12's rate cap: a probe within a second of the last one for the
+    /// same user gets that answer with no look of its own; after a second,
+    /// for another user, or after an attempt, the probe looks again.
+    #[test]
+    fn a_probe_within_a_second_of_the_last_gets_its_answer_without_a_look() {
+        let answer = |likely: bool, ms: u64| Outcome::Probe {
+            face: true,
+            attentive: true,
+            face_px: 90.0,
+            scannable: true,
+            likely,
+            cadence: Cadence::default(),
+            elapsed_ms: ms,
+        };
+        let mut cap = ProbeCap::default();
+        let looks = std::cell::Cell::new(0u32);
+        let look = |likely: bool| {
+            looks.set(looks.get() + 1);
+            answer(likely, u64::from(looks.get()))
+        };
+        let t = Instant::now();
+        assert_eq!(cap.answer("alice", t, || look(true)), answer(true, 1));
+        let soon = t + Duration::from_millis(400);
+        assert_eq!(cap.answer("alice", soon, || look(false)), answer(true, 1));
+        assert_eq!(
+            cap.answer("alice", t + Duration::from_millis(999), || look(false)),
+            answer(true, 1)
+        );
+        assert_eq!(
+            looks.get(),
+            1,
+            "one look for three probes inside the second"
+        );
+        assert_eq!(cap.answer("bob", soon, || look(false)), answer(false, 2));
+        let later = t + PROBE_MIN_GAP;
+        assert_eq!(cap.answer("alice", later, || look(false)), answer(false, 3));
+        cap.forget("alice");
+        assert_eq!(cap.answer("alice", later, || look(true)), answer(true, 4));
+        assert_eq!(looks.get(), 4);
+        // An error is kept like any answer: the lock screen reads it as no
+        // face, so repeating it never starts a scan.
+        let mut cap = ProbeCap::default();
+        let err = || Outcome::Error {
+            message: "busy".into(),
+        };
+        assert_eq!(cap.answer("alice", t, err), err());
+        assert_eq!(cap.answer("alice", soon, || look(true)), err());
+    }
+
     /// H12: the probe reply never carries a score, only the yes or no, and
     /// it carries the lock screen's intervals from `[unlock]`.
     #[test]
@@ -802,7 +1125,7 @@ mod probe_tests {
         let json = serde_json::to_string(&o).unwrap();
         assert_eq!(
             json,
-            r#"{"result":"probe","face":true,"attentive":true,"face_px":92.0,"scannable":true,"likely":true,"cadence":{"ac":2.0,"performance":3.0,"balanced":5.0,"power-saver":8.0},"elapsed_ms":470}"#
+            r#"{"result":"probe","face":true,"attentive":true,"face_px":92.0,"scannable":true,"likely":true,"cadence":{"ac":1.0,"performance":2.0,"balanced":3.0,"power-saver":5.0},"elapsed_ms":470}"#
         );
         assert!(!json.contains("score"), "{}", json);
         // A reply from a daemon without the two fields reads as the lock

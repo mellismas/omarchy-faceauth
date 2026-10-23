@@ -83,20 +83,34 @@ pub enum Outcome {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         load_error: Option<String>,
     },
-    /// Enrolment result.
+    /// Enrollment result.
     Enrolled {
         added: usize,
         total: usize,
         consistency_min: f32,
         consistency_mean: f32,
         path: String,
+        /// What the person at the root terminal must know about what was
+        /// stored: the gestures a raised floor switched off (C3), the looks
+        /// a terminal enrollment kept no frames for (A6).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
     },
+    /// A terminal enrollment has learned the face from its straight look,
+    /// and its looks start now. Sent on the enrollment's connection before
+    /// its outcome, so the terminal prompts the first look only then.
+    Learned,
     /// Templates deleted.
     Deleted,
     /// A polkit context was noted for the request the agent is serving.
     Noted,
+    /// To polkit's PAM module: ask the agent for the request's cookie
+    /// (`lockgate::polkit_cookie_question`) and ask again with it (round 16c).
+    NeedCookie,
     /// The presence watch's mode, whether the daemon watches this user,
-    /// and, when it does, what the watch last decided (H16).
+    /// and, when it does, what the watch last decided (H16). With
+    /// `secure_available` false the camera cannot strobe and the secure
+    /// mode is not offered; it is absent before the camera has been opened.
     PresenceMode {
         mode: String,
         watching: bool,
@@ -104,21 +118,67 @@ pub enum Outcome {
         state: Option<crate::presence::State>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         away_for: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secure_available: Option<bool>,
     },
     /// Too many failed attempts for this user recently; try again later.
     Cooldown { seconds: u64 },
-    /// The consent request ended without an answer that could count: no
-    /// window to ask in, the requester gone, no answer inside a caller's
-    /// budget. Not a decision; the module ignores it and the caller's stack
-    /// falls to its password.
+    /// The consent request ended without an approval the module acts on.
+    /// The common cases: the nod window ran out with no nod or no answer
+    /// (`NoNod`, `NoAnswer`), the window could not be shown (`NoWindow`),
+    /// the requester went away (`Gone`), another user's request holds the
+    /// window (`OtherUser`), too many of this user's requests are waiting
+    /// (`TooMany`), there is no graphical session to ask in (`NoSession`),
+    /// or a wrong password; and on the sudo lane the user's own no, a
+    /// shake, a dismissal, a failed confirm or the refusal one of those
+    /// left standing (`refused`). The module ignores it and the caller's
+    /// stack falls to its password.
     ConsentDenied { reason: String, elapsed_ms: u64 },
     /// The user said no to a polkit request: a head shake, the window
-    /// dismissed, or the confirm after the nods refused. The module fails
+    /// dismissed, the confirm after the nods refused, or a request inside
+    /// the refusal one of those left standing (A5). The module fails
     /// the stack on it and the agent cancels the request, so no other prompt
     /// follows. A sudo request gets `ConsentDenied` for the same answer
     /// instead: sudo's terminal prompt is where a password goes next, and a
     /// failure there would only make sudo ask again, ten times.
     Refused { reason: String, elapsed_ms: u64 },
+    /// A sudo request that ended without an approval while the session
+    /// reads as locked (`lane_answer`). The module answers
+    /// PAM_AUTHINFO_UNAVAIL, which goes on, as an ignore does, to sudo's
+    /// key-fallback line, and that line is refused by the daemon while
+    /// locked, so sudo goes to its password and the key's touch stays with
+    /// the lock screen.
+    RefusedParked { reason: String, elapsed_ms: u64 },
+    /// Answer to the lock screen's `key_lane` question, asked without the
+    /// camera: whether its security key lane is there for this user, and
+    /// why not when it is not.
+    KeyLane {
+        available: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// Answer to the lock screen's `fprint_lane` question, asked without
+    /// the camera: whether its fingerprint lane goes through the daemon for
+    /// this user, and why not when it does not.
+    FprintLane {
+        available: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// A stack's key line may run now: the module asks for the PIN, if its
+    /// line asks for one, and sends the check.
+    KeyReady,
+    /// A stack's key line cannot run now: the module says so once and asks
+    /// again, so the key is offered after the unlock. `state` is the kind
+    /// of wait, first after the tag: `locked` (positive), `held` (the hold
+    /// after an unlock), `unknown` (no answer; the module gives up on it
+    /// after `lockgate::UNKNOWN_LIMIT`) or `card` (another card has the
+    /// key).
+    KeyWait { state: String, reason: String },
+    /// Never sent by the daemon: the CLI's answer when there is no daemon
+    /// to ask at all (its socket missing, or nothing listening on it), so
+    /// the lock screen can say faceauth is not running.
+    NotRunning,
 }
 
 /// A probe reply without `likely` came from a daemon that does not compute
@@ -309,6 +369,79 @@ pub fn denied_text(why: &str, caller: &crate::consent::CallerInfo) -> String {
     }
 }
 
+/// A sudo request's end while parked behind the lock: anything but an
+/// approval or a requester gone becomes `RefusedParked`, whatever the lock
+/// reads when `lane_answer` asks again. Polkit keeps its answers here.
+pub fn parked(caller: &crate::consent::CallerInfo, o: Outcome) -> Outcome {
+    match o {
+        Outcome::ConsentDenied { reason, elapsed_ms }
+            if caller.via == "sudo" && Refusal::parse(&reason) != Some(Refusal::Gone) =>
+        {
+            Outcome::RefusedParked { reason, elapsed_ms }
+        }
+        o => o,
+    }
+}
+
+/// The one gate every consent reply passes on its way back to the PAM
+/// module (`server/handle.rs`), whichever way the request ended. An
+/// approval and a requester gone pass as they are; so does everything
+/// else while the one verdict reads unlocked (`look`: the verdict and the
+/// request's origin, asked only when needed): sudo's stack then goes on to
+/// its key-fallback line, which the daemon runs, and to the password, and
+/// polkit's ends on a refusal and goes on otherwise. While the verdict is
+/// anything but unlocked, every other sudo answer is `RefusedParked`
+/// (sudo goes on to its key line, which waits for the unlock or falls to
+/// the password). A polkit answer becomes `Refused`, which ends polkit's
+/// stack, only on a positive lock with the request from the locked desktop
+/// (round 6, item 12: the password stays reachable otherwise); polkit's
+/// key line never runs a check while locked either way.
+pub fn lane_answer(
+    via: &str,
+    o: Outcome,
+    look: &dyn Fn() -> (crate::lockgate::Verdict, crate::lockgate::Origin),
+) -> Outcome {
+    use crate::lockgate::{Origin, Verdict};
+    let (reason, elapsed_ms) = match &o {
+        Outcome::Match { .. } => return o,
+        Outcome::ConsentDenied { reason, .. } if Refusal::parse(reason) == Some(Refusal::Gone) => {
+            return o
+        }
+        Outcome::ConsentDenied { reason, elapsed_ms }
+        | Outcome::Refused { reason, elapsed_ms }
+        | Outcome::RefusedParked { reason, elapsed_ms } => (reason.clone(), *elapsed_ms),
+        Outcome::Error { message } => (message.clone(), 0),
+        other => (
+            serde_json::to_value(other)
+                .ok()
+                .and_then(|v| {
+                    v["result"]
+                        .as_str()
+                        .map(|r| format!("{} without an approval", r))
+                })
+                .unwrap_or_else(|| "no approval".into()),
+            0,
+        ),
+    };
+    let (verdict, origin) = look();
+    if verdict == Verdict::Unlocked {
+        return o;
+    }
+    if via == "polkit" {
+        if matches!(o, Outcome::Refused { .. })
+            || verdict != Verdict::Locked
+            || origin != Origin::Desktop
+        {
+            return o;
+        }
+        return Outcome::Refused { reason, elapsed_ms };
+    }
+    if matches!(o, Outcome::RefusedParked { .. }) {
+        return o;
+    }
+    Outcome::RefusedParked { reason, elapsed_ms }
+}
+
 /// The user's no, as the caller's lane can take it: polkit gets a refusal
 /// that ends the request; sudo gets a fall-through to its own prompt.
 pub fn refused(caller: &crate::consent::CallerInfo, why: Refusal, elapsed_ms: u64) -> Outcome {
@@ -378,6 +511,277 @@ mod refusal_tests {
             refused(&sudo, Refusal::Shaken, 1),
             Outcome::ConsentDenied { .. }
         ));
+    }
+
+    /// 1: a sudo request unapproved behind the lock skips sudo's FIDO2
+    /// line; one the user saw and refused does not, a hang-up stays a
+    /// hang-up, an approval stays an approval, and polkit keeps its own
+    /// answers, a refusal that ends the request included.
+    #[test]
+    fn a_sudo_request_unapproved_behind_the_lock_skips_the_key() {
+        let sudo = crate::consent::CallerInfo {
+            via: "sudo".into(),
+            ..Default::default()
+        };
+        let polkit = crate::consent::CallerInfo {
+            via: "polkit".into(),
+            ..Default::default()
+        };
+        for why in [
+            Refusal::Dismissed,
+            Refusal::WrongPassword,
+            Refusal::RefusedRecently,
+        ] {
+            let o = parked(&sudo, refused(&sudo, why.clone(), 3));
+            assert!(
+                matches!(&o, Outcome::RefusedParked { reason, elapsed_ms: 3 } if *reason == why.wire()),
+                "{:?}",
+                o
+            );
+            let wire = serde_json::to_string(&o).unwrap();
+            assert!(
+                wire.starts_with("{\"result\":\"refused_parked\","),
+                "{}",
+                wire
+            );
+        }
+        assert!(
+            matches!(
+                refused(&sudo, Refusal::Dismissed, 1),
+                Outcome::ConsentDenied { .. }
+            ),
+            "unparked, the no falls through to the key"
+        );
+        assert!(matches!(
+            parked(&sudo, consent_denied(Refusal::Gone, 1)),
+            Outcome::ConsentDenied { .. }
+        ));
+        let approved = Outcome::Match {
+            score: None,
+            frames: 0,
+            elapsed_ms: 1,
+        };
+        assert_eq!(parked(&sudo, approved.clone()), approved);
+        assert!(
+            matches!(
+                parked(&polkit, refused(&polkit, Refusal::Dismissed, 1)),
+                Outcome::Refused { .. }
+            ),
+            "polkit's no still ends the request"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lane_answer_tests {
+    use super::*;
+
+    /// Every refusal the daemon gives, as the consent request's end.
+    fn every_refusal() -> Vec<Refusal> {
+        vec![
+            Refusal::Shaken,
+            Refusal::Dismissed,
+            Refusal::Confirm("not live".into()),
+            Refusal::WrongPassword,
+            Refusal::NoAnswer,
+            Refusal::NoWindow,
+            Refusal::NoNod,
+            Refusal::NoSession,
+            Refusal::OtherUser,
+            Refusal::TooMany,
+            Refusal::RefusedRecently,
+        ]
+    }
+
+    /// Every unapproved end a consent request can have, other than the
+    /// requester hanging up.
+    fn every_unapproved_end() -> Vec<Outcome> {
+        let mut ends: Vec<Outcome> = every_refusal()
+            .into_iter()
+            .flat_map(|r| {
+                [
+                    consent_denied(r.clone(), 7),
+                    Outcome::Refused {
+                        reason: r.wire(),
+                        elapsed_ms: 7,
+                    },
+                    Outcome::RefusedParked {
+                        reason: r.wire(),
+                        elapsed_ms: 7,
+                    },
+                ]
+            })
+            .collect();
+        ends.extend([
+            Outcome::Error {
+                message: "busy".into(),
+            },
+            Outcome::Error {
+                message: "the lid is closed".into(),
+            },
+            Outcome::Error {
+                message: "face authentication is local only: no session".into(),
+            },
+            Outcome::ConsentDenied {
+                reason: "something new".into(),
+                elapsed_ms: 1,
+            },
+            Outcome::NoFace { elapsed_ms: 3 },
+            Outcome::NotEnrolled,
+            Outcome::Cooldown { seconds: 30 },
+            Outcome::NoMatch {
+                score: None,
+                frames: 2,
+                elapsed_ms: 3,
+            },
+        ]);
+        ends
+    }
+
+    /// Round 3's 1: while the session is locked, every sudo answer but an
+    /// approval or a hang-up is a parked refusal, and every polkit one from
+    /// the locked desktop a refusal, which ends the stack.
+    #[test]
+    fn while_locked_nothing_unapproved_reaches_a_key_line() {
+        use crate::lockgate::{Origin, Verdict};
+        let locked = || (Verdict::Locked, Origin::Desktop);
+        for o in every_unapproved_end() {
+            let sudo = lane_answer("sudo", o.clone(), &locked);
+            assert!(
+                matches!(sudo, Outcome::RefusedParked { .. }),
+                "sudo {:?} -> {:?}",
+                o,
+                sudo
+            );
+            assert!(
+                serde_json::to_string(&sudo)
+                    .unwrap()
+                    .starts_with("{\"result\":\"refused_parked\","),
+                "{:?}",
+                sudo
+            );
+            let polkit = lane_answer("polkit", o.clone(), &locked);
+            assert!(
+                matches!(polkit, Outcome::Refused { .. }),
+                "polkit {:?} -> {:?}",
+                o,
+                polkit
+            );
+        }
+        let approved = Outcome::Match {
+            score: None,
+            frames: 0,
+            elapsed_ms: 1,
+        };
+        let gone = consent_denied(Refusal::Gone, 1);
+        for via in ["sudo", "polkit"] {
+            assert_eq!(lane_answer(via, approved.clone(), &locked), approved);
+            assert_eq!(lane_answer(via, gone.clone(), &locked), gone);
+        }
+        assert!(matches!(
+            lane_answer("sudo", consent_denied(Refusal::TooMany, 9), &locked),
+            Outcome::RefusedParked { reason, elapsed_ms: 9 } if reason == Refusal::TooMany.wire()
+        ));
+    }
+
+    /// Round 4: unlocked, every answer passes as it is. A sudo request,
+    /// refused at a card the user saw or never shown one, goes on to its
+    /// key-fallback line (Mike: "can still use key or password"), which
+    /// the daemon runs and refuses on its own while locked; polkit's
+    /// refusal still ends its request. The lock is asked only where it
+    /// decides the answer.
+    #[test]
+    fn unlocked_every_answer_passes_and_sudo_goes_on_to_its_key_line() {
+        use crate::lockgate::{Origin, Verdict};
+        let asked = std::cell::Cell::new(0);
+        let unlocked = || {
+            asked.set(asked.get() + 1);
+            (Verdict::Unlocked, Origin::Desktop)
+        };
+        for o in every_unapproved_end() {
+            assert_eq!(lane_answer("sudo", o.clone(), &unlocked), o, "{:?}", o);
+            assert_eq!(lane_answer("polkit", o.clone(), &unlocked), o, "{:?}", o);
+        }
+        // The shake-then-key path: the shake's answer on sudo is the
+        // consent denial the module ignores, so the key line runs next.
+        assert!(matches!(
+            lane_answer(
+                "sudo",
+                refused(&sudo_caller(), Refusal::Shaken, 4),
+                &unlocked
+            ),
+            Outcome::ConsentDenied { .. }
+        ));
+        // Polkit's refusal still ends the request.
+        assert!(matches!(
+            lane_answer(
+                "polkit",
+                refused(&polkit_caller(), Refusal::Shaken, 4),
+                &unlocked
+            ),
+            Outcome::Refused { .. }
+        ));
+        asked.set(0);
+        lane_answer(
+            "sudo",
+            Outcome::Match {
+                score: None,
+                frames: 0,
+                elapsed_ms: 1,
+            },
+            &unlocked,
+        );
+        lane_answer("sudo", consent_denied(Refusal::Gone, 1), &unlocked);
+        assert_eq!(asked.get(), 0);
+        lane_answer("sudo", consent_denied(Refusal::Shaken, 1), &unlocked);
+        assert_eq!(asked.get(), 1);
+    }
+
+    /// Round 6, item 12: the password stays reachable. Only a positive
+    /// lock with the request from the locked desktop ends polkit's stack;
+    /// a hold, an unknown lock state and a request from a text console or
+    /// a remote login pass as they are, so polkit goes on to its key line,
+    /// which waits for the unlock or falls to the password, never to a key
+    /// check while locked. Sudo goes on in every case.
+    #[test]
+    fn polkit_ends_only_on_a_positive_lock_from_the_desktop() {
+        use crate::lockgate::{Origin, Verdict};
+        for (verdict, origin) in [
+            (Verdict::Held, Origin::Desktop),
+            (Verdict::Unknown, Origin::Desktop),
+            (Verdict::Locked, Origin::Elsewhere),
+            (Verdict::Held, Origin::Elsewhere),
+            (Verdict::Unknown, Origin::Elsewhere),
+        ] {
+            let look = || (verdict, origin);
+            for o in every_unapproved_end() {
+                if matches!(o, Outcome::Refused { .. }) {
+                    continue;
+                }
+                let polkit = lane_answer("polkit", o.clone(), &look);
+                assert_eq!(polkit, o, "{:?} {:?}: {:?}", verdict, origin, o);
+                let sudo = lane_answer("sudo", o.clone(), &look);
+                assert!(
+                    matches!(sudo, Outcome::RefusedParked { .. }),
+                    "sudo goes on to its key line: {:?}",
+                    sudo
+                );
+            }
+        }
+    }
+
+    fn sudo_caller() -> crate::consent::CallerInfo {
+        crate::consent::CallerInfo {
+            via: "sudo".into(),
+            ..Default::default()
+        }
+    }
+
+    fn polkit_caller() -> crate::consent::CallerInfo {
+        crate::consent::CallerInfo {
+            via: "polkit".into(),
+            ..Default::default()
+        }
     }
 }
 

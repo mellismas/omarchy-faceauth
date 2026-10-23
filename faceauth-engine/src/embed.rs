@@ -1,5 +1,5 @@
 //! ArcFace-style embedding with AuraFace-v1 `glintr100` (Apache-2.0):
-//! 112x112 input normalised as `(v - 127.5) / 127.5`, 512-D output, L2-normalised.
+//! 112x112 input normalized as `(v - 127.5) / 127.5`, 512-D output, L2-normalized.
 
 use crate::image::Grey;
 use crate::runtime;
@@ -62,11 +62,7 @@ impl ArcFace {
     /// of leaving them in the allocator (`bench_ort_pipeline` measures both).
     pub fn release(&mut self) {
         if self.session.take().is_some() {
-            // SAFETY: malloc_trim takes no pointers and touches only the
-            // allocator's own free lists; it is safe from any thread.
-            unsafe {
-                libc::malloc_trim(0);
-            }
+            runtime::trim_heap();
             log::info!("recognition model released; it reloads on the next attempt");
         }
     }

@@ -67,12 +67,19 @@ pub fn session(path: impl AsRef<Path>, threads: usize) -> Result<Session> {
     // The load parses the whole file and copies its weights out; the parse
     // is freed but glibc keeps the pages (up to 350 MB for the recognition
     // model) unless asked to return them.
+    trim_heap();
+    Ok(session)
+}
+
+/// Hand the allocator's free pages back to the OS: glibc keeps freed
+/// memory for reuse unless asked. The engine's only unsafe code.
+#[allow(unsafe_code)]
+pub(crate) fn trim_heap() {
     // SAFETY: malloc_trim takes no pointers and touches only the allocator's
     // own free lists; it is safe from any thread.
     unsafe {
         libc::malloc_trim(0);
     }
-    Ok(session)
 }
 
 /// Human-readable inputs and outputs of a model, for `faceauth engine inspect`.

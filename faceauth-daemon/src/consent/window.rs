@@ -1,13 +1,13 @@
 //! The consent window as the daemon drives it: the card's states and
-//! heartbeat, the answer token it hands the card, and the acknowledgement
-//! and dwell that decide when nods begin to count.
+//! heartbeat, the answer token it hands the card, and the acknowledgment
+//! that says the card is up before any answer counts.
 
 #[cfg(test)]
 use super::passwordless::PASSWORDLESS_MAX_MINUTES;
 #[cfg(test)]
 use super::requester::clip_command;
 use super::requester::CallerInfo;
-use super::shell::shell_call;
+use super::shell::{shell_call_pinned, shell_summon_pinned, Pin};
 use super::state::ConsentState;
 #[cfg(test)]
 use super::state::{test_state, Answer};
@@ -20,8 +20,13 @@ use std::time::{Duration, Instant};
 /// denied.
 pub const ACK_WAIT: Duration = Duration::from_secs(3);
 
-/// After the window acknowledges, how long before a nod leg counts: a nod
-/// already in motion when the card appeared was not a nod at this card.
+/// After the window acknowledges, how long before a check of the security
+/// key or the fingerprint counts: a touch or a finger already under way
+/// when the card appeared was not meant for this card. Nods have no dwell
+/// (Mike, 2026-10-19): finding the face takes longer than this already.
+/// A card naming a passwordless rider keeps it for nods too
+/// (`ConsentState::rider_on_card`): the rider can reach the card with no
+/// scan before its nods.
 pub const ACK_DWELL: Duration = Duration::from_millis(1500);
 
 /// Sixteen random bytes as hex, or nothing: a token that could not be drawn
@@ -49,15 +54,17 @@ pub struct Dialog {
     state: &'static ConsentState,
     /// When the window acknowledged this request.
     acked_at: Option<Instant>,
-    /// When the card was last shown the "nod" state with an
-    /// acknowledgement wait: the dwell runs from here, so nods count only
-    /// once the card asking for them has been up for `ACK_DWELL` (D4).
-    nod_shown_at: Option<Instant>,
     /// The daemon is waiting for the user to come back to the card after
     /// a nod window passed unanswered; the card offers "Ready to nod".
     waiting: bool,
     /// The last pending state and message sent, for the heartbeat.
     last: Option<(String, String)>,
+    /// The user's desktops when the request's card was made, as its work
+    /// began (fix round 10, Codex 6; at its first show in round 9): every
+    /// show, call and notice checks they are still exactly the user's live
+    /// desktops before it is dispatched, and each unit checks again as it
+    /// starts. None when there was no desktop then: nothing is dispatched.
+    pin: Option<Pin>,
 }
 
 /// While a request waits (for attention, or parked behind a lock) the
@@ -81,9 +88,28 @@ struct Payload<'a> {
     /// row from this and nothing local, so it always says what a nod does.
     passwordless_minutes: Option<u32>,
     /// The nod window is following the enrolled face right now. The card
-    /// greys the passwordless button otherwise, and the daemon refuses an
+    /// grays the passwordless button otherwise, and the daemon refuses an
     /// arm otherwise, so the button and the socket obey one signal.
     face_present: bool,
+    /// A key watch is running for this request: a touch of the user's
+    /// security key approves it, and the card says so.
+    key_armed: bool,
+    /// The lane's key line asks for a PIN: the card shows a PIN field
+    /// beside the key line.
+    key_pin: bool,
+    /// No PIN is waiting or in use: the card asks for the PIN, not for a
+    /// touch.
+    key_pin_wanted: bool,
+    /// A fingerprint watch is running for this request: a matching finger
+    /// approves it, and the card says so on a line of its own.
+    fprint_armed: bool,
+    /// What that line says: `place` (place a finger), `retry` (no match,
+    /// try again) or `busy` (the reader did not answer).
+    fprint_status: &'static str,
+    /// The daemon holds no acknowledgment for this show and waits for one:
+    /// the card acknowledges once it has drawn this payload, even for a
+    /// request it already showed (the card coming back after the unlock).
+    ack_wanted: bool,
 }
 
 impl Dialog {
@@ -102,9 +128,9 @@ impl Dialog {
             token,
             state,
             acked_at: None,
-            nod_shown_at: None,
             waiting: false,
             last: None,
+            pin: Pin::take(user).ok(),
         })
     }
 
@@ -136,30 +162,13 @@ impl Dialog {
         &self.token
     }
 
-    /// Forget the window's acknowledgement: the next show waits for a
-    /// fresh one and the dwell runs whole from it. Used when what the nod
-    /// grants has changed after the card was acknowledged (a rider was
-    /// armed), so no nod counts until the card naming the rider is up.
+    /// Forget the window's acknowledgment: the next show waits for a
+    /// fresh one. Used when what the nod grants has changed after the card
+    /// was acknowledged (a rider was armed), so no nod counts until the
+    /// card naming the rider has acknowledged.
     pub fn reset_ack(&mut self) {
         self.acked_at = None;
         self.state.reset_ack(&self.user, &self.token);
-    }
-
-    /// How long a nod must wait before it counts: until `ACK_DWELL` after
-    /// the acknowledgement or after the nod card was shown, whichever is
-    /// later, and the whole dwell when there is no acknowledgement. The
-    /// acknowledgement lands during the scan, so on its own it would be
-    /// spent before the nod card is up; the nod show is what the dwell is
-    /// for (D4).
-    pub fn dwell_left(&self, now: Instant) -> Duration {
-        let Some(acked) = self.acked_at else {
-            return ACK_DWELL;
-        };
-        let from = match self.nod_shown_at {
-            Some(shown) if shown > acked => shown,
-            _ => acked,
-        };
-        (from + ACK_DWELL).saturating_duration_since(now)
     }
 
     /// Has the window acknowledged this request?
@@ -168,14 +177,42 @@ impl Dialog {
         self.state.acknowledged(&self.user, &self.token)
     }
 
+    /// The card's pin, taken when it was made.
+    fn pinned(&self) -> Result<&Pin> {
+        self.pin.as_ref().ok_or_else(|| {
+            anyhow!(
+                "{} had no graphical session when the request began; nothing is run in their manager",
+                self.user
+            )
+        })
+    }
+
+    /// A notice about this request, under the card's pin.
+    pub fn notify(&self, title: &str, body: &str) {
+        if let Ok(pin) = self.pinned() {
+            self.beat();
+            super::shell::notify(pin, title, body);
+        }
+    }
+
+    /// Tell the request's PAM line now that the daemon is at work (fix
+    /// round 10, Opus N3): before every call into the session, each of
+    /// which may run up to `USER_CALL_WITHIN`, so calls in a row never add
+    /// up to a silence the line gives up on.
+    pub fn beat(&self) {
+        self.state.beat_now(&self.user);
+    }
+
     fn shell(&self, args: &[&str]) -> Result<()> {
-        shell_call(&self.user, args)
+        let pin = self.pinned()?;
+        self.beat();
+        shell_call_pinned(pin, args)
     }
 
     /// Show or update the window. Fails when there is no graphical session to
     /// show it in, which callers treat as "no consent possible".
     /// The first show of a request also waits for the window's own
-    /// acknowledgement; without one within `ACK_WAIT` there is no
+    /// acknowledgment; without one within `ACK_WAIT` there is no
     /// window on screen that the daemon can vouch for, and that is an error.
     pub fn show(&mut self, state: &str, message: &str, caller: &CallerInfo) -> Result<()> {
         self.waiting = false;
@@ -197,15 +234,18 @@ impl Dialog {
         need_ack: bool,
     ) -> Result<()> {
         // A pending-state show that first carries an armed rider is a card
-        // the user has not read: the acknowledgement is reset before the
-        // summon, so this show waits for a fresh one and the dwell runs
-        // whole from it. The card acknowledges again on a changed rider.
-        if need_ack && self.state.rider_unshown(&self.user) {
-            self.reset_ack();
-        }
-        let (passwordless_minutes, face_present) =
+        // the user has not read: the acknowledgment is reset in the same
+        // look at the record that marks the rider shown, before the summon,
+        // so this show waits for a fresh one. The card acknowledges again
+        // on a changed rider.
+        let (passwordless_minutes, face_present, ack_reset) =
             self.state
-                .rider_for_payload(&self.user, &self.token, caller.via == "sudo", need_ack);
+                .rider_snapshot(&self.user, &self.token, caller.via == "sudo", need_ack);
+        if ack_reset {
+            self.acked_at = None;
+        }
+        let key = self.state.key_for_payload(&self.user, &self.token);
+        let fprint = self.state.fprint_for_payload(&self.user, &self.token);
         let payload = serde_json::to_string(&Payload {
             state,
             message,
@@ -214,13 +254,18 @@ impl Dialog {
             waiting: self.waiting,
             passwordless_minutes,
             face_present,
+            key_armed: key.armed,
+            key_pin: key.pin,
+            key_pin_wanted: key.pin_wanted,
+            fprint_armed: fprint.armed,
+            fprint_status: fprint.status.word(),
+            ack_wanted: need_ack && self.acked_at.is_none(),
         })?;
-        self.shell(&["shell", "summon", "omarchy.faceauth", &payload])?;
+        let pin = self.pinned()?;
+        self.beat();
+        shell_summon_pinned(pin, "omarchy.faceauth", &payload)?;
         self.open = true;
         self.last = Some((state.to_string(), message.to_string()));
-        if need_ack && state == "nod" {
-            self.nod_shown_at = Some(Instant::now());
-        }
         if need_ack && self.acked_at.is_none() {
             if !self
                 .state
@@ -243,7 +288,7 @@ impl Dialog {
 
     /// Re-send a pending state to a window that has already acknowledged
     /// the request, with the payload's rider and face fields as they are
-    /// now, without waiting for another acknowledgement.
+    /// now, without waiting for another acknowledgment.
     pub fn show_again(&mut self, state: &str, message: &str, caller: &CallerInfo) -> Result<()> {
         self.show_inner(state, message, caller, false)
     }
@@ -279,7 +324,7 @@ impl Drop for Dialog {
 mod window_ack_tests {
     use super::*;
 
-    /// The acknowledgement is accepted only with the live request's token,
+    /// The acknowledgment is accepted only with the live request's token,
     /// and a new request forgets the last one's.
     #[test]
     fn an_acknowledgement_needs_the_live_token_and_is_per_request() {
@@ -295,12 +340,7 @@ mod window_ack_tests {
         let token = d.token().to_string();
         assert!(st.ack(user, Some(&token)));
         assert!(d.acknowledged());
-        assert_eq!(
-            d.dwell_left(Instant::now()),
-            ACK_DWELL,
-            "no dwell has run before the show records the acknowledgement"
-        );
-        // The acknowledgement wakes a show waiting for it through the
+        // The acknowledgment wakes a show waiting for it through the
         // condition variable, not a poll.
         d.reset_ack();
         assert!(!d.acknowledged());
@@ -318,23 +358,6 @@ mod window_ack_tests {
         assert!(!d2.acknowledged(), "a new request starts unacknowledged");
         assert!(!st.ack(user, Some(&old)), "the old token no longer answers");
         assert!(!st.wait_ack(user, d2.token(), Instant::now() + Duration::from_millis(50)));
-    }
-
-    #[test]
-    fn the_dwell_runs_from_the_acknowledgement() {
-        let cfg = Config::default();
-        let user = "faceauth-dwell-test-user";
-        let st = test_state();
-        let _turn = st.test_live(1000, user);
-        let mut d = Dialog::new(&cfg, user, st).unwrap();
-        let at = Instant::now();
-        d.acked_at = Some(at);
-        assert_eq!(d.dwell_left(at), ACK_DWELL);
-        assert_eq!(
-            d.dwell_left(at + Duration::from_millis(1000)),
-            Duration::from_millis(500)
-        );
-        assert_eq!(d.dwell_left(at + Duration::from_secs(5)), Duration::ZERO);
     }
 }
 
@@ -360,8 +383,11 @@ mod payload_size_tests {
                 who: "sudo (pid 1234)  from  bash (1200) <- foot (1100)".into(),
                 parents: "bash (1200) <- foot (1100)".into(),
                 kill_pid: 1234,
+                kill_ino: 0,
                 via: "sudo".into(),
                 requester: Some(1234),
+                requester_fd: None,
+                bind: Default::default(),
             };
             let json = serde_json::to_string(&Payload {
                 state: "scanning",
@@ -371,6 +397,12 @@ mod payload_size_tests {
                 waiting: false,
                 passwordless_minutes: None,
                 face_present: false,
+                key_armed: false,
+                key_pin: false,
+                key_pin_wanted: false,
+                fprint_armed: false,
+                fprint_status: "place",
+                ack_wanted: true,
             })
             .unwrap();
             assert!(
@@ -380,7 +412,9 @@ mod payload_size_tests {
                 json.len()
             );
             let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-            for read in ["who", "command", "clipped", "verified", "kill_pid", "via"] {
+            for read in [
+                "who", "command", "clipped", "verified", "kill_pid", "kill_ino", "via",
+            ] {
                 assert!(
                     v["caller"].get(read).is_some(),
                     "the card reads caller.{}",
@@ -449,60 +483,87 @@ mod window_text_tests {
 }
 
 #[cfg(test)]
-mod dwell_tests {
-    use super::*;
-
-    /// D4: the acknowledgement lands during the scan, so a dwell measured
-    /// from it alone is spent before the nod card is up. The dwell runs
-    /// from the nod show instead, and whole again on every re-show.
-    #[test]
-    fn the_dwell_runs_from_the_nod_show_not_the_acknowledgement() {
-        let cfg = Config::default();
-        let user = "faceauth-nod-dwell-test-user";
-        let st = test_state();
-        let _turn = st.test_live(1000, user);
-        let mut d = Dialog::new(&cfg, user, st).unwrap();
-        let acked = Instant::now();
-        d.acked_at = Some(acked);
-        // The earliest the hook can run: the settle, the pattern settle
-        // and eight frames of phase lock at 30 fps, then the nod show.
-        let hook_at = acked + Duration::from_millis(1200 + 150 + 270);
-        assert_eq!(
-            d.dwell_left(hook_at),
-            Duration::ZERO,
-            "from the ack alone the dwell has lapsed"
-        );
-        d.nod_shown_at = Some(hook_at);
-        assert_eq!(
-            d.dwell_left(hook_at),
-            ACK_DWELL,
-            "at the hook the whole dwell is left"
-        );
-        assert_eq!(
-            d.dwell_left(hook_at + Duration::from_millis(1000)),
-            Duration::from_millis(500)
-        );
-        assert_eq!(
-            d.dwell_left(hook_at + Duration::from_secs(5)),
-            Duration::ZERO
-        );
-        // A re-show later (a rider armed, a re-arm) starts it over.
-        let again = hook_at + Duration::from_secs(40);
-        d.nod_shown_at = Some(again);
-        assert_eq!(d.dwell_left(again), ACK_DWELL);
-        // An acknowledgement newer than the nod show wins, as before.
-        d.acked_at = Some(again + Duration::from_secs(1));
-        assert_eq!(d.dwell_left(again + Duration::from_secs(1)), ACK_DWELL);
-    }
-}
-
-#[cfg(test)]
 mod passwordless_tests {
     use super::*;
 
+    /// A nod window whose card names a passwordless rider keeps the dwell
+    /// and the still second (`wait_for_nods`), however the rider reached the
+    /// card: re-shown after the nods began, or carried by the first nod show
+    /// when it was armed between the match and that show (Codex's delta
+    /// review of 1126adf). The window reads it from the record, not from
+    /// how the caller got there.
+    /// Arming closes with the nods: one look at the record says whether a
+    /// rider was armed since the window's last check, and refuses any arm
+    /// after it, so none reaches the confirm's show, which would mark it
+    /// shown with no nod at a card naming it (Codex's second delta review).
+    #[test]
+    fn arming_closes_with_the_nods() {
+        let cfg = Config::default();
+        let user = "faceauth-rider-close-test-user";
+        let st = test_state();
+        let _turn = st.test_live(1000, user);
+        let d = Dialog::new(&cfg, user, st).unwrap();
+        let token = d.token().to_string();
+        st.rider_for_payload(user, &token, true, true);
+        assert!(st.set_face_present(user, true));
+        assert!(
+            !st.close_rider_arming(user),
+            "nothing armed, the nods stand"
+        );
+        assert_eq!(
+            st.arm_passwordless(user, &token, 15),
+            Err("look at the camera first"),
+            "closed: no arm after the nods"
+        );
+        assert!(st.set_face_present(user, true));
+        assert_eq!(st.arm_passwordless(user, &token, 15), Ok(()));
+        assert!(
+            st.close_rider_arming(user),
+            "an arm since the last check sends the card back"
+        );
+        st.rider_snapshot(user, &token, true, true);
+        assert!(st.set_face_present(user, true));
+        assert!(
+            !st.close_rider_arming(user),
+            "a rider the card has shown is the one the nods answered"
+        );
+        drop(d);
+    }
+
+    #[test]
+    fn a_card_naming_a_rider_is_known_to_the_nod_window() {
+        let cfg = Config::default();
+        let user = "faceauth-rider-on-card-test-user";
+        let st = test_state();
+        let _turn = st.test_live(1000, user);
+        let d = Dialog::new(&cfg, user, st).unwrap();
+        let token = d.token().to_string();
+        st.rider_for_payload(user, &token, true, true);
+        assert!(!st.rider_on_card(user), "no rider, nothing to guard");
+        assert!(st.set_face_present(user, true));
+        assert_eq!(
+            st.arm_passwordless(user, &token, PASSWORDLESS_MAX_MINUTES),
+            Ok(())
+        );
+        assert!(
+            !st.rider_on_card(user),
+            "armed but not yet shown: the window ends on it instead"
+        );
+        // Any show that waits for an acknowledgment marks it shown, the
+        // first nod show among them.
+        let (shown, _, reset) = st.rider_snapshot(user, &token, true, true);
+        assert_eq!(shown, Some(PASSWORDLESS_MAX_MINUTES));
+        assert!(reset);
+        assert!(
+            st.rider_on_card(user),
+            "the card names it: the nods after this show are guarded"
+        );
+        drop(d);
+    }
+
     /// The rider belongs to one request: it is armed only with that
     /// request's token, on a sudo lane, while the enrolled face is in the
-    /// nod window; it is honoured only once the card has been shown it;
+    /// nod window; it is honored only once the card has been shown it;
     /// and it is gone when that request's Dialog drops.
     #[test]
     fn a_rider_is_bound_to_its_request_and_dies_with_it() {
@@ -558,13 +619,13 @@ mod passwordless_tests {
         assert_eq!(
             st.rider_for_payload(user, &token, true, false),
             (None, true),
-            "a payload that waits for no acknowledgement does not carry an unshown rider"
+            "a payload that waits for no acknowledgment does not carry an unshown rider"
         );
         assert!(st.rider_unshown(user), "and it stays unshown");
         assert_eq!(
             st.take_passwordless(user, &token),
             None,
-            "an arm the card has not been shown is not honoured"
+            "an arm the card has not been shown is not honored"
         );
         assert_eq!(st.arm_passwordless(user, &token, 15), Ok(()));
         assert_eq!(
@@ -633,10 +694,10 @@ mod passwordless_tests {
         assert_eq!(st.rider_state(user), None);
     }
 
-    /// An arm after the acknowledgement resets it: the next show waits for
-    /// a fresh one and the dwell runs whole from it.
+    /// An arm after the acknowledgment resets it: the next show waits for
+    /// a fresh one.
     #[test]
-    fn an_arm_after_the_ack_restarts_the_ack_and_the_dwell() {
+    fn an_arm_after_the_ack_restarts_the_ack() {
         let cfg = Config::default();
         let user = "faceauth-passwordless-ack-test-user";
         let st = test_state();
@@ -646,19 +707,10 @@ mod passwordless_tests {
         assert!(st.ack(user, Some(&token)));
         let at = Instant::now() - Duration::from_secs(5);
         d.acked_at = Some(at);
-        assert_eq!(d.dwell_left(Instant::now()), Duration::ZERO);
         assert!(d.acknowledged());
         d.reset_ack();
         assert_eq!(d.acked_at(), None);
-        assert!(
-            !d.acknowledged(),
-            "the old acknowledgement no longer counts"
-        );
-        assert_eq!(
-            d.dwell_left(Instant::now()),
-            ACK_DWELL,
-            "the next nod window starts with a full dwell"
-        );
+        assert!(!d.acknowledged(), "the old acknowledgment no longer counts");
         assert!(
             st.ack(user, Some(&token)),
             "the card acknowledges the re-shown request"
@@ -692,6 +744,12 @@ mod passwordless_tests {
             waiting: false,
             passwordless_minutes,
             face_present,
+            key_armed: false,
+            key_pin: false,
+            key_pin_wanted: false,
+            fprint_armed: false,
+            fprint_status: "place",
+            ack_wanted: false,
         })
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -709,6 +767,104 @@ mod passwordless_tests {
             st.rider_for_payload(user, &old, true, true),
             (None, false),
             "the old token reaches nothing"
+        );
+    }
+
+    /// The payload says the key works exactly while a watch is armed on
+    /// this request, asks for its PIN only when the lane's line does, and
+    /// a new request starts with both off.
+    #[test]
+    fn the_payload_says_whether_the_key_is_armed() {
+        let cfg = Config::default();
+        let user = "faceauth-key-payload-test-user";
+        let st = test_state();
+        let _turn = st.test_live(1000, user);
+        let d = Dialog::new(&cfg, user, st).unwrap();
+        let tok = d.token().to_string();
+        assert_eq!(
+            st.key_for_payload(user, &tok).pair(),
+            (false, false),
+            "a request starts with the key off"
+        );
+        let g = st.arm_key(user, &tok, false).unwrap();
+        assert_eq!(st.key_for_payload(user, &tok).pair(), (true, false));
+        assert_eq!(
+            st.key_for_payload(user, "another-token").pair(),
+            (false, false)
+        );
+        st.disarm_key(user, &tok, g);
+        assert_eq!(
+            st.key_for_payload(user, &tok).pair(),
+            (false, false),
+            "off once the watch ends"
+        );
+        st.arm_key(user, &tok, true).unwrap();
+        assert_eq!(
+            st.key_for_payload(user, &tok).pair(),
+            (true, true),
+            "a PIN lane asks for the PIN"
+        );
+        drop(d);
+        let d2 = Dialog::new(&cfg, user, st).unwrap();
+        assert_eq!(
+            st.key_for_payload(user, d2.token()).pair(),
+            (false, false),
+            "nothing armed carries over to the next request"
+        );
+    }
+
+    /// The payload says the fingerprint works exactly while its watch is
+    /// armed on this request, carries the watch's status, sends the card
+    /// again when the status changes, and a new request starts with it off.
+    #[test]
+    fn the_payload_says_whether_the_fingerprint_is_armed() {
+        use crate::consent::state::FprintStatus;
+        let cfg = Config::default();
+        let user = "faceauth-fprint-payload-test-user";
+        let st = test_state();
+        let _turn = st.test_live(1000, user);
+        let d = Dialog::new(&cfg, user, st).unwrap();
+        let tok = d.token().to_string();
+        assert!(
+            !st.fprint_for_payload(user, &tok).armed,
+            "a request starts with it off"
+        );
+        let g = st.arm_fprint(user, &tok).unwrap();
+        let card = st.fprint_for_payload(user, &tok);
+        assert!(card.armed);
+        assert_eq!(card.status.word(), "place");
+        assert!(!st.fprint_for_payload(user, "another-token").armed);
+        assert!(!st.take_key_card_stale(user));
+        st.fprint_status(user, &tok, g, FprintStatus::Retry);
+        assert_eq!(st.fprint_for_payload(user, &tok).status.word(), "retry");
+        assert!(
+            st.take_key_card_stale(user),
+            "a changed status sends the card again"
+        );
+        st.fprint_status(user, &tok, g, FprintStatus::Retry);
+        assert!(!st.take_key_card_stale(user), "an unchanged one does not");
+        st.fprint_status(user, &tok, g + 7, FprintStatus::Busy);
+        assert_eq!(
+            st.fprint_for_payload(user, &tok).status.word(),
+            "retry",
+            "a watch no longer armed reports nothing"
+        );
+        st.disarm_fprint(user, &tok, g);
+        assert!(
+            !st.fprint_for_payload(user, &tok).armed,
+            "off once the watch ends"
+        );
+        st.arm_fprint(user, &tok).unwrap();
+        st.key_off(user, false);
+        assert!(
+            !st.fprint_for_payload(user, &tok).armed,
+            "a hold or the wait for attention takes it off with the key"
+        );
+        drop(d);
+        let d2 = Dialog::new(&cfg, user, st).unwrap();
+        assert!(
+            !st.fprint_for_payload(user, d2.token()).armed,
+            "nothing armed carries over to the next request"
         );
     }
 }

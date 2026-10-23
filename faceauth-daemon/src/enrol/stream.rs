@@ -1,12 +1,12 @@
 //! What passes between the daemon and the walk-through window: how the
 //! setup script starts a session, and the one line per frame the window
 //! draws from. Positions are in ring units the daemon computes, so the
-//! window and the judgement agree.
+//! window and the judgment agree.
 
 use serde::{Deserialize, Serialize};
 
 /// How the setup script starts a session: the label its templates carry
-/// and the screen to begin at ("welcome" for a first enrolment, "distance"
+/// and the screen to begin at ("welcome" for a first enrollment, "distance"
 /// for Add Look).
 #[derive(Clone, Debug, Deserialize)]
 pub struct Start {
@@ -16,11 +16,13 @@ pub struct Start {
 }
 
 /// One line of the stream the window draws from. Positions are in ring
-/// units: 0 is the centre, 1 is the ring. The daemon does the mapping so
-/// the window and the judgement agree.
+/// units: 0 is the center, 1 is the ring. The daemon does the mapping so
+/// the window and the judgment agree.
 #[derive(Clone, Debug, Serialize)]
 pub struct Tick {
-    /// "welcome", "centre", "path", "hold", "verify", "done", "failed".
+    /// The step (`Step::name`: "welcome", "centre", "range", "path",
+    /// "hold", "verify", "bridge", "round", and "record" in a development
+    /// build), or "done" or "failed" as the session ends.
     pub step: &'static str,
     /// For hold steps, the look the target sits at.
     pub zone: Option<&'static str>,
@@ -28,7 +30,7 @@ pub struct Tick {
     /// Face width as a fraction of the frame's shorter side, and what it says.
     pub size: f32,
     pub distance: &'static str,
-    /// The dot: where the head points, relative to this person's centre.
+    /// The dot: where the head points, relative to this person's center.
     pub dot_x: f32,
     pub dot_y: f32,
     /// The target the dot should be in.
@@ -56,8 +58,8 @@ pub struct Tick {
 }
 
 /// The smoothed readings, the raw ones, the mesh's pose and the face's
-/// place in the frame (0..1), flattened into the tick in a development
-/// build.
+/// place in the frame (0..1), carried in the tick's `record` object in a
+/// development build.
 #[cfg(feature = "dev-tools")]
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct TickRecord {
@@ -75,7 +77,7 @@ pub struct TickRecord {
     pub mesh_score: Option<f32>,
     pub x: f32,
     pub y: f32,
-    /// This person's centre, once learned.
+    /// This person's center, once learned.
     pub centre_yaw: f32,
     pub level: f32,
 }

@@ -21,7 +21,7 @@ pub const MAX_TEMPLATES: usize = 40;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Template {
-    /// L2-normalised embedding.
+    /// L2-normalized embedding.
     pub embedding: Vec<f32>,
     /// Detector score of the frame it came from.
     pub quality: f32,
@@ -53,15 +53,16 @@ pub struct UserTemplates {
     /// is a different person; a mismatch on load is treated as not enrolled.
     /// Required: a file without it does not parse, so the check always runs.
     pub uid: u32,
-    /// Which recognition model produced these; a model change invalidates them.
+    /// Which recognition model produced these; an enrollment refuses to add
+    /// to a set from another model.
     pub model: String,
     pub templates: Vec<Template>,
-    /// This person's gesture rounds, recorded in the enrolment walk-through.
+    /// This person's gesture rounds, recorded in the enrollment walk-through.
     #[serde(default)]
     pub gesture: GestureCal,
 }
 
-/// What the enrolment walk-through recorded of this person's gestures, in
+/// What the enrollment walk-through recorded of this person's gestures, in
 /// degrees from the face mesh. The consent window's floors derive from
 /// where each gesture round stops reading (`floors_deg`); the swings are
 /// kept for the record. A record written before round-4 C3 also carries
@@ -89,6 +90,14 @@ pub struct GestureCal {
     pub nod_reads_to_deg: Vec<f32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shake_reads_to_deg: Vec<f32>,
+    /// The least floors, degrees, at which none of the person's everyday
+    /// rounds reads as a nod, or as a shake: the walk-through replays the
+    /// everyday rounds at the derived floors and raises a floor that lets
+    /// one through (round-4 C3). None where the derived floor reads none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nod_floor_min_deg: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shake_floor_min_deg: Option<f32>,
 }
 
 /// An everyday round on the mesh: its largest 1.5 s swing in yaw and in
@@ -112,11 +121,22 @@ impl GestureCal {
     pub const NOD_DEG_MAX: f32 = 16.0;
     pub const SHAKE_DEG_MAX: f32 = 24.0;
 
-    /// The mesh detectors' floors, degrees, derived by replay: the highest
-    /// floor at which every one of this person's recorded gesture rounds
-    /// still reads, times `MESH_FLOOR_MARGIN`, never under the detector's
-    /// own minimum nor over the cap. Nothing recorded means the defaults.
+    /// The mesh detectors' floors, degrees: the derived ones, raised where
+    /// the everyday replay found one of the person's everyday rounds
+    /// reading as a gesture there.
     pub fn floors_deg(&self, default_nod: f32, default_shake: f32) -> (f32, f32) {
+        let (nod, shake) = self.derived_floors_deg(default_nod, default_shake);
+        (
+            nod.max(self.nod_floor_min_deg.unwrap_or(nod)),
+            shake.max(self.shake_floor_min_deg.unwrap_or(shake)),
+        )
+    }
+
+    /// The floors derived by replay: the highest floor at which every one
+    /// of this person's recorded gesture rounds still reads, times
+    /// `MESH_FLOOR_MARGIN`, never under the detector's own minimum nor over
+    /// the cap. Nothing recorded means the defaults.
+    pub fn derived_floors_deg(&self, default_nod: f32, default_shake: f32) -> (f32, f32) {
         let derive = |reads_to: &[f32], default: f32, cap: f32| {
             reads_to
                 .iter()
@@ -197,7 +217,7 @@ impl UserTemplates {
     pub const QUALITY_FLOOR: f32 = 0.6;
 
     /// Trim the set to `max` templates, one at a time, and return how many
-    /// went. The order matters: a set pruned by nearest neighbour alone
+    /// went. The order matters: a set pruned by nearest neighbor alone
     /// keeps whatever is least like the rest, so an impostor's frame or a
     /// garbage crop is the last thing to go and the person's own looks go
     /// first. So each round drops, in this order, a template inconsistent
@@ -333,7 +353,7 @@ mod tests {
 
     /// A file from before the camera and the uid were required (the
     /// development laptop's, or one edited to drop them) does not load:
-    /// `load` fails naming re-enrolment, and nothing in it can match on
+    /// `load` fails naming re-enrollment, and nothing in it can match on
     /// any camera (H5). A file with both loads.
     #[test]
     fn a_file_without_device_or_uid_does_not_load() {
@@ -364,8 +384,8 @@ mod tests {
                 Ok(t) => panic!("a file without {} loaded: {:?}", field, t),
             };
             assert!(
-                err.contains("re-enrol") && err.contains(field),
-                "the error names the missing field and re-enrolment: {}",
+                err.contains("re-enroll") && err.contains(field),
+                "the error names the missing field and re-enrollment: {}",
                 err
             );
         }
@@ -444,8 +464,8 @@ mod tests {
         assert_eq!(u.prune_to(10), 0);
     }
 
-    /// An impostor's frame and a garbage crop have no close neighbour, so a
-    /// nearest-neighbour prune kept them and dropped the person's own looks.
+    /// An impostor's frame and a garbage crop have no close neighbor, so a
+    /// nearest-neighbor prune kept them and dropped the person's own looks.
     /// They go first now: the outlier, then the poor crop, then duplicates.
     #[test]
     fn pruning_drops_the_impostor_and_the_junk_before_the_person() {

@@ -1,5 +1,8 @@
-//! Head pose from the detector's five landmarks: enough to say whether a face
-//! is turned toward the camera ("attention") without a landmark model.
+//! Head pose from the detector's five landmarks: the measures the pose
+//! sweep, the enrollment walk-through and the CLI's engine tools record.
+//! Attention is not decided here: seen from below, the detector's nose
+//! point slides toward the chin and its pitch stops moving, so the one
+//! attention rule is `mesh::is_attentive` on the face mesh's angles.
 
 /// Landmarks in detector order: right eye, left eye, nose tip, right mouth
 /// corner, left mouth corner (image coordinates; "right" is the subject's right,
@@ -59,35 +62,34 @@ pub fn pose(l: &[[f32; 2]; 5]) -> Pose {
     }
 }
 
-/// Facing the camera closely enough to count as attention.
-pub fn is_attentive(p: &Pose, max_yaw: f32, max_roll_deg: f32) -> bool {
-    p.yaw.abs() <= max_yaw
-        && p.roll.abs().to_degrees() <= max_roll_deg
-        && (0.2..=0.85).contains(&p.pitch)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn frontal_face_is_attentive() {
+    fn frontal_face_reads_level() {
         // The ArcFace template itself: a frontal, level face.
         let t = crate::align::ARCFACE_112;
         let p = pose(&t);
         assert!(p.yaw.abs() < 0.05, "{:?}", p);
         assert!(p.roll.abs() < 0.02, "{:?}", p);
         assert!((0.4..0.6).contains(&p.pitch), "{:?}", p);
-        assert!(is_attentive(&p, 0.25, 25.0));
     }
 
+    /// The five-point measures still read a turn and a tilt, at the sizes
+    /// the mesh rule's bounds correspond to (a yaw of 0.25 inter-eye
+    /// distances is about 21 degrees; roll is in radians here).
     #[test]
-    fn turned_and_tilted_faces_are_not() {
+    fn turned_and_tilted_faces_read_as_such() {
         let mut turned = crate::align::ARCFACE_112;
         turned[2][0] += 15.0; // nose shifted toward the left eye: yaw
-        assert!(!is_attentive(&pose(&turned), 0.25, 25.0));
+        assert!(pose(&turned).yaw.abs() > 0.25, "{:?}", pose(&turned));
         let mut tilted = crate::align::ARCFACE_112;
         tilted[1][1] += 25.0; // one eye much lower: roll
-        assert!(!is_attentive(&pose(&tilted), 0.25, 25.0));
+        assert!(
+            pose(&tilted).roll.abs().to_degrees() > 25.0,
+            "{:?}",
+            pose(&tilted)
+        );
     }
 }

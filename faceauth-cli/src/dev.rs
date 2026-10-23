@@ -1,30 +1,119 @@
 //! The bring-up and tuning tools: direct camera access, the engine on
 //! still frames and live, the pose sweep and readout, the liveness
-//! capture, the terminal-only enrolment into a development store and the
+//! capture, the terminal-only enrollment into a development store and the
 //! verify loop. None of it ships: the package build has no `dev-tools`
 //! feature, so the shipped CLI is the commands a user or a setup script
 //! runs and nothing a reviewer has to read past (H2). One of these tools,
 //! `enroll --store`, writes into a store of its own from the direct camera,
-//! bound to the IR sensor it probed like the daemon's own enrolment (H5),
+//! bound to the IR sensor it probed like the daemon's own enrollment (H5),
 //! and still must not exist in the package.
 
+use super::args::flags_and_words;
 use super::*;
 use faceauth_camera::calib::{self, Exposure, Window};
 use faceauth_camera::unpack::{bayer_reduce, BayerOrder};
 use faceauth_camera::{Camera, Frame, Illuminator};
 use std::io::Write;
 
-pub(super) const USAGE: &str = "\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only] [--exposure LINES]\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine mesh --models DIR IMAGE.pgm\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth sweep [--user NAME] [--seconds N] [--log FILE] [--threshold T]   (root; scores per frame while you turn your head)\n  faceauth pose [--user NAME] [--rounds N] [--seconds N]   (root; a live pose readout)\n  faceauth enroll --store DIR ...                   (direct camera access; templates bound to the probed IR sensor)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]";
+pub(super) const USAGE: &str = "\n  faceauth cam test [--seconds N] [--led on|off|alt] [--snapshot DIR] [--ir-only] [--exposure LINES]\n  faceauth engine inspect MODEL.onnx\n  faceauth engine test --models DIR IMAGE.pgm [IMAGE2.pgm]\n  faceauth engine mesh --models DIR IMAGE.pgm\n  faceauth engine live --models DIR [--seconds N] [--led on|off] [--save DIR]\n  faceauth engine halves --models DIR --reference DIR [--cut ROW] [--csv FILE] DIR...   (recorded frames scored whole and by halves against a reference look)\n  faceauth liveness capture --models DIR --label TEXT --save DIR [--seconds N]\n  faceauth sweep [--user NAME] [--seconds N] [--log FILE] [--threshold T]   (root; scores per frame while you turn your head)\n  faceauth pose [--user NAME] [--rounds N] [--seconds N]   (root; a live pose readout)\n  faceauth enroll --store DIR [--models DIR] [--user NAME] [--label TEXT] [--seconds N] [--count N]   (direct camera access; templates bound to the probed IR sensor)\n  faceauth verify --store DIR [--user NAME] [--seconds N] [--label TEXT --log scores.csv]";
 
 /// The development commands, or None when `argv` is not one of them.
+/// Each is started only once its arguments pass `check_args`.
 pub(super) fn dispatch(argv: &[&str]) -> Option<Result<()>> {
-    match run(argv) {
+    let checked = check_args(argv)?;
+    match checked.and_then(|()| run(argv)) {
         Err(e) if e.to_string() == NOT_A_DEV_COMMAND => None,
         r => Some(r),
     }
 }
 
 const NOT_A_DEV_COMMAND: &str = "not a development command";
+
+/// A development command's arguments checked as `check_args` checks the
+/// production ones; None when `argv` names no development command.
+pub(super) fn check_args(argv: &[&str]) -> Option<Result<()>> {
+    let ((rest, switches, valued), own) = takes(argv)?;
+    Some(flags_and_words(rest, switches, valued, own))
+}
+
+/// Which words, besides its flags, a development command takes as its own.
+type Own = fn(&str) -> bool;
+
+/// What each development command takes, as `takes` says for the
+/// production ones, and which other words are its own: the still images
+/// the engine reads, the directories `engine halves` compares.
+fn takes<'a>(argv: &'a [&'a str]) -> Option<(Takes<'a>, Own)> {
+    let none: Own = |_| false;
+    let image: Own = |w| w.ends_with(".pgm");
+    let dir: Own = |w| !w.starts_with('-');
+    Some(match argv {
+        ["cam", "test", rest @ ..] => (
+            (
+                rest,
+                &["--ir-only"],
+                &["--seconds", "--led", "--snapshot", "--exposure"],
+            ),
+            none,
+        ),
+        ["engine", "inspect", _model, rest @ ..] => ((rest, &[], &[]), none),
+        ["engine", "test" | "mesh", rest @ ..] => ((rest, &[], &["--models"]), image),
+        ["engine", "live", rest @ ..] => (
+            (rest, &[], &["--models", "--seconds", "--led", "--save"]),
+            none,
+        ),
+        ["engine", "halves", rest @ ..] => (
+            (rest, &[], &["--models", "--reference", "--cut", "--csv"]),
+            dir,
+        ),
+        ["enroll", rest @ ..] if rest.contains(&"--store") => (
+            (
+                rest,
+                &[],
+                &[
+                    "--store",
+                    "--models",
+                    "--user",
+                    "--label",
+                    "--seconds",
+                    "--count",
+                ],
+            ),
+            none,
+        ),
+        ["sweep", rest @ ..] => (
+            (
+                rest,
+                &[],
+                &["--socket", "--user", "--seconds", "--log", "--threshold"],
+            ),
+            none,
+        ),
+        ["pose", rest @ ..] => (
+            (rest, &[], &["--socket", "--user", "--rounds", "--seconds"]),
+            none,
+        ),
+        ["liveness", "capture", rest @ ..] => (
+            (rest, &[], &["--models", "--label", "--save", "--seconds"]),
+            none,
+        ),
+        ["verify", rest @ ..] => (
+            (
+                rest,
+                &[],
+                &[
+                    "--models",
+                    "--store",
+                    "--user",
+                    "--seconds",
+                    "--label",
+                    "--log",
+                ],
+            ),
+            none,
+        ),
+        _ => return None,
+    })
+}
 
 fn run(argv: &[&str]) -> Result<()> {
     match argv {
@@ -91,6 +180,7 @@ fn run(argv: &[&str]) -> Result<()> {
             Ok(())
         }
         ["engine", "live", rest @ ..] => engine_live(rest),
+        ["engine", "halves", rest @ ..] => engine_halves(rest),
         ["enroll", rest @ ..] if rest.contains(&"--store") => enroll(rest),
         ["sweep", rest @ ..] => {
             // Root: how the match falls off with head pose, against the
@@ -99,7 +189,7 @@ fn run(argv: &[&str]) -> Result<()> {
             let socket =
                 PathBuf::from(opt(rest, "--socket").unwrap_or(faceauth_daemon::config::SOCKET));
             let user = user_arg(rest)?;
-            let seconds: f32 = opt(rest, "--seconds").unwrap_or("20").parse()?;
+            let seconds = seconds_arg(rest, 20.0, 1.0, 600.0)?;
             let threshold: f32 = opt(rest, "--threshold").unwrap_or("0.70").parse()?;
             println!("Pose sweep for {}: {} s. Follow the cues; move slowly and keep your eyes on the screen.", user, seconds as u32);
             // Cues on a timer while the daemon records: five equal phases.
@@ -246,7 +336,7 @@ fn run(argv: &[&str]) -> Result<()> {
                 PathBuf::from(opt(rest, "--socket").unwrap_or(faceauth_daemon::config::SOCKET));
             let user = user_arg(rest)?;
             let rounds: usize = opt(rest, "--rounds").unwrap_or("8").parse()?;
-            let seconds: f32 = opt(rest, "--seconds").unwrap_or("3").parse()?;
+            let seconds = seconds_arg(rest, 3.0, 1.0, 60.0)?;
             println!("Pose readout for {}: {} rounds of {} s. Turn is yaw (negative left), pitch is nose_pitch (higher is chin down). Move and watch.", user, rounds, seconds);
             println!(
                 "{:>5} {:>7} {:>7} {:>7} {:>7} {:>7} {:>6}",
@@ -300,7 +390,7 @@ fn run(argv: &[&str]) -> Result<()> {
 }
 
 struct Loop {
-    /// Metering window in raw frame coordinates; None = centre window.
+    /// Metering window in raw frame coordinates; None = center window.
     window: Option<Window>,
     cam: Camera,
     frame: Frame,
@@ -380,6 +470,7 @@ fn cam_test(rest: &[&str]) -> Result<()> {
                 ))
             }
             "--ir-only" => ir_only = true,
+            // Kept for the match on a word: `check_args` admits no other.
             _ => usage(),
         }
     }
@@ -523,7 +614,14 @@ fn cam_test(rest: &[&str]) -> Result<()> {
         let f = &ir_loop.frame;
         let mut grey = vec![0u8; f.width * f.height];
         calib::ir_to_grey8(&f.px, ir_black, ir_white, calib::IR_LOOK, &mut grey);
-        write_pgm(&dir.join("ir.pgm"), f.width, f.height, &grey)?;
+        let path = dir.join("ir.pgm");
+        faceauth_engine::Grey {
+            width: f.width,
+            height: f.height,
+            data: grey,
+        }
+        .write_pgm(&path)
+        .with_context(|| path.display().to_string())?;
         if let Some(r) = &rgb_loop {
             let (w2, h2) = (r.frame.width / 2, r.frame.height / 2 - 1);
             let n = (r.frame.width / 2) * (r.frame.height / 2);
@@ -557,13 +655,6 @@ fn cam_test(rest: &[&str]) -> Result<()> {
     if let Some(r) = rgb_loop.as_mut() {
         r.cam.stop()?;
     }
-    Ok(())
-}
-
-fn write_pgm(path: &PathBuf, w: usize, h: usize, data: &[u8]) -> Result<()> {
-    let mut f = std::fs::File::create(path).with_context(|| path.display().to_string())?;
-    write!(f, "P5\n{} {}\n255\n", w, h)?;
-    f.write_all(data)?;
     Ok(())
 }
 
@@ -662,6 +753,7 @@ fn engine_live(rest: &[&str]) -> Result<()> {
             "--models" => {
                 it.next();
             }
+            // Kept for the match on a word: `check_args` admits no other.
             _ => usage(),
         }
     }
@@ -786,7 +878,7 @@ fn engine_live(rest: &[&str]) -> Result<()> {
     }
     if n > 0 {
         println!(
-            "{} frames analysed, mean {:.1} ms per frame (detect + align + embed)",
+            "{} frames analyzed, mean {:.1} ms per frame (detect + align + embed)",
             n,
             sum_ms / n as f64
         );
@@ -804,7 +896,8 @@ struct Sample {
 
 /// Stream the IR camera with the illuminator on and face-box metering, and
 /// collect up to `want` embeddings of the best-scoring detections within `seconds`.
-/// This is the capture the daemon runs for both enrolment and verification.
+/// A development capture, simpler than the daemon's: percentile-stretched
+/// frames, steady light, no flash gate and no face following.
 fn capture_burst(
     p: &mut faceauth_engine::Pipeline,
     seconds: u64,
@@ -880,7 +973,7 @@ fn capture_burst(
             });
         }
         // Skip frames before the face-box metering has had a chance to act, and
-        // space samples out so an enrolment covers different poses.
+        // space samples out so an enrollment covers different poses.
         if seen <= 2
             || (!out.is_empty() && last_sample.elapsed() < Duration::from_millis(spacing_ms))
         {
@@ -1278,7 +1371,7 @@ fn liveness_capture(rest: &[&str]) -> Result<()> {
         let ring_flash = mean_region(1.4, 2.0);
         let _ = (face_flash, ring_flash);
         // Glint at native resolution: brightest flash pixel within 5 px of each eye
-        // landmark over the mean of that neighbourhood.
+        // landmark over the mean of that neighborhood.
         let glint_native = |ex: f32, ey: f32| -> f32 {
             let (cx, cy) = (ex.round() as i32, ey.round() as i32);
             let (mut mx, mut sum, mut cnt) = (0f32, 0f32, 0usize);
@@ -1359,9 +1452,383 @@ fn liveness_capture(rest: &[&str]) -> Result<()> {
 /// a test (F13); root probes as the daemon does.
 fn dev_store(dir: &str) -> Result<faceauth_daemon::store::Store> {
     use faceauth_daemon::store::{Sealing, Store};
-    if unsafe { libc_geteuid() } == 0 {
+    if nix::unistd::geteuid().is_root() {
         Store::open(dir)
     } else {
         Store::open_with(dir, Sealing::Plain("development store, not root".into()))
+    }
+}
+
+/// Where the aligned crop is cut into its halves, as a row of the 112x112
+/// crop: halfway between the ArcFace template's eye line (row 51.6) and
+/// its nose tip (row 71.7). The top half, rows 0 to 61, is forehead, brows
+/// and eyes; the bottom half, rows 62 to 111, is nose, mouth and chin. The
+/// halves do not overlap.
+const HALF_CUT: usize = 62;
+
+/// Which part of the aligned crop an embedding sees.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Half {
+    Full,
+    Top,
+    Bottom,
+}
+
+/// The aligned crop with the part an embedding must not see filled with
+/// mid-gray, which the model's input normalization, (v - 127.5) / 127.5,
+/// reads as nothing. Masked, not cropped: the model takes a whole 112x112
+/// aligned face with the eyes, nose and mouth at fixed places, and a half
+/// crop would have to be stretched or padded back to that size, which
+/// moves every feature off the place the model learned it at.
+fn half_of(crop: &faceauth_engine::Grey, half: Half, cut: usize) -> faceauth_engine::Grey {
+    let mut out = crop.clone();
+    let cut = cut.min(crop.height);
+    let rows = match half {
+        Half::Full => return out,
+        Half::Top => cut..crop.height,
+        Half::Bottom => 0..cut,
+    };
+    for y in rows {
+        out.data[y * crop.width..(y + 1) * crop.width].fill(128);
+    }
+    out
+}
+
+/// One recorded frame, embedded whole and by halves.
+struct HalfSample {
+    name: String,
+    /// Looking straight at the camera: the terminal enrollment's center
+    /// band on the five-point turn (within 0.12).
+    straight: bool,
+    full: Vec<f32>,
+    top: Vec<f32>,
+    bottom: Vec<f32>,
+}
+
+impl HalfSample {
+    fn of(&self, half: Half) -> &[f32] {
+        match half {
+            Half::Full => &self.full,
+            Half::Top => &self.top,
+            Half::Bottom => &self.bottom,
+        }
+    }
+}
+
+/// Every `.pgm` frame in `dir` with exactly one face, embedded whole and
+/// by halves, in name order; with how many frames had no face and how
+/// many more than one (both skipped, as the walk-through skips them).
+fn half_samples(
+    p: &mut faceauth_engine::Pipeline,
+    dir: &std::path::Path,
+    cut: usize,
+) -> Result<(Vec<HalfSample>, usize, usize)> {
+    let mut names: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("read {}", dir.display()))?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "pgm"))
+        .collect();
+    names.sort();
+    let (mut out, mut none, mut crowd) = (Vec::new(), 0usize, 0usize);
+    for path in names {
+        let img = faceauth_engine::Grey::read_pgm(&path)?;
+        let faces = p.detector.detect(&img, 0.6)?;
+        let face = match faces.as_slice() {
+            [] => {
+                none += 1;
+                continue;
+            }
+            [one] => one,
+            _ => {
+                crowd += 1;
+                continue;
+            }
+        };
+        let crop = faceauth_engine::align::align_112(&img, &face.landmarks);
+        let mut embed = |half| p.embedder.embed(&half_of(&crop, half, cut));
+        out.push(HalfSample {
+            name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            straight: faceauth_engine::pose::pose(&face.landmarks).yaw.abs() <= 0.12,
+            full: embed(Half::Full)?,
+            top: embed(Half::Top)?,
+            bottom: embed(Half::Bottom)?,
+        });
+    }
+    Ok((out, none, crowd))
+}
+
+/// The smallest, the median and the largest of `v`, or None when empty.
+fn spread(v: &mut [f32]) -> Option<(f32, f32, f32)> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+    let n = v.len();
+    let median = if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    };
+    Some((v[0], median, v[n - 1]))
+}
+
+/// The measurement behind the proposed Add Look gate (round-4 A6):
+/// a new look is allowed only when one half of the face is fully visible
+/// and matches that same half of the stored looks above a strict line.
+/// Whether this model separates half faces on this IR camera is not known,
+/// so this scores recorded frames, labeled by condition (one directory
+/// each, such as the walk-through's record mode writes), whole and by
+/// halves against a reference look, and prints the spread per condition.
+/// Each frame's score is its best similarity to any reference frame, half
+/// against the same half; a reference frame is never scored against
+/// itself. Nothing is stored and no camera is opened.
+fn engine_halves(rest: &[&str]) -> Result<()> {
+    let dir = models_dir(rest);
+    let mut reference: Option<PathBuf> = None;
+    let mut cut = HALF_CUT;
+    let mut csv: Option<PathBuf> = None;
+    let mut conditions: Vec<PathBuf> = Vec::new();
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        let mut value = || it.next().ok_or_else(|| anyhow!("{} needs a value", a));
+        match *a {
+            "--models" => {
+                value()?;
+            }
+            "--reference" => reference = Some(PathBuf::from(value()?)),
+            "--cut" => cut = value()?.parse()?,
+            "--csv" => csv = Some(PathBuf::from(value()?)),
+            flag if flag.starts_with("--") => bail!("unknown flag {}", flag),
+            d => conditions.push(PathBuf::from(d)),
+        }
+    }
+    let reference = reference.ok_or_else(|| anyhow!("--reference DIR"))?;
+    if !(1..112).contains(&cut) {
+        bail!("--cut is a row of the 112-row crop, 1 to 111");
+    }
+    if !conditions.iter().any(|c| c == &reference) {
+        conditions.insert(0, reference.clone());
+    }
+    let mut p = faceauth_engine::Pipeline::load(&dir)?;
+    println!(
+        "halves: the 112x112 aligned crop cut at row {}: top rows 0-{} (forehead, brows, eyes), bottom rows {}-111 (nose, mouth, chin); each half embedded with the other filled with mid-gray, which the model reads as nothing",
+        cut,
+        cut - 1,
+        cut
+    );
+    let label = |d: &PathBuf| {
+        d.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| d.display().to_string())
+    };
+    let (refs, none, crowd) = half_samples(&mut p, &reference, cut)?;
+    if refs.len() < 2 {
+        bail!(
+            "{}: {} frames with one face; a reference needs two or more",
+            reference.display(),
+            refs.len()
+        );
+    }
+    let mut out = match &csv {
+        Some(path) => {
+            let mut f = std::fs::File::create(path)?;
+            writeln!(f, "condition,frame,straight,full,top,bottom")?;
+            Some(f)
+        }
+        None => None,
+    };
+    println!(
+        "{:<16} {:>8} {:>6} {:>5} {:>6} {:>6} {:>6}",
+        "condition", "frames", "part", "n", "min", "median", "max"
+    );
+    for cond in &conditions {
+        let own;
+        let (samples, none, crowd) = if cond == &reference {
+            (&refs, none, crowd)
+        } else {
+            own = half_samples(&mut p, cond, cut)?;
+            (&own.0, own.1, own.2)
+        };
+        let is_ref = cond == &reference;
+        // Each frame's best similarity to the reference, per part.
+        let best = |s: &HalfSample, half: Half| -> f32 {
+            refs.iter()
+                .filter(|r| !(is_ref && r.name == s.name))
+                .map(|r| faceauth_engine::cosine(r.of(half), s.of(half)))
+                .fold(-1.0, f32::max)
+        };
+        let scored: Vec<(&HalfSample, [f32; 3])> = samples
+            .iter()
+            .map(|s| {
+                (
+                    s,
+                    [
+                        best(s, Half::Full),
+                        best(s, Half::Top),
+                        best(s, Half::Bottom),
+                    ],
+                )
+            })
+            .collect();
+        if let Some(f) = out.as_mut() {
+            for (s, v) in &scored {
+                writeln!(
+                    f,
+                    "{},{},{},{:.4},{:.4},{:.4}",
+                    label(cond),
+                    s.name,
+                    s.straight,
+                    v[0],
+                    v[1],
+                    v[2]
+                )?;
+            }
+        }
+        println!(
+            "{:<16} {} with one face, {} with none, {} with more than one{}",
+            label(cond),
+            samples.len(),
+            none,
+            crowd,
+            if is_ref { " (the reference)" } else { "" }
+        );
+        for (which, straight_only) in [("all", false), ("straight", true)] {
+            for (k, half) in [Half::Full, Half::Top, Half::Bottom]
+                .into_iter()
+                .enumerate()
+            {
+                let mut v: Vec<f32> = scored
+                    .iter()
+                    .filter(|(s, _)| !straight_only || s.straight)
+                    .map(|(_, v)| v[k])
+                    .collect();
+                let n = v.len();
+                match spread(&mut v) {
+                    Some((lo, mid, hi)) => println!(
+                        "{:<16} {:>8} {:>6} {:>5} {:>6.3} {:>6.3} {:>6.3}",
+                        "",
+                        which,
+                        format!("{:?}", half).to_lowercase(),
+                        n,
+                        lo,
+                        mid,
+                        hi
+                    ),
+                    None => println!(
+                        "{:<16} {:>8} {:>6} {:>5}",
+                        "",
+                        which,
+                        format!("{:?}", half).to_lowercase(),
+                        0
+                    ),
+                }
+            }
+        }
+    }
+    if let Some(path) = &csv {
+        println!("per-frame scores in {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod dev_flag_tests {
+    use super::*;
+
+    /// J23: a development tool refuses a flag it does not take, a flag
+    /// without its value and a stray word, as the production commands do,
+    /// and takes the flags and words its usage line shows.
+    #[test]
+    fn each_tool_takes_its_flags_and_words_and_refuses_others() {
+        for ok in [
+            &["cam", "test", "--seconds", "5", "--led", "alt", "--ir-only"][..],
+            &["engine", "inspect", "det.onnx"],
+            &["engine", "test", "--models", "m", "a.pgm", "b.pgm"],
+            &["engine", "mesh", "a.pgm", "--models", "m"],
+            &["engine", "live", "--models", "m", "--save", "out"],
+            &[
+                "engine",
+                "halves",
+                "--models",
+                "m",
+                "--reference",
+                "ref",
+                "--cut",
+                "60",
+                "hand",
+                "phone",
+            ],
+            &["liveness", "capture", "--label", "print", "--save", "out"],
+            &["sweep", "--user", "alice", "--threshold", "0.7"],
+            &["pose", "--rounds", "3", "--socket", "/run/x"],
+            &["enroll", "--store", "s", "--user", "alice", "--count", "5"],
+            &[
+                "verify", "--store", "s", "--label", "genuine", "--log", "x.csv",
+            ],
+        ] {
+            let r = check_args(ok).unwrap_or_else(|| panic!("{:?} is not a tool", ok));
+            r.unwrap_or_else(|e| panic!("{:?}: {}", ok, e));
+        }
+        for bad in [
+            &["cam", "test", "--secs", "5"][..],
+            &["cam", "test", "--led"],
+            &["engine", "inspect", "det.onnx", "extra"],
+            &["engine", "test", "a.png"],
+            &["engine", "live", "--seconds", "5", "--led"],
+            &["engine", "halves", "--refrence", "ref"],
+            &["sweep", "--user", "alice", "--treshold", "0.7"],
+            &["pose", "3"],
+            &["enroll", "--store", "s", "--poses", "up"],
+            &["verify", "--store", "s", "--label"],
+            &["liveness", "capture", "--save", "out", "--ir-only"],
+        ] {
+            let r = check_args(bad).unwrap_or_else(|| panic!("{:?} is not a tool", bad));
+            assert!(r.is_err(), "{:?} was taken", bad);
+        }
+        for production in [&["doctor"][..], &["enroll", "--look"], &["no-such-command"]] {
+            assert!(check_args(production).is_none(), "{:?}", production);
+        }
+    }
+}
+
+#[cfg(test)]
+mod halves_tests {
+    use super::*;
+
+    /// The top half keeps rows above the cut and grays the rest; the bottom
+    /// half the other way round; the whole crop is untouched. Mid-gray is
+    /// what the model's input normalization reads as nothing.
+    #[test]
+    fn a_half_greys_the_other_half_of_the_aligned_crop() {
+        let mut crop = faceauth_engine::Grey::new(112, 112);
+        for (i, v) in crop.data.iter_mut().enumerate() {
+            *v = (i % 251) as u8;
+        }
+        let top = half_of(&crop, Half::Top, HALF_CUT);
+        let bottom = half_of(&crop, Half::Bottom, HALF_CUT);
+        assert_eq!(half_of(&crop, Half::Full, HALF_CUT), crop);
+        for y in 0..112 {
+            for x in 0..112 {
+                let i = y * 112 + x;
+                let (t, b) = (top.data[i], bottom.data[i]);
+                if y < HALF_CUT {
+                    assert_eq!((t, b), (crop.data[i], 128), "row {}", y);
+                } else {
+                    assert_eq!((t, b), (128, crop.data[i]), "row {}", y);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_spread_is_the_least_the_median_and_the_most() {
+        assert_eq!(spread(&mut []), None);
+        assert_eq!(spread(&mut [0.5]), Some((0.5, 0.5, 0.5)));
+        assert_eq!(spread(&mut [0.9, 0.1, 0.5]), Some((0.1, 0.5, 0.9)));
+        assert_eq!(spread(&mut [0.9, 0.1, 0.4, 0.6]), Some((0.1, 0.5, 0.9)));
     }
 }

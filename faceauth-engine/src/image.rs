@@ -1,7 +1,7 @@
-//! 8-bit greyscale images and the few operations the pipeline needs.
+//! 8-bit grayscale images and the few operations the pipeline needs.
 
-/// Row-major 8-bit grey, no padding.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Row-major 8-bit gray, no padding.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Grey {
     pub width: usize,
     pub height: usize,
@@ -91,7 +91,7 @@ impl Grey {
         out
     }
 
-    /// Planar NCHW float tensor with the grey replicated into three channels,
+    /// Planar NCHW float tensor with the gray replicated into three channels,
     /// each value `(v - mean) / scale`. The first plane is written once and
     /// the other two are copies of it inside the same allocation: the
     /// detector calls this on a 640x640 canvas for every frame, and a
@@ -149,30 +149,49 @@ impl Grey {
         flip_x: bool,
         flip_y: bool,
     ) -> Grey {
+        let mut out = Grey::default();
+        out.set_from_u10_oriented(px, width, height, transpose, flip_x, flip_y);
+        out
+    }
+
+    /// `from_u10_oriented` into this frame, reusing its buffer: a capture
+    /// loop that keeps one frame allocates only when the size changes,
+    /// where a fresh frame per call cost a 300 kB allocation on every frame
+    /// the camera delivers (C7). Every pixel is written.
+    pub fn set_from_u10_oriented(
+        &mut self,
+        px: &[u16],
+        width: usize,
+        height: usize,
+        transpose: bool,
+        flip_x: bool,
+        flip_y: bool,
+    ) {
         assert!(px.len() >= width * height, "short sensor buffer");
         let (ow, oh) = if transpose {
             (height, width)
         } else {
             (width, height)
         };
-        let mut out = Grey::new(ow, oh);
+        self.width = ow;
+        self.height = oh;
+        self.data.resize(ow * oh, 0);
         if width == 0 || height == 0 {
-            return out;
+            return;
         }
         match (transpose, flip_x) {
-            (true, true) => orient_u10::<true, true>(px, width, &mut out, flip_y),
-            (true, false) => orient_u10::<true, false>(px, width, &mut out, flip_y),
-            (false, true) => orient_u10::<false, true>(px, width, &mut out, flip_y),
-            (false, false) => orient_u10::<false, false>(px, width, &mut out, flip_y),
+            (true, true) => orient_u10::<true, true>(px, width, self, flip_y),
+            (true, false) => orient_u10::<true, false>(px, width, self, flip_y),
+            (false, true) => orient_u10::<false, true>(px, width, self, flip_y),
+            (false, false) => orient_u10::<false, false>(px, width, self, flip_y),
         }
-        out
     }
 
+    /// The image as a binary PGM, header and pixels in one write.
     pub fn write_pgm(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
-        use std::io::Write;
-        let mut f = std::fs::File::create(path)?;
-        write!(f, "P5\n{} {}\n255\n", self.width, self.height)?;
-        f.write_all(&self.data)
+        let mut out = format!("P5\n{} {}\n255\n", self.width, self.height).into_bytes();
+        out.extend_from_slice(&self.data);
+        std::fs::write(path, out)
     }
 
     pub fn read_pgm(path: impl AsRef<std::path::Path>) -> anyhow::Result<Grey> {
@@ -253,6 +272,24 @@ fn orient_u10<const TRANSPOSE: bool, const FLIP_X: bool>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A PGM is the `P5` header with the size and 255, then the pixels,
+    /// nothing after, and it reads back as the same image.
+    #[test]
+    fn a_pgm_is_the_p5_header_then_the_pixels() {
+        let img = Grey {
+            width: 3,
+            height: 2,
+            data: vec![0, 1, 2, 253, 254, 255],
+        };
+        let path = std::env::temp_dir().join(format!("faceauth-pgm-{}.pgm", std::process::id()));
+        img.write_pgm(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let back = Grey::read_pgm(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(bytes, b"P5\n3 2\n255\n\x00\x01\x02\xfd\xfe\xff");
+        assert_eq!((back.width, back.height, back.data), (3, 2, img.data));
+    }
 
     /// The region mean follows the box, clamps it to the frame, and falls
     /// back to the frame mean when the box misses the frame.
@@ -349,7 +386,7 @@ mod tests {
 
     /// The fused 16-bit conversion and orientation equals the two-pass
     /// result for every combination of transpose and flips (poc_hygiene_2's
-    /// equality assertion, generalised).
+    /// equality assertion, generalized).
     #[test]
     fn fused_orientation_equals_the_two_pass_result() {
         let (w, h) = (13usize, 7usize);
@@ -369,6 +406,37 @@ mod tests {
                         fx,
                         fy
                     );
+                }
+            }
+        }
+    }
+
+    /// C7: a frame written again in place is the frame a fresh conversion
+    /// gives, in every orientation, and keeps its buffer: once the size is
+    /// known the capture loop allocates nothing per frame.
+    #[test]
+    fn a_reused_frame_equals_a_fresh_one_and_keeps_its_buffer() {
+        let (w, h) = (13usize, 7usize);
+        let raw: Vec<u16> = (0..w * h).map(|i| ((i * 977) % 1024) as u16).collect();
+        let other: Vec<u16> = (0..w * h).map(|i| ((i * 331 + 7) % 1024) as u16).collect();
+        let mut frame = Grey::default();
+        frame.set_from_u10_oriented(&raw, w, h, true, true, true);
+        let buffer = frame.data.as_ptr();
+        for src in [&other, &raw] {
+            for t in [false, true] {
+                for fx in [false, true] {
+                    for fy in [false, true] {
+                        frame.set_from_u10_oriented(src, w, h, t, fx, fy);
+                        assert_eq!(
+                            frame,
+                            Grey::from_u10_oriented(src, w, h, t, fx, fy),
+                            "transpose {} flip_x {} flip_y {}",
+                            t,
+                            fx,
+                            fy
+                        );
+                        assert_eq!(frame.data.as_ptr(), buffer, "the buffer was replaced");
+                    }
                 }
             }
         }

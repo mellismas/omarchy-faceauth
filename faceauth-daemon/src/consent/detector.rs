@@ -7,8 +7,8 @@
 /// complete motions: four legs of alternating direction (down, up, down, up
 /// or the reverse on the pitch axis; left, right, left, right or the reverse
 /// on the yaw axis), each a clear excursion, done together within a short
-/// span, from a head that was still just before and does not move its face
-/// elsewhere meanwhile. How a person begins and ends (from the centre or
+/// span, from a head that does not move its face elsewhere meanwhile and,
+/// where `still_s` asks for it, was still just before. How a person begins and ends (from the center or
 /// from one side) does not matter: four alternating legs is the shape.
 ///
 /// The legs come from a zigzag over the median-filtered signal: an extreme
@@ -23,7 +23,7 @@ pub struct Oscillation {
     /// Longest leg, in seconds: a shake's legs are slower than a nod's.
     pub leg_max_s: f32,
     /// Motion gate: how far, as a fraction of face width, the filtered face
-    /// centre may end the gesture from where it began, sideways and up.
+    /// center may end the gesture from where it began, sideways and up.
     /// The axis the gesture itself moves the box along gets the wider one.
     shift_tol_x: f32,
     shift_tol_y: f32,
@@ -46,7 +46,7 @@ pub struct Oscillation {
     /// for a nod, by at least this fraction of the face width between the
     /// leg's start and its extreme. A head that moves carries its box; a
     /// detector fit that switches solutions moves one landmark and leaves
-    /// the box where it was (recorded 2026-09-22: box centre moved 1 px
+    /// the box where it was (recorded 2026-09-22: box center moved 1 px
     /// through a fit flip that read as a nod; 9 to 16 px through real nods).
     /// None turns the rule off.
     pub co_motion: Option<(u8, f32)>,
@@ -76,13 +76,16 @@ pub struct Oscillation {
     /// Completed legs as (start, end, extreme value, amplitude).
     pub legs: Vec<(f32, f32, f32, f32)>,
     last_active: Option<f32>,
-    /// Recent (t, face width, centre x, centre y) for the motion gate.
+    /// Recent (t, face width, center x, center y) for the motion gate.
     motion: Vec<(f32, f32, f32, f32)>,
-    /// Seconds the face was already steadily in view before t = 0 (the scan
-    /// that matched it): counts toward the still second before a first leg.
+    /// How long the face must have been still before the first leg, in
+    /// seconds; zero asks for none. The shake's guard against a head
+    /// turning to the screen; the nod has none (`NodDetector::mesh`).
+    pub still_s: f32,
+    /// Seconds of stillness credited before t = 0, toward `still_s`. The
+    /// live window credits none (D4); a replay credits the still second a
+    /// recording starts after.
     pub prior_still: f32,
-    /// Completed gestures.
-    pub gestures: usize,
 }
 
 impl Oscillation {
@@ -107,8 +110,8 @@ impl Oscillation {
     const REST_S: f32 = 0.5;
     /// Median window over the raw signal.
     const MEDIAN: usize = 3;
-    /// The face must have been still this long before the first leg.
-    const STILL_S: f32 = 1.0;
+    /// Default `still_s`: the face still this long before the first leg.
+    pub const STILL_S: f32 = 1.0;
     /// Default: filtered face width may end the gesture this far from where
     /// it began; more is the body moving. A shake narrows the box as the
     /// head turns, so its detector allows more.
@@ -139,6 +142,7 @@ impl Oscillation {
             shift_tol_x,
             shift_tol_y,
             max_amp,
+            still_s: Self::STILL_S,
             prior_still: 0.0,
             span_s: Self::SPAN_S,
             rest_s: Self::REST_S,
@@ -164,7 +168,6 @@ impl Oscillation {
             legs: Vec::new(),
             last_active: None,
             motion: Vec::new(),
-            gestures: 0,
         }
     }
 
@@ -247,31 +250,27 @@ impl Oscillation {
             self.legs.clear();
             return false;
         }
-        // The gesture must follow a still second: someone who has only just
-        // sat down or turned to the screen, glancing between it and the
-        // keyboard, has not gestured yet. A face seen for less than that
-        // second has not been still either.
-        if self
-            .motion
-            .first()
-            .map(|m| m.0 - self.prior_still > first - Self::STILL_S + 0.2)
-            .unwrap_or(false)
-            || self.moved(first - Self::STILL_S, first, "the face had just arrived")
+        // The gesture must follow a still second where `still_s` asks for
+        // one: someone who has only just sat down or turned to the screen,
+        // glancing between it and the keyboard, has not gestured yet. A
+        // face seen for less than that second has not been still either.
+        if self.still_s > 0.0
+            && (self
+                .motion
+                .first()
+                .map(|m| m.0 - self.prior_still > first - self.still_s + 0.2)
+                .unwrap_or(false)
+                || self.moved(first - self.still_s, first, "the face had just arrived"))
         {
             self.legs.clear();
             return false;
         }
-        self.gestures += 1;
         self.legs.clear();
         true
     }
 
-    /// Feed one face frame; returns true when a gesture just completed.
-    pub fn push(&mut self, v: f32, t: f32) -> bool {
-        self.push_with(v, t, None)
-    }
-
-    /// As `push`, with the face's width and centre for the motion gate.
+    /// Feed one face frame, with the face's width and center for the
+    /// motion gate; returns true when a gesture just completed.
     pub fn push_with(&mut self, v: f32, t: f32, face: Option<(f32, f32, f32)>) -> bool {
         if let Some((w, cx, cy)) = face {
             self.motion.push((t, w, cx, cy));
@@ -365,9 +364,9 @@ impl Oscillation {
                 } else {
                     p < self.cand.0
                 };
-                // Not moving at all: a step at the still-face noise level, an
-                // absolute of the floor (a still face moves 0.003 of a width
-                // between frames; a slow turnaround moves more).
+                // Not moving at all: a step under `rest_step` degrees, an
+                // absolute, not a fraction of the floor (a still head reads
+                // about 0.7 degrees between frames, a turnaround several).
                 let still = self.last_step < self.rest_step;
                 if further {
                     self.cand = (p, t);
@@ -492,24 +491,19 @@ impl NodDetector {
     /// head reads 0.7 on average, a turnaround several).
     pub const MESH_REST_STEP: f32 = 1.5;
     /// A nod keeps the head facing the camera: yaw may range this much
-    /// over the gesture's span, in degrees. Set on the five-point yaw
-    /// measure as 0.25 of it (a still head ranged 0.03, the user's nods up
-    /// to 0.11, a head shake 0.6 or more, and a shake's perspective wobble
-    /// on the pitch measure would otherwise have read as nods) and
-    /// restated in degrees at `YAW_DEG_PER_UNIT`, so the rule did not move.
+    /// over the gesture's span, in degrees. First set on the five-point
+    /// yaw measure as 0.25 of it (a still head ranged 0.03, the user's
+    /// nods up to 0.11, a head shake 0.6 or more, and a shake's
+    /// perspective wobble on the pitch measure would otherwise have read
+    /// as nods), where a 30 degree turn reads about 0.35.
     pub const YAW_QUIET_DEG: f32 = 21.43;
-    /// A nod counts only from a head facing the camera (the presence
-    /// watch's attentive yaw): the mean yaw over the nod's span, degrees,
-    /// must be within this. A head held turned toward another screen nods
-    /// the same way on the pitch axis, but it is not nodding at the card.
-    /// 0.40 of the five-point measure, restated as above; the reference
-    /// nods held 30 degrees off still read and are refused from 36.
+    /// A nod counts only from a head facing the camera: the mean yaw over
+    /// the nod's span, degrees, must be within this. A head held turned
+    /// toward another screen nods the same way on the pitch axis, but it
+    /// is not nodding at the card. First set as 0.40 of the five-point
+    /// measure; the reference nods held 30 degrees off still read and are
+    /// refused from 36.
     pub const YAW_FACING_DEG: f32 = 34.29;
-    /// Degrees of mesh yaw per unit of the five-point yaw measure (a 30
-    /// degree turn read about 0.35 on it). The gesture rules are written
-    /// in degrees; the presence watch's `max_yaw` is still in five-point
-    /// units and converts with this.
-    pub const YAW_DEG_PER_UNIT: f32 = 30.0 / 0.35;
 
     pub fn mesh(floor_deg: f32) -> Self {
         let floor = floor_deg.max(Self::MESH_MIN_DEG);
@@ -526,6 +520,12 @@ impl NodDetector {
         // detector fit that flips does not (1 px through a recorded flip,
         // 9 to 16 px through real nods). See `Oscillation::CO_MOTION`.
         inner.co_motion = Some((2, Oscillation::CO_MOTION));
+        // No still second before the first leg (Mike, 2026-10-19): finding
+        // the face takes long enough on its own, and a nod held back for one
+        // is a nod the user has to repeat. The cost: a nod still in motion
+        // from approving one card can count toward a card queued behind it,
+        // and the change from one card to the next is plain on screen.
+        inner.still_s = 0.0;
         NodDetector {
             inner,
             nods: 0,
@@ -539,7 +539,7 @@ impl NodDetector {
 
     /// Feed one frame: the pitch, the yaw for the quiet-yaw and facing
     /// rules (None when the caller has none), the time, and the box's
-    /// width and centre for the motion rules. True when a nod pair just
+    /// width and center for the motion rules. True when a nod pair just
     /// completed.
     pub fn push_full(
         &mut self,
@@ -638,42 +638,45 @@ impl ShakeDetector {
 }
 
 #[cfg(test)]
-mod dwell_tests {
+mod still_tests {
     use super::*;
 
-    /// A head already nodding when the nod window opens: 0.3 s near rest
-    /// (the settle), then two nods at mesh scale (15 degrees, 0.27 s legs),
-    /// the box riding each leg by 0.08 face widths; `still_first` puts a
-    /// full still second in front instead.
-    fn nodding(still_first: bool) -> Option<f32> {
+    /// Two motions from a head that settles for 0.3 s first, or for a full
+    /// second with `still_first`: legs of 0.27 s at 30 fps, the box riding
+    /// each leg by 0.08 face widths, down and up for a nod (15 degrees a
+    /// leg), side to side for a shake (30). The time the detector counted
+    /// it, if it did.
+    fn motions(nod: bool, still_first: bool) -> Option<f32> {
         let mut det = NodDetector::mesh(NodDetector::MESH_MIN_DEG);
+        let mut shake = ShakeDetector::mesh(ShakeDetector::MESH_MIN_DEG);
         assert_eq!(
-            det.inner.prior_still, 0.0,
-            "the nod window credits no still second"
+            (det.inner.prior_still, shake.inner.prior_still),
+            (0.0, 0.0),
+            "the live window credits no still second"
         );
+        let deg = if nod { 15.0 } else { 30.0 };
         let fps = 30.0f32;
         let mut t = 0.0f32;
-        let (w, cx, cy0) = (90.0f32, 250.0f32, 340.0f32);
-        let mut frames: Vec<(f32, f32)> = Vec::new();
-        for _ in 0..(if still_first { 45 } else { 9 }) {
-            frames.push((0.0, cy0));
-        }
+        let (w, cx0, cy0) = (90.0f32, 250.0f32, 340.0f32);
+        // Each frame as a fraction of a leg's swing.
+        let mut frames: Vec<f32> = vec![0.0; if still_first { 45 } else { 9 }];
         let leg = 8usize;
         for _ in 0..2 {
             for k in 1..=leg {
-                let f = k as f32 / leg as f32;
-                frames.push((15.0 * f, cy0 + 7.0 * f));
+                frames.push(k as f32 / leg as f32);
             }
             for k in 1..=leg {
-                let f = k as f32 / leg as f32;
-                frames.push((15.0 * (1.0 - f), cy0 + 7.0 * (1.0 - f)));
+                frames.push(1.0 - k as f32 / leg as f32);
             }
         }
-        for _ in 0..30 {
-            frames.push((0.0, cy0));
-        }
-        for (p, cy) in frames {
-            if det.push_full(p, Some(0.0), t, Some((w, cx, cy))) {
+        frames.extend([0.0; 30]);
+        for f in frames {
+            let hit = if nod {
+                det.push_full(deg * f, Some(0.0), t, Some((w, cx0, cy0 + 7.0 * f)))
+            } else {
+                shake.push_with(deg * f, t, Some((w, cx0 + 7.0 * f, cy0)))
+            };
+            if hit {
                 return Some(t);
             }
             t += 1.0 / fps;
@@ -681,17 +684,27 @@ mod dwell_tests {
         None
     }
 
-    /// D4: a nod under way when the window opens does not count; the same
-    /// nod from a head seen still for a second does.
+    /// Mike's ruling of 2026-10-19: finding the face takes long enough on
+    /// its own, so a nod counts from right after the settle, with no still
+    /// second in front of it. A shake keeps its still second: a head
+    /// turning to the screen and back is not a refusal.
     #[test]
-    fn a_nod_under_way_at_the_window_start_does_not_count() {
+    fn a_nod_counts_without_a_still_second_and_a_shake_still_needs_one() {
         assert!(
-            nodding(false).is_none(),
-            "a nod already in motion at the card is not a nod at it"
+            motions(true, false).is_some(),
+            "a nod right after the settle counts"
         );
         assert!(
-            nodding(true).is_some(),
-            "the same nod after an observed still second counts"
+            motions(true, true).is_some(),
+            "a nod after a still second counts too"
+        );
+        assert!(
+            motions(false, false).is_none(),
+            "a shake already under way at the card is not a refusal"
+        );
+        assert!(
+            motions(false, true).is_some(),
+            "the same shake after a still second refuses"
         );
     }
 }

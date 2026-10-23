@@ -1,4 +1,4 @@
-//! The enrolment walk-through: a guided session that steers the person
+//! The enrollment walk-through: a guided session that steers the person
 //! through the looks the identity needs, with a window drawing a dot they
 //! move into targets. The daemon owns the camera, judges every frame and
 //! stores the templates; the window (a Quickshell plugin, run as the user)
@@ -9,11 +9,18 @@
 //! The session is opened by root (the setup script's `sudo faceauth enroll
 //! --guided`), which waits for the outcome. The person's own window
 //! watches the stream and sends Continue, Redo and Cancel.
+//!
+//! The terminal enrollments (`--terminal`, `--look`) run here too, with no
+//! window, under the same rules for whose face is read (`terminal`).
 
 mod dot;
+mod everyday;
+mod flash;
+mod follow;
 mod session;
 mod steps;
 mod stream;
+mod terminal;
 mod walk;
 
 pub use dot::{
@@ -28,4 +35,5 @@ pub use steps::{
 #[cfg(feature = "dev-tools")]
 pub use stream::TickRecord;
 pub use stream::{Start, Tick};
+pub use terminal::{run as run_terminal, STRAIGHT_SECONDS};
 pub use walk::run;

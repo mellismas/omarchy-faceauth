@@ -1,0 +1,27 @@
+name: Model URLs
+
+# Every URL in models.toml answers 200 and each model is the size the
+# manifest gives (B2). The files live on other people's servers as well as
+# this project's releases, so the check also runs weekly: a file can move
+# without anything here changing.
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  model-urls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Every manifest URL answers 200
+        run: bash tests/model-urls-test.sh

@@ -137,7 +137,7 @@ impl Store {
         // skipped (H5).
         let t: UserTemplates = serde_json::from_str(text).with_context(|| {
             format!(
-                "parse {}: not a template set this build reads; re-enrol",
+                "parse {}: not a template set this build reads; re-enroll",
                 p.display()
             )
         })?;
@@ -361,10 +361,10 @@ impl Store {
         Ok(())
     }
 
-    /// Enrolment's recovery from a blob this machine can no longer open (a
+    /// Enrollment's recovery from a blob this machine can no longer open (a
     /// cleared TPM, a firmware reset, a corrupt file): set it aside as
     /// `<user>.cred.unreadable-<unix seconds>` so a fresh set can be written.
-    /// Root-only by way of its only caller (enrolment), and never on the
+    /// Root-only by way of its only caller (enrollment), and never on the
     /// authentication path.
     pub fn set_aside_unreadable(&self, user: &str) -> Result<Option<PathBuf>> {
         let sealed = self.sealed_path_for(user)?;
@@ -383,7 +383,7 @@ impl Store {
         Ok(Some(aside))
     }
 
-    /// Enrolment's recovery, narrowed to what it is for: the blob goes aside
+    /// Enrollment's recovery, narrowed to what it is for: the blob goes aside
     /// only when `e` is the credential tool's verdict on it (or a parse
     /// failure of what it decrypted). A TPM that is busy, missing from the
     /// sandbox, or slow is not a reason to discard a good set (F2).
@@ -404,16 +404,16 @@ impl Store {
     /// refuses. Delete the templates first, deliberately (F2).
     pub fn check_can_replace(&self, user: &str) -> Result<()> {
         if let (Sealing::Plain(why), true) = (self.sealing(), self.is_sealed(user)) {
-            bail!("templates for {} are sealed and this daemon cannot seal ({}); enrolment refused rather than downgrade them to plaintext. Delete them first if that is intended", user, why);
+            bail!("templates for {} are sealed and this daemon cannot seal ({}); enrollment refused rather than downgrade them to plaintext. Delete them first if that is intended", user, why);
         }
         Ok(())
     }
 
-    /// The one way an enrolment opens a user's set, terminal or
+    /// The one way an enrollment opens a user's set, terminal or
     /// walk-through: the store must be allowed to replace what it holds
     /// (`check_can_replace`), and a set it cannot read goes aside only on
     /// the credential tool's own verdict. A TPM that is busy, unreachable
-    /// or slow keeps the good set, and the enrolment fails instead of
+    /// or slow keeps the good set, and the enrollment fails instead of
     /// starting over with nothing (F2, on both paths).
     pub fn open_for_enrolment(&self, user: &str) -> Result<Option<UserTemplates>> {
         self.check_can_replace(user)?;
@@ -421,7 +421,7 @@ impl Store {
             Ok(t) => Ok(t),
             Err(e) => match self.set_aside_if_unreadable(user, &e)? {
                 Some(aside) => {
-                    log::warn!("enrolment for {}: existing templates unreadable ({}); set aside as {} and starting fresh", user, e, aside.display());
+                    log::warn!("enrollment for {}: existing templates unreadable ({}); set aside as {} and starting fresh", user, e, aside.display());
                     Ok(None)
                 }
                 None => Err(e),
@@ -453,7 +453,7 @@ impl Store {
 
     /// The directory a user's gesture recordings go in (dev-tools builds
     /// only): a directory per user, so a delete takes exactly that user's
-    /// files and never a neighbour's whose name shares a prefix.
+    /// files and never a neighbor's whose name shares a prefix.
     pub fn gestures_dir_for(&self, user: &str) -> Result<PathBuf> {
         Self::check_user(user)?;
         Ok(self.dir.join("gestures").join(user))
@@ -524,6 +524,8 @@ fn non_finite_field(t: &UserTemplates) -> Option<String> {
         .chain(&g.shake_deg)
         .chain(&g.nod_reads_to_deg)
         .chain(&g.shake_reads_to_deg)
+        .chain(&g.nod_floor_min_deg)
+        .chain(&g.shake_floor_min_deg)
         .chain(g.everyday_deg.iter().flat_map(|e| [&e.dyaw, &e.dpitch]));
     if floats.into_iter().any(|v| !v.is_finite()) {
         return Some("gesture calibration".into());
@@ -531,6 +533,8 @@ fn non_finite_field(t: &UserTemplates) -> Option<String> {
     None
 }
 
+/// A user's uid by name, from the system's user database; None for a
+/// name it does not know.
 pub fn current_uid(user: &str) -> Option<u32> {
     nix::unistd::User::from_name(user)
         .ok()
@@ -604,7 +608,7 @@ mod tests {
         assert!(!dir.join("alice.tmp-1-0").exists() && !dir.join("alice.tmp-2-7").exists());
         assert!(
             dir.join("alicia.tmp-3-0").exists(),
-            "a neighbour's file is not touched"
+            "a neighbor's file is not touched"
         );
         std::fs::write(dir.join("alice.tmp-9-0"), b"half").unwrap();
         assert!(store.delete("alice").unwrap());
@@ -618,6 +622,12 @@ mod tests {
         bad.templates.push(tmpl(vec![1.0, 0.0], 1, "cam"));
         bad.gesture.nod_reads_to_deg = vec![f32::INFINITY];
         assert!(store.save(&bad).is_err());
+        bad.gesture.nod_reads_to_deg = vec![15.0];
+        bad.gesture.shake_floor_min_deg = Some(f32::NAN);
+        assert!(
+            store.save(&bad).is_err(),
+            "a raised floor is checked like the rest"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -679,7 +689,7 @@ mod tests {
 
     /// Deleting a user takes the set-aside blobs, the gesture recordings
     /// and the walk-through recordings with the templates, and nobody
-    /// else's: not a neighbour whose name extends theirs ("alice") nor one
+    /// else's: not a neighbor whose name extends theirs ("alice") nor one
     /// that adds a hyphen ("al-x") (F5, round-4 F4).
     #[test]
     fn delete_removes_every_trace_of_the_user_and_only_theirs() {

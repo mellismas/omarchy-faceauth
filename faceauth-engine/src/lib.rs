@@ -1,11 +1,18 @@
 //! Face matching engine for Omarchy FaceAuth: detect, align, embed, compare,
 //! on ONNX Runtime loaded from the distro library at run time.
 //!
-//! Models (named with their hashes and licences in `models.toml`): YuNet for
+//! Models (named with their hashes and licenses in `models.toml`): YuNet for
 //! detection with five landmarks, a similarity alignment to the ArcFace
 //! 112x112 template, AuraFace-v1 (`glintr100`) for 512-D embeddings, and
 //! MediaPipe's face mesh for the head pose the gestures and the attention
-//! check are read from. Grey frames are fed as three identical channels.
+//! check are read from. Gray frames are fed as three identical channels.
+//!
+//! No unsafe code but the one allocator call in `runtime::trim_heap`,
+//! which alone is allowed it: deny rather than forbid, since forbid admits
+//! no exception.
+
+#![deny(unsafe_code)]
+#![deny(dead_code)]
 
 pub mod align;
 pub mod detect;
@@ -15,6 +22,7 @@ pub mod liveness;
 pub mod mesh;
 pub mod motion;
 pub mod pose;
+pub mod profile;
 pub mod runtime;
 
 use anyhow::{Context, Result};
@@ -77,7 +85,7 @@ impl Pipeline {
     }
 }
 
-/// Cosine similarity of two L2-normalised embeddings. Two embeddings of
+/// Cosine similarity of two L2-normalized embeddings. Two embeddings of
 /// different lengths came from different models and have no similarity:
 /// the answer is 0, never the dot product of the shorter prefix, which
 /// a template from another model could otherwise score against.

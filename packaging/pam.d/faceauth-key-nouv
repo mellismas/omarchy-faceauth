@@ -1,0 +1,5 @@
+#%PAM-1.0
+# The key check's stack for a key line that says userverification=0: no
+# verification on the key, whatever the credential's own attributes ask.
+# Installed beside faceauth-key, and run only by faceauth-keycheck.
+auth       required     pam_u2f.so cue authfile=/etc/fido2/fido2 userverification=0

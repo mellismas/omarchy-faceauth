@@ -135,6 +135,8 @@ fn bench_ort_pipeline() {
     assert_eq!(before, after, "the reloaded session embeds the same");
     drop(p);
     let r4 = status("VmRSS:");
+    // SAFETY: malloc_trim takes no pointers and touches only the
+    // allocator's own free lists.
     unsafe { malloc_trim(0) };
     let r5 = status("VmRSS:");
     println!(
@@ -145,7 +147,7 @@ fn bench_ort_pipeline() {
     );
 }
 
-/// The recognition session under one combination of optimisation level
+/// The recognition session under one combination of optimization level
 /// (`BENCH_LEVEL` 1, 2 or 3), intra-op threads (`BENCH_THREADS`) and
 /// weight prepacking (`BENCH_NOPREPACK=1` turns it off): resident memory,
 /// load time and the cost of one embed.
@@ -194,6 +196,7 @@ fn bench_ort_recognition_variant() {
         .commit_from_file(format!("{}/{}", models_dir(), embed::AURAFACE_FILE))
         .unwrap();
     // As runtime::session does after every load.
+    // SAFETY: as above.
     unsafe { malloc_trim(0) };
     let load = t.elapsed().as_secs_f64() * 1e3;
     let r1 = status("VmRSS:");
@@ -250,6 +253,7 @@ fn bench_ort_session_threads() {
     let mut e = runtime::session(format!("{}/{}", dir, embed::AURAFACE_FILE), emb).unwrap();
     let r3 = status("VmRSS:");
     if std::env::var("BENCH_TRIM").is_ok() {
+        // SAFETY: as above.
         unsafe { malloc_trim(0) };
         println!("after malloc_trim: +{} MB", (status("VmRSS:") - r0) / 1024);
     }

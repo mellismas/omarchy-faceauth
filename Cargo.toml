@@ -3,18 +3,25 @@ resolver = "2"
 members = ["faceauth-camera", "faceauth-engine", "faceauth-daemon", "faceauth-cli", "pam_faceauth"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 authors = ["Michael Ellis"]
 repository = "https://github.com/mellismas/omarchy-faceauth"
+# The oldest toolchain that builds the workspace: ort 2.0.0-rc.13 asks for
+# 1.88 (the code itself needs 1.87, for `is_multiple_of`).
+rust-version = "1.88"
 
 [workspace.dependencies]
+# The workspace's own crates, by path and with no version: none is
+# published, so a version here would only drift from the workspace's.
+faceauth-camera = { path = "faceauth-camera" }
+faceauth-engine = { path = "faceauth-engine" }
+faceauth-daemon = { path = "faceauth-daemon" }
 anyhow = "1"
-thiserror = "2"
 log = "0.4"
 # No default features: the daemon and the CLI log to journald or a
-# terminal pipe, so the colour and regex-filter stacks (about 750 KB per
+# terminal pipe, so the color and regex-filter stacks (about 750 KB per
 # binary) buy nothing; RUST_LOG=level still works without them.
 env_logger = { version = "0.11", default-features = false }
 nix = { version = "0.31", features = ["ioctl", "fs", "poll", "mman", "socket", "uio"] }
@@ -24,9 +31,14 @@ serde_json = "1"
 toml = "1.1"
 
 # One lint policy for every crate (H1): an unsafe operation inside an
-# unsafe fn is still spelled out, and clippy's default set is on.
+# unsafe fn is still spelled out, every unsafe block says why it is sound
+# in a `// SAFETY:` line (H21), and clippy's default set is on. The check
+# (.github/workflows/check.yml) runs clippy with -D warnings, so the
+# default set fails it too.
 [workspace.lints.rust]
-unsafe_op_in_unsafe_fn = "warn"
+unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
-all = "warn"
+# The group below the single lints, so a lint named here keeps its level.
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"

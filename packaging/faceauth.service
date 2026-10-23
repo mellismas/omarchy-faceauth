@@ -16,6 +16,17 @@ Restart=on-failure
 RestartSec=2
 RuntimeDirectory=faceauth
 RuntimeDirectoryMode=0755
+# A crash and its restart are not an outage (fix round 11). systemd keeps
+# /run/faceauth through an automatic restart and through `systemctl
+# restart`, and removes it only once the unit is stopped, or failed with no
+# restart to come (v262 src/core/unit.c, unit_release_resources). The PAM
+# module counts the daemon as down, and gives sudo and polkit the stock
+# key, only when the directory is gone; a socket missing or refusing inside
+# it is a daemon restarting, and goes to the password.
+RuntimeDirectoryPreserve=restart
+# The kernel's OOM killer picks the daemon late (fix round 11): a restart
+# it forces is not an outage either, but it costs every request.
+OOMScoreAdjust=-500
 StateDirectory=faceauth
 StateDirectoryMode=0700
 ConfigurationDirectory=faceauth
@@ -72,7 +83,33 @@ LimitCORE=0
 # and about 60 MB with it released; each load peaks near 740 MB for half
 # a second. A runaway is killed well before the system is.
 MemoryMax=1024M
-TasksMax=64
+# Tasks are threads and processes together. At most: the idle daemon's 7
+# (TasksCurrent, measured live) and the presence watch's lock call (the
+# helper, `timeout` and `systemd-run`); one thread per connection place, up
+# to the largest max_connections the config takes (MAX_CONNECTIONS_CAP,
+# 128, config.rs; 64 by default); and one per consent request of the one
+# user whose requests hold the window (CONSENT_PER_UID, 32,
+# consent/state.rs), which wait without a place. Any request may be running
+# a call into the user's session, `timeout` plus `systemd-run`, so each
+# counts three. The security key adds five: the watch of the request on
+# screen, its systemd-run, the timeout and systemctl that stop a check, and
+# the next watch waiting for that stop (consent/key.rs; the check itself
+# runs in a unit of its own). The nod window's lock watches add six: at
+# most two hold a thread (LOCK_WATCHES_MAX, consent/wait.rs), the window's
+# own and one still finishing a look after its window ended, each with its
+# look's `timeout` and `systemd-run`. A key unlock from the lock screen,
+# or a sudo or polkit stack's key-fallback line, holds a place with one
+# task more, its check's systemd-run beside the lock check or the stop it
+# makes. The lock screen's reserved channels (round 7) sit outside the
+# places, a thread each, at most 32 (server/channel.rs), with one
+# listener thread:
+# (128 + 32) * 3 + 128 + 32 + 7 + 3 + 5 + 1 + 6 = 662. With that
+# room, a burst of one user's requests meets CONSENT_PER_UID's clean
+# refusal before the daemon cannot start a thread and drops other users'
+# requests (D6). serve.rs's
+# the_units_tasks_max_holds_every_request_the_daemon_admits holds this line
+# to the constants.
+TasksMax=666
 # The daemon logs at info unless RUST_LOG says otherwise; nothing to set here.
 
 [Install]

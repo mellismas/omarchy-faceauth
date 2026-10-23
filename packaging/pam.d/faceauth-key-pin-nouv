@@ -1,0 +1,5 @@
+#%PAM-1.0
+# The key check's stack for a key line that asks for the key's PIN and says
+# userverification=0. Installed beside faceauth-key, and run only by
+# faceauth-keycheck.
+auth       required     pam_u2f.so cue authfile=/etc/fido2/fido2 pinverification=1 userverification=0

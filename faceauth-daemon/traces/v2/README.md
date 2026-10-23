@@ -6,7 +6,7 @@ frame: `t yaw pitch roll pos_x pos_y w cx cy size score`. Angles in degrees
 from the face mesh (yaw negative turned to the subject's left as this camera
 sees it, pitch positive chin down, roll positive left eye lower); pos_x and
 pos_y the accumulated image motion of the face in face widths, which nothing
-reads since the image-motion detectors went (round-4 C3); w, cx, cy the
+has read since the image-motion detectors were removed; w, cx, cy the
 detector box; size the face width as a fraction of the frame's shorter
 side; score the mesh's face confidence. Numbers only, never an image.
 

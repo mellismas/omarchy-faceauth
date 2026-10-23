@@ -1,4 +1,4 @@
-//! The watch's judgement, tick by tick: who is holding the away clock,
+//! The watch's judgment, tick by tick: who is holding the away clock,
 //! when a hidden face still counts, and when the session should lock. It
 //! takes observations rather than frames, so the tests can drive it
 //! through a whole sitting.
@@ -16,10 +16,18 @@ use std::time::{Duration, Instant};
 /// identity on every tick.
 pub const IDENTIFY_EVERY: u32 = 3;
 
-/// The default mode's tick. Mike, 2026-09-24: secure mode looks every five
-/// seconds, the default mode less often; the default mode only needs to see
-/// that someone is there within the away time.
+/// The default mode's tick. The secure mode looks every five seconds, the
+/// default mode less often: it only needs to see that someone is there
+/// within the away time.
 pub const DEFAULT_MODE_TICK_SECONDS: f32 = 10.0;
+
+/// How long after a check confirmed the user a side view (a face in the
+/// chair turned past every enrolled look, which no check can read) holds
+/// the default mode's clock. Someone reading a second screen turns back to
+/// this one now and then, and the next check there renews it; someone
+/// else turned that way after the user left holds it no longer than this.
+/// A judgment, not a measurement.
+pub const SIDE_VIEW_HOLD: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,8 +40,14 @@ pub enum State {
 
 /// The watch's state between ticks, and the rules that move it: what
 /// `run` drives from the camera, kept apart from it so the rules can be
-/// exercised on made-up observations.
+/// exercised on made-up observations. A consent card runs a copy of the
+/// live one on its own looks while it holds the camera, so its away clock
+/// holds wherever the watch's would (`in_consent`).
+#[derive(Clone)]
 pub(crate) struct Watch {
+    /// Who the journal lines are from: the watch itself, or its copy
+    /// under a consent card.
+    who: &'static str,
     cfg: PresenceConfig,
     pub(crate) state: State,
     last_seen: Option<Instant>,
@@ -47,6 +61,10 @@ pub(crate) struct Watch {
     /// passing check restores it.
     identity_ok: bool,
     identity_fails: u32,
+    /// When a check last confirmed the user (a passing check of the
+    /// watch's, a consent card's match, or a face unlock); None until one
+    /// has. A side view holds the clock only for `SIDE_VIEW_HOLD` after it.
+    last_confirmed: Option<Instant>,
 }
 
 /// What one tick decided.
@@ -56,11 +74,17 @@ pub(crate) struct Step {
     /// failed and is retried).
     pub(crate) lock: bool,
     pub(crate) away_for: Option<f32>,
+    /// Whether this look held the away clock: the face counted as the
+    /// user's, or the same shape stood in for a hidden one.
+    pub(crate) held: bool,
+    /// Whether it was the shape alone that held it.
+    pub(crate) by_shape: bool,
 }
 
 impl Watch {
     pub(crate) fn new(cfg: PresenceConfig) -> Watch {
         Watch {
+            who: "presence",
             cfg,
             state: State::Unknown,
             last_seen: None,
@@ -70,7 +94,15 @@ impl Watch {
             locked_by_presence: false,
             identity_ok: true,
             identity_fails: 0,
+            last_confirmed: None,
         }
+    }
+
+    /// This watch as a consent card's copy: the same state and rules, its
+    /// journal lines marked as the card's.
+    pub(crate) fn in_consent(mut self) -> Watch {
+        self.who = "presence, under a consent card";
+        self
     }
 
     /// A consent window that ran, or a face match, since the last tick: the
@@ -79,8 +111,31 @@ impl Watch {
         if self.last_seen.map(|l| at > l).unwrap_or(true) {
             self.last_seen = Some(at);
             if self.state != State::Present {
-                log::info!("presence: consent or match since the last tick; clock restarts");
+                log::info!(
+                    "{}: consent or match since the last tick; clock restarts",
+                    self.who
+                );
             }
+        }
+    }
+
+    /// The user identified at `at` where the watch did not look (a consent
+    /// card's scan matched them), at `frame` and `bbox`: the clock, the last
+    /// full sighting and the shape reference move there, and the identity
+    /// is good, as a passing check of the watch's own would leave them. So
+    /// the shape hold for a hidden face runs from the latest real sighting,
+    /// not from the last one the watch itself made.
+    pub(crate) fn sighted(&mut self, at: Instant, frame: &Grey, bbox: [f32; 4]) {
+        if self.last_full.is_none_or(|t| at > t) {
+            self.last_full = Some(at);
+            self.reference = Some((frame.clone(), bbox));
+            self.identity_ok = true;
+            self.identity_fails = 0;
+            self.partial_logged = false;
+            self.last_confirmed = Some(at);
+        }
+        if self.last_seen.is_none_or(|t| at > t) {
+            self.last_seen = Some(at);
         }
     }
 
@@ -101,6 +156,9 @@ impl Watch {
         self.last_seen = Some(now);
         self.identity_ok = true;
         self.identity_fails = 0;
+        // A face unlock confirmed the user; a password confirmed nobody at
+        // the camera, so side views hold nothing until a check does.
+        self.last_confirmed = by_face.then_some(now);
         self.state = if by_face {
             State::Present
         } else {
@@ -115,6 +173,7 @@ impl Watch {
             if id {
                 self.identity_fails = 0;
                 self.identity_ok = true;
+                self.last_confirmed = Some(now);
             } else {
                 self.identity_fails += 1;
                 // Default: two checks running, so one flaky read does not
@@ -132,9 +191,17 @@ impl Watch {
         // not leaving. Secure: only a face that passed this tick's
         // identity check; an unchecked face, or one the gate read no
         // signal from, holds nothing.
+        // A side view (a face turned past every enrolled look, which no
+        // check can read) holds as the user's only for `SIDE_VIEW_HOLD`
+        // after a check confirmed them: the user reading a second screen,
+        // not whoever sits down turned that way once they have gone.
+        let side_view_holds = !obs.side_view
+            || self
+                .last_confirmed
+                .is_some_and(|t| now.duration_since(t) < SIDE_VIEW_HOLD);
         let seen = obs.face
             && match mode {
-                PresenceMode::Default => self.identity_ok || obs.attentive,
+                PresenceMode::Default => (self.identity_ok && side_view_holds) || obs.attentive,
                 PresenceMode::Secure => obs.identity == Some(true),
             };
         // A hidden face may still be the user in the chair: a hand or a
@@ -149,7 +216,10 @@ impl Watch {
         // the screen while it scores just under the line, or leaves the
         // strobe no signal to read; those are hidden too. Only a face turned
         // to the screen that misses by a wide margin is someone else looking
-        // at the session, and the shape under it holds nothing.
+        // at the session, and the shape under it holds nothing. A face the
+        // mesh read no pose from arrives attentive when its check missed
+        // wide (`observe::facing_the_session`), so it lands here too: the
+        // shape tells a person from the wall, not one person from another.
         let stranger = obs.face && obs.attentive && obs.identity == Some(false) && !obs.near_miss;
         let hidden = !stranger;
         let held_by_shape = if !seen
@@ -162,7 +232,7 @@ impl Watch {
             };
             if sim >= SAME_SHAPE {
                 if !self.partial_logged {
-                    log::info!("presence: the user's face is not seen but the same shape is in the chair ({:.2}); the clock is held", sim);
+                    log::info!("{}: the user's face is not seen but the same shape is in the chair ({:.2}); the clock is held", self.who, sim);
                     self.partial_logged = true;
                 }
                 true
@@ -171,7 +241,7 @@ impl Watch {
                     // Logged once per episode so the threshold can be set from
                     // what real hands and sheets score. A scene similarity, not
                     // a match score.
-                    log::info!("presence: the user's face is not seen and the shape under the last box differs ({:.2} < {}); the clock runs", sim, SAME_SHAPE);
+                    log::info!("{}: the user's face is not seen and the shape under the last box differs ({:.2} < {}); the clock runs", self.who, sim, SAME_SHAPE);
                     self.partial_logged = true;
                 }
                 false
@@ -203,7 +273,7 @@ impl Watch {
             }
         } else if !held_by_shape && (self.state == State::Present || self.state == State::Stranger)
         {
-            log::info!("presence: nobody holds the clock this look (face {}, identity {:?}, frame {}, last full sighting {})", obs.face, obs.identity, obs.frame.is_some(), self.last_full.map(|t| format!("{:.0}s ago", now.duration_since(t).as_secs_f32())).unwrap_or_else(|| "never".into()));
+            log::info!("{}: nobody holds the clock this look (face {}, identity {:?}, frame {}, last full sighting {})", self.who, obs.face, obs.identity, obs.frame.is_some(), self.last_full.map(|t| format!("{:.0}s ago", now.duration_since(t).as_secs_f32())).unwrap_or_else(|| "never".into()));
         }
         let unseen = self.last_seen.map(|t| now.duration_since(t));
         let away_for = unseen.map(|d| d.as_secs_f32());
@@ -237,7 +307,8 @@ impl Watch {
         };
         if next != self.state {
             log::info!(
-                "presence: {:?} -> {:?}{}",
+                "{}: {:?} -> {:?}{}",
+                self.who,
                 self.state,
                 next,
                 away_for
@@ -256,6 +327,8 @@ impl Watch {
             state: next,
             lock,
             away_for,
+            held: seen || held_by_shape,
+            by_shape: held_by_shape && !seen,
         }
     }
 }
@@ -315,6 +388,44 @@ pub fn partial_holds(now: Instant, last_full: Option<Instant>, limit: Option<Dur
 mod watch_tests {
     use super::*;
     use crate::presence::{AwayTime, LockWord};
+
+    /// A consent card's match is a sighting of the watch's too. Two and a
+    /// half minutes after the watch last checked the user, past the secure
+    /// mode's window for holding a hidden face by its shape, a near miss
+    /// (a hand on the chin) locks; with the card's match of a moment ago
+    /// fed in, its frame the shape reference, the same near miss is held.
+    #[test]
+    fn a_card_match_moves_the_watchs_shape_window() {
+        let t0 = Instant::now();
+        let mut frame = Grey::new(120, 120);
+        frame
+            .data
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, v)| *v = (i % 251) as u8);
+        let bbox = [20.0, 10.0, 40.0, 40.0];
+        let at_the_desk = |identity: Option<bool>, near_miss: bool| Observation {
+            face: true,
+            attentive: true,
+            frame: Some(frame.clone()),
+            bbox: Some(bbox),
+            identity,
+            near_miss,
+            side_view: false,
+        };
+        let mut w = Watch::new(cfg());
+        assert!(
+            w.step(&at_the_desk(Some(true), false), t0, PresenceMode::Secure)
+                .held
+        );
+        let later = t0 + Duration::from_secs(150);
+        let near_miss = at_the_desk(Some(false), true);
+        let mut lapsed = w.clone();
+        assert!(lapsed.step(&near_miss, later, PresenceMode::Secure).lock);
+        w.sighted(later - Duration::from_secs(1), &frame, bbox);
+        let s = w.step(&near_miss, later, PresenceMode::Secure);
+        assert!(s.held && !s.lock);
+    }
 
     /// The live cadence, as `run` computes it: the user passes identity
     /// checks for three ticks and leaves; from tick 4 on a stranger (an
@@ -415,9 +526,9 @@ mod watch_tests {
         }
     }
 
-    /// Mike, 2026-09-25: the default mode's away time may be "never". An
-    /// empty chair then never locks, however long it stays empty; the
-    /// secure mode, which has no "never", still locks it on its own time.
+    /// The default mode's away time may be "never". An empty chair then
+    /// never locks, however long it stays empty; the secure mode, which
+    /// has no "never", still locks it on its own time.
     #[test]
     fn default_mode_set_to_never_leaves_an_empty_chair_unlocked() {
         let never = PresenceConfig {
@@ -515,9 +626,9 @@ mod watch_tests {
         }
     }
 
-    /// Default mode, the attention rule: the enrolled user is held to the
-    /// attention setting (off by default), so reading a paper beside the
-    /// screen does not lock the desk; a face whose checks failed has to be
+    /// Default mode, the attention rule: the enrolled user holds the clock
+    /// whatever they look at, so reading a paper beside the screen does not
+    /// lock the desk; a face whose checks failed has to be
     /// looking at the screen to hold the clock. One failed check is
     /// tolerated before that applies.
     #[test]
@@ -598,6 +709,7 @@ mod watch_tests {
             bbox: Some([20.0, 10.0, 40.0, 40.0]),
             identity: Some(true),
             near_miss: false,
+            side_view: false,
         };
         let hidden = Observation {
             face: false,
@@ -606,6 +718,7 @@ mod watch_tests {
             bbox: None,
             identity: None,
             near_miss: false,
+            side_view: false,
         };
         let mut looks = vec![seen.clone()];
         looks.extend((0..8).map(|_| hidden.clone()));
@@ -673,6 +786,7 @@ mod watch_tests {
             bbox: Some([20.0, 10.0, 40.0, 40.0]),
             identity: Some(true),
             near_miss: false,
+            side_view: false,
         };
         let chin = |identity| Observation {
             face: true,
@@ -681,6 +795,7 @@ mod watch_tests {
             bbox: Some([20.0, 10.0, 40.0, 40.0]),
             identity,
             near_miss: false,
+            side_view: false,
         };
         // Between checks the look carries no verdict; on a check the
         // covered crop fails. Neither holds by itself.
@@ -741,6 +856,7 @@ mod watch_tests {
             bbox: Some([20.0, 10.0, 40.0, 40.0]),
             identity: Some(true),
             near_miss: false,
+            side_view: false,
         };
         let stranger = Observation {
             identity: Some(false),
@@ -778,6 +894,7 @@ mod watch_tests {
             bbox: Some([20.0, 10.0, 40.0, 40.0]),
             identity: Some(true),
             near_miss: false,
+            side_view: false,
         };
         let near = Observation {
             identity: Some(false),
@@ -837,6 +954,95 @@ mod watch_tests {
         assert_eq!(tick_for(&c, PresenceMode::Secure, true), 10.0);
         assert_eq!(tick_for(&c, PresenceMode::Default, false), 10.0);
         assert_eq!(tick_for(&c, PresenceMode::Default, true), 10.0);
+    }
+}
+
+#[cfg(test)]
+mod side_view_tests {
+    use super::*;
+
+    /// A side view: a face in the chair, turned past every enrolled look,
+    /// read as no check, with no frame for the shape to hold on.
+    fn side() -> Observation {
+        Observation {
+            side_view: true,
+            ..obs_at(true, false, None)
+        }
+    }
+
+    /// The user confirmed, then reading a second screen: the side views
+    /// hold the clock for `SIDE_VIEW_HOLD` after that check and no longer,
+    /// then the away time runs. Someone else turned the same way after the
+    /// user left holds it no longer than that either.
+    #[test]
+    fn a_side_view_holds_only_for_a_while_after_a_confirmed_check() {
+        let t0 = Instant::now();
+        let mut w = Watch::new(cfg());
+        w.step(&obs_at(true, true, Some(true)), t0, PresenceMode::Default);
+        let hold = SIDE_VIEW_HOLD.as_secs();
+        let mut first_lock = None;
+        for s in (10..hold + 120).step_by(10) {
+            if w.step(&side(), t0 + Duration::from_secs(s), PresenceMode::Default)
+                .lock
+            {
+                first_lock = Some(s);
+                break;
+            }
+        }
+        let at = first_lock.expect("the side views stop holding");
+        assert!(
+            at > hold,
+            "held through the hold ({} s): locked at {} s",
+            hold,
+            at
+        );
+        assert!(
+            at <= hold + 30,
+            "the away time runs from the end of the hold: {} s",
+            at
+        );
+    }
+
+    /// No check has confirmed anyone: a watch just started (someone faced
+    /// the screen, so the clock runs, but no check has read them), or a
+    /// session unlocked by password. Side views hold nothing then, and the
+    /// away time runs as it would for an empty chair.
+    #[test]
+    fn a_side_view_holds_nothing_without_a_confirmed_check() {
+        let t0 = Instant::now();
+        let mut w = Watch::new(cfg());
+        w.step(&obs_at(true, true, None), t0, PresenceMode::Default);
+        let mut locked_at = None;
+        for s in (10..120).step_by(10) {
+            if w.step(&side(), t0 + Duration::from_secs(s), PresenceMode::Default)
+                .lock
+            {
+                locked_at = Some(s);
+                break;
+            }
+        }
+        assert!(
+            locked_at.is_some_and(|s| s <= 40),
+            "never confirmed: {:?}",
+            locked_at
+        );
+        let mut w = Watch::new(cfg());
+        w.step(&obs_at(true, true, Some(true)), t0, PresenceMode::Default);
+        w.resumed(t0 + Duration::from_secs(5), false);
+        let mut locked_at = None;
+        for s in (10..120).step_by(10) {
+            if w.step(&side(), t0 + Duration::from_secs(s), PresenceMode::Default)
+                .lock
+            {
+                locked_at = Some(s);
+                break;
+            }
+        }
+        assert!(
+            locked_at.is_some_and(|s| s <= 40),
+            "after a password: {:?}",
+            locked_at
+        );
     }
 }
 

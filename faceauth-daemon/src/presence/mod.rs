@@ -13,9 +13,12 @@
 //! laptop handed to someone stays open while they look at it, and the
 //! session locks only once the chair has been empty for `away_seconds`
 //! (never by time, when that is "never").
-//! Identity is checked every `IDENTIFY_EVERY` ticks there, but only to tell
-//! the shell who is holding the clock and to take the shape reference for a
-//! hidden face; it never decides the lock. In the `secure` mode identity is
+//! Identity is checked there on the ticks divisible by `IDENTIFY_EVERY` (3),
+//! and while the state is not `Present` on the even ticks too (ticks
+//! divisible by 2 or 3): it tells the shell who is holding the clock,
+//! takes the shape reference for a hidden face, and lets a confirmed user
+//! hold the clock while not facing the screen; a face turned to the screen
+//! holds it whatever the check says. In the `secure` mode identity is
 //! checked on every tick, only a face that passes holds the clock, the first
 //! failed check locks the session at once, and an empty chair locks after
 //! `secure_away_seconds`. Each mode reads its own away time, the one of the
@@ -43,16 +46,21 @@ mod test_support;
 mod watch;
 
 pub use config::{
-    presence_mode, set_presence_mode, AwayTime, LockWord, ObscuredFaceLock, PresenceConfig,
-    PresenceMode, SECURE_OBSCURED_LOCK_MINUTES, SECURE_OBSCURED_LOCK_RANGE,
+    mode_for_camera, presence_mode, set_presence_mode, AwayTime, LockWord, ObscuredFaceLock,
+    PresenceConfig, PresenceMode, SECURE_NEEDS_STROBE, SECURE_NOT_KNOWN,
+    SECURE_OBSCURED_LOCK_MINUTES, SECURE_OBSCURED_LOCK_RANGE,
 };
 pub use lock::{SessionLock, LOCK_CHECK_TICKS, LOCK_HELPER, SESSION_LOCK};
-pub(crate) use observe::{observe_in, probe_look, Observation};
+pub(crate) use observe::{observe_in, probe_look, Observation, ProbeReading};
+#[cfg(test)]
+pub(crate) use observe::{probe_look_with, stub_eyes::StubEyes};
 pub use observe::{
-    ATTENTIVE_MAX_ROLL_DEG, ATTENTIVE_MAX_YAW, FACE_SETTLE_MAX, LOOK_SEE_BUDGET, NEAR_MISS_SLACK,
-    PRESENCE_STROBE_WINDOW,
+    ATTENTIVE_MAX_ROLL_DEG, ATTENTIVE_MAX_YAW_DEG, FACE_SETTLE_MAX, LOOK_SEE_BUDGET,
+    NEAR_MISS_SLACK, PRESENCE_STROBE_WINDOW,
 };
+pub(crate) use run::{note_sighting, on_battery_now, watch_copy};
 pub use run::{run, snapshot, Snapshot};
+pub(crate) use watch::Watch;
 pub use watch::{
     partial_holds, same_shape, tick_for, State, DEFAULT_MODE_TICK_SECONDS, IDENTIFY_EVERY,
     SAME_SHAPE,

@@ -1,5 +1,5 @@
 //! Image comparison for the presence watch: how alike one region of two
-//! frames is, by zero-mean normalised cross-correlation, so the walk-away
+//! frames is, by zero-mean normalized cross-correlation, so the walk-away
 //! lock can tell a person who left (the torso below the face box no longer
 //! correlates with the one they filled) from a hand over the face. The
 //! per-frame image-motion measure that the gesture detectors once read
@@ -35,7 +35,7 @@ pub fn below(bbox: [f32; 4], width: usize, height: usize) -> Region {
     }
 }
 
-/// How alike two frames are inside `r`: zero-mean normalised
+/// How alike two frames are inside `r`: zero-mean normalized
 /// cross-correlation of the region sampled every fourth pixel, so brightness
 /// and exposure changes cancel and only the pattern counts. 1.0 is the same
 /// scene, about 0 is unrelated, and a person who has left leaves a region

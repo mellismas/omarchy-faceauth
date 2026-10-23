@@ -112,6 +112,11 @@ fn bench_frame_stages() {
     bench("capture next: fused from_u10_oriented (after)", 200, || {
         black_box(Grey::from_u10_oriented(&raw, 640, 480, true, true, true));
     });
+    let mut frame = Grey::default();
+    bench("capture next: into a reused frame (C7)", 200, || {
+        frame.set_from_u10_oriented(&raw, 640, 480, true, true, true);
+        black_box(&frame);
+    });
     bench("frame mean, f64 running sum (before)", 200, || {
         black_box(img.data.iter().map(|&v| v as f64).sum::<f64>() / img.data.len() as f64);
     });
