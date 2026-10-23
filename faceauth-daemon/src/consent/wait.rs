@@ -323,7 +323,7 @@ impl LockWatch {
         live: &'static AtomicUsize,
     ) -> Result<LockWatch, LockQuestion> {
         // Keep the bounded claim compatible with the workspace's Rust 1.88
-        // minimum: fetch_update is deprecated and try_update needs Rust 1.99.
+        // minimum: fetch_update is deprecated and try_update needs Rust 1.95.
         let mut count = live.load(Ordering::SeqCst);
         loop {
             if count >= LOCK_WATCHES_MAX {
