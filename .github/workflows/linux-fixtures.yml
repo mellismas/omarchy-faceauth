@@ -2,6 +2,7 @@ name: Linux build and authentication fixtures
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
   workflow_dispatch:
@@ -11,6 +12,7 @@ permissions:
 
 jobs:
   linux:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Debian Linux build and fixtures
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -36,6 +38,7 @@ jobs:
           runuser -u fixture -- cargo test --locked -p pam_faceauth --lib -- --nocapture
 
   arch:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Arch Linux build and fixtures
     runs-on: ubuntu-latest
     timeout-minutes: 20
