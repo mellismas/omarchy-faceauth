@@ -10,9 +10,19 @@ on:
 permissions:
   contents: read
 
+# PR runs (Mike, 2026-11-07): a draft starts no hosted job. A PR runs when it
+# opens ready, is reopened, or is marked ready, and on every later push while it
+# is ready. Adding the `ci-final` label reruns it; other labels run nothing and
+# get their own group, so they cancel nothing. A newer run for the same PR
+# cancels the older one. Pushes to main and manual runs each get their own
+# group, so every main commit keeps its run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}-${{ github.event.action == 'labeled' && github.event.label.name != 'ci-final' && github.run_id || 'ci' }}
+  cancel-in-progress: true
+
 jobs:
   linux:
-    if: github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'labeled' || github.event.label.name == 'ci-final') && github.event.action != 'synchronize')
+    if: github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'labeled' || github.event.label.name == 'ci-final'))
     name: Debian Linux build and fixtures
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -38,7 +48,7 @@ jobs:
           runuser -u fixture -- cargo test --locked -p pam_faceauth --lib -- --nocapture
 
   arch:
-    if: github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'labeled' || github.event.label.name == 'ci-final') && github.event.action != 'synchronize')
+    if: github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'labeled' || github.event.label.name == 'ci-final'))
     name: Arch Linux build and fixtures
     runs-on: ubuntu-latest
     timeout-minutes: 20
