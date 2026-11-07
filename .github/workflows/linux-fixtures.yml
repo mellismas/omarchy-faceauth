@@ -13,10 +13,11 @@ permissions:
 # PR runs (Mike, 2026-11-07): a draft starts no hosted job. A PR runs when it
 # opens ready, is reopened, or is marked ready, and on every later push while it
 # is ready. Adding the `ci-final` label reruns it; other labels run nothing and
-# get their own group, so they cancel nothing. A newer run for the same PR or
-# branch cancels the older one.
+# get their own group, so they cancel nothing. A newer run for the same PR
+# cancels the older one. Pushes to main and manual runs each get their own
+# group, so every main commit keeps its run.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.action == 'labeled' && github.event.label.name != 'ci-final' && github.run_id || 'ci' }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}-${{ github.event.action == 'labeled' && github.event.label.name != 'ci-final' && github.run_id || 'ci' }}
   cancel-in-progress: true
 
 jobs:
