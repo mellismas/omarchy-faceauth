@@ -12,6 +12,8 @@ workspace = true
 anyhow.workspace = true
 libc.workspace = true
 log.workspace = true
-# A release candidate because no 2.0 release exists yet; the load-dynamic
+# A release candidate because no 2.0 release exists yet, pinned exactly because
+# release candidates break the API between candidates (rc.15 moved the
+# Environment into Session::builder); port deliberately. The load-dynamic
 # feature is what lets the engine bind Arch's libonnxruntime.so at run time.
-ort = { version = "2.0.0-rc.13", default-features = false, features = ["load-dynamic"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic"] }

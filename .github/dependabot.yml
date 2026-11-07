@@ -22,3 +22,8 @@ updates:
     groups:
       cargo-minor-and-patch:
         update-types: [minor, patch]
+    # ort is pinned to an exact release candidate (faceauth-engine/Cargo.toml);
+    # later candidates change its API, so the move is a deliberate port.
+    ignore:
+      - dependency-name: ort
+      - dependency-name: ort-sys
