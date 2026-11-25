@@ -138,11 +138,15 @@ jobs:
         run: |
           mkdir -p .review-plugins/.claude-plugin
           echo '{"name":"pinned-review","owner":{"name":"mellismas"},"plugins":[{"name":"code-review","source":"./plugins/code-review"}]}' > .review-plugins/.claude-plugin/marketplace.json
-      - uses: anthropics/claude-code-action@61a9c274fa7110a66dfafc1bbbced03833eb25fe # v1.0.269
+      - uses: anthropics/claude-code-action@4d75e5f390ee76b2e09c1980ecc99ff3a2e088c8 # v1.0.275
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           plugin_marketplaces: "./.review-plugins"
           plugins: "code-review@pinned-review"
           prompt: "/code-review:code-review --comment ${{ github.repository }}/pull/${{ needs.resolve.outputs.number }}"
-          claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment"'
+          # --permission-mode default keeps --allowedTools a strict list. From v1.0.273 the
+          # action starts sessions in auto mode, where a safety review can pass tool calls
+          # that no allow rule covers. This job reads text a pull request controls and holds
+          # the Claude token, so it stays on the earlier default. Do not remove the flag.
+          claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment" --permission-mode default'
