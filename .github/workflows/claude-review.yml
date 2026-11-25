@@ -110,6 +110,16 @@ jobs:
       contents: read
       pull-requests: write
       issues: read
+    # Subprocess isolation for the review session. With this set, Claude Code
+    # strips its own credentials, the Claude token among them, from the
+    # environment of every program the session starts, and runs each one in its
+    # own process namespace, so a command the review may run can't read the
+    # token from the session's process either. GH_TOKEN stays, because the
+    # review's gh calls need it; it is this job's own token and ends with the
+    # job. The action turns this on by itself only for allowed_non_write_users,
+    # which this workflow must not set. Do not remove it.
+    env:
+      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
     steps:
       # The base commit of a PR into main, and main itself otherwise: never the
       # PR head, and never a non-main base. Anyone who can push can write to a
@@ -138,6 +148,20 @@ jobs:
         run: |
           mkdir -p .review-plugins/.claude-plugin
           echo '{"name":"pinned-review","owner":{"name":"mellismas"},"plugins":[{"name":"code-review","source":"./plugins/code-review"}]}' > .review-plugins/.claude-plugin/marketplace.json
+      # The isolation set in this job's env needs bubblewrap, and Ubuntu 24.04
+      # has to allow unprivileged user namespaces for it. The action installs
+      # these only for allowed_non_write_users, and only best-effort. Here a
+      # failure stops the job before the session starts: the last line proves a
+      # process namespace can be made, and Claude Code itself refuses to start
+      # without bubblewrap.
+      - name: Install the review session's sandbox
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap socat
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-pid --ro-bind / / --proc /proc --dev /dev true
       - uses: anthropics/claude-code-action@4d75e5f390ee76b2e09c1980ecc99ff3a2e088c8 # v1.0.275
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
