@@ -55,5 +55,5 @@ The agentright gate covers lint, typecheck, formatting, duplication, and the deb
 ## Git Workflow
 
 - Commit early and often on a feature branch, with a clear message for each logical step.
-- Claim the work early with a draft pull request; drafts don't trigger the automated Codex and Claude reviews. Mark it ready only when the component is complete and passes the local checks.
+- Claim the work with a draft pull request and mark it ready as the Agent Rules above direct: their claim rule and their ready-PR rule govern, including when a platform can't open a draft early. In this repository the Claude review and the hosted build skip drafts and start when a pull request is marked ready.
 - Keep each pull request to one component, so reviews stay focused.
