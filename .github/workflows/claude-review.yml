@@ -112,12 +112,15 @@ jobs:
       issues: read
     # Subprocess isolation for the review session. With this set, Claude Code
     # strips its own credentials, the Claude token among them, from the
-    # environment of every program the session starts, and runs each one in its
-    # own process namespace, so a command the review may run can't read the
-    # token from the session's process either. GH_TOKEN stays, because the
-    # review's gh calls need it; it is this job's own token and ends with the
-    # job. The action turns this on by itself only for allowed_non_write_users,
-    # which this workflow must not set. Do not remove it.
+    # environment of every program the session starts, and runs each command
+    # its Bash tool starts in its own process namespace, so a command the
+    # review may run can't read the token from the session's process either.
+    # A hook gets the stripped environment but not the namespace; this job
+    # configures no hooks, and one added later would not be isolated that way.
+    # GH_TOKEN stays, because the review's gh calls need it; it is this job's
+    # own token and ends with the job. The action turns this on by itself only
+    # for allowed_non_write_users, which this workflow must not set. Do not
+    # remove it.
     env:
       CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
     steps:
