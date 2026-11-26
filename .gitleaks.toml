@@ -1,0 +1,50 @@
+# gitleaks configuration for this repo. It keeps every default rule and adds
+# two narrow allowlists for two old commits only.
+#
+# Why this file exists: the first push of a new branch makes the pre-push hook
+# scan the branch's whole history, because there is no remote tip to diff
+# against. One old test line trips the generic-api-key rule on every new
+# branch, and no edit to a current file can clear a hit in an old commit. The
+# line is a stand-in answer token in the consent window's payload-size test
+# (a #[cfg(test)] module): a fixed hex string with the length of the token
+# fresh_token() makes from /dev/urandom at run time. It holds no credential.
+# Commit 91efd1c051e1 added it to faceauth-daemon/src/consent.rs, and commit
+# 71ae248fd7da moved it into faceauth-daemon/src/consent/window.rs when
+# consent.rs became a module folder. The current tree builds that stand-in
+# from zeros at run time instead, so it no longer matches the rule.
+#
+# How narrow each allowlist is: condition = "AND" means a finding is skipped
+# only when its rule, its commit, its file path, and its line all match. The
+# line pattern allows only a token field holding 32 lowercase hex characters,
+# with surrounding whitespace. The commits are fixed points in history, so
+# nothing committed later can match one, and a finding from a scan of the
+# current tree has no commit and never matches. The two blocks stay separate
+# so each commit pairs only with its own path.
+#
+# The line pattern spells the field name with a character class and names no
+# value, so this file neither repeats the flagged text nor trips the rule it
+# configures.
+
+# Top-level [[allowlists]] with targetRules needs gitleaks v8.25.0 or later.
+minVersion = "v8.25.0"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "consent payload-size test's stand-in answer token, in consent.rs"
+targetRules = ["generic-api-key"]
+condition = "AND"
+commits = ["91efd1c051e11520d0e294bb1f74ca244648638b"]
+paths = ['''^faceauth-daemon/src/consent\.rs$''']
+regexTarget = "line"
+regexes = ['''^\s*t[o]ken: "[0-9a-f]{32}",\s*$''']
+
+[[allowlists]]
+description = "the same test line, after consent.rs became the consent/ module folder"
+targetRules = ["generic-api-key"]
+condition = "AND"
+commits = ["71ae248fd7da5ce11f5d412b4be0a34d6f788b2d"]
+paths = ['''^faceauth-daemon/src/consent/window\.rs$''']
+regexTarget = "line"
+regexes = ['''^\s*t[o]ken: "[0-9a-f]{32}",\s*$''']

@@ -367,7 +367,9 @@ mod payload_size_tests {
                 state: "scanning",
                 message: "Look at the camera.",
                 caller: &caller,
-                token: "00112233445566778899aabbccddeeff",
+                // A real answer token is 32 hex characters; zeros keep its size
+                // without looking like a credential to a secret scanner.
+                token: &"0".repeat(32),
                 waiting: false,
                 passwordless_minutes: None,
                 face_present: false,
