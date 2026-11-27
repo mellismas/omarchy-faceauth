@@ -9,5 +9,6 @@ CLAUDE.md @mellismas
 .agentright-debt-baseline.json @mellismas
 checkrepo-*.json @mellismas
 agentright.toml @mellismas
-.gitleaks.toml @mellismas
-.gitleaksignore @mellismas
+# Every name gitleaks can read its config or ignore list from: .gitleaks.toml,
+# .gitleaks.json (read before .gitleaks.toml when present), and .gitleaksignore.
+.gitleaks* @mellismas
