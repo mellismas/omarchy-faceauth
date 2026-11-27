@@ -9,3 +9,7 @@ CLAUDE.md @mellismas
 .agentright-debt-baseline.json @mellismas
 checkrepo-*.json @mellismas
 agentright.toml @mellismas
+# Files that change what gitleaks reports: the lowercase config and ignore names it reads by default
+# (.gitleaks.json before .gitleaks.toml, .gitleaksignore) and .gitattributes (-diff hides files).
+.gitleaks* @mellismas
+.gitattributes @mellismas
