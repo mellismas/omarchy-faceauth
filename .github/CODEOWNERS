@@ -9,3 +9,5 @@ CLAUDE.md @mellismas
 .agentright-debt-baseline.json @mellismas
 checkrepo-*.json @mellismas
 agentright.toml @mellismas
+.gitleaks.toml @mellismas
+.gitleaksignore @mellismas
